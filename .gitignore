@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# builds
+dist/
+build/
+
+# env & secrets (никогда в git)
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+logs/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
+
+# runtime
+tmp/
+coverage/
