@@ -374,6 +374,14 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
   const [fresh, setFresh] = useState<string | null>(null);
   const [err, setErr] = useState('');
   const [showTrash, setShowTrash] = useState(false);
+  const [q, setQ] = useState<api.QueueStatus | null>(null);
+  const [qErr, setQErr] = useState('');
+  const loadQ = () => api.queueStatus().then(setQ).catch((e) => setQErr((e as Error).message));
+  useEffect(() => {
+    void loadQ();
+    const t = setInterval(() => void loadQ(), 5000);
+    return () => clearInterval(t);
+  }, []);
   const loadTokens = () => api.listTokens().then(setTokens).catch((e) => setErr((e as Error).message));
   useEffect(() => { void loadTokens(); }, []);
   const addToken = async () => {
@@ -411,6 +419,32 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
           </div>
         ))}
         {!tokens.length && <div className="copy">Токенов нет — нужен для Finder/WebDAV</div>}
+      </div>
+      <div className="panel">
+        <div className="row"><strong>Конвертация</strong><button className="btn ghost" onClick={() => void loadQ()}>обновить</button></div>
+        {qErr && <div className="err">{qErr}</div>}
+        {q && (
+          <div className="row" style={{ gap: 12 }}>
+            <span className="meta">⏳ {q.byState.pending ?? 0} в очереди</span>
+            <span className="meta">⚙ {q.byState.processing ?? 0} обрабатывается</span>
+            <span className="meta">✓ {q.byState.done ?? 0} готово</span>
+            <span className="meta">✗ {q.byState.failed ?? 0} ошибок</span>
+          </div>
+        )}
+        {q?.processing && <div className="copy">Сейчас: {q.processing.kind} · {q.processing.sha256} · идёт {q.processing.startedMinAgo} мин</div>}
+        {q?.recent && q.recent.length > 0 && (
+          <div>
+            {q.recent.slice(0, 8).map((j) => (
+              <div className="item" key={j.id}>
+                <span className="icon">{j.state === 'done' ? '✅' : j.state === 'failed' ? '❌' : j.state === 'processing' ? '⚙️' : '🕓'}</span>
+                <span className="fname">{j.kind === 'photo' ? 'фото' : 'видео'} · {j.sha256}</span>
+                <span className="meta">{j.masterReady ? 'мастер ✓' : j.state}</span>
+                {j.error && <div className="copy" style={{ width: '100%' }}>{j.error}</div>}
+              </div>
+            ))}
+          </div>
+        )}
+        {q && !q.recent?.length && <div className="copy">Задач пока нет</div>}
       </div>
       <div className="panel">
         <div className="row"><strong>Корзина</strong><button className="btn ghost" onClick={() => setShowTrash(!showTrash)}>{showTrash ? 'скрыть' : 'открыть'}</button></div>
