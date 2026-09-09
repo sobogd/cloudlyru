@@ -69,10 +69,13 @@ export class DavService {
 
   private async folderByPath(userId: string, parts: string[]) {
     const rootId = await this.auth.rootFolderId(userId);
+    const photoId = await this.auth.photoRootIdOrNull(userId);
     let folderId = rootId;
     for (const name of parts) {
       const f = await this.prisma.folder.findFirst({ where: { parentId: folderId, name, deletedAt: null } });
       if (!f) return null;
+      // системная медиатека «Фото» скрыта в WebDAV (как и в разделе «Файлы»)
+      if (photoId && f.id === photoId) return null;
       folderId = f.id;
     }
     return folderId;
@@ -96,6 +99,7 @@ export class DavService {
     const parts = davPath.split('/').filter(Boolean);
     const entry = await this.entryByPath(userId, parts);
     const rootId = await this.auth.rootFolderId(userId);
+    const photoId = await this.auth.photoRootIdOrNull(userId);
 
     let responses: Array<{ href: string; isCollection: boolean; name: string; size?: number; mtime?: Date }> = [];
 
@@ -118,6 +122,7 @@ export class DavService {
           }),
         ]);
         for (const c of folders) {
+          if (photoId && c.id === photoId) continue; // системная «Фото» не показывается в Finder
           responses.push({ href: `${href === '/' ? '' : href}/${encodeURIComponent(c.name)}`, isCollection: true, name: c.name, mtime: c.updatedAt });
         }
         for (const c of entries) {

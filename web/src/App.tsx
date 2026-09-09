@@ -137,13 +137,11 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       <div className="panel">
-        {(view?.folders || []).map((f) => (
+        {(view?.folders || []).filter((f) => f.id !== photoFolderId).map((f) => (
           <div className="item" key={f.id}>
             <span className="icon">📁</span>
             <span className="fname" onClick={() => setStack((s) => [...s, { id: f.id, name: f.name }])}>{f.name}</span>
-            {f.id !== photoFolderId && (
-              <button className="btn ghost" onClick={() => rm('folder', f.id, f.name)}>🗑</button>
-            )}
+            <button className="btn ghost" onClick={() => rm('folder', f.id, f.name)}>🗑</button>
           </div>
         ))}
         {(view?.entries || []).map((e) => (
@@ -189,6 +187,7 @@ function UploadPage({ folderId, folderName, photoFolderId, onClose }: { folderId
   // обычные папки: файлы ложатся как есть, без конвертации
   const isPhotoLibrary = Boolean(folderId && photoFolderId && folderId === photoFolderId);
   const [, force] = useState(0);
+  const [skipNote, setSkipNote] = useState('');
   const running = useRef(false);
   const stopped = useRef(false);
   const ctrl = useRef<AbortController | null>(null);
@@ -232,6 +231,11 @@ function UploadPage({ folderId, folderName, photoFolderId, onClose }: { folderId
     if (!files.length || running.current) return;
     for (const f of files) {
       const k = kind ?? (api.guessMime(f).startsWith('image/') ? 'photo' : api.guessMime(f).startsWith('video/') ? 'video' : 'doc');
+      if (isPhotoLibrary && k === 'doc') {
+        setSkipNote(`«${f.name}» — в «Фото» можно загружать только фото и видео`);
+        continue;
+      }
+      setSkipNote('');
       rows.current.push({ key: `up${++upKey}`, file: f, name: f.name, size: f.size, kind: k, state: 'queued', pct: 0 });
     }
     render();
@@ -282,9 +286,9 @@ function UploadPage({ folderId, folderName, photoFolderId, onClose }: { folderId
 
       <div className="copy" style={{ margin: '10px 2px' }}>
         {isPhotoLibrary ? (
-          <>Куда: <b>{folderName}</b> — фото/видео будут оптимизированы (AVIF/AV1 + превью) и появятся в разделе «Фото».</>
+          <>Куда: <b>{folderName}</b> — фото/видео будут оптимизированы (AVIF/AV1 + превью) и появятся в разделе «Фото». Документы сюда загружать нельзя.</>
         ) : (
-          <>Куда: <b>{folderName}</b> — файлы сохранятся как есть, без конвертации. Чтобы медиа попало в «Фото», загружайте в папку «Фото».</>
+          <>Куда: <b>{folderName}</b> — файлы сохранятся как есть, без конвертации. Фото/видео с оптимизацией загружайте в разделе «Фото».</>
         )}
       </div>
 
@@ -299,8 +303,10 @@ function UploadPage({ folderId, folderName, photoFolderId, onClose }: { folderId
         <div className="copy">Перетащите файлы сюда (можно несколько) — или выберите тип ниже</div>
       </div>
 
+      {skipNote && <div className="notice" style={{ margin: '8px 2px' }}>⚠ {skipNote}</div>}
+
       <div className="upgrid">
-        {(Object.keys(UP_META) as UpKind[]).map((k) => (
+        {(Object.keys(UP_META) as UpKind[]).filter((k) => !(isPhotoLibrary && k === 'doc')).map((k) => (
           <label key={k} className="upbtn">
             <input
               type="file"
@@ -380,8 +386,8 @@ function UploadPage({ folderId, folderName, photoFolderId, onClose }: { folderId
 }
 
 // ================= Фото (медиатека: таймлайн + поездки + карта) =================
-// Показывает только содержимое системной папки «Фото» (зона PHOTOS) — загрузка через ⬆️
-// или в папку «Фото» на диске; медиа в обычных папках («Файлы») не оптимизируется и сюда не попадает.
+// Показывает только содержимое системной папки «Фото» (зона PHOTOS); сама папка скрыта из
+// «Файлы» и WebDAV. Загрузка — через ⬆️ (только фото/видео), удаление — из деталки в корзину.
 
 function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   type Screen = { kind: 'grid' } | { kind: 'view'; idx: number };
@@ -453,6 +459,20 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
           <span style={{ flex: 1 }} />
           <button className="iconbtn" title="Инфо" onClick={() => setInfo(!info)}>ℹ️</button>
           <a className="iconbtn" title="Оригинал (AVIF/AV1)" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">🖼️</a>
+          <button
+            className="iconbtn"
+            title="Удалить (в корзину)"
+            onClick={async () => {
+              if (!confirm(`Удалить «${it.name}» в корзину?`)) return;
+              try {
+                await api.deleteFile(it.entryId);
+                setScreen({ kind: 'grid' });
+                void load();
+              } catch (e) {
+                alert((e as Error).message);
+              }
+            }}
+          >🗑</button>
           <button className="iconbtn" disabled={screen.idx === 0} title="Назад" onClick={() => { setScreen({ kind: 'view', idx: screen.idx - 1 }); setInfo(false); }}>⬅️</button>
           <button className="iconbtn" disabled={screen.idx >= media.length - 1} title="Вперёд" onClick={() => { setScreen({ kind: 'view', idx: screen.idx + 1 }); setInfo(false); }}>➡️</button>
         </div>
@@ -508,7 +528,7 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
             )}
           </div>
         ))}
-        {!media.length && <div className="copy">Нет фото и видео. Загрузите их через ⬆️ или в папку «Фото» на диске — медиа оптимизируется и появится здесь автоматически.</div>}
+        {!media.length && <div className="copy">Нет фото и видео. Загрузите их через ⬆️ — медиа оптимизируется и появится здесь автоматически.</div>}
       </div>
     </div>
   );
