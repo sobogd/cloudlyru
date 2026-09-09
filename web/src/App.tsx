@@ -198,7 +198,7 @@ function Photos() {
   if (screen.kind === 'view' && current) {
     const it = current;
     return (
-      <div>
+      <div className="full">
         <div className="row" style={{ margin: '4px 0' }}>
           <button className="btn ghost" title="Назад" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
           <span style={{ flex: 1 }} />
@@ -230,9 +230,13 @@ function Photos() {
             <div className="copy">Статус обновляется автоматически — можно не перезагружать страницу.</div>
           </div>
         ) : isVid(it.mime) ? (
-          <video src={api.video720Url(it.sha256!)} controls autoPlay style={{ width: '100%', maxHeight: '78vh', background: '#000', borderRadius: 8 }} />
+          <div className="mediaarea">
+            <video src={api.video720Url(it.sha256!)} controls autoPlay style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+          </div>
         ) : (
-          <LoadImg src={api.previewUrl(it.sha256!, 2048)} style={{ width: '100%', maxHeight: '78vh', objectFit: 'contain', background: '#000', borderRadius: 8 }} />
+          <div className="mediaarea">
+            <PhotoZoom src={api.previewUrl(it.sha256!, 2048)} />
+          </div>
         )}
 
       </div>
@@ -283,6 +287,84 @@ function Photos() {
         ))}
         {!media.length && <div className="copy">Нет фото/видео — загрузите из галереи</div>}
       </div>
+    </div>
+  );
+}
+
+
+// Зум только для фото (щипок/дабл-тап/пан); страница при этом не зуммится
+function PhotoZoom({ src }: { src: string }) {
+  const [ok, setOk] = useState(false);
+  const [v, setV] = useState({ s: 1, x: 0, y: 0 });
+  const cur = useRef({ s: 1, x: 0, y: 0 });
+  const pts = useRef(new Map<number, { x: number; y: number }>());
+  const pinch0 = useRef(0);
+  const pan0 = useRef({ x: 0, y: 0, px: 0, py: 0 });
+  const lastTap = useRef(0);
+
+  const clamp = (n: number) => Math.max(1, Math.min(5, n));
+  const apply = (s: number, x: number, y: number) => {
+    s = clamp(s);
+    if (s <= 1) { x = 0; y = 0; }
+    cur.current = { s, x, y };
+    setV({ s, x, y });
+  };
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    Array.from(e.changedTouches).forEach((t) => pts.current.set(t.identifier, { x: t.clientX, y: t.clientY }));
+    if (pts.current.size === 2) {
+      const [a, b] = [...pts.current.values()];
+      pinch0.current = Math.hypot(a.x - b.x, a.y - b.y);
+      pan0.current = { x: cur.current.x, y: cur.current.y, px: 0, py: 0 };
+    } else if (pts.current.size === 1) {
+      const p = pts.current.values().next().value;
+      pan0.current = { x: cur.current.x, y: cur.current.y, px: p.x, py: p.y };
+    }
+  };
+  const onTouchMove = (e: React.TouchEvent) => {
+    Array.from(e.changedTouches).forEach((t) => pts.current.set(t.identifier, { x: t.clientX, y: t.clientY }));
+    const arr = [...pts.current.values()];
+    if (arr.length === 2 && pinch0.current > 0) {
+      const d = Math.hypot(arr[0].x - arr[1].x, arr[0].y - arr[1].y);
+      apply(cur.current.s * (d / pinch0.current), cur.current.x, cur.current.y);
+    } else if (arr.length === 1 && cur.current.s > 1) {
+      const p = arr[0];
+      apply(cur.current.s, pan0.current.x + (p.x - pan0.current.px), pan0.current.y + (p.y - pan0.current.py));
+    }
+  };
+  const onTouchEnd = (e: React.TouchEvent) => {
+    Array.from(e.changedTouches).forEach((t) => pts.current.delete(t.identifier));
+    if (pts.current.size === 0) {
+      const now = Date.now();
+      if (now - lastTap.current < 300) {
+        if (cur.current.s > 1) apply(1, 0, 0); else apply(2.5, 0, 0);
+      }
+      lastTap.current = now;
+    }
+  };
+
+  return (
+    <div
+      style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', touchAction: 'none', overflow: 'hidden', position: 'relative' }}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+    >
+      {!ok && (
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}><span className="spin" /></div>
+      )}
+      <img
+        src={src}
+        alt=""
+        onLoad={() => setOk(true)}
+        onError={() => setOk(true)}
+        style={{
+          maxWidth: '100%', maxHeight: '100%', objectFit: 'contain',
+          transform: `translate(${v.x}px, ${v.y}px) scale(${v.s})`,
+          transition: 'transform 120ms ease-out',
+          opacity: ok ? 1 : 0,
+        }}
+      />
     </div>
   );
 }

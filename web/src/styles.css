@@ -47,3 +47,7 @@ body { background: #0f1115; }
 .spin { width: 26px; height: 26px; border: 3px solid #2b4256; border-top-color: #6ea8ff; border-radius: 50%; animation: sp 0.8s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg); } }
 .navbtn { font-size: 20px; }
+html, body { overscroll-behavior: none; }
+.full { height: calc(100dvh - 128px); overflow: hidden; display: flex; flex-direction: column; }
+.mediaarea { flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden; touch-action: none; background: #000; border-radius: 10px; position: relative; }
+.zoomed { transform-origin: 0 0; will-change: transform; max-width: none; max-height: none; }
