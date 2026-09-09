@@ -51,6 +51,17 @@
       "@prisma/engines",
       "argon2",
       "prisma"
-    ]
+    ],
+    "supportedArchitectures": {
+      "os": [
+        "current",
+        "linux"
+      ],
+      "cpu": [
+        "current",
+        "x64",
+        "arm64"
+      ]
+    }
   }
 }
