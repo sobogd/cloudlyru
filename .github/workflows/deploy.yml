@@ -1,7 +1,8 @@
 name: Deploy (auto on push to main)
 
-# Автодеплой CloudlyRu: любой push в main по путям приложения (src/prisma/package*)
-# собирает и деплоит на прод. Инфраструктурные файлы (.github, deploy/) деплой НЕ триггерят.
+# Автодеплой CloudlyRu: любой push в main по путям приложения собирает и деплоит на прод.
+# Раннер использует node 20 — тот же мажор, что на сервере (ABI нативных модулей argon2/prisma).
+# Инфраструктурные файлы (.github, deploy/) деплой не триггерят.
 # Ручной запуск: gh workflow run deploy.yml -f run_migrations=true|false
 
 on:
@@ -32,15 +33,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: pnpm }
+        with: { node-version: 20, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec prisma generate
       - run: pnpm build
-      # self-contained prod bundle (node_modules prod + dist) — аналог `pnpm --filter … deploy` из iq-rest
-      - name: Prepare bundle
+      - name: Prepare bundle (tar: dist + prod/нативные node_modules)
         run: |
-          pnpm deploy --prod --legacy ./out-cloudlyru
-          cp -r dist out-cloudlyru/dist
+          tar czf cloudlyru.tgz \
+            package.json pnpm-lock.yaml prisma dist node_modules
       - name: Prisma migrate deploy (SSH tunnel to prod Postgres)
         if: ${{ github.event_name == 'push' || inputs.run_migrations }}
         env:
@@ -61,11 +61,10 @@ jobs:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          source: "out-cloudlyru/*"
+          source: "cloudlyru.tgz"
           target: "/home/deploy/apps/cloudlyru"
-          strip_components: 1
           overwrite: true
-      - name: Write .env + pm2 reload
+      - name: Swap runtime + write .env + pm2 reload
         uses: appleboy/ssh-action@v1.0.3
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -82,6 +81,18 @@ jobs:
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
+            # распаковать бандл в свежую папку и атомарно заменить рантайм
+            rm -rf incoming && mkdir incoming
+            tar xzf cloudlyru.tgz -C incoming
+            rm -f cloudlyru.tgz
+            rm -rf dist node_modules
+            mv incoming/dist ./dist
+            mv incoming/node_modules ./node_modules
+            cp incoming/package.json ./package.json
+            cp incoming/pnpm-lock.yaml ./pnpm-lock.yaml
+            cp -r incoming/prisma ./prisma
+            rm -rf incoming
+
             cat > .env <<EOF
             NODE_ENV=production
             PORT=8305

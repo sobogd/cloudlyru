@@ -39,7 +39,9 @@ if ! command -v psql >/dev/null 2>&1; then
   exit 1
 fi
 if [[ "$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'")" != "1" ]]; then
-  sudo -u postgres psql -v pw="$DB_PASS" -c "CREATE ROLE \"$DB_USER\" LOGIN PASSWORD :'pw'" >/dev/null
+  # экранируем одинарные кавычки в пароле и подставляем напрямую (psql -c не интерполирует :'var')
+  ESC_PASS="$(printf '%s' "$DB_PASS" | sed "s/'/''/g")"
+  sudo -u postgres psql -c "CREATE ROLE \"$DB_USER\" LOGIN PASSWORD '$ESC_PASS'" >/dev/null
   echo "роль создана"
 else
   echo "роль уже есть — пропуск"
@@ -52,19 +54,11 @@ else
 fi
 
 echo "==> 3/3 nginx ($DOMAIN)"
+# HTTP-only server block: SSL-секцию добавляет certbot --nginx (см. DEPLOY.md)
 cat > /etc/nginx/sites-available/cloudlyru.conf <<'NGINX'
 server {
     listen 80;
     server_name files.iq-factura.com;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name files.iq-factura.com;
-
-    ssl_certificate     /etc/letsencrypt/live/files.iq-factura.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/files.iq-factura.com/privkey.pem;
 
     client_max_body_size 25m;
     client_body_buffer_size 512k;
@@ -86,7 +80,7 @@ server {
 NGINX
 ln -sf /etc/nginx/sites-available/cloudlyru.conf /etc/nginx/sites-enabled/cloudlyru.conf
 nginx -t && systemctl reload nginx
-echo "nginx ok (сертификат: sudo certbot --nginx -d $DOMAIN — если ещё нет)"
+echo "nginx ok. Дальше: sudo certbot --nginx -d $DOMAIN"
 
 echo
 echo "Готово. Теперь: первый деплой из Actions (push в main) применит миграции и поднимет pm2 cloudlyru."
