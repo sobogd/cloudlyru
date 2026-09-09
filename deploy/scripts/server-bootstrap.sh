@@ -60,7 +60,7 @@ server {
     listen 80;
     server_name files.iq-factura.com;
 
-    client_max_body_size 25m;
+    client_max_body_size 0;
     client_body_buffer_size 512k;
     proxy_request_buffering off;
 

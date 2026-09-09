@@ -82,4 +82,45 @@ export class AuthService implements OnModuleInit {
     await this.prisma.user.update({ where: { id: userId }, data: { rootFolderId: root.id } });
     return root.id;
   }
+
+  // ============ App-password / device-токены (WebDAV, клиенты) ============
+
+  async createToken(userId: string, label: string): Promise<{ id: string; token: string; label: string }> {
+    const clean = String(label ?? 'app').slice(0, 64) || 'app';
+    const token = randomToken(32);
+    const t = await this.prisma.apiToken.create({
+      data: { userId, label: clean, tokenHash: sha256Hex(token), scope: 'files:rw' },
+    });
+    // plain-токен показывается один раз
+    return { id: t.id, token, label: t.label };
+  }
+
+  async listTokens(userId: string) {
+    const rows = await this.prisma.apiToken.findMany({
+      where: { userId, revokedAt: null },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, label: true, scope: true, lastUsedAt: true, createdAt: true },
+    });
+    return rows;
+  }
+
+  async revokeToken(userId: string, tokenId: string) {
+    const res = await this.prisma.apiToken.updateMany({
+      where: { id: tokenId, userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    if (res.count === 0) throw badRequest('token not found');
+    return { ok: true };
+  }
+
+  /** Проверка Basic-токена (WebDAV): возвращает userId или null. */
+  async resolveApiToken(token: string): Promise<string | null> {
+    if (!token) return null;
+    const t = await this.prisma.apiToken.findUnique({ where: { tokenHash: sha256Hex(token) } });
+    if (!t || t.revokedAt) return null;
+    await this.prisma.apiToken
+      .update({ where: { id: t.id }, data: { lastUsedAt: new Date() } })
+      .catch(() => undefined);
+    return t.userId;
+  }
 }

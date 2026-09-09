@@ -137,6 +137,23 @@ export class S3Service implements OnModuleDestroy {
     await this.s3().send(cmd);
   }
 
+  /** Стримовая PUT-запись (WebDAV, большие файлы). */
+  async putObjectStream(
+    key: string,
+    body: NodeJS.ReadableStream,
+    contentType: string,
+    contentLength?: number,
+  ): Promise<void> {
+    const cmd = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      Body: body as never,
+      ContentType: contentType,
+      ...(contentLength ? { ContentLength: contentLength } : {}),
+    });
+    await this.s3().send(cmd);
+  }
+
   /** Временная presigned-ссылка на скачивание (TTL 15 мин). */
   async presignedGet(key: string, mime: string): Promise<string> {
     const cmd = new GetObjectCommand({

@@ -10,6 +10,7 @@ import { FilesModule } from './files/files.module';
 import { UploadsModule } from './uploads/uploads.module';
 import { TrashModule } from './trash/trash.module';
 import { SharesModule } from './shares/shares.module';
+import { DavModule } from './dav/dav.module';
 import { HealthModule } from './health/health.module';
 
 @Module({
@@ -22,6 +23,7 @@ import { HealthModule } from './health/health.module';
     UploadsModule,
     TrashModule,
     SharesModule,
+    DavModule,
     HealthModule,
   ],
   providers: [

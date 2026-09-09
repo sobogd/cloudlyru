@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Post, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { CurrentUser, Public, RateLimit, RequestUser } from '../common/decorators';
@@ -41,5 +41,24 @@ export class AuthController {
   @Get('me')
   me(@CurrentUser() user: RequestUser) {
     return this.auth.me(user.id);
+  }
+
+  // ===== App-password / device-токены =====
+
+  @Post('tokens')
+  createToken(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
+    const label = typeof body.label === 'string' ? body.label : 'app';
+    return this.auth.createToken(user.id, label);
+  }
+
+  @Get('tokens')
+  listTokens(@CurrentUser() user: RequestUser) {
+    return this.auth.listTokens(user.id);
+  }
+
+  @HttpCode(200)
+  @Delete('tokens/:id')
+  revokeToken(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.auth.revokeToken(user.id, id);
   }
 }
