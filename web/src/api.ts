@@ -91,7 +91,7 @@ export const createToken = (label: string) => request<{ id: string; token: strin
 export const revokeToken = (id: string) => request<{ ok: boolean }>(`/auth/tokens/${id}`, { method: 'DELETE' });
 
 // ===== M2: timeline / trips / albums =====
-export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; latitude?: number; longitude?: number; mime: string; size: number }
+export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; latitude?: number; longitude?: number; mime: string; sha256?: string; masterMime?: string | null; masterReady: boolean; jobState?: string | null; jobProgress?: number; jobError?: string | null; size: number }
 export interface TripPoint { capturedAt: string; latitude: number; longitude: number; entryId: string }
 export interface Trip { id: string; start: string; end: string; title: string; count: number; points: TripPoint[] }
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }

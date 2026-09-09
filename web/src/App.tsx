@@ -4,12 +4,13 @@ import 'leaflet/dist/leaflet.css';
 import * as api from './api';
 import './styles.css';
 
-type Tab = 'files' | 'photos' | 'shares' | 'albums' | 'settings';
+type Tab = 'files' | 'photos' | 'shares' | 'albums' | 'trash' | 'settings';
 const NAV: Array<{ id: Tab; icon: string; label: string }> = [
   { id: 'files', icon: '📁', label: 'Файлы' },
   { id: 'photos', icon: '🖼️', label: 'Фото' },
   { id: 'shares', icon: '🔗', label: 'Шаринг' },
   { id: 'albums', icon: '🗂️', label: 'Альбомы' },
+  { id: 'trash', icon: '🗑️', label: 'Корзина' },
   { id: 'settings', icon: '⚙️', label: 'Настройки' },
 ];
 
@@ -61,6 +62,7 @@ function Shell({ user, onLogout }: { user: string; onLogout: () => void }) {
         {tab === 'photos' && <Photos />}
         {tab === 'shares' && <Shares />}
         {tab === 'albums' && <Albums />}
+        {tab === 'trash' && <TrashPage />}
         {tab === 'settings' && <Settings login={user} onLogout={onLogout} />}
       </main>
       <nav className="nav">
@@ -217,7 +219,9 @@ function Photos() {
         {media.map((it, idx) => (
           <div key={it.entryId} style={{ width: '31.5%', position: 'relative' }}>
             {!it.masterReady ? (
-              <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center', color: '#8a95a6' }} title="конвертируется">⏳</div>
+              <div title={it.jobError ? it.jobError : 'конвертация'} style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'grid', placeItems: 'center', color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 12, textAlign: 'center', padding: 4 }}>
+                {it.jobState === 'failed' ? '❌ ошибка' : it.jobState === 'processing' ? <>⏳ {it.jobProgress ?? 0}%</> : it.jobState === 'pending' ? '⏳ в очереди' : '⏳'}
+              </div>
             ) : it.sha256 ? (
               <div style={{ cursor: 'pointer' }} onClick={() => setViewer(idx)}>
                 <img src={api.previewUrl(it.sha256, 512)} alt={it.name} loading="lazy"
@@ -373,15 +377,6 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
   const [tokens, setTokens] = useState<api.ApiTokenRow[]>([]);
   const [fresh, setFresh] = useState<string | null>(null);
   const [err, setErr] = useState('');
-  const [showTrash, setShowTrash] = useState(false);
-  const [q, setQ] = useState<api.QueueStatus | null>(null);
-  const [qErr, setQErr] = useState('');
-  const loadQ = () => api.queueStatus().then(setQ).catch((e) => setQErr((e as Error).message));
-  useEffect(() => {
-    void loadQ();
-    const t = setInterval(() => void loadQ(), 5000);
-    return () => clearInterval(t);
-  }, []);
   const loadTokens = () => api.listTokens().then(setTokens).catch((e) => setErr((e as Error).message));
   useEffect(() => { void loadTokens(); }, []);
   const addToken = async () => {
@@ -405,7 +400,7 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
         <div className="row"><strong>Приложения (WebDAV/Finder)</strong><button className="btn" onClick={addToken}>🔑 токен</button></div>
         {fresh && (
           <div className="panel" style={{ background: '#1c2430' }}>
-            <div className="copy">Токен (показывается один раз): <b>{fresh}</b></div>
+            <div className="copy">Токен (один раз): <b>{fresh}</b></div>
             <div className="copy">WebDAV: https://files.iq-factura.com/api/v1/dav · логин: {login}</div>
           </div>
         )}
@@ -420,46 +415,13 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
         ))}
         {!tokens.length && <div className="copy">Токенов нет — нужен для Finder/WebDAV</div>}
       </div>
-      <div className="panel">
-        <div className="row"><strong>Конвертация</strong><button className="btn ghost" onClick={() => void loadQ()}>обновить</button></div>
-        {qErr && <div className="err">{qErr}</div>}
-        {q && (
-          <div className="row" style={{ gap: 12 }}>
-            <span className="meta">⏳ {q.byState.pending ?? 0} в очереди</span>
-            <span className="meta">⚙ {q.byState.processing ?? 0} обрабатывается</span>
-            <span className="meta">✓ {q.byState.done ?? 0} готово</span>
-            <span className="meta">✗ {q.byState.failed ?? 0} ошибок</span>
-          </div>
-        )}
-        {q?.processing && (
-          <div>
-            <div className="copy">Сейчас: {q.processing.kind} · {q.processing.sha256} · идёт {q.processing.startedMinAgo} мин · {q.processing.progress}%</div>
-            <progress value={q.processing.progress} max={100} />
-          </div>
-        )}
-        {q?.recent && q.recent.length > 0 && (
-          <div>
-            {q.recent.slice(0, 8).map((j) => (
-              <div className="item" key={j.id}>
-                <span className="icon">{j.state === 'done' ? '✅' : j.state === 'failed' ? '❌' : j.state === 'processing' ? '⚙️' : '🕓'}</span>
-                <span className="fname">{j.kind === 'photo' ? 'фото' : 'видео'} · {j.sha256}</span>
-                <span className="meta">{j.masterReady ? 'мастер ✓' : j.state}</span>
-                {j.error && <div className="copy" style={{ width: '100%' }}>{j.error}</div>}
-              </div>
-            ))}
-          </div>
-        )}
-        {q && !q.recent?.length && <div className="copy">Задач пока нет</div>}
-      </div>
-      <div className="panel">
-        <div className="row"><strong>Корзина</strong><button className="btn ghost" onClick={() => setShowTrash(!showTrash)}>{showTrash ? 'скрыть' : 'открыть'}</button></div>
-        {showTrash && <Trash />}
-      </div>
     </div>
   );
 }
 
-function Trash() {
+// ================= Корзина =================
+
+function TrashPage() {
   const [view, setView] = useState<api.TrashView | null>(null);
   const [err, setErr] = useState('');
   const load = () => api.trash().then(setView).catch((e) => setErr((e as Error).message));
@@ -467,17 +429,33 @@ function Trash() {
   const restore = async (kind: 'folder' | 'file', id: string) => {
     try { await api.restoreItem(kind, id); await load(); } catch (e) { setErr((e as Error).message); }
   };
+  const purge = async () => {
+    if (!confirm('Очистить корзину полностью? Удалённые файлы и превью будут стёрты безвозвратно.')) return;
+    try { await api.purgeTrash(); await load(); } catch (e) { setErr((e as Error).message); }
+  };
+  const items = [
+    ...(view?.folders || []).map((t) => ({ ...t, kind: 'folder' as const })),
+    ...(view?.entries || []).map((t) => ({ ...t, kind: 'file' as const })),
+  ];
   return (
     <div>
+      <div className="row">
+        <strong>Корзина</strong>
+        <span style={{ flex: 1 }} />
+        <button className="btn danger" onClick={purge}>🧹 Очистить</button>
+      </div>
       {err && <div className="err">{err}</div>}
-      {[...(view?.folders || []).map((t) => ({ ...t, kind: 'folder' as const })), ...(view?.entries || []).map((t) => ({ ...t, kind: 'file' as const }))].map((t) => (
-        <div className="item" key={t.kind + t.id}>
-          <span className="icon">{t.kind === 'folder' ? '📁' : '📄'}</span>
-          <span className="fname">{t.name}</span>
-          <button className="btn ghost" onClick={() => restore(t.kind, t.id)}>восстановить</button>
-        </div>
-      ))}
-      {!view?.folders.length && !view?.entries.length && <div className="copy">Корзина пуста</div>}
+      <div className="panel">
+        {items.map((t) => (
+          <div className="item" key={t.kind + t.id}>
+            <span className="icon">{t.kind === 'folder' ? '📁' : '📄'}</span>
+            <span className="fname">{t.name}</span>
+            <span className="meta">{new Date(t.deletedAt).toLocaleString()}</span>
+            <button className="btn ghost" onClick={() => restore(t.kind, t.id)}>восстановить</button>
+          </div>
+        ))}
+        {!items.length && <div className="copy">Корзина пуста</div>}
+      </div>
     </div>
   );
 }

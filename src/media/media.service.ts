@@ -19,6 +19,9 @@ export interface TimelineItem {
   mime: string;
   masterMime?: string | null;
   masterReady: boolean;
+  jobState?: string | null;
+  jobProgress?: number;
+  jobError?: string | null;
   size: number;
 }
 
@@ -128,6 +131,7 @@ export class MediaService {
             size: true,
             mime: true,
             media: { select: { capturedAt: true, latitude: true, longitude: true } },
+            jobs: { orderBy: { createdAt: 'desc' }, take: 1, select: { state: true, progress: true, error: true } },
           },
         },
       },
@@ -142,6 +146,9 @@ export class MediaService {
       mime: r.asset?.mime,
       masterMime: r.asset?.masterMime ?? null,
       masterReady: Boolean(r.asset?.masterReadyAt),
+      jobState: r.asset?.jobs?.[0]?.state ?? null,
+      jobProgress: r.asset?.jobs?.[0]?.progress ?? 0,
+      jobError: r.asset?.jobs?.[0]?.error ?? null,
       size: Number(r.asset?.size ?? 0),
     }));
   }
@@ -155,6 +162,7 @@ export class MediaService {
         asset: {
           select: {
             media: { select: { capturedAt: true, latitude: true, longitude: true } },
+            jobs: { orderBy: { createdAt: 'desc' }, take: 1, select: { state: true, progress: true, error: true } },
           },
         },
       },
