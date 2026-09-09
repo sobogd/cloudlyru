@@ -35,6 +35,9 @@ importers:
       dotenv:
         specifier: ^16.4.5
         version: 16.6.1
+      express:
+        specifier: ^4.19.2
+        version: 4.22.1
       reflect-metadata:
         specifier: ^0.2.2
         version: 0.2.2
