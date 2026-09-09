@@ -67,8 +67,9 @@ nginx (VPS, 80/443, TLS) ──►  NestJS API (127.0.0.1:<PORT>)
 
 - Поддомен: `files.iq-factura.com` → A-запись на **выделенный VPS под cloudlyru** (⚠️ НЕ общий прод iq-rest — см. Открытые вопросы №1).
 - Порт приложения: выбрать свободный, например **8305** (не пересекается с 8001–8005, 8123, 8130, 8131).
-- TLS: если домен за Cloudflare-прокси (оранжевое облако) → сертификат на CF (режим Full), nginx слушает 80/443 и проксирует на 8305. Если DNS без CF → certbot (Let's Encrypt).
-- **Лимит Cloudflare 100 МБ на запрос** (если CF проксирует): загрузки проектируем **чанками по 5–20 МБ** с resume — это требование в коде, а не опция.
+- **Решение (согласовано): без прокси.** A-запись `files.iq-factura.com` → IP VPS напрямую. Никакого Cloudflare-прокси между клиентами/доменом и VPS; VPS ходит в S3 напрямую через SDK (прокси между сервером и S3 нет и не нужен).
+- TLS — **certbot (Let's Encrypt)**.
+- Загрузки проектируем **чанками по 5–20 МБ с resume** — это требование для мобильных сетей (обрывы, докачка с места), а не следствие прокси.
 - nginx: отдельный `server {}` блок, **не трогая существующие блоки iq-rest** на сервере.
 
 ```nginx
@@ -84,10 +85,9 @@ server {
     listen 443 ssl http2;
     server_name files.iq-factura.com;
 
-    # --- если сертификаты выдаёт certbot (НЕ CF-proxy), раскомментируй:
-    # ssl_certificate     /etc/letsencrypt/live/files.iq-factura.com/fullchain.pem;
-    # ssl_certificate_key /etc/letsencrypt/live/files.iq-factura.com/privkey.pem;
-    # если CF-proxy (Full) — сертификаты CF/настоящие, обычно достаточно блока 80→https выше
+    # сертификаты выдаёт certbot (DNS напрямую, без прокси):
+    ssl_certificate     /etc/letsencrypt/live/files.iq-factura.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/files.iq-factura.com/privkey.pem;
 
     client_max_body_size 50m;      # чанки до 20 МБ + запас; стриминг без буферизации ниже
     client_body_buffer_size 512k;
@@ -248,10 +248,10 @@ model AuditLog {
 - База ~**€6.49/мес**: 1 ТБ хранения + ~1 ТБ исходящего трафика включены (почасовая тарификация с капом).
 - Сверх: **€6.35/мес за доп. ТБ**, трафик €1/ТБ. Входящий трафик и API-вызовы — бесплатно.
 - **Минимальный биллинг-размер объекта 64 КБ** → нельзя складывать тысячи мелких объектов (превью/мини-файлы). Оригиналы фото/видео — крупные, ок.
-- Регион: **FSN1** (Германия) — рядом с VPS, внутренний трафик бесплатный.
+- Регион: **NBG1** (Нюрнберг) — бакет `cloudlyru` уже создан; endpoint `https://nbg1.your-objectstorage.com`. Если VPS окажется в том же регионе Hetzner — внутренний трафик бесплатный (уточнить DC VPS, некритично: входящий трафик в S3 бесплатен всегда).
 
 ### 6.2 Бакет
-- Имя: `cloudlyru-files` (или как создал в консоли Hetzner; записать в env `S3_FILES_BUCKET`).
+- Имя: **`cloudlyru`** (создан в консоли Hetzner; регион NBG1). Endpoint для SDK: `https://nbg1.your-objectstorage.com`, `S3_FILES_BUCKET=cloudlyru`. (В коде проверить виртуально-хостинговый стиль `cloudlyru.nbg1.your-objectstorage.com` против path-style по докам Hetzner — выбрать рабочий вариант для @aws-sdk.)
 - **Versioning: ON** — откат случайного удаления/перезаписи.
 - **Lifecycle**: правило по префиксу `db/` — удалять объекты старше 30 дней (старые дампы); для `files/` — почистить старые **версии** старше 90 дней (сами объекты не трогаем).
 - Object Lock (WORM) на короткий retention — решить в M1 вместе с корзиной в коде (обсуждено: «никакая ошибка не удалит всё»).
@@ -267,7 +267,7 @@ tmp/                          # мусор от прерванных загру�
 - Загрузка M0: **через сервер** (чанки), сервер пишет multipart в S3 и считает SHA-256 → дедуп до записи. Presigned PUT напрямую с клиента — оптимизация M1 для больших видео.
 
 ### 6.4 Креды (безопасно)
-- Имена env: `S3_FILES_ACCESS_KEY`, `S3_FILES_SECRET_KEY` (+ `S3_FILES_ENDPOINT`, `S3_FILES_REGION=fsn1`, `S3_FILES_BUCKET`).
+- Имена env: `S3_FILES_ACCESS_KEY`, `S3_FILES_SECRET_KEY` (+ `S3_FILES_ENDPOINT=https://nbg1.your-objectstorage.com`, `S3_FILES_REGION=nbg1`, `S3_FILES_BUCKET=cloudlyru`).
 - Значения **только на сервере** в `.env` (chmod 600), никогда в git/чате. В репо — `.env.example` с пустыми плейсхолдерами.
 
 ---
@@ -345,9 +345,9 @@ ADMIN_LOGIN=admin
 ADMIN_PASSWORD_HASH=            # заполняется seed-скриптом
 S3_FILES_ACCESS_KEY=
 S3_FILES_SECRET_KEY=
-S3_FILES_ENDPOINT=https://fsn1.your-objectstorage.com
-S3_FILES_REGION=fsn1
-S3_FILES_BUCKET=cloudlyru-files
+S3_FILES_ENDPOINT=https://nbg1.your-objectstorage.com
+S3_FILES_REGION=nbg1
+S3_FILES_BUCKET=cloudlyru
 UPLOAD_CHUNK_MAX_MB=20
 TRASH_RETENTION_DAYS=30
 ```
@@ -358,7 +358,7 @@ TRASH_RETENTION_DAYS=30
 
 ## 12. Развёртывание на VPS (шаги)
 
-⚠️ Выполнять на **выделенном** VPS под cloudlyru (не на общем проде iq-rest) — см. Открытые вопросы.
+⚠️ **Тот же VPS, что и остальные сервисы** — отдельный запуск по образцу iq-translate. НЕ трогаем блоки/процессы/БД iq-rest. Изоляция: отдельная БД `cloudly` (юзер `cloudly`), отдельная папка `/opt/cloudlyru`, отдельный pm2-процесс `cloudlyru` (порт 8305, слушает 127.0.0.1), отдельный nginx `server {}` для `files.iq-factura.com`, файрвол уже открыт (80/443). Стартовая нагрузка минимальна — общий VPS ок.
 
 ```bash
 # 1. База
@@ -381,9 +381,8 @@ pm2 save && pm2 startup          # автозапуск после ребута
 sudo ln -s /etc/nginx/sites-available/cloudlyru.conf /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 
-# 5. TLS
-#    если CF-proxy: ничего не делать (сертификат на CF) — проверить режим Full
-#    если DNS напрямую: sudo certbot --nginx -d files.iq-factura.com
+# 5. TLS (DNS напрямую, без прокси)
+sudo certbot --nginx -d files.iq-factura.com
 
 # 6. Cron бэкапа БД
 crontab -e   # 0 3 * * * /opt/cloudlyru/deploy/scripts/backup-db.sh >> /var/log/cloudly-backup.log 2>&1
@@ -422,13 +421,13 @@ curl -s https://files.iq-factura.com/api/v1/healthz
 
 ---
 
-## 15. Открытые вопросы (нужны ответы до кодинга)
+## 15. Открытые вопросы (статус: решено, один хвост)
 
-1. **Какой VPS**: отдельный под cloudlyru (рекомендую, CX22/CX32 у Hetzner) или тот же, что прод iq-rest? Если общий — нужен явный план изоляции (отдельный юзер/порт/папка, не трогать блоки iq-rest).
-2. **DNS**: `files.iq-factura.com` за Cloudflare-прокси (оранжевое облако) или A-запись напрямую на VPS? От этого зависит TLS (CF vs certbot) и актуальность лимита 100 МБ.
-3. **Репозиторий**: `sobogd/cloudlyru` — private или public (проект задуман open-source)? Пока создаю private — легко переключить.
-4. **Бакет**: имя и регион созданного в Hetzner бакета (ожидаю `cloudlyru-files`, FSN1) — подтвердить.
-5. **ОС VPS** (Ubuntu 24.04?) и есть ли уже nginx/postgres на нём — для шагов §12.
+1. ~~Какой VPS~~ → **Тот же VPS, отдельный запуск** (по образцу iq-translate): отдельные БД/папка/pm2-процесс/nginx-блок, блоки iq-rest не трогаем.
+2. ~~DNS/прокси~~ → **Без прокси вообще**: A-запись напрямую, certbot, VPS→S3 напрямую через SDK.
+3. ~~Репозиторий~~ → **`sobogd/cloudlyru` private** (создан и запушен); в public переключим, когда созреет (open-source цель).
+4. ~~Бакет~~ → **`cloudlyru` @ NBG1**, endpoint `https://nbg1.your-objectstorage.com`.
+5. **Хвост**: ОС VPS (Ubuntu 24.04?) и точный DC — подтвердить перед деплоем; проверить, свободен ли порт 8305.
 
 ---
 
