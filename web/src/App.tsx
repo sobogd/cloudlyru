@@ -165,13 +165,34 @@ function Photos() {
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
   const [err, setErr] = useState('');
-  useEffect(() => {
-    api.timeline().then(setItems).catch((e) => setErr((e as Error).message));
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
+  const load = async () => {
+    try { setItems(await api.timeline()); } catch (e) { setErr((e as Error).message); }
     api.trips().then(setTrips).catch(() => undefined);
-  }, []);
+  };
+  useEffect(() => { void load(); }, []);
+  const upload = async (files: FileList | null) => {
+    if (!files || !files.length) return;
+    setBusy(true); setErr(''); setNotice('');
+    try {
+      for (const f of Array.from(files)) {
+        await api.uploadFile(f, undefined, undefined); // без папки: файл в корень, в «Фото» появится по EXIF
+        setNotice(`Загружено: ${f.name}`);
+      }
+      await load();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
   const isImg = (m: string) => /^image\//.test(m || '');
   return (
     <div>
+      <div className="row">
+        <label className="btn" style={{ display: 'inline-block' }}>📤 Загрузить фото
+          <input type="file" accept="image/*" multiple style={{ display: 'none' }} disabled={busy} onChange={(e) => void upload(e.target.files)} />
+        </label>
+        {notice && <span className="notice">{notice}</span>}
+      </div>
       {err && <div className="err">{err}</div>}
       {trips.length > 0 && (
         <div className="panel">
