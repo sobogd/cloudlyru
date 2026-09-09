@@ -80,6 +80,12 @@ export const createShare = (body: { kind: 'folder' | 'file'; targetId: string; p
   request<ShareInfo>('/shares', { method: 'POST', body: JSON.stringify(body) });
 export const revokeShare = (token: string) => request<{ ok: boolean }>(`/shares/${token}`, { method: 'DELETE' });
 
+// ===== app-токены (WebDAV/клиенты) =====
+export interface ApiTokenRow { id: string; label: string; scope: string; lastUsedAt: string | null; createdAt: string }
+export const listTokens = () => request<ApiTokenRow[]>('/auth/tokens');
+export const createToken = (label: string) => request<{ id: string; token: string; label: string }>('/auth/tokens', { method: 'POST', body: JSON.stringify({ label }) });
+export const revokeToken = (id: string) => request<{ ok: boolean }>(`/auth/tokens/${id}`, { method: 'DELETE' });
+
 // ===== M2: timeline / trips / albums =====
 export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; latitude?: number; longitude?: number; mime: string; size: number }
 export interface TripPoint { capturedAt: string; latitude: number; longitude: number; entryId: string }

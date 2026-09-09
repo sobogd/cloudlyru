@@ -21,3 +21,23 @@ input, select { background: #171b22; border: 1px solid #343b46; color: #e6e8eb; 
 .loginbox { max-width: 340px; margin: 10vh auto; display: grid; gap: 10px; }
 .copy { font-size: 12px; color: #9aa7b8; word-break: break-all; }
 progress { width: 100%; }
+
+/* Mobile-first: нижний бар */
+body { background: #0f1115; }
+.app { max-width: none; padding: 0; }
+.head { position: sticky; top: 0; z-index: 5; background: #0f1115ee; backdrop-filter: blur(6px);
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #262b33; }
+.content { max-width: 1000px; margin: 0 auto; padding: 12px 12px 92px; }
+.nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+  display: flex; justify-content: space-around; align-items: stretch;
+  background: #10141bee; backdrop-filter: blur(8px); border-top: 1px solid #262b33;
+  padding-bottom: env(safe-area-inset-bottom); }
+.navbtn { flex: 1; background: none; border: 0; color: #8a95a6; display: grid; justify-items: center;
+  gap: 2px; padding: 8px 2px 10px; font-size: 10px; cursor: pointer; }
+.navbtn.active { color: #6ea8ff; }
+.navico { font-size: 20px; line-height: 1; }
+.panel { margin: 8px 0; }
+.row { gap: 6px; }
+@media (min-width: 900px) {
+  .content { max-width: 1000px; }
+}
