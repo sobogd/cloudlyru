@@ -20,6 +20,12 @@ export class FoldersController {
     return this.folders.listChildren(id, user.id);
   }
 
+  /** Метаданные папки: GET /folders/:id/meta */
+  @Get(':id/meta')
+  meta(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.folders.meta(id, user.id);
+  }
+
   @Post()
   create(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
     const parentId = asOptionalString(body.parentId, 'parentId');

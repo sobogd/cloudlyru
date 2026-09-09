@@ -51,6 +51,20 @@ export const deleteFolder = (id: string) => request<{ ok: boolean }>(`/folders/$
 export const deleteFile = (id: string) => request<{ ok: boolean }>(`/files/${id}`, { method: 'DELETE' });
 export const fileUrl = (id: string) => `${BASE}/files/${id}/content`;
 
+// ===== метаданные для деталок =====
+export interface FileMedia { capturedAt: string | null; latitude?: number; longitude?: number; make?: string; model?: string; width?: number; height?: number }
+export interface FileMeta {
+  id: string; name: string; createdAt: string; folderId: string; zone: string; path: string;
+  size: number; mime: string; ext?: string; sha256: string; masterMime?: string | null;
+  media?: FileMedia | null;
+}
+export const fileMeta = (id: string) => request<FileMeta>(`/files/${id}`);
+export interface FolderMeta {
+  id: string; name: string; zone: string; path: string;
+  folders: number; entries: number; createdAt: string; updatedAt: string;
+}
+export const folderMeta = (id: string) => request<FolderMeta>(`/folders/${id}/meta`);
+
 const CHUNK_BYTES = 5 * 1024 * 1024;
 
 /** mime по расширению, если браузер не отдал type (HEIC/RAW и т.п.). */

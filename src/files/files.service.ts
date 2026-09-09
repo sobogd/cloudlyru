@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { MediaService } from '../media/media.service';
+import { ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { conflict, notFound } from '../common/errors';
@@ -61,21 +62,55 @@ export class FilesService {
     return { id: entry.id, deduped: Boolean(sameAssetLive), zone };
   }
 
+  /** Полные метаданные файла для деталки: путь, размер/тип/хэш, EXIF и статус оптимизации. */
   async getEntryMeta(entryId: string) {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
-      include: { asset: true, folder: { select: { id: true, name: true } } },
+      include: { asset: { include: { media: true } }, folder: true },
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
+    const m = entry.asset.media;
     return {
       id: entry.id,
       name: entry.name,
       createdAt: entry.createdAt,
       folderId: entry.folderId,
+      zone: entry.zone,
+      path: await this.folderPath(entry.folder),
       size: Number(entry.asset.size),
       mime: entry.asset.mime,
+      ext: entry.asset.ext ?? undefined,
       sha256: entry.asset.sha256,
+      masterMime: entry.asset.masterMime && entry.asset.masterReadyAt ? entry.asset.masterMime : null,
+      media: m
+        ? {
+            capturedAt: m.capturedAt ? m.capturedAt.toISOString() : null,
+            latitude: m.latitude ?? undefined,
+            longitude: m.longitude ?? undefined,
+            make: m.make ?? undefined,
+            model: m.model ?? undefined,
+            width: m.width ?? undefined,
+            height: m.height ?? undefined,
+          }
+        : null,
     };
+  }
+
+  /** Человекочитаемый путь файла: «Главная / папка / …». */
+  private async folderPath(folder: { id: string; parentId: string | null; name: string }): Promise<string> {
+    const names: string[] = [];
+    let cur: { id: string; parentId: string | null; name: string } = folder;
+    for (let i = 0; i < 32 && cur.name !== ROOT_FOLDER_NAME; i++) {
+      names.unshift(cur.name);
+      if (!cur.parentId) break;
+      const parent = await this.prisma.folder.findUnique({
+        where: { id: cur.parentId },
+        select: { id: true, parentId: true, name: true },
+      });
+      if (!parent) break;
+      cur = parent;
+    }
+    return ['Главная', ...names].join(' / ');
   }
 
   /** Presigned-URL для скачивания. Фото-зона: оптимизированный мастер; файлы-зона: оригинал как есть. */

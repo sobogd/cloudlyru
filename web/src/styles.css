@@ -110,3 +110,18 @@ html, body { overscroll-behavior: none; }
 .uphead { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
 .upcount { font-size: 13px; color: #cfd6e0; }
 .uppanel .uprow { padding: 6px 2px; }
+
+/* Файлы: плоский список на фоне, без «карточки»; строка = только иконка + имя */
+.fileslist { margin: 0; }
+.fileslist .item { padding: 13px 6px; cursor: pointer; }
+.fileslist .icon { width: 30px; font-size: 22px; }
+.fileslist .fname { font-size: 15px; }
+
+/* Деталка файла/папки */
+.filehead strong.detname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.metarow { display: grid; grid-template-columns: 118px 1fr; gap: 10px; align-items: baseline;
+  padding: 9px 2px; border-bottom: 1px solid #1f242c; }
+.metarow:last-child { border-bottom: 0; }
+.metak { color: #6d7889; font-size: 13px; }
+.metav { font-size: 13px; color: #e6e8eb; word-break: break-all; white-space: pre-wrap; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }

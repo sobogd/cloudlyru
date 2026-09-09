@@ -69,6 +69,42 @@ export class FoldersService {
     };
   }
 
+  /** Метаданные папки для деталки: путь, счётчики, даты. */
+  async meta(id: string, userId: string) {
+    const folder = await this.resolveAccessible(id, userId);
+    const [folderCount, entryCount] = await Promise.all([
+      this.prisma.folder.count({ where: { parentId: folder.id, deletedAt: null } }),
+      this.prisma.fileEntry.count({ where: { folderId: folder.id, deletedAt: null } }),
+    ]);
+    return {
+      id: folder.id,
+      name: folder.name,
+      zone: folder.zone,
+      path: await this.folderPath(folder),
+      folders: folderCount,
+      entries: entryCount,
+      createdAt: folder.createdAt,
+      updatedAt: folder.updatedAt,
+    };
+  }
+
+  /** Человекочитаемый путь папки: «Главная / папка / …». */
+  private async folderPath(folder: { id: string; parentId: string | null; name: string }): Promise<string> {
+    const names: string[] = [];
+    let cur: { id: string; parentId: string | null; name: string } = folder;
+    for (let i = 0; i < 32 && cur.name !== ROOT_FOLDER_NAME; i++) {
+      names.unshift(cur.name);
+      if (!cur.parentId) break;
+      const parent = await this.prisma.folder.findUnique({
+        where: { id: cur.parentId },
+        select: { id: true, parentId: true, name: true },
+      });
+      if (!parent) break;
+      cur = parent;
+    }
+    return ['Главная', ...names].join(' / ');
+  }
+
   async create(parentId: string | undefined, name: string, userId: string) {
     assertSafeName(name);
     const parent = await this.resolveAccessible(parentId, userId);

@@ -259,6 +259,7 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
   const [stack, setStack] = useState<Array<{ id?: string; name: string }>>([{ name: 'Главная' }]);
   const [view, setView] = useState<api.FolderView | null>(null);
   const [err, setErr] = useState('');
+  const [detail, setDetail] = useState<{ kind: 'file' | 'folder'; id: string } | null>(null);
   const currentId = stack[stack.length - 1]?.id;
 
   const load = async (parentId?: string) => {
@@ -281,15 +282,21 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
     if (!name) return;
     try { await api.mkdir(name, currentId); await load(currentId); } catch (e) { setErr((e as Error).message); }
   };
-  const rm = async (kind: 'folder' | 'file', id: string, name: string) => {
-    if (!confirm(`Удалить «${name}» в корзину?`)) return;
-    try {
-      if (kind === 'folder') await api.deleteFolder(id); else await api.deleteFile(id);
-      await load(currentId);
-    } catch (e) { setErr((e as Error).message); }
-  };
   const goHome = () => setStack((s) => s.slice(0, 1));
   const goUp = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
+  const closeDetail = () => { setDetail(null); void load(currentId); };
+
+  // ===== Деталка (файл или папка) =====
+  if (detail) {
+    if (detail.kind === 'file') return <FileDetail entryId={detail.id} onBack={closeDetail} />;
+    return (
+      <FolderDetail
+        folderId={detail.id}
+        onBack={closeDetail}
+        onOpen={(name) => { setDetail(null); setStack((s) => [...s, { id: detail.id, name }]); }}
+      />
+    );
+  }
 
   return (
     <div>
@@ -318,27 +325,131 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
       )}
       {busy && <div className="uploadwall" />}
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
-      <div className="panel">
+      <div className="fileslist">
         {(view?.folders || []).filter((f) => f.id !== photoFolderId).map((f) => (
-          <div className="item" key={f.id}>
+          <div className="item" key={f.id} onClick={() => setDetail({ kind: 'folder', id: f.id })}>
             <span className="icon">📁</span>
-            <span className="fname" onClick={() => setStack((s) => [...s, { id: f.id, name: f.name }])}>{f.name}</span>
-            <button className="btn ghost" onClick={() => rm('folder', f.id, f.name)}>🗑</button>
+            <span className="fname">{f.name}</span>
           </div>
         ))}
         {(view?.entries || []).map((e) => (
-          <div className="item" key={e.id}>
+          <div className="item" key={e.id} onClick={() => setDetail({ kind: 'file', id: e.id })}>
             <span className="icon">{fileIcon(e.mime)}</span>
-            <a className="fname" href={api.fileUrl(e.id)}>{e.name}</a>
-            <span className="meta">{fmt(e.size || 0)}</span>
-            <button className="btn ghost" onClick={() => rm('file', e.id, e.name)}>🗑</button>
+            <span className="fname">{e.name}</span>
           </div>
         ))}
-        {!view?.folders.length && !view?.entries.length && <div className="copy">Пусто — нажмите 📄, чтобы загрузить файлы в эту папку</div>}
+        {!view?.folders.length && !view?.entries.length && (
+          <div className="copy" style={{ padding: '14px 6px' }}>Пусто — нажмите 📄, чтобы загрузить файлы в эту папку</div>
+        )}
       </div>
     </div>
   );
 }
+
+// ===== Деталка файла: назад / скачать / удалить + вся метадата =====
+
+function MetaRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
+  return (
+    <div className="metarow">
+      <span className="metak">{k}</span>
+      <span className={`metav${mono ? ' mono' : ''}`}>{v}</span>
+    </div>
+  );
+}
+
+function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }) {
+  const [meta, setMeta] = useState<api.FileMeta | null>(null);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    api.fileMeta(entryId).then(setMeta).catch((e) => setErr((e as Error).message));
+  }, [entryId]);
+
+  const del = async () => {
+    if (!confirm(`Удалить «${meta?.name ?? 'файл'}» в корзину?`)) return;
+    try { await api.deleteFile(entryId); onBack(); } catch (e) { alert((e as Error).message); }
+  };
+
+  return (
+    <div>
+      <div className="filehead">
+        <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
+        <strong className="detname">{meta?.name ?? 'Файл'}</strong>
+        {meta && (
+          <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} target="_blank" rel="noreferrer">⬇️</a>
+        )}
+        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+      </div>
+      {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
+      {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
+      {meta && (
+        <div className="panel">
+          <MetaRow k="Имя" v={meta.name} />
+          <MetaRow k="Тип" v={meta.ext ? `${meta.ext.toUpperCase()} — ${meta.mime}` : meta.mime} />
+          <MetaRow k="Размер" v={fmt(meta.size)} />
+          <MetaRow k="Расположение" v={meta.path} />
+          <MetaRow k="Создан" v={new Date(meta.createdAt).toLocaleString()} />
+          {meta.masterMime && <MetaRow k="Оптимизирован" v={meta.masterMime} />}
+          {meta.media && (
+            <>
+              {meta.media.capturedAt && <MetaRow k="Дата съёмки" v={new Date(meta.media.capturedAt).toLocaleString()} />}
+              {meta.media.make || meta.media.model ? <MetaRow k="Камера" v={[meta.media.make, meta.media.model].filter(Boolean).join(' ')} /> : null}
+              {meta.media.width && meta.media.height ? <MetaRow k="Кадр" v={`${meta.media.width} × ${meta.media.height}`} /> : null}
+              {meta.media.latitude != null && meta.media.longitude != null ? (
+                <MetaRow k="Координаты" v={`${meta.media.latitude.toFixed(6)}, ${meta.media.longitude.toFixed(6)}`} />
+              ) : null}
+            </>
+          )}
+          <MetaRow k="SHA-256" v={meta.sha256} mono />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===== Деталка папки: назад / открыть / удалить + метадата =====
+
+function FolderDetail({ folderId, onBack, onOpen }: { folderId: string; onBack: () => void; onOpen: (name: string) => void }) {
+  const [meta, setMeta] = useState<api.FolderMeta | null>(null);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    api.folderMeta(folderId).then(setMeta).catch((e) => setErr((e as Error).message));
+  }, [folderId]);
+
+  const del = async () => {
+    if (!confirm(`Удалить папку «${meta?.name ?? ''}» с содержимым в корзину?`)) return;
+    try { await api.deleteFolder(folderId); onBack(); } catch (e) { alert((e as Error).message); }
+  };
+
+  return (
+    <div>
+      <div className="filehead">
+        <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
+        <strong className="detname">{meta?.name ?? 'Папка'}</strong>
+        {meta && (
+          <button className="iconbtn" title="Открыть папку" onClick={() => onOpen(meta.name)}>📂</button>
+        )}
+        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+      </div>
+      {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
+      {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
+      {meta && (
+        <div className="panel">
+          <MetaRow k="Имя" v={meta.name} />
+          <MetaRow k="Расположение" v={meta.path} />
+          <MetaRow k="Вложенные папки" v={String(meta.folders)} />
+          <MetaRow k="Файлы" v={String(meta.entries)} />
+          <MetaRow k="Создана" v={new Date(meta.createdAt).toLocaleString()} />
+          <MetaRow k="Изменена" v={new Date(meta.updatedAt).toLocaleString()} />
+          <div className="row" style={{ marginTop: 12 }}>
+            <button className="btn" onClick={() => onOpen(meta.name)}>📂 Открыть</button>
+            <button className="btn danger" onClick={del}>🗑 В корзину</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 // ================= Фото (медиатека: таймлайн + поездки + карта) =================
 // Показывает только содержимое системной папки «Фото» (зона PHOTOS); сама папка скрыта из
