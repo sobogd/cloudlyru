@@ -79,3 +79,21 @@ export const listShares = () => request<ShareInfo[]>('/shares');
 export const createShare = (body: { kind: 'folder' | 'file'; targetId: string; password?: string; capability?: string; expiresAt?: string | null }) =>
   request<ShareInfo>('/shares', { method: 'POST', body: JSON.stringify(body) });
 export const revokeShare = (token: string) => request<{ ok: boolean }>(`/shares/${token}`, { method: 'DELETE' });
+
+// ===== M2: timeline / trips / albums =====
+export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; latitude?: number; longitude?: number; mime: string; size: number }
+export interface TripPoint { capturedAt: string; latitude: number; longitude: number; entryId: string }
+export interface Trip { id: string; start: string; end: string; title: string; count: number; points: TripPoint[] }
+export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
+export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
+
+export const timeline = () => request<TimelineItem[]>('/timeline');
+export const trips = () => request<Trip[]>('/trips');
+export const listAlbums = () => request<AlbumInfo[]>('/albums');
+export const getAlbum = (id: string) => request<AlbumView>(`/albums/${id}`);
+export const createAlbum = (name: string) => request<AlbumInfo>('/albums', { method: 'POST', body: JSON.stringify({ name }) });
+export const addAlbumItems = (id: string, entryIds: string[]) =>
+  request<{ ok: boolean; inAlbum: number }>(`/albums/${id}/items`, { method: 'POST', body: JSON.stringify({ entryIds }) });
+export const deleteAlbum = (id: string) => request<{ ok: boolean }>(`/albums/${id}`, { method: 'DELETE' });
+export const removeAlbumItem = (id: string, entryId: string) =>
+  request<{ ok: boolean }>(`/albums/${id}/items/${entryId}`, { method: 'DELETE' });
