@@ -3,6 +3,8 @@
 
 generator client {
   provider = "prisma-client-js"
+  // прод-сервер — ARM64 (Hetzner aarch64, Ubuntu 22.04, OpenSSL 3); раннер GitHub — x64
+  binaryTargets = ["native", "linux-arm64-openssl-3.0.x"]
 }
 
 datasource db {
