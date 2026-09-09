@@ -298,14 +298,15 @@ function PhotoZoom({ src }: { src: string }) {
   const [v, setV] = useState({ s: 1, x: 0, y: 0 });
   const cur = useRef({ s: 1, x: 0, y: 0 });
   const pts = useRef(new Map<number, { x: number; y: number }>());
-  const pinch0 = useRef(0);
+  const pinch = useRef({ dist0: 0, s0: 1 });
   const pan0 = useRef({ x: 0, y: 0, px: 0, py: 0 });
   const lastTap = useRef(0);
+  const box = useRef<HTMLDivElement>(null);
 
-  const clamp = (n: number) => Math.max(1, Math.min(5, n));
+  const clamp = (n: number) => Math.max(1, Math.min(8, n));
   const apply = (s: number, x: number, y: number) => {
     s = clamp(s);
-    if (s <= 1) { x = 0; y = 0; }
+    if (s <= 1.001) { x = 0; y = 0; }
     cur.current = { s, x, y };
     setV({ s, x, y });
   };
@@ -314,8 +315,7 @@ function PhotoZoom({ src }: { src: string }) {
     Array.from(e.changedTouches).forEach((t) => pts.current.set(t.identifier, { x: t.clientX, y: t.clientY }));
     if (pts.current.size === 2) {
       const [a, b] = [...pts.current.values()];
-      pinch0.current = Math.hypot(a.x - b.x, a.y - b.y);
-      pan0.current = { x: cur.current.x, y: cur.current.y, px: 0, py: 0 };
+      pinch.current = { dist0: Math.hypot(a.x - b.x, a.y - b.y), s0: cur.current.s };
     } else if (pts.current.size === 1) {
       const p = pts.current.values().next().value;
       pan0.current = { x: cur.current.x, y: cur.current.y, px: p.x, py: p.y };
@@ -324,9 +324,10 @@ function PhotoZoom({ src }: { src: string }) {
   const onTouchMove = (e: React.TouchEvent) => {
     Array.from(e.changedTouches).forEach((t) => pts.current.set(t.identifier, { x: t.clientX, y: t.clientY }));
     const arr = [...pts.current.values()];
-    if (arr.length === 2 && pinch0.current > 0) {
+    if (arr.length === 2 && pinch.current.dist0 > 0) {
       const d = Math.hypot(arr[0].x - arr[1].x, arr[0].y - arr[1].y);
-      apply(cur.current.s * (d / pinch0.current), cur.current.x, cur.current.y);
+      // непрерывный произвольный зум от начала жеста (не от текущего шага)
+      apply(pinch.current.s0 * (d / pinch.current.dist0), cur.current.x, cur.current.y);
     } else if (arr.length === 1 && cur.current.s > 1) {
       const p = arr[0];
       apply(cur.current.s, pan0.current.x + (p.x - pan0.current.px), pan0.current.y + (p.y - pan0.current.py));
@@ -336,7 +337,7 @@ function PhotoZoom({ src }: { src: string }) {
     Array.from(e.changedTouches).forEach((t) => pts.current.delete(t.identifier));
     if (pts.current.size === 0) {
       const now = Date.now();
-      if (now - lastTap.current < 300) {
+      if (now - lastTap.current < 280) {
         if (cur.current.s > 1) apply(1, 0, 0); else apply(2.5, 0, 0);
       }
       lastTap.current = now;
@@ -345,6 +346,7 @@ function PhotoZoom({ src }: { src: string }) {
 
   return (
     <div
+      ref={box}
       style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', touchAction: 'none', overflow: 'hidden', position: 'relative' }}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
@@ -361,8 +363,8 @@ function PhotoZoom({ src }: { src: string }) {
         style={{
           maxWidth: '100%', maxHeight: '100%', objectFit: 'contain',
           transform: `translate(${v.x}px, ${v.y}px) scale(${v.s})`,
-          transition: 'transform 120ms ease-out',
           opacity: ok ? 1 : 0,
+          userSelect: 'none', WebkitUserSelect: 'none', touchAction: 'none',
         }}
       />
     </div>
