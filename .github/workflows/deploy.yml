@@ -1,0 +1,120 @@
+name: Deploy (auto on push to main)
+
+# Автодеплой CloudlyRu: любой push в main по путям приложения (src/prisma/package*)
+# собирает и деплоит на прод. Инфраструктурные файлы (.github, deploy/) деплой НЕ триггерят.
+# Ручной запуск: gh workflow run deploy.yml -f run_migrations=true|false
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'prisma/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.env.example'
+  workflow_dispatch:
+    inputs:
+      run_migrations:
+        description: Prisma migrate deploy
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: cloudlyru-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec prisma generate
+      - run: pnpm build
+      # self-contained prod bundle (node_modules prod + dist) — аналог `pnpm --filter … deploy` из iq-rest
+      - name: Prepare bundle
+        run: |
+          pnpm deploy --prod --legacy ./out-cloudlyru
+          cp -r dist out-cloudlyru/dist
+      - name: Prisma migrate deploy (SSH tunnel to prod Postgres)
+        if: ${{ github.event_name == 'push' || inputs.run_migrations }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -i ~/.ssh/id_deploy -fN -L 5433:localhost:5432 "deployer@${SERVER_IP}"
+          TUNNEL_URL="$(printf '%s' "$DATABASE_URL" | sed -E 's#@[^/]+/#@localhost:5433/#')"
+          DATABASE_URL="$TUNNEL_URL" pnpm exec prisma migrate deploy
+      - name: Copy bundle to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: deployer
+          key: ${{ secrets.SSH_KEY }}
+          source: "out-cloudlyru/*"
+          target: "/home/deploy/apps/cloudlyru"
+          strip_components: 1
+          overwrite: true
+      - name: Write .env + pm2 reload
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+          ADMIN_LOGIN: ${{ secrets.ADMIN_LOGIN }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
+          S3_FILES_SECRET_KEY: ${{ secrets.S3_FILES_SECRET_KEY }}
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: deployer
+          key: ${{ secrets.SSH_KEY }}
+          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY
+          script: |
+            set -e
+            cd /home/deploy/apps/cloudlyru
+            cat > .env <<EOF
+            NODE_ENV=production
+            PORT=8305
+            BASE_URL=https://files.iq-factura.com
+            DATABASE_URL=$DATABASE_URL
+            SESSION_SECRET=$SESSION_SECRET
+            SESSION_TTL_DAYS=30
+            COOKIE_NAME=cl_session
+            ADMIN_LOGIN=$ADMIN_LOGIN
+            ADMIN_PASSWORD=$ADMIN_PASSWORD
+            S3_FILES_ACCESS_KEY=$S3_FILES_ACCESS_KEY
+            S3_FILES_SECRET_KEY=$S3_FILES_SECRET_KEY
+            S3_FILES_ENDPOINT=https://nbg1.your-objectstorage.com
+            S3_FILES_REGION=nbg1
+            S3_FILES_BUCKET=cloudlyru
+            S3_FILES_FORCE_PATH_STYLE=true
+            UPLOAD_CHUNK_MAX_MB=20
+            MAX_FILE_SIZE_MB=51200
+            TRASH_RETENTION_DAYS=30
+            EOF
+            chmod 600 .env
+            pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \
+              || pm2 start dist/main.js --name cloudlyru --time --cwd /home/deploy/apps/cloudlyru
+            pm2 save
+            # health-чек с ретраями
+            ok=0
+            for i in $(seq 1 10); do
+              if curl -fsS http://127.0.0.1:8305/api/v1/healthz >/dev/null 2>&1; then ok=1; break; fi
+              sleep 2
+            done
+            if [ "$ok" != "1" ]; then
+              echo "--- healthz FAILED, последние логи: ---"
+              pm2 logs cloudlyru --lines 60 --nostream || true
+              exit 1
+            fi
+            echo "healthz OK"
