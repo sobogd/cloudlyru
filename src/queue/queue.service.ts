@@ -35,10 +35,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit() {
     if ((env.CONVERT_ENABLED ?? 'true') !== 'true') return;
-    // зависшие задачи после рестарта — возвращаем в очередь
-    await this.prisma.job
-      .updateMany({ where: { state: 'processing', updatedAt: { lt: new Date(Date.now() - STALE_MS) } }, data: { state: 'pending' } })
-      .catch(() => undefined);
+    // после рестарта все processing возвращаем в очередь (рестарт = прерванный воркер)
+    await this.prisma.job.updateMany({ where: { state: 'processing' }, data: { state: 'pending' } }).catch(() => undefined);
     this.timer = setInterval(() => void this.tick(), 2000);
     this.logger.log(`конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB)`);
   }
@@ -166,37 +164,36 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const posterRaw = join(tmpdir(), `clq-${job.id}-poster.png`);
     const previewPath = join(tmpdir(), `clq-${job.id}-720.mp4`);
 
-    // 1) мастер: AV1 (svt-av1), метаданные копируются
-    await this.run([
-      'ffmpeg', '-y', '-i', rawPath,
-      '-map_metadata', '0',
-      '-map', '0:v:0',
-      '-c:v', 'libsvtav1', '-preset', '8', '-crf', '20', '-pix_fmt', 'yuv420p',
-      '-map', '0:a?', '-c:a', 'aac', '-b:a', '128k',
-      '-movflags', '+faststart',
-      masterPath,
-    ], 4 * 60 * 60 * 1000);
-
-    // 2) постер (кадр на ~1с → WebP 512)
-    await this.run(['ffmpeg', '-y', '-ss', '1', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 120000);
+    // 1) постер (кадр ~1с → WebP 512) — быстро, чтобы ролик сразу появился в ленте
+    await this.run(['ffmpeg', '-y', '-ss', '1', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 180000);
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
-    // 3) 720p превью (AV1, быстрее — preset 10)
+    // 2) 720p-превью (AV1 libaom, быстрее полного)
     await this.run([
       'ffmpeg', '-y', '-i', rawPath,
       '-map', '0:v:0', '-vf', 'scale=-2:720',
-      '-c:v', 'libsvtav1', '-preset', '10', '-crf', '26', '-pix_fmt', 'yuv420p',
+      '-c:v', 'libaom-av1', '-crf', '36', '-cpu-used', '8', '-row-mt', '1', '-pix_fmt', 'yuv420p',
       '-map', '0:a?', '-c:a', 'aac', '-b:a', '96k',
       '-movflags', '+faststart',
       previewPath,
     ], 6 * 60 * 60 * 1000);
+    const { statSync } = await import('fs');
+    await this.s3.putFile(MediaService.video720Key(sha), previewPath, 'video/mp4');
+    void statSync;
 
-    await Promise.all([
-      this.s3.putFile(MediaService.videoMasterKey(sha), masterPath, 'video/mp4'),
-      this.s3.putFile(MediaService.video720Key(sha), previewPath, 'video/mp4'),
-    ]);
+    // 3) мастер: AV1 полный (в конце), метаданные копируются
+    await this.run([
+      'ffmpeg', '-y', '-i', rawPath,
+      '-map_metadata', '0',
+      '-map', '0:v:0',
+      '-c:v', 'libaom-av1', '-crf', '32', '-cpu-used', '8', '-row-mt', '1', '-pix_fmt', 'yuv420p',
+      '-map', '0:a?', '-c:a', 'aac', '-b:a', '128k',
+      '-movflags', '+faststart',
+      masterPath,
+    ], 6 * 60 * 60 * 1000);
 
+    await this.s3.putFile(MediaService.videoMasterKey(sha), masterPath, 'video/mp4');
     await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'video/mp4', masterReadyAt: new Date() } });
   }
 

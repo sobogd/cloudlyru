@@ -17,14 +17,35 @@ export class MediaController {
     private readonly s3: S3Service,
   ) {}
 
-  /** Превью WebP: ?w=512 (сетка) | ?w=2048 (полный экран). */
+  /** Превью WebP: ?w=512 (сетка; для видео — постер) | ?w=2048 (полный экран фото). */
   @Public()
   @Get('previews/:sha')
   async preview(@Param('sha') sha: string, @Query('w') wRaw: string | undefined, @Res() res: Response) {
+    const asset = await this.prisma.asset.findUnique({ where: { sha256: sha } });
+    if (!asset) return res.status(404).end();
+    const isVideo = asset.masterMime === 'video/mp4' || String(asset.mime).startsWith('video/');
     const w = Number(wRaw ?? 512);
-    const key = w === 2048 ? MediaService.fullKey(sha) : w === 512 ? MediaService.gridKey(sha) : null;
+    let key: string | null = null;
+    if (w === 512) key = isVideo ? MediaService.videoPosterKey(sha) : MediaService.gridKey(sha);
+    else if (w === 2048 && !isVideo) key = MediaService.fullKey(sha);
     if (!key || !(await this.s3.headObject(key))) return res.status(404).end();
-    const url = await this.s3.presignedInline(key, 'image/webp');
+    return res.redirect(302, await this.s3.presignedInline(key, 'image/webp'));
+  }
+
+  /** 720p-превью видео (просмотр); фолбэк — мастер AV1. */
+  @Public()
+  @Get('video-preview/:sha')
+  async videoPreview(@Param('sha') sha: string, @Res() res: Response) {
+    const asset = await this.prisma.asset.findUnique({ where: { sha256: sha } });
+    if (!asset) return res.status(404).end();
+    let url: string;
+    if (await this.s3.headObject(MediaService.video720Key(sha))) {
+      url = await this.s3.presignedInline(MediaService.video720Key(sha), 'video/mp4');
+    } else if (asset.masterMime === 'video/mp4' && (await this.s3.headObject(MediaService.videoMasterKey(sha)))) {
+      url = await this.s3.presignedInline(MediaService.videoMasterKey(sha), 'video/mp4');
+    } else {
+      return res.status(404).end();
+    }
     return res.redirect(302, url);
   }
 

@@ -41,3 +41,6 @@ body { background: #0f1115; }
 @media (min-width: 900px) {
   .content { max-width: 1000px; }
 }
+
+.viewer { position: fixed; inset: 0; background: #000c; z-index: 40; display: grid; place-items: center; }
+.viewer-inner { max-width: 96vw; }

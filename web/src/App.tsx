@@ -164,32 +164,38 @@ function Photos() {
   const [items, setItems] = useState<api.TimelineItem[]>([]);
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
+  const [viewer, setViewer] = useState<number | null>(null);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
+  const isImg = (m: string) => /^image\//.test(m || '');
+  const isVid = (m: string) => /^video\//.test(m || '');
   const load = async () => {
     try { setItems(await api.timeline()); } catch (e) { setErr((e as Error).message); }
     api.trips().then(setTrips).catch(() => undefined);
   };
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void load(); const t = setInterval(() => { void load(); }, 6000); return () => clearInterval(t); }, []);
   const upload = async (files: FileList | null) => {
     if (!files || !files.length) return;
     setBusy(true); setErr(''); setNotice('');
     try {
       for (const f of Array.from(files)) {
-        await api.uploadFile(f, undefined, undefined); // без папки: файл в корень, в «Фото» появится по EXIF
-        setNotice(`Загружено: ${f.name}`);
+        await api.uploadFile(f, undefined, undefined);
+        setNotice(`Загружено: ${f.name} — конвертация в фоне`);
       }
       await load();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
-  const isImg = (m: string) => /^image\//.test(m || '');
+  const media = items.filter((it) => isImg(it.mime) || isVid(it.mime));
+  const openOriginal = (sha?: string) => { if (sha) window.open(api.originalUrl(sha), '_blank'); };
+  const showFull = (sha?: string) => { if (sha) window.open(isVid(media[viewer ?? 0].mime) ? api.video720Url(sha) : api.previewUrl(sha, 2048), '_blank'); };
+
   return (
     <div>
       <div className="row">
-        <label className="btn" style={{ display: 'inline-block' }}>📤 Загрузить фото
-          <input type="file" accept="image/*" multiple style={{ display: 'none' }} disabled={busy} onChange={(e) => void upload(e.target.files)} />
+        <label className="btn" style={{ display: 'inline-block' }}>📤 Загрузить фото/видео
+          <input type="file" accept="image/*,video/*" multiple style={{ display: 'none' }} disabled={busy} onChange={(e) => void upload(e.target.files)} />
         </label>
         {notice && <span className="notice">{notice}</span>}
       </div>
@@ -208,21 +214,56 @@ function Photos() {
       )}
       {activeTrip && <TripMap trip={trips.find((t) => t.id === activeTrip)!} />}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-        {items.map((it) => (
-          <div key={it.entryId} style={{ width: '31.5%' }}>
-            {isImg(it.mime) ? (
-              <img src={api.fileUrl(it.entryId)} alt={it.name} loading="lazy"
-                style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
+        {media.map((it, idx) => (
+          <div key={it.entryId} style={{ width: '31.5%', position: 'relative' }}>
+            {!it.masterReady ? (
+              <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center', color: '#8a95a6' }} title="конвертируется">⏳</div>
+            ) : it.sha256 ? (
+              <div style={{ cursor: 'pointer' }} onClick={() => setViewer(idx)}>
+                <img src={api.previewUrl(it.sha256, 512)} alt={it.name} loading="lazy"
+                  style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
+                {isVid(it.mime) && (
+                  <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 28, textShadow: '0 0 12px #000' }}>▶</span>
+                )}
+              </div>
             ) : (
-              <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center' }}>🎞</div>
+              <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center' }}>📄</div>
             )}
           </div>
         ))}
-        {!items.length && <div className="copy">Нет фото — загрузите изображения</div>}
+        {!media.length && <div className="copy">Нет фото/видео — загрузите из галереи</div>}
       </div>
+      {viewer !== null && media[viewer] && (
+        <div className="viewer" onClick={() => setViewer(null)}>
+          <div className="viewer-inner" onClick={(e) => e.stopPropagation()}>
+            <div className="row">
+              <span className="fname">{media[viewer].name}</span>
+              <span className="meta">{media[viewer].capturedAt ? new Date(media[viewer].capturedAt).toLocaleString() : ''}</span>
+              <span style={{ flex: 1 }} />
+              {isVid(media[viewer].mime) ? (
+                <a className="btn" href={api.video720Url(media[viewer].sha256!)} target="_blank" rel="noreferrer">720p</a>
+              ) : (
+                <a className="btn" href={api.previewUrl(media[viewer].sha256!, 2048)} target="_blank" rel="noreferrer">2К</a>
+              )}
+              <button className="btn ghost" onClick={() => openOriginal(media[viewer].sha256)}>Оригинал</button>
+              <button className="btn ghost" onClick={() => setViewer(null)}>✕</button>
+            </div>
+            {isVid(media[viewer].mime) ? (
+              <video src={api.video720Url(media[viewer].sha256!)} controls autoPlay style={{ width: '100%', maxHeight: '72vh', background: '#000' }} />
+            ) : (
+              <img src={api.previewUrl(media[viewer].sha256!, 2048)} alt="" style={{ width: '100%', maxHeight: '72vh', objectFit: 'contain', background: '#000' }} />
+            )}
+            <div className="row">
+              <button className="btn ghost" disabled={viewer === 0} onClick={(e) => { e.stopPropagation(); setViewer((v) => Math.max(0, (v ?? 0) - 1)); }}>◀</button>
+              <button className="btn ghost" disabled={viewer === media.length - 1} onClick={(e) => { e.stopPropagation(); setViewer((v) => Math.min(media.length - 1, (v ?? 0) + 1)); }}>▶</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
 
 function TripMap({ trip }: { trip: api.Trip }) {
   const ref = useRef<HTMLDivElement>(null);

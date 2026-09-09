@@ -93,6 +93,9 @@ export interface Trip { id: string; start: string; end: string; title: string; c
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
+export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
+export const originalUrl = (sha: string) => `/api/v1/originals/${sha}`;
+export const video720Url = (sha: string) => `/api/v1/video-preview/${sha}`;
 export const timeline = () => request<TimelineItem[]>('/timeline');
 export const trips = () => request<Trip[]>('/trips');
 export const listAlbums = () => request<AlbumInfo[]>('/albums');
