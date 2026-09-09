@@ -44,3 +44,5 @@ body { background: #0f1115; }
 
 .viewer { position: fixed; inset: 0; background: #000c; z-index: 40; display: grid; place-items: center; }
 .viewer-inner { max-width: 96vw; }
+.spin { width: 26px; height: 26px; border: 3px solid #2b4256; border-top-color: #6ea8ff; border-radius: 50%; animation: sp 0.8s linear infinite; }
+@keyframes sp { to { transform: rotate(360deg); } }

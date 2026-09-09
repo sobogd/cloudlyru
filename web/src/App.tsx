@@ -53,10 +53,6 @@ function Shell({ user, onLogout }: { user: string; onLogout: () => void }) {
   const [tab, setTab] = useState<Tab>('files');
   return (
     <div className="app">
-      <header className="head">
-        <strong>CloudlyRu</strong>
-        <span className="meta">{user}</span>
-      </header>
       <main className="content">
         {tab === 'files' && <Files />}
         {tab === 'photos' && <Photos />}
@@ -163,45 +159,95 @@ function Files() {
 // ================= Фото (умный вид: таймлайн + поездки + карта) =================
 
 function Photos() {
+  type Screen = { kind: 'grid' } | { kind: 'view'; idx: number } | { kind: 'upload' };
   const [items, setItems] = useState<api.TimelineItem[]>([]);
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
-  const [viewer, setViewer] = useState<number | null>(null);
+  const [screen, setScreen] = useState<Screen>({ kind: 'grid' });
+  const [pending, setPending] = useState<File[] | null>(null);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState('');
   const isImg = (m: string) => /^image\//.test(m || '');
   const isVid = (m: string) => /^video\//.test(m || '');
-  const load = async () => {
-    try { setItems(await api.timeline()); } catch (e) { setErr((e as Error).message); }
-    api.trips().then(setTrips).catch(() => undefined);
-  };
-  useEffect(() => { void load(); const t = setInterval(() => { void load(); }, 6000); return () => clearInterval(t); }, []);
-  const upload = async (files: FileList | null) => {
-    if (!files || !files.length) return;
-    setBusy(true); setErr(''); setNotice('');
-    try {
-      for (const f of Array.from(files)) {
-        await api.uploadFile(f, undefined, undefined);
-        setNotice(`Загружено: ${f.name} — конвертация в фоне`);
-      }
-      await load();
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-  const media = items.filter((it) => isImg(it.mime) || isVid(it.mime));
-  const openOriginal = (sha?: string) => { if (sha) window.open(api.originalUrl(sha), '_blank'); };
-  const showFull = (sha?: string) => { if (sha) window.open(isVid(media[viewer ?? 0].mime) ? api.video720Url(sha) : api.previewUrl(sha, 2048), '_blank'); };
 
+  const load = async () => {
+    try { setItems(await api.timeline()); } catch { /* keep old */ }
+  };
+  useEffect(() => { void load(); api.trips().then(setTrips).catch(() => undefined); }, []);
+  // #7: автообновление статусов, пока что-то грузится/конвертируется или открыта деталка
+  useEffect(() => {
+    if (screen.kind === 'upload') return;
+    const t = setInterval(() => { void load(); }, 3000);
+    return () => clearInterval(t);
+  }, [screen.kind]);
+
+  const media = items.filter((it) => isImg(it.mime) || isVid(it.mime));
+  const current = screen.kind === 'view' ? media[screen.idx] : null;
+  const openUpload = (files: FileList | null) => {
+    if (!files || !files.length) return;
+    setPending(Array.from(files));
+    setScreen({ kind: 'upload' });
+  };
+
+  // ===== Экран загрузки (#5) =====
+  if (screen.kind === 'upload') {
+    return <UploadFlow initial={pending} onDone={() => { setScreen({ kind: 'grid' }); setPending(null); void load(); }} />;
+  }
+
+  // ===== Экран деталки (#1-4) =====
+  if (screen.kind === 'view' && current) {
+    const it = current;
+    return (
+      <div>
+        <div className="row">
+          <button className="btn ghost" onClick={() => setScreen({ kind: 'grid' })}>← Фото</button>
+          <span className="fname">{it.name}</span>
+          <span className="meta">{it.capturedAt ? new Date(it.capturedAt).toLocaleString() : ''}</span>
+          <span style={{ flex: 1 }} />
+          {isVid(it.mime) && it.masterReady && <a className="btn" href={api.video720Url(it.sha256!)} target="_blank" rel="noreferrer">720p</a>}
+          <a className="btn ghost" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">Оригинал</a>
+        </div>
+
+        {!it.masterReady ? (
+          <div className="panel">
+            {/* #2: статус/лог, пока грузится или ошибка */}
+            <div className="copy">
+              {it.jobState === 'failed'
+                ? '❌ Ошибка конвертации'
+                : it.jobState === 'processing'
+                  ? `⏳ Конвертация: ${it.jobProgress ?? 0}%`
+                  : it.jobState === 'pending'
+                    ? '⏳ В очереди на конвертацию'
+                    : '⏳ Загрузка/подготовка…'}
+            </div>
+            {it.jobState === 'processing' && <progress value={it.jobProgress ?? 0} max={100} />}
+            {it.jobState === 'failed' && it.jobError && <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c' }}>{it.jobError}</pre>}
+            <div className="copy">Статус обновляется автоматически — можно не перезагружать страницу.</div>
+          </div>
+        ) : isVid(it.mime) ? (
+          <video src={api.video720Url(it.sha256!)} controls autoPlay style={{ width: '100%', maxHeight: '78vh', background: '#000', borderRadius: 8 }} />
+        ) : (
+          <LoadImg src={api.previewUrl(it.sha256!, 2048)} style={{ width: '100%', maxHeight: '78vh', objectFit: 'contain', background: '#000', borderRadius: 8 }} />
+        )}
+
+        <div className="row">
+          <button className="btn ghost" disabled={screen.idx === 0} onClick={() => setScreen({ kind: 'view', idx: screen.idx - 1 })}>◀</button>
+          <span style={{ flex: 1 }} />
+          <button className="btn ghost" disabled={screen.idx >= media.length - 1} onClick={() => setScreen({ kind: 'view', idx: screen.idx + 1 })}>▶</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== Экран-сетка =====
   return (
     <div>
       <div className="row">
-        <label className="btn" style={{ display: 'inline-block' }}>📤 Загрузить фото/видео
-          <input type="file" accept="image/*,video/*" multiple style={{ display: 'none' }} disabled={busy} onChange={(e) => void upload(e.target.files)} />
+        <label className="btn" style={{ display: 'inline-block' }}>📤 Загрузить
+          <input type="file" accept="image/*,video/*" multiple style={{ display: 'none' }} disabled={busy} onChange={openUpload} />
         </label>
-        {notice && <span className="notice">{notice}</span>}
+        {err && <span className="err">{err}</span>}
       </div>
-      {err && <div className="err">{err}</div>}
       {trips.length > 0 && (
         <div className="panel">
           <div className="meta">Поездки — нажми, чтобы увидеть маршрут</div>
@@ -217,18 +263,18 @@ function Photos() {
       {activeTrip && <TripMap trip={trips.find((t) => t.id === activeTrip)!} />}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
         {media.map((it, idx) => (
-          <div key={it.entryId} style={{ width: '31.5%', position: 'relative' }}>
+          <div key={it.entryId} style={{ width: '31.5%' }} onClick={() => setScreen({ kind: 'view', idx })}>
             {!it.masterReady ? (
-              <div title={it.jobError ? it.jobError : 'конвертация'} style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'grid', placeItems: 'center', color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 12, textAlign: 'center', padding: 4 }}>
+              <div
+                title={it.jobError || 'конвертация'}
+                style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'grid', placeItems: 'center', color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 11, textAlign: 'center', padding: 4, cursor: 'pointer' }}
+              >
                 {it.jobState === 'failed' ? '❌ ошибка' : it.jobState === 'processing' ? <>⏳ {it.jobProgress ?? 0}%</> : it.jobState === 'pending' ? '⏳ в очереди' : '⏳'}
               </div>
             ) : it.sha256 ? (
-              <div style={{ cursor: 'pointer' }} onClick={() => setViewer(idx)}>
-                <img src={api.previewUrl(it.sha256, 512)} alt={it.name} loading="lazy"
-                  style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
-                {isVid(it.mime) && (
-                  <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 28, textShadow: '0 0 12px #000' }}>▶</span>
-                )}
+              <div style={{ position: 'relative', cursor: 'pointer' }}>
+                <LoadImg src={api.previewUrl(it.sha256, 512)} style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
+                {isVid(it.mime) && <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 28, textShadow: '0 0 12px #000' }}>▶</span>}
               </div>
             ) : (
               <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center' }}>📄</div>
@@ -237,36 +283,97 @@ function Photos() {
         ))}
         {!media.length && <div className="copy">Нет фото/видео — загрузите из галереи</div>}
       </div>
-      {viewer !== null && media[viewer] && (
-        <div className="viewer" onClick={() => setViewer(null)}>
-          <div className="viewer-inner" onClick={(e) => e.stopPropagation()}>
-            <div className="row">
-              <span className="fname">{media[viewer].name}</span>
-              <span className="meta">{media[viewer].capturedAt ? new Date(media[viewer].capturedAt).toLocaleString() : ''}</span>
-              <span style={{ flex: 1 }} />
-              {isVid(media[viewer].mime) ? (
-                <a className="btn" href={api.video720Url(media[viewer].sha256!)} target="_blank" rel="noreferrer">720p</a>
-              ) : (
-                <a className="btn" href={api.previewUrl(media[viewer].sha256!, 2048)} target="_blank" rel="noreferrer">2К</a>
-              )}
-              <button className="btn ghost" onClick={() => openOriginal(media[viewer].sha256)}>Оригинал</button>
-              <button className="btn ghost" onClick={() => setViewer(null)}>✕</button>
+    </div>
+  );
+}
+
+// #4: лоадер для изображений
+function LoadImg({ src, style }: { src: string; style?: React.CSSProperties }) {
+  const [ok, setOk] = useState(false);
+  return (
+    <div style={{ position: 'relative' }}>
+      {!ok && (
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', minHeight: 120 }}>
+          <span className="spin" />
+        </div>
+      )}
+      <img src={src} alt="" style={{ ...style, visibility: ok ? 'visible' : 'hidden' }} onLoad={() => setOk(true)} onError={() => setOk(true)} loading="lazy" />
+    </div>
+  );
+}
+
+// #5: загрузка на отдельном экране с полным статусом
+function UploadFlow({ initial, onDone }: { initial: File[] | null; onDone: () => void }) {
+  const [rows, setRows] = useState<Array<{ name: string; size: number; pct: number; phase: string; error?: string }>>([]);
+  const [overall, setOverall] = useState(0);
+  const [running, setRunning] = useState(false);
+  const [finished, setFinished] = useState(false);
+
+  const run = async (files: File[]) => {
+    const list = files.map((f) => ({ name: f.name, size: f.size, pct: 0, phase: 'ожидание' }));
+    setRows(list); setRunning(true); setFinished(false); setOverall(0);
+    let doneCnt = 0;
+    for (let i = 0; i < list.length; i++) {
+      const f = files[i];
+      try {
+        await api.uploadFile(f, undefined, (p) => {
+          list[i].pct = p;
+          list[i].phase = p >= 100 ? 'загружено — конвертация в фоне' : 'загрузка';
+          setRows([...list]);
+        });
+        list[i].pct = 100;
+        list[i].phase = 'загружено — конвертация в фоне';
+      } catch (e) {
+        list[i].error = (e as Error).message;
+        list[i].phase = 'ошибка';
+      }
+      setRows([...list]);
+      doneCnt += 1;
+      setOverall(Math.round((doneCnt / list.length) * 100));
+    }
+    setRunning(false);
+    setFinished(true);
+  };
+  const started = useRef(false);
+  useEffect(() => {
+    if (initial && !started.current) { started.current = true; void run(initial); }
+  }, [initial]);
+
+  return (
+    <div>
+      <div className="row"><button className="btn ghost" onClick={onDone}>← Фото</button><strong>Загрузка</strong></div>
+      {rows.length > 0 && running && (
+        <div className="notice" style={{ margin: '6px 0' }}>⚠ Не закрывайте и не обновляйте страницу, пока идёт загрузка.</div>
+      )}
+      {rows.length > 0 && (
+        <div className="panel">
+          {rows.map((it, i) => (
+            <div className="item" key={i}>
+              <span className="icon">{it.error ? '❌' : it.pct >= 100 ? '✅' : '⬆️'}</span>
+              <span className="fname">{it.name}</span>
+              <span className="meta">{it.error ? 'ошибка' : it.phase + (it.pct >= 100 || it.error ? '' : ` ${it.pct}%`)}</span>
+              {!it.error && it.pct < 100 && <progress value={it.pct} max={100} />}
             </div>
-            {isVid(media[viewer].mime) ? (
-              <video src={api.video720Url(media[viewer].sha256!)} controls autoPlay style={{ width: '100%', maxHeight: '72vh', background: '#000' }} />
-            ) : (
-              <img src={api.previewUrl(media[viewer].sha256!, 2048)} alt="" style={{ width: '100%', maxHeight: '72vh', objectFit: 'contain', background: '#000' }} />
-            )}
-            <div className="row">
-              <button className="btn ghost" disabled={viewer === 0} onClick={(e) => { e.stopPropagation(); setViewer((v) => Math.max(0, (v ?? 0) - 1)); }}>◀</button>
-              <button className="btn ghost" disabled={viewer === media.length - 1} onClick={(e) => { e.stopPropagation(); setViewer((v) => Math.min(media.length - 1, (v ?? 0) + 1)); }}>▶</button>
-            </div>
+          ))}
+          <div className="row">
+            <span className="meta">Всего: {overall}%</span>
+            <progress value={overall} max={100} style={{ flex: 1 }} />
           </div>
+          {finished && <button className="btn" onClick={onDone}>Готово — смотреть в «Фото»</button>}
+        </div>
+      )}
+      {rows.length === 0 && !running && (
+        <div className="panel">
+          <label className="btn" style={{ display: 'inline-block', fontSize: 16, padding: '12px 20px' }}>📤 Выбрать фото/видео
+            <input type="file" accept="image/*,video/*" multiple style={{ display: 'none' }} onChange={(e) => { if (e.target.files) void run(Array.from(e.target.files)); }} />
+          </label>
+          <div className="copy" style={{ marginTop: 8 }}>Файлы загрузятся по очереди. Не уходите со страницы до завершения.</div>
         </div>
       )}
     </div>
   );
 }
+
 
 
 function TripMap({ trip }: { trip: api.Trip }) {
