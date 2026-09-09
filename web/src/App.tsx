@@ -259,7 +259,8 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
   const [stack, setStack] = useState<Array<{ id?: string; name: string }>>([{ name: 'Главная' }]);
   const [view, setView] = useState<api.FolderView | null>(null);
   const [err, setErr] = useState('');
-  const [detail, setDetail] = useState<{ kind: 'file' | 'folder'; id: string } | null>(null);
+  const [openFile, setOpenFile] = useState<string | null>(null);
+  const [folderMeta, setFolderMeta] = useState(false);
   const currentId = stack[stack.length - 1]?.id;
 
   const load = async (parentId?: string) => {
@@ -284,16 +285,21 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
   };
   const goHome = () => setStack((s) => s.slice(0, 1));
   const goUp = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
-  const closeDetail = () => { setDetail(null); void load(currentId); };
+  const closeFile = () => { setOpenFile(null); void load(currentId); };
 
-  // ===== Деталка (файл или папка) =====
-  if (detail) {
-    if (detail.kind === 'file') return <FileDetail entryId={detail.id} onBack={closeDetail} />;
+  // ===== Деталка файла (из списка) =====
+  if (openFile) return <FileDetail entryId={openFile} onBack={closeFile} />;
+
+  // ===== Деталка текущей папки (из шестерёнки, только внутри папок) =====
+  if (folderMeta && currentId) {
     return (
       <FolderDetail
-        folderId={detail.id}
-        onBack={closeDetail}
-        onOpen={(name) => { setDetail(null); setStack((s) => [...s, { id: detail.id, name }]); }}
+        folderId={currentId}
+        onBack={() => { setFolderMeta(false); void load(currentId); }}
+        onDeleted={() => {
+          setFolderMeta(false);
+          setStack((s) => (s.length > 1 ? s.slice(0, -1) : s)); // после удаления — на уровень выше
+        }}
       />
     );
   }
@@ -303,6 +309,9 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
       <div className="filehead">
         <button className="iconbtn" title="Главная" onClick={goHome} disabled={stack.length === 1}>🏠</button>
         <button className="iconbtn" title="На уровень выше" onClick={goUp} disabled={stack.length === 1}>⬆️</button>
+        {stack.length > 1 && (
+          <button className="iconbtn" title="Свойства папки" onClick={() => setFolderMeta(true)} disabled={busy}>⚙️</button>
+        )}
         <span style={{ flex: 1 }} />
         <button className="iconbtn" title="Новая папка" onClick={mkdir} disabled={busy}>📂</button>
         <label className="iconbtn" title="Загрузить файлы (любого типа)">
@@ -327,13 +336,13 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       <div className="fileslist">
         {(view?.folders || []).filter((f) => f.id !== photoFolderId).map((f) => (
-          <div className="item" key={f.id} onClick={() => setDetail({ kind: 'folder', id: f.id })}>
+          <div className="item" key={f.id} onClick={() => setStack((s) => [...s, { id: f.id, name: f.name }])}>
             <span className="icon">📁</span>
             <span className="fname">{f.name}</span>
           </div>
         ))}
         {(view?.entries || []).map((e) => (
-          <div className="item" key={e.id} onClick={() => setDetail({ kind: 'file', id: e.id })}>
+          <div className="item" key={e.id} onClick={() => setOpenFile(e.id)}>
             <span className="icon">{fileIcon(e.mime)}</span>
             <span className="fname">{e.name}</span>
           </div>
@@ -346,7 +355,7 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
   );
 }
 
-// ===== Деталка файла: назад / скачать / удалить + вся метадата =====
+// ===== Деталка файла: назад / скачать / удалить + вся метадата на фоне =====
 
 function MetaRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   return (
@@ -382,7 +391,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
       {meta && (
-        <div className="panel">
+        <div className="detbody">
           <MetaRow k="Имя" v={meta.name} />
           <MetaRow k="Тип" v={meta.ext ? `${meta.ext.toUpperCase()} — ${meta.mime}` : meta.mime} />
           <MetaRow k="Размер" v={fmt(meta.size)} />
@@ -406,9 +415,9 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
   );
 }
 
-// ===== Деталка папки: назад / открыть / удалить + метадата =====
+// ===== Деталка папки (шестерёнка внутри папки): назад / удалить + метадата на фоне =====
 
-function FolderDetail({ folderId, onBack, onOpen }: { folderId: string; onBack: () => void; onOpen: (name: string) => void }) {
+function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBack: () => void; onDeleted: () => void }) {
   const [meta, setMeta] = useState<api.FolderMeta | null>(null);
   const [err, setErr] = useState('');
   useEffect(() => {
@@ -417,7 +426,7 @@ function FolderDetail({ folderId, onBack, onOpen }: { folderId: string; onBack: 
 
   const del = async () => {
     if (!confirm(`Удалить папку «${meta?.name ?? ''}» с содержимым в корзину?`)) return;
-    try { await api.deleteFolder(folderId); onBack(); } catch (e) { alert((e as Error).message); }
+    try { await api.deleteFolder(folderId); onDeleted(); } catch (e) { alert((e as Error).message); }
   };
 
   return (
@@ -425,25 +434,18 @@ function FolderDetail({ folderId, onBack, onOpen }: { folderId: string; onBack: 
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
         <strong className="detname">{meta?.name ?? 'Папка'}</strong>
-        {meta && (
-          <button className="iconbtn" title="Открыть папку" onClick={() => onOpen(meta.name)}>📂</button>
-        )}
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
       {meta && (
-        <div className="panel">
+        <div className="detbody">
           <MetaRow k="Имя" v={meta.name} />
           <MetaRow k="Расположение" v={meta.path} />
           <MetaRow k="Вложенные папки" v={String(meta.folders)} />
           <MetaRow k="Файлы" v={String(meta.entries)} />
           <MetaRow k="Создана" v={new Date(meta.createdAt).toLocaleString()} />
           <MetaRow k="Изменена" v={new Date(meta.updatedAt).toLocaleString()} />
-          <div className="row" style={{ marginTop: 12 }}>
-            <button className="btn" onClick={() => onOpen(meta.name)}>📂 Открыть</button>
-            <button className="btn danger" onClick={del}>🗑 В корзину</button>
-          </div>
         </div>
       )}
     </div>

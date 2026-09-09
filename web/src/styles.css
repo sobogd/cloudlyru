@@ -119,6 +119,7 @@ html, body { overscroll-behavior: none; }
 
 /* Деталка файла/папки */
 .filehead strong.detname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.detbody { margin: 6px 0 0; padding: 0 2px; }
 .metarow { display: grid; grid-template-columns: 118px 1fr; gap: 10px; align-items: baseline;
   padding: 9px 2px; border-bottom: 1px solid #1f242c; }
 .metarow:last-child { border-bottom: 0; }
