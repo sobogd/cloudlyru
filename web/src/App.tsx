@@ -1,4 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import * as api from './api';
 import './styles.css';
 
@@ -243,6 +245,7 @@ function Trash() {
 function Timeline() {
   const [items, setItems] = useState<api.TimelineItem[]>([]);
   const [trips, setTrips] = useState<api.Trip[]>([]);
+  const [activeTrip, setActiveTrip] = useState<string | null>(null);
   const [err, setErr] = useState('');
   useEffect(() => {
     api.timeline().then(setItems).catch((e) => setErr((e as Error).message));
@@ -254,17 +257,17 @@ function Timeline() {
       {err && <div className="err">{err}</div>}
       {trips.length > 0 && (
         <div className="panel">
-          <h3>Поездки ({trips.length})</h3>
+          <h3>Поездки ({trips.length}) — кликни, чтобы увидеть маршрут</h3>
           {trips.map((t) => (
-            <div className="item" key={t.id}>
+            <div className="item" key={t.id} onClick={() => setActiveTrip(t.id === activeTrip ? null : t.id)} style={{ cursor: 'pointer' }}>
               <span className="icon">✈️</span>
               <span className="fname">{t.title}</span>
-              <span className="meta">{t.count} точек на карте</span>
+              <span className="meta">{t.count} точек</span>
             </div>
           ))}
-          <div className="copy">Карта появится в следующем шаге M2.</div>
         </div>
       )}
+      {activeTrip && <TripMap trip={trips.find((t) => t.id === activeTrip)!} />}
       <div className="panel">
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
           {items.map((it) => (
@@ -335,6 +338,25 @@ function Albums() {
       )}
     </div>
   );
+}
+
+function TripMap({ trip }: { trip: api.Trip }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ref.current || !trip.points.length) return;
+    const pts = trip.points.map((p) => [p.latitude, p.longitude] as [number, number]);
+    const map = L.map(ref.current, { scrollWheelZoom: false });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
+    }).addTo(map);
+    L.polyline(pts, { color: '#2b6cff', weight: 3 }).addTo(map);
+    L.marker(pts[0]).addTo(map).bindPopup('старт');
+    if (pts.length > 1) L.marker(pts[pts.length - 1]).addTo(map).bindPopup('финиш');
+    const b = L.latLngBounds(pts).pad(0.25);
+    map.fitBounds(b, { maxZoom: 13 });
+    return () => { map.remove(); };
+  }, [trip]);
+  return <div className="panel" style={{ padding: 0 }}><div ref={ref} style={{ height: 380, borderRadius: 8 }} /></div>;
 }
 
 function fmt(bytes: number): string {
