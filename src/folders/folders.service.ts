@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { assertSafeName } from '../common/utils';
+import { QueueService } from '../queue/queue.service';
 import { badRequest, conflict, notFound } from '../common/errors';
 
 const isRoot = (f: { name: string }) => f.name === ROOT_FOLDER_NAME;
@@ -11,6 +12,7 @@ export class FoldersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auth: AuthService,
+    private readonly queue: QueueService,
   ) {}
 
   private async rootId(userId: string): Promise<string> {
@@ -100,6 +102,7 @@ export class FoldersService {
     if (isRoot(folder)) throw badRequest('cannot delete root');
     const ids = await this.collectSubtreeIds(id);
     await this.prisma.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
+    await this.cancelAssetsIn(ids);
     return { ok: true, affected: ids.length };
   }
 
@@ -108,6 +111,7 @@ export class FoldersService {
     await this.resolveAccessibleOrDeleted(id, userId);
     const ids = await this.collectSubtreeIds(id);
     await this.prisma.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: null } });
+    await this.requeueAssetsIn(ids);
     return { ok: true, affected: ids.length };
   }
 
@@ -127,6 +131,21 @@ export class FoldersService {
       }
       throw conflict('folder name already exists');
     }
+  }
+
+
+  /** assetId'ы файлов внутри папок (для отмены/возврата конвертации). */
+  private async assetsIn(folderIds: string[]): Promise<string[]> {
+    const rows = await this.prisma.fileEntry.findMany({ where: { folderId: { in: folderIds } }, select: { assetId: true } });
+    return [...new Set(rows.map((r) => r.assetId))];
+  }
+  private async cancelAssetsIn(folderIds: string[]): Promise<void> {
+    const assetIds = await this.assetsIn(folderIds);
+    if (assetIds.length) await this.queue.cancelForAssets(assetIds);
+  }
+  private async requeueAssetsIn(folderIds: string[]): Promise<void> {
+    const assetIds = await this.assetsIn(folderIds);
+    if (assetIds.length) await this.queue.requeueForAssets(assetIds);
   }
 
   /** BFS всех id поддерева, включая саму папку. */

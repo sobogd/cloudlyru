@@ -27,6 +27,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
   private running = false;
+  private activeJob: { id: string; assetId: string } | null = null;
+  private activeChild: import('child_process').ChildProcess | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -65,6 +67,27 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Отменить задачи ассетов (файл удалён) и вернуть из корзины при восстановлении. */
+  async cancelForAssets(assetIds: string[]): Promise<void> {
+    if (!assetIds.length) return;
+    await this.prisma.job
+      .updateMany({ where: { assetId: { in: assetIds }, state: { in: ['pending', 'processing'] } }, data: { state: 'failed', error: 'cancelled: файл удалён', finishedAt: new Date() } })
+      .catch(() => undefined);
+    // если удалённый файл прямо сейчас кодируется — убиваем ffmpeg
+    if (this.activeJob && assetIds.includes(this.activeJob.assetId) && this.activeChild) {
+      this.logger.warn(`отмена активной задачи ${this.activeJob.id} (файл удалён) — убиваю ffmpeg`);
+      try { this.activeChild.kill('SIGKILL'); } catch { /* ignore */ }
+    }
+  }
+
+  /** Вернуть в очередь отменённые задачи (файл восстановлен из корзины). */
+  async requeueForAssets(assetIds: string[]): Promise<void> {
+    if (!assetIds.length) return;
+    await this.prisma.job
+      .updateMany({ where: { assetId: { in: assetIds }, state: 'failed', error: { contains: 'cancelled' } }, data: { state: 'pending', error: null, attempts: 0 } })
+      .catch(() => undefined);
+  }
+
   private async tick() {
     if (this.stopped || this.running) return;
     this.running = true;
@@ -88,6 +111,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async process(job: JobRow) {
+    this.activeJob = { id: job.id, assetId: job.assetId };
     const dir = join(tmpdir(), `clq-${job.id}`);
     mkdirSync(dir, { recursive: true });
     const rawPath = join(dir, 'raw');
@@ -105,13 +129,19 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     } catch (e) {
       const msg = (e as Error).message || 'error';
       this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)}`);
-      const attempts = ((await this.prisma.job.findUnique({ where: { id: job.id } }))?.attempts ?? 1);
-      if (attempts < MAX_ATTEMPTS) {
-        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: msg } });
-      } else {
-        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: msg, finishedAt: new Date() } });
+      const row = await this.prisma.job.findUnique({ where: { id: job.id } });
+      const cancelled = row?.state === 'failed' && row?.error?.startsWith('cancelled');
+      if (!cancelled) {
+        const attempts = row?.attempts ?? 1;
+        if (attempts < MAX_ATTEMPTS) {
+          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: msg } });
+        } else {
+          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: msg, finishedAt: new Date() } });
+        }
       }
     } finally {
+      this.activeJob = null;
+      this.activeChild = null;
       rmSync(dir, { recursive: true, force: true });
     }
   }
@@ -201,6 +231,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return new Promise((resolve, reject) => {
       const script = `ulimit -v ${WORKER_MEM_KB} 2>/dev/null; exec -- "$@"`;
       const child = spawn('bash', ['-c', script, 'clq-worker', ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
+      this.activeChild = child;
       let errTail = '';
       (child.stderr || ({} as NodeJS.ReadableStream)).on('data', (chunk: Buffer) => {
         errTail = (errTail + chunk.toString()).slice(-2000);
