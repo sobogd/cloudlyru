@@ -102,3 +102,11 @@ html, body { overscroll-behavior: none; }
 .uprow progress { height: 6px; }
 .ubar { height: 5px; background: #262c37; border-radius: 3px; overflow: hidden; margin: 3px 0; }
 .ubar i { display: block; height: 100%; background: #2b6cff; border-radius: 3px; }
+
+/* Инлайн-загрузка: панель прогресса над содержимым + блокировка UI во время загрузки */
+.uploadwall { position: fixed; inset: 0; z-index: 90; background: transparent; }
+.uppanel { position: relative; z-index: 91; background: #10141b; border: 1px solid #2a313c;
+  border-radius: 12px; padding: 10px 12px; margin: 0 0 10px; }
+.uphead { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
+.upcount { font-size: 13px; color: #cfd6e0; }
+.uppanel .uprow { padding: 6px 2px; }

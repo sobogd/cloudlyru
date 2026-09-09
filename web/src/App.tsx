@@ -51,6 +51,29 @@ function Login({ onLogin }: { onLogin: (u: api.UserInfo) => void }) {
 
 function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void }) {
   const [tab, setTab] = useState<Tab>('files');
+
+  // Запрет «свайпа обновления страницы» (pull-to-refresh): на современных браузерах —
+  // CSS overscroll-behavior:none; здесь фолбэк JS для старых Safari, где CSS не работает.
+  useEffect(() => {
+    if (typeof CSS !== 'undefined' && CSS.supports('overscroll-behavior-y', 'none')) return;
+    let y0: number | null = null;
+    const onStart = (e: TouchEvent) => { y0 = e.changedTouches[0]?.clientY ?? null; };
+    const onMove = (e: TouchEvent) => {
+      if (window.scrollY > 0 || y0 == null) return;
+      // жесты внутри деталки/зума/карты не трогаем
+      const el = e.target as HTMLElement | null;
+      if (el && el.closest('.mediaarea, .viewer, .tbar, .det-info')) return;
+      const y = e.changedTouches[0]?.clientY;
+      if (y != null && y > y0) e.preventDefault();
+    };
+    document.addEventListener('touchstart', onStart, { passive: true });
+    document.addEventListener('touchmove', onMove, { passive: false });
+    return () => {
+      document.removeEventListener('touchstart', onStart);
+      document.removeEventListener('touchmove', onMove);
+    };
+  }, []);
+
   return (
     <div className="app">
       <main className="content">
@@ -81,19 +104,177 @@ function fileIcon(mime?: string): string {
   return '📄';
 }
 
+// ================= Общая инлайн-загрузка (без отдельной страницы) =================
+// Очередь файлов с панелью прогресса над содержимым; во время загрузки остальной UI
+// блокируется оверлеем. Завершившиеся файлы появляются в списке/сетке сразу.
+
+interface UpFile { key: number; file: File; state: 'queued' | 'uploading' | 'done' | 'failed'; pct: number; error?: string; }
+let upSeq = 0;
+
+function useBulkUpload(folderId: string | undefined, onUploaded?: () => void) {
+  const ref = useRef<UpFile[]>([]);
+  const [rows, setRows] = useState<UpFile[]>([]);
+  const cb = useRef(onUploaded);
+  cb.current = onUploaded;
+  const running = useRef(false);
+  const stopped = useRef(false);
+  const ctrl = useRef<AbortController | null>(null);
+  const sync = () => setRows(ref.current.slice());
+
+  const start = async () => {
+    if (running.current) return;
+    running.current = true;
+    stopped.current = false;
+    try {
+      for (;;) {
+        const i = ref.current.findIndex((r) => r.state === 'queued');
+        if (i < 0 || stopped.current) break;
+        const row = ref.current[i];
+        row.state = 'uploading';
+        row.pct = 0;
+        sync();
+        const ac = new AbortController();
+        ctrl.current = ac;
+        try {
+          await api.uploadFile(row.file, folderId, (p) => { row.pct = p; sync(); }, ac.signal);
+          row.state = 'done';
+          row.pct = 100;
+          sync();
+          cb.current?.();
+        } catch (e) {
+          if (stopped.current || ac.signal.aborted) {
+            // отменённый текущий файл не показываем (он не загрузился)
+            ref.current = ref.current.filter((x) => x.key !== row.key);
+          } else {
+            row.state = 'failed';
+            row.error = (e as Error).message || 'ошибка';
+          }
+          sync();
+        } finally {
+          ctrl.current = null;
+        }
+      }
+    } finally {
+      running.current = false;
+      if (stopped.current) {
+        stopped.current = false;
+        // отмена: остаются только уже загруженные
+        ref.current = ref.current.filter((x) => x.state === 'done');
+        sync();
+      }
+    }
+  };
+
+  const addFiles = (files: File[]) => {
+    if (!files.length || running.current) return;
+    ref.current = ref.current.filter((r) => r.state !== 'done');
+    for (const f of files) ref.current.push({ key: ++upSeq, file: f, state: 'queued', pct: 0 });
+    sync();
+    void start();
+  };
+
+  const cancel = () => {
+    stopped.current = true;
+    ctrl.current?.abort();
+  };
+  const retryFailed = () => {
+    ref.current = ref.current.map((r) => (r.state === 'failed' ? { ...r, state: 'queued' as const, pct: 0, error: undefined } : r));
+    sync();
+    void start();
+  };
+  const dismissFailed = () => {
+    ref.current = ref.current.filter((r) => r.state !== 'failed');
+    sync();
+  };
+
+  // когда всё догрузилось — панель сама исчезает
+  const allDone = rows.length > 0 && !rows.some((r) => r.state !== 'done');
+  useEffect(() => {
+    if (!allDone) return;
+    const t = setTimeout(() => { ref.current = []; sync(); }, 900);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allDone]);
+
+  return {
+    rows,
+    busy: rows.some((r) => r.state === 'queued' || r.state === 'uploading'),
+    addFiles,
+    cancel,
+    retryFailed,
+    dismissFailed,
+  };
+}
+
+/** Панель прогресса инлайн-загрузки: «x из N» + иконка отмены справа + прогресс по каждому файлу. */
+function UploadPanel({ rows, busy, onCancel, onRetryFailed, onDismissFailed }: {
+  rows: UpFile[];
+  busy: boolean;
+  onCancel: () => void;
+  onRetryFailed: () => void;
+  onDismissFailed: () => void;
+}) {
+  const doneN = rows.filter((r) => r.state === 'done').length;
+  const failN = rows.filter((r) => r.state === 'failed').length;
+  const active = rows.find((r) => r.state === 'uploading');
+  const label = busy
+    ? `загрузка ${doneN + (active ? 1 : 0)} из ${rows.length}`
+    : failN > 0
+      ? `не загрузилось: ${failN}`
+      : `загружено ${doneN} из ${rows.length}`;
+  return (
+    <div className="uppanel">
+      <div className="uphead">
+        <span className="upcount">{label}</span>
+        <span style={{ flex: 1 }} />
+        {busy ? (
+          <button className="iconbtn" title="Отменить — убрать незагруженное" onClick={onCancel}>✕</button>
+        ) : failN > 0 ? (
+          <>
+            <button className="btn ghost" onClick={onRetryFailed}>⟳ повторить</button>
+            <button className="iconbtn" title="Убрать ошибки" onClick={onDismissFailed}>✕</button>
+          </>
+        ) : null}
+      </div>
+      {rows.map((r) => (
+        <div className="uprow" key={r.key}>
+          <span className="icon">{r.state === 'done' ? '✅' : r.state === 'failed' ? '❌' : r.state === 'uploading' ? '⏳' : '🕒'}</span>
+          <div className="upmain">
+            <div className="upname">{r.file.name} <span className="meta">{fmt(r.file.size)}</span></div>
+            {r.state === 'failed' ? (
+              <div className="upmeta">{r.error}</div>
+            ) : (
+              <div className="ubar">
+                <i style={{ width: `${r.state === 'done' ? 100 : r.pct}%`, background: r.state === 'done' ? '#2fae5f' : undefined }} />
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Files({ photoFolderId }: { photoFolderId: string | null }) {
   const [stack, setStack] = useState<Array<{ id?: string; name: string }>>([{ name: 'Главная' }]);
   const [view, setView] = useState<api.FolderView | null>(null);
   const [err, setErr] = useState('');
-  const [page, setPage] = useState<'list' | 'upload'>('list');
   const currentId = stack[stack.length - 1]?.id;
-  const currentName = stack[stack.length - 1]?.name ?? 'Главная';
 
   const load = async (parentId?: string) => {
     setErr('');
     try { setView(await api.listFolder(parentId)); } catch (e) { setErr((e as Error).message); }
   };
   useEffect(() => { void load(currentId); }, [currentId]);
+
+  const up = useBulkUpload(currentId, () => { void load(currentId); });
+  const busy = up.busy;
+  // во время загрузки блокируем остальной UI (оверлей + без скролла)
+  useEffect(() => {
+    if (!busy) return;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = ''; };
+  }, [busy]);
 
   const mkdir = async () => {
     const name = prompt('Имя новой папки');
@@ -107,34 +288,35 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
       await load(currentId);
     } catch (e) { setErr((e as Error).message); }
   };
-
-  // Отдельная страница загрузки в текущую папку
-  if (page === 'upload') {
-    return (
-      <UploadPage
-        folderId={currentId}
-        folderName={currentName}
-        photoFolderId={photoFolderId}
-        onClose={() => { setPage('list'); void load(currentId); }}
-      />
-    );
-  }
+  const goHome = () => setStack((s) => s.slice(0, 1));
+  const goUp = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
 
   return (
     <div>
       <div className="filehead">
-        <div className="crumbs">
-          {stack.map((c, i) => (
-            <span key={i}>
-              {i > 0 && <span className="meta">/</span>}
-              <button className="crumb" onClick={() => setStack((s) => s.slice(0, i + 1))}>{c.name}</button>
-            </span>
-          ))}
-        </div>
+        <button className="iconbtn" title="Главная" onClick={goHome} disabled={stack.length === 1}>🏠</button>
+        <button className="iconbtn" title="На уровень выше" onClick={goUp} disabled={stack.length === 1}>⬆️</button>
         <span style={{ flex: 1 }} />
-        <button className="iconbtn" title="Новая папка" onClick={mkdir}>➕</button>
-        <button className="iconbtn" title="Загрузить в эту папку" onClick={() => setPage('upload')}>⬆️</button>
+        <button className="iconbtn" title="Новая папка" onClick={mkdir} disabled={busy}>📂</button>
+        <label className="iconbtn" title="Загрузить файлы (любого типа)">
+          📄
+          <input
+            type="file"
+            multiple
+            style={{ display: 'none' }}
+            disabled={busy}
+            onChange={(e) => {
+              if (e.target.files?.length) up.addFiles(Array.from(e.target.files));
+              e.target.value = '';
+            }}
+          />
+        </label>
       </div>
+
+      {up.rows.length > 0 && (
+        <UploadPanel rows={up.rows} busy={up.busy} onCancel={up.cancel} onRetryFailed={up.retryFailed} onDismissFailed={up.dismissFailed} />
+      )}
+      {busy && <div className="uploadwall" />}
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       <div className="panel">
         {(view?.folders || []).filter((f) => f.id !== photoFolderId).map((f) => (
@@ -152,242 +334,16 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
             <button className="btn ghost" onClick={() => rm('file', e.id, e.name)}>🗑</button>
           </div>
         ))}
-        {!view?.folders.length && !view?.entries.length && <div className="copy">Пусто — нажмите ⬆️, чтобы загрузить файлы в эту папку</div>}
+        {!view?.folders.length && !view?.entries.length && <div className="copy">Пусто — нажмите 📄, чтобы загрузить файлы в эту папку</div>}
       </div>
-    </div>
-  );
-}
-
-// ================= Страница загрузки (в конкретную папку) =================
-// Кнопки «Фото / Видео / Документы» открывают правильный системный пикер
-// (галерея для фото/видео, файлы — для документов), дальше — очередь с
-// прогрессом, статусами, повтором ошибок и предупреждением не уходить.
-
-type UpKind = 'photo' | 'video' | 'doc';
-interface UpRow {
-  key: string;
-  file: File;
-  name: string;
-  size: number;
-  kind: UpKind;
-  state: 'queued' | 'uploading' | 'done' | 'failed';
-  pct: number;
-  error?: string;
-}
-const UP_META: Record<UpKind, { icon: string; label: string; accept: string; hint: string }> = {
-  photo: { icon: '📷', label: 'Фото', accept: 'image/*', hint: 'откроется галерея' },
-  video: { icon: '🎬', label: 'Видео', accept: 'video/*', hint: 'галерея/видео' },
-  doc: { icon: '📄', label: 'Документы', accept: '', hint: 'любые файлы' },
-};
-let upKey = 0;
-
-function UploadPage({ folderId, folderName, photoFolderId, onClose }: { folderId?: string; folderName: string; photoFolderId?: string | null; onClose: () => void }) {
-  const rows = useRef<UpRow[]>([]);
-  // «Фото» (медиа-зона): файлы конвертируются в AVIF/AV1 и появляются в разделе «Фото»;
-  // обычные папки: файлы ложатся как есть, без конвертации
-  const isPhotoLibrary = Boolean(folderId && photoFolderId && folderId === photoFolderId);
-  const [, force] = useState(0);
-  const [skipNote, setSkipNote] = useState('');
-  const running = useRef(false);
-  const stopped = useRef(false);
-  const ctrl = useRef<AbortController | null>(null);
-  const render = () => force((n) => n + 1);
-
-  const pump = async () => {
-    if (running.current) return;
-    running.current = true;
-    stopped.current = false;
-    render();
-    try {
-      for (;;) {
-        const i = rows.current.findIndex((r) => r.state === 'queued');
-        if (i < 0 || stopped.current) break;
-        const row = rows.current[i];
-        row.state = 'uploading';
-        row.pct = 0;
-        render();
-        const ac = new AbortController();
-        ctrl.current = ac;
-        try {
-          await api.uploadFile(row.file, folderId, (p) => { row.pct = p; render(); }, ac.signal);
-          row.state = 'done';
-          row.pct = 100;
-        } catch (e) {
-          row.state = 'failed';
-          row.pct = Math.min(row.pct, 99);
-          row.error = ac.signal.aborted ? 'загрузка остановлена' : (e as Error).message || 'ошибка';
-        } finally {
-          ctrl.current = null;
-        }
-        render();
-      }
-    } finally {
-      running.current = false;
-      render();
-    }
-  };
-
-  const addEntries = (files: File[], kind: UpKind | null) => {
-    if (!files.length || running.current) return;
-    for (const f of files) {
-      const k = kind ?? (api.guessMime(f).startsWith('image/') ? 'photo' : api.guessMime(f).startsWith('video/') ? 'video' : 'doc');
-      if (isPhotoLibrary && k === 'doc') {
-        setSkipNote(`«${f.name}» — в «Фото» можно загружать только фото и видео`);
-        continue;
-      }
-      setSkipNote('');
-      rows.current.push({ key: `up${++upKey}`, file: f, name: f.name, size: f.size, kind: k, state: 'queued', pct: 0 });
-    }
-    render();
-    void pump();
-  };
-
-  const retry = (i: number) => {
-    const row = rows.current[i];
-    if (!row || row.state !== 'failed') return;
-    row.state = 'queued';
-    row.pct = 0;
-    row.error = undefined;
-    render();
-    void pump();
-  };
-  const stop = () => {
-    stopped.current = true;
-    ctrl.current?.abort();
-  };
-
-  // предупреждение при попытке уйти со страницы во время загрузки
-  useEffect(() => {
-    if (!running.current && !rows.current.some((r) => r.state === 'queued' || r.state === 'uploading')) return;
-    const h = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ''; };
-    window.addEventListener('beforeunload', h);
-    return () => window.removeEventListener('beforeunload', h);
-  });
-  // уход со страницы (переключение вкладки) — отменяем активную загрузку
-  useEffect(() => () => { ctrl.current?.abort(); }, []);
-
-  const all = rows.current;
-  const totalBytes = all.reduce((s, r) => s + r.size, 0);
-  const gotBytes = all.reduce((s, r) => s + Math.round((r.size * r.pct) / 100), 0);
-  const doneN = all.filter((r) => r.state === 'done').length;
-  const failN = all.filter((r) => r.state === 'failed').length;
-  const busyN = all.filter((r) => r.state === 'queued' || r.state === 'uploading').length;
-  const pct = totalBytes ? Math.round((gotBytes / totalBytes) * 100) : 0;
-
-  return (
-    <div>
-      <div className="filehead">
-        <button className="iconbtn" title="Назад к файлам" onClick={onClose}>⬅️</button>
-        <span style={{ flex: 1 }} />
-        <strong className="up-title">Загрузка</strong>
-        <span style={{ flex: 1 }} />
-        <span style={{ width: 34 }} />
-      </div>
-
-      <div className="copy" style={{ margin: '10px 2px' }}>
-        {isPhotoLibrary ? (
-          <>Куда: <b>{folderName}</b> — фото/видео будут оптимизированы (AVIF/AV1 + превью) и появятся в разделе «Фото». Документы сюда загружать нельзя.</>
-        ) : (
-          <>Куда: <b>{folderName}</b> — файлы сохранятся как есть, без конвертации. Фото/видео с оптимизацией загружайте в разделе «Фото».</>
-        )}
-      </div>
-
-      <div
-        className="updrop"
-        onDragOver={(e) => e.preventDefault()}
-        onDrop={(e) => {
-          e.preventDefault();
-          if (e.dataTransfer?.files?.length) addEntries(Array.from(e.dataTransfer.files), null);
-        }}
-      >
-        <div className="copy">Перетащите файлы сюда (можно несколько) — или выберите тип ниже</div>
-      </div>
-
-      {skipNote && <div className="notice" style={{ margin: '8px 2px' }}>⚠ {skipNote}</div>}
-
-      <div className="upgrid">
-        {(Object.keys(UP_META) as UpKind[]).filter((k) => !(isPhotoLibrary && k === 'doc')).map((k) => (
-          <label key={k} className="upbtn">
-            <input
-              type="file"
-              accept={UP_META[k].accept}
-              multiple
-              disabled={running.current}
-              onChange={(e) => {
-                if (e.target.files?.length) addEntries(Array.from(e.target.files), k);
-                e.target.value = '';
-              }}
-            />
-            <div className="upbtn-ico">{UP_META[k].icon}</div>
-            <div className="upbtn-label">{UP_META[k].label}</div>
-            <div className="meta">{UP_META[k].hint}</div>
-          </label>
-        ))}
-      </div>
-
-      {all.length > 0 && (
-        <div className="panel" style={{ padding: '4px 12px' }}>
-          {all.map((r, i) => (
-            <div className="uprow" key={r.key}>
-              <span className="icon">{r.state === 'done' ? '✅' : r.state === 'failed' ? '❌' : r.state === 'uploading' ? '⏳' : '🕒'}</span>
-              <div className="upmain">
-                <div className="upname">{r.name} <span className="meta">{fmt(r.size)}</span></div>
-                <div className="upmeta">
-                  {r.state === 'queued' && 'в очереди…'}
-                  {r.state === 'uploading' && `загрузка ${r.pct}%`}
-                  {r.state === 'done' && (isPhotoLibrary && r.kind !== 'doc' ? 'загружено · конвертация в фоне' : 'загружено')}
-                  {r.state === 'failed' && `ошибка: ${r.error}`}
-                </div>
-                {r.state === 'uploading' && <progress value={r.pct} max={100} />}
-                {r.state === 'queued' && <div className="ubar"><i style={{ width: 0 }} /></div>}
-                {r.state === 'done' && <div className="ubar"><i style={{ width: '100%', background: '#2fae5f' }} /></div>}
-                {r.state === 'failed' && (
-                  <div className="row" style={{ margin: '2px 0 0' }}>
-                    <button className="btn ghost" onClick={() => retry(i)}>⟳ Повторить</button>
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {all.length > 0 && (
-        <div className="panel">
-          <div className="row" style={{ margin: '0 0 8px' }}>
-            <span className="meta">Загружено {doneN} из {all.length} · {pct}%</span>
-            <span style={{ flex: 1 }} />
-            {running.current && <button className="btn danger" onClick={stop}>⏹ Остановить</button>}
-            {!running.current && busyN > 0 && <button className="btn" onClick={() => void pump()}>▶ Продолжить</button>}
-            {!running.current && busyN === 0 && failN > 0 && (
-              <button className="btn" onClick={() => { rows.current.forEach((r, i) => { if (r.state === 'failed') retry(i); }); }}>⟳ Повторить ошибки</button>
-            )}
-          </div>
-          <progress value={pct} max={100} />
-          {!running.current && busyN === 0 && doneN === all.length && doneN > 0 && (
-            <div className="notice" style={{ margin: '10px 0 4px' }}>
-              ✅ Готово: {doneN} файлов загружено в «{folderName}»{isPhotoLibrary ? ' — конвертация выполняется в фоне' : ''}
-            </div>
-          )}
-          {!running.current && busyN === 0 && failN > 0 && (
-            <div className="err" style={{ margin: '10px 0 4px' }}>Не загрузилось файлов: {failN}</div>
-          )}
-          {!running.current && busyN === 0 && (
-            <button className="btn" style={{ width: '100%', marginTop: 10 }} onClick={onClose}>Готово — вернуться в папку</button>
-          )}
-        </div>
-      )}
-
-      {all.length > 0 && running.current && (
-        <div className="notice" style={{ margin: '8px 2px' }}>⚠ Не закрывайте и не обновляйте страницу, пока идёт загрузка</div>
-      )}
     </div>
   );
 }
 
 // ================= Фото (медиатека: таймлайн + поездки + карта) =================
 // Показывает только содержимое системной папки «Фото» (зона PHOTOS); сама папка скрыта из
-// «Файлы» и WebDAV. Загрузка — через ⬆️ (только фото/видео), удаление — из деталки в корзину.
+// «Файлы» и WebDAV. Загрузка — иконки 📷/🎬 в шапке (только фото/видео), прогресс — панелью
+// над галереей, UI блокируется на время загрузки; удаление — из деталки в корзину.
 
 function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   type Screen = { kind: 'grid' } | { kind: 'view'; idx: number };
@@ -395,7 +351,6 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
   const [screen, setScreen] = useState<Screen>({ kind: 'grid' });
-  const [upload, setUpload] = useState(false);
   const [info, setInfo] = useState(false);
   const isImg = (m: string) => /^image\//.test(m || '');
   const isVid = (m: string) => /^video\//.test(m || '');
@@ -410,17 +365,14 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
     return () => clearInterval(t);
   }, []);
 
-  // ===== Прямая загрузка в медиатеку «Фото» =====
-  if (upload) {
-    return (
-      <UploadPage
-        folderId={photoFolderId ?? undefined}
-        folderName="Фото"
-        photoFolderId={photoFolderId}
-        onClose={() => { setUpload(false); void load(); api.trips().then(setTrips).catch(() => undefined); }}
-      />
-    );
-  }
+  const up = useBulkUpload(photoFolderId ?? undefined, () => { void load(); });
+  const busy = up.busy;
+  // во время загрузки блокируем остальной UI (оверлей + без скролла)
+  useEffect(() => {
+    if (!busy) return;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = ''; };
+  }, [busy]);
 
   const media = items.filter((it) => isImg(it.mime) || isVid(it.mime));
   const current = screen.kind === 'view' ? media[screen.idx] : null;
@@ -492,9 +444,43 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
         <strong>Фото</strong>
         <span style={{ flex: 1 }} />
         {photoFolderId && (
-          <button className="iconbtn" title="Загрузить фото/видео в «Фото» (с оптимизацией)" onClick={() => setUpload(true)}>⬆️</button>
+          <>
+            <label className="iconbtn" title="Загрузить фото (из галереи)">
+              📷
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                style={{ display: 'none' }}
+                disabled={busy}
+                onChange={(e) => {
+                  if (e.target.files?.length) up.addFiles(Array.from(e.target.files));
+                  e.target.value = '';
+                }}
+              />
+            </label>
+            <label className="iconbtn" title="Загрузить видео">
+              🎬
+              <input
+                type="file"
+                accept="video/*"
+                multiple
+                style={{ display: 'none' }}
+                disabled={busy}
+                onChange={(e) => {
+                  if (e.target.files?.length) up.addFiles(Array.from(e.target.files));
+                  e.target.value = '';
+                }}
+              />
+            </label>
+          </>
         )}
       </div>
+
+      {up.rows.length > 0 && (
+        <UploadPanel rows={up.rows} busy={up.busy} onCancel={up.cancel} onRetryFailed={up.retryFailed} onDismissFailed={up.dismissFailed} />
+      )}
+      {busy && <div className="uploadwall" />}
       {trips.length > 0 && (
         <div className="panel">
           <div className="meta">Поездки — нажми, чтобы увидеть маршрут</div>
@@ -528,7 +514,7 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
             )}
           </div>
         ))}
-        {!media.length && <div className="copy">Нет фото и видео. Загрузите их через ⬆️ — медиа оптимизируется и появится здесь автоматически.</div>}
+        {!media.length && <div className="copy">Нет фото и видео. Нажмите 📷 или 🎬 — медиа оптимизируется и появится здесь автоматически.</div>}
       </div>
     </div>
   );
