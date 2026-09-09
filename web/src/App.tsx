@@ -199,13 +199,13 @@ function Photos() {
     const it = current;
     return (
       <div className="full">
-        <div className="row" style={{ margin: '4px 0' }}>
-          <button className="btn ghost" title="Назад" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
+        <div className="tbar">
+          <button className="iconbtn" title="Назад" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
           <span style={{ flex: 1 }} />
-          <button className="btn ghost" title="Инфо" onClick={() => setInfo(!info)}>ℹ️</button>
-          <a className="btn ghost" title="Оригинал (AVIF/AV1)" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">🖼️</a>
-          <button className="btn ghost" disabled={screen.idx === 0} title="Назад" onClick={() => { setScreen({ kind: 'view', idx: screen.idx - 1 }); setInfo(false); }}>⬅️</button>
-          <button className="btn ghost" disabled={screen.idx >= media.length - 1} title="Вперёд" onClick={() => { setScreen({ kind: 'view', idx: screen.idx + 1 }); setInfo(false); }}>➡️</button>
+          <button className="iconbtn" title="Инфо" onClick={() => setInfo(!info)}>ℹ️</button>
+          <a className="iconbtn" title="Оригинал (AVIF/AV1)" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">🖼️</a>
+          <button className="iconbtn" disabled={screen.idx === 0} title="Назад" onClick={() => { setScreen({ kind: 'view', idx: screen.idx - 1 }); setInfo(false); }}>⬅️</button>
+          <button className="iconbtn" disabled={screen.idx >= media.length - 1} title="Вперёд" onClick={() => { setScreen({ kind: 'view', idx: screen.idx + 1 }); setInfo(false); }}>➡️</button>
         </div>
         {info && (
           <div className="copy" style={{ margin: '2px 10px 6px', color: '#b6c2d4' }}>
