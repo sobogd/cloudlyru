@@ -120,6 +120,21 @@ export class S3Service implements OnModuleDestroy {
     }
   }
 
+  /** Скачать объект целиком в память (для EXIF-парсинга; maxBytes-страховка). */
+  async getObjectBytes(key: string, maxBytes = 150 * 1024 * 1024): Promise<Buffer> {
+    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: key });
+    const out = await this.s3().send(cmd);
+    if (!out.Body) throw new Error('S3: empty body');
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const c of out.Body as AsyncIterable<Uint8Array>) {
+      total += c.length;
+      if (total > maxBytes) throw new Error('object too large to buffer');
+      chunks.push(Buffer.from(c));
+    }
+    return Buffer.concat(chunks);
+  }
+
   /** Server-side copy (для перекладывания tmp-объекта в content-addressed ключ). */
   async copyObject(srcKey: string, dstKey: string): Promise<void> {
     const cmd = new CopyObjectCommand({ Bucket: this.bucket, Key: dstKey, CopySource: `${this.bucket}/${srcKey}` });

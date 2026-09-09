@@ -11,6 +11,7 @@ import { UploadsModule } from './uploads/uploads.module';
 import { TrashModule } from './trash/trash.module';
 import { SharesModule } from './shares/shares.module';
 import { DavModule } from './dav/dav.module';
+import { MediaModule } from './media/media.module';
 import { HealthModule } from './health/health.module';
 
 @Module({
@@ -24,6 +25,7 @@ import { HealthModule } from './health/health.module';
     TrashModule,
     SharesModule,
     DavModule,
+    MediaModule,
     HealthModule,
   ],
   providers: [

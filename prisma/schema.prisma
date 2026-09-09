@@ -78,6 +78,7 @@ model FileEntry {
   deletedAt DateTime?
   folder    Folder   @relation(fields: [folderId], references: [id], onDelete: Cascade)
   asset     Asset    @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  albumItems AlbumItem[]
 
   @@unique([folderId, name])
   @@index([folderId, deletedAt])
@@ -92,6 +93,7 @@ model Asset {
   ext       String?
   createdAt DateTime    @default(now())
   entries   FileEntry[]
+  media     MediaMeta?
 }
 
 // Активная чанкованная загрузка (сессия в памяти сервиса; parts-этаги в RAM)
@@ -149,4 +151,39 @@ model AuditLog {
   createdAt DateTime @default(now())
 
   @@index([createdAt])
+}
+
+// ===== M2: медиа-метаданные (EXIF), альбомы =====
+
+model MediaMeta {
+  id          String   @id @default(uuid())
+  assetId     String   @unique
+  capturedAt  DateTime?
+  latitude    Float?
+  longitude   Float?
+  make        String?
+  model       String?
+  width       Int?
+  height      Int?
+  createdAt   DateTime @default(now())
+  asset       Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+}
+
+model Album {
+  id        String      @id @default(uuid())
+  userId    String
+  name      String
+  createdAt DateTime    @default(now())
+  items     AlbumItem[]
+}
+
+model AlbumItem {
+  id        String   @id @default(uuid())
+  albumId   String
+  entryId   String
+  createdAt DateTime @default(now())
+  album     Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  entry     FileEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@unique([albumId, entryId])
 }
