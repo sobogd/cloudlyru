@@ -55,3 +55,9 @@ html, body { overscroll-behavior: none; }
 .iconbtn { border: 0; background: none; color: #e6e8eb; font-size: 20px; line-height: 1; padding: 4px 8px; cursor: pointer; border-radius: 10px; }
 .iconbtn:disabled { opacity: 0.3; }
 .iconbtn:active { background: #262c37; }
+/* Деталка — полноэкранно, без «островов» */
+.content { padding-left: 0; padding-right: 0; }
+.full { margin: 0; height: calc(100dvh - 108px); }
+.tbar { margin: 0; border-radius: 0; border: 0; border-bottom: 1px solid #22282f; background: #10141b; padding: 6px 12px; }
+.mediaarea { border-radius: 0; }
+.mediaarea video { border-radius: 0 !important; }
