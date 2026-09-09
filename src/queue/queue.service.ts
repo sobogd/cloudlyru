@@ -178,9 +178,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       '-movflags', '+faststart',
       previewPath,
     ], 6 * 60 * 60 * 1000);
-    const { statSync } = await import('fs');
     await this.s3.putFile(MediaService.video720Key(sha), previewPath, 'video/mp4');
-    void statSync;
+    // «готово для просмотра» — постер+720 уже есть; полный мастер дожимается в фоне
+    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'video/mp4', masterReadyAt: new Date() } });
 
     // 3) мастер: AV1 полный (в конце), метаданные копируются
     await this.run([
@@ -194,7 +194,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     ], 6 * 60 * 60 * 1000);
 
     await this.s3.putFile(MediaService.videoMasterKey(sha), masterPath, 'video/mp4');
-    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'video/mp4', masterReadyAt: new Date() } });
   }
 
   /** Запуск бинаря под ограничением виртуальной памяти (ulimit -v). */
