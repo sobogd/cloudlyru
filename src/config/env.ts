@@ -29,7 +29,7 @@ const envSchema = z.object({
   TRASH_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
 
   CONVERT_ENABLED: z.string().default('false'),
-  CONVERT_MEM_MB: z.coerce.number().int().positive().default(1024),
+  CONVERT_MEM_MB: z.coerce.number().int().positive().default(1536),
 });
 
 export type Env = z.infer<typeof envSchema>;
