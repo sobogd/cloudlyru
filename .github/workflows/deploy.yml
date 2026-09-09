@@ -120,6 +120,8 @@ jobs:
             UPLOAD_CHUNK_MAX_MB=20
             MAX_FILE_SIZE_MB=51200
             TRASH_RETENTION_DAYS=30
+            CONVERT_ENABLED=true
+            CONVERT_MEM_MB=1024
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

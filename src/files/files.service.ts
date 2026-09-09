@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
+import { MediaService } from '../media/media.service';
 import { assertSafeName } from '../common/utils';
 import { conflict, notFound } from '../common/errors';
 
@@ -82,6 +83,12 @@ export class FilesService {
       include: { asset: true },
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
+    if (entry.asset.masterMime === 'image/avif' && entry.asset.masterReadyAt) {
+      return this.s3.presignedInline(MediaService.photoMasterKey(entry.asset.sha256), 'image/avif');
+    }
+    if (entry.asset.masterMime === 'video/mp4' && entry.asset.masterReadyAt) {
+      return this.s3.presignedInline(MediaService.videoMasterKey(entry.asset.sha256), 'video/mp4');
+    }
     return this.s3.presignedGet(S3Service.assetKey(entry.asset.sha256), entry.asset.mime);
   }
 

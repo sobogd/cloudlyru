@@ -9,6 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
 import { MediaService } from '../media/media.service';
+import { QueueService } from '../queue/queue.service';
 import { assertSafeName } from '../common/utils';
 import { notFound } from '../common/errors';
 
@@ -22,6 +23,7 @@ export class DavService {
     private readonly files: FilesService,
     private readonly auth: AuthService,
     private readonly media: MediaService,
+    private readonly queue: QueueService,
   ) {}
 
   /** Проверка Authorization: Basic login:apptoken. */
@@ -202,10 +204,11 @@ export class DavService {
     }
     await this.s3.deleteObject(tmpKey).catch(() => undefined);
 
-    // EXIF для изображений (best-effort)
+    // EXIF + очередь конвертации (best-effort)
     try {
-      await this.media.maybeCapture(assetId, sha256, Number(contentLength ?? 0), mime);
+      await this.media.captureMeta(assetId, sha256, Number(contentLength ?? 0), mime);
     } catch { /* ignore */ }
+    await this.queue.enqueue(assetId, sha256, mime);
 
     // перезапись существующего файла с тем же именем — обновляем entry на новый asset
     const dup = await this.prisma.fileEntry.findFirst({ where: { folderId: parentId, name } });

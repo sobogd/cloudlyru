@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
 import { MediaService } from '../media/media.service';
+import { QueueService } from '../queue/queue.service';
 import { env } from '../config/env';
 import { assertSafeName, randomToken, sha256Hex } from '../common/utils';
 import { badRequest, forbidden, notFound, tooMany, unauthorized } from '../common/errors';
@@ -34,6 +35,7 @@ export class SharesService {
     private readonly s3: S3Service,
     private readonly files: FilesService,
     private readonly media: MediaService,
+    private readonly queue: QueueService,
   ) {}
 
   // ============ Владелец ============
@@ -242,8 +244,9 @@ export class SharesService {
     const asset = await this.prisma.asset.findUniqueOrThrow({ where: { sha256 } });
     const entry = await this.files.createEntry(folder.id, name, asset.id);
     try {
-      await this.media.maybeCapture(asset.id, sha256, body.length, mime);
+      await this.media.captureMeta(asset.id, sha256, body.length, mime);
     } catch { /* ignore */ }
+    await this.queue.enqueue(asset.id, sha256, mime);
     return { ok: true, entryId: entry.id, size: body.length, deduped: Boolean(existing) };
   }
 

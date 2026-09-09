@@ -92,8 +92,11 @@ model Asset {
   mime      String
   ext       String?
   createdAt DateTime    @default(now())
+  masterReadyAt DateTime?
+  masterMime  String?
   entries   FileEntry[]
   media     MediaMeta?
+  jobs      Job[]
 }
 
 // Активная чанкованная загрузка (сессия в памяти сервиса; parts-этаги в RAM)
@@ -186,4 +189,24 @@ model AlbumItem {
   entry     FileEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
 
   @@unique([albumId, entryId])
+}
+
+
+// ===== M2.5: очередь конвертации (оригинал -> AVIF/AV1 + производные) =====
+
+model Job {
+  id        String    @id @default(uuid())
+  assetId   String
+  kind      String // 'photo' | 'video'
+  state     String    @default("pending") // pending|processing|done|failed
+  error     String?
+  attempts  Int       @default(0)
+  createdAt DateTime  @default(now())
+  startedAt DateTime?
+  finishedAt DateTime?
+  updatedAt DateTime  @updatedAt
+  asset     Asset     @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([state, createdAt])
+  @@index([assetId])
 }

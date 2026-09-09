@@ -10,7 +10,12 @@ import {
   CopyObjectCommand,
   PutObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
 } from '@aws-sdk/client-s3';
+import { createWriteStream } from 'fs';
+import { createReadStream } from 'fs';
+import { stat } from 'fs/promises';
+import { pipeline } from 'stream/promises';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { env } from '../config/env';
 
@@ -150,6 +155,43 @@ export class S3Service implements OnModuleDestroy {
       ContentType: contentType,
     });
     await this.s3().send(cmd);
+  }
+
+  /** Существует ли объект (HeadObject). */
+  async headObject(key: string): Promise<boolean> {
+    try {
+      await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Скачать объект в локальный файл (для воркера конвертации). */
+  async downloadToFile(key: string, filePath: string): Promise<void> {
+    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: key });
+    const out = await this.s3().send(cmd);
+    if (!out.Body) throw new Error('S3: empty body');
+    await pipeline(out.Body as NodeJS.ReadableStream, createWriteStream(filePath));
+  }
+
+  /** Залить локальный файл (Content-Length из stat). */
+  async putFile(key: string, filePath: string, contentType: string): Promise<void> {
+    const size = (await stat(filePath)).size;
+    const cmd = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      Body: createReadStream(filePath),
+      ContentType: contentType,
+      ContentLength: size,
+    });
+    await this.s3().send(cmd);
+  }
+
+  /** presigned GET inline (для превью/мастеров в браузере). */
+  async presignedInline(key: string, mime: string): Promise<string> {
+    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: key, ResponseContentType: mime });
+    return getSignedUrl(this.s3(), cmd, { expiresIn: 15 * 60 });
   }
 
   /** Стримовая PUT-запись (WebDAV, большие файлы). */

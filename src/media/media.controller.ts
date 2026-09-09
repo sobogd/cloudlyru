@@ -1,18 +1,51 @@
-import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { MediaService } from './media.service';
 import { AlbumsService } from './albums.service';
-import { CurrentUser, RequestUser } from '../common/decorators';
+import { S3Service } from '../s3/s3.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { CurrentUser, Public, RequestUser } from '../common/decorators';
 import { asString, isPlainObject } from '../common/utils';
-import { badRequest } from '../common/errors';
+import { badRequest, notFound } from '../common/errors';
 
 @Controller()
 export class MediaController {
   constructor(
     private readonly media: MediaService,
     private readonly albums: AlbumsService,
+    private readonly prisma: PrismaService,
+    private readonly s3: S3Service,
   ) {}
 
-  // ===== Таймлайн / поездки =====
+  /** Превью WebP: ?w=512 (сетка) | ?w=2048 (полный экран). */
+  @Public()
+  @Get('previews/:sha')
+  async preview(@Param('sha') sha: string, @Query('w') wRaw: string | undefined, @Res() res: Response) {
+    const w = Number(wRaw ?? 512);
+    const key = w === 2048 ? MediaService.fullKey(sha) : w === 512 ? MediaService.gridKey(sha) : null;
+    if (!key || !(await this.s3.headObject(key))) return res.status(404).end();
+    const url = await this.s3.presignedInline(key, 'image/webp');
+    return res.redirect(302, url);
+  }
+
+  /** «Оригинал»: AVIF (фото) / AV1 mp4 (видео) мастер; фолбэк — сырьё. */
+  @Public()
+  @Get('originals/:sha')
+  async original(@Param('sha') sha: string, @Res() res: Response) {
+    const asset = await this.prisma.asset.findUnique({ where: { sha256: sha } });
+    if (!asset) throw notFound('asset not found');
+    let key: string | null = null;
+    let mime = 'application/octet-stream';
+    if (asset.masterMime === 'image/avif' && (await this.s3.headObject(MediaService.photoMasterKey(sha)))) {
+      key = MediaService.photoMasterKey(sha);
+      mime = 'image/avif';
+    } else if (asset.masterMime === 'video/mp4' && (await this.s3.headObject(MediaService.videoMasterKey(sha)))) {
+      key = MediaService.videoMasterKey(sha);
+      mime = 'video/mp4';
+    }
+    const url = key ? await this.s3.presignedInline(key, mime) : await this.s3.presignedGet(S3Service.assetKey(sha), asset.mime);
+    return res.redirect(302, url);
+  }
 
   @Get('timeline')
   timeline(@Query('limit') limit?: string, @Query('before') before?: string) {
@@ -24,8 +57,6 @@ export class MediaController {
   trips() {
     return this.media.trips();
   }
-
-  // ===== Альбомы =====
 
   @Get('albums')
   listAlbums(@CurrentUser() user: RequestUser) {

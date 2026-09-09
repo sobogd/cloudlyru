@@ -27,6 +27,9 @@ const envSchema = z.object({
   UPLOAD_CHUNK_MAX_MB: z.coerce.number().positive().default(20),
   MAX_FILE_SIZE_MB: z.coerce.number().positive().default(51200),
   TRASH_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+
+  CONVERT_ENABLED: z.string().default('false'),
+  CONVERT_MEM_MB: z.coerce.number().int().positive().default(1024),
 });
 
 export type Env = z.infer<typeof envSchema>;

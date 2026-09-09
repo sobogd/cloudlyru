@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service, S3Part } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
 import { MediaService } from '../media/media.service';
+import { QueueService } from '../queue/queue.service';
 import { AuthService } from '../auth/auth.service';
 import { CHUNK_MAX_BYTES, MAX_FILE_BYTES } from '../config/env';
 import { assertSafeName, randomToken } from '../common/utils';
@@ -34,6 +35,7 @@ export class UploadsService implements OnModuleInit {
     private readonly files: FilesService,
     private readonly auth: AuthService,
     private readonly media: MediaService,
+    private readonly queue: QueueService,
   ) {}
 
   async onModuleInit() {
@@ -163,10 +165,11 @@ export class UploadsService implements OnModuleInit {
 
     // EXIF (дата съёмки/координаты) — best-effort, не валит загрузку
     try {
-      await this.media.maybeCapture(assetId, sha256, size, mime);
+      await this.media.captureMeta(assetId, sha256, size, mime);
     } catch {
       /* ignore */
     }
+    await this.queue.enqueue(assetId, sha256, mime);
 
     return {
       entry: { id: entry.id },
