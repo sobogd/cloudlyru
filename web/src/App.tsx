@@ -63,9 +63,8 @@ function Shell({ user, onLogout }: { user: string; onLogout: () => void }) {
       </main>
       <nav className="nav">
         {NAV.map((n) => (
-          <button key={n.id} className={tab === n.id ? 'navbtn active' : 'navbtn'} onClick={() => setTab(n.id)}>
+          <button key={n.id} className={tab === n.id ? 'navbtn active' : 'navbtn'} onClick={() => setTab(n.id)} title={n.label} aria-label={n.label}>
             <span className="navico">{n.icon}</span>
-            <span>{n.label}</span>
           </button>
         ))}
       </nav>
@@ -167,6 +166,7 @@ function Photos() {
   const [pending, setPending] = useState<File[] | null>(null);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const [info, setInfo] = useState(false);
   const isImg = (m: string) => /^image\//.test(m || '');
   const isVid = (m: string) => /^video\//.test(m || '');
 
@@ -199,14 +199,19 @@ function Photos() {
     const it = current;
     return (
       <div>
-        <div className="row">
-          <button className="btn ghost" onClick={() => setScreen({ kind: 'grid' })}>← Фото</button>
-          <span className="fname">{it.name}</span>
-          <span className="meta">{it.capturedAt ? new Date(it.capturedAt).toLocaleString() : ''}</span>
+        <div className="row" style={{ margin: '4px 0' }}>
+          <button className="btn ghost" title="Назад" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
           <span style={{ flex: 1 }} />
-          {isVid(it.mime) && it.masterReady && <a className="btn" href={api.video720Url(it.sha256!)} target="_blank" rel="noreferrer">720p</a>}
-          <a className="btn ghost" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">Оригинал</a>
+          <button className="btn ghost" title="Инфо" onClick={() => setInfo(!info)}>ℹ️</button>
+          <a className="btn ghost" title="Оригинал (AVIF/AV1)" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">🖼️</a>
+          <button className="btn ghost" disabled={screen.idx === 0} title="Назад" onClick={() => { setScreen({ kind: 'view', idx: screen.idx - 1 }); setInfo(false); }}>⬅️</button>
+          <button className="btn ghost" disabled={screen.idx >= media.length - 1} title="Вперёд" onClick={() => { setScreen({ kind: 'view', idx: screen.idx + 1 }); setInfo(false); }}>➡️</button>
         </div>
+        {info && (
+          <div className="copy" style={{ margin: '2px 10px 6px', color: '#b6c2d4' }}>
+            {it.name}{it.capturedAt ? ` · ${new Date(it.capturedAt).toLocaleString()}` : ''}
+          </div>
+        )}
 
         {!it.masterReady ? (
           <div className="panel">
@@ -230,11 +235,6 @@ function Photos() {
           <LoadImg src={api.previewUrl(it.sha256!, 2048)} style={{ width: '100%', maxHeight: '78vh', objectFit: 'contain', background: '#000', borderRadius: 8 }} />
         )}
 
-        <div className="row">
-          <button className="btn ghost" disabled={screen.idx === 0} onClick={() => setScreen({ kind: 'view', idx: screen.idx - 1 })}>◀</button>
-          <span style={{ flex: 1 }} />
-          <button className="btn ghost" disabled={screen.idx >= media.length - 1} onClick={() => setScreen({ kind: 'view', idx: screen.idx + 1 })}>▶</button>
-        </div>
       </div>
     );
   }
