@@ -128,8 +128,8 @@ function Files() {
           </span>
         ))}
         <span style={{ flex: 1 }} />
-        <button className="btn" onClick={mkdir}>＋Папка</button>
-        <label className="btn" style={{ display: 'inline-block' }}>⬆
+        <button className="btn" onClick={mkdir}>📁 Папка</button>
+        <label className="btn" style={{ display: 'inline-block' }}>📤 Загрузить
           <input type="file" multiple style={{ display: 'none' }} disabled={busy} onChange={(e) => void upload(e.target.files)} />
         </label>
       </div>
@@ -242,15 +242,15 @@ function Shares() {
   };
   return (
     <div>
-      <div className="row"><button className="btn" onClick={create}>＋ Создать ссылку</button></div>
+      <div className="row"><button className="btn" onClick={create}>🔗 Создать ссылку</button></div>
       {notice && <div className="notice">{notice}</div>}
       {err && <div className="err">{err}</div>}
       {items.map((s) => (
         <div className="item" key={s.token}>
           <span className="icon">🔗</span>
           <span className="fname">{s.kind} · {s.capability}{s.hasPassword ? ' · 🔒' : ''}{s.expiresAt ? ` · до ${new Date(s.expiresAt).toLocaleDateString()}` : ''}</span>
-          <button className="btn ghost" onClick={() => { navigator.clipboard.writeText(s.url); setNotice('Скопировано'); }}>⧉</button>
-          <button className="btn ghost" onClick={async () => { await api.revokeShare(s.token); await load(); }}>✕</button>
+          <button className="btn ghost" onClick={() => { navigator.clipboard.writeText(s.url); setNotice('Скопировано'); }}>📋</button>
+          <button className="btn ghost" onClick={async () => { await api.revokeShare(s.token); await load(); }}>🚫</button>
         </div>
       ))}
       {!items.length && <div className="copy">Активных шарингов нет</div>}
@@ -273,7 +273,7 @@ function Albums() {
   };
   return (
     <div>
-      <div className="row"><button className="btn" onClick={create}>＋ Альбом</button></div>
+      <div className="row"><button className="btn" onClick={create}>🗂️ Альбом</button></div>
       {err && <div className="err">{err}</div>}
       {albums.map((a) => (
         <div className="item" key={a.id}>
@@ -332,7 +332,7 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
         </div>
       </div>
       <div className="panel">
-        <div className="row"><strong>Приложения (WebDAV/Finder)</strong><button className="btn" onClick={addToken}>＋ токен</button></div>
+        <div className="row"><strong>Приложения (WebDAV/Finder)</strong><button className="btn" onClick={addToken}>🔑 токен</button></div>
         {fresh && (
           <div className="panel" style={{ background: '#1c2430' }}>
             <div className="copy">Токен (показывается один раз): <b>{fresh}</b></div>
@@ -345,7 +345,7 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
             <span className="icon">🔑</span>
             <span className="fname">{t.label}</span>
             <span className="meta">{t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString() : 'не использовался'}</span>
-            <button className="btn ghost" onClick={async () => { await api.revokeToken(t.id); await loadTokens(); }}>✕</button>
+            <button className="btn ghost" onClick={async () => { await api.revokeToken(t.id); await loadTokens(); }}>🚫</button>
           </div>
         ))}
         {!tokens.length && <div className="copy">Токенов нет — нужен для Finder/WebDAV</div>}
