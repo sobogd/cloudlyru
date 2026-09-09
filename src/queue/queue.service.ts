@@ -158,16 +158,22 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   private async convertPhoto(job: JobRow, rawPath: string) {
     const sha = job.sha256;
-    let pipeline: any; // sharp pipeline (тип через ReturnType) 
-    try {
-      pipeline = sharp(rawPath).rotate();
-      // проверяем читаемость
-      await pipeline.clone().metadata();
-    } catch {
-      // HEIC/HEIF: декод через libheif (heif-convert → png)
+    let pipeline: any; // sharp pipeline
+    if (/^image\/(heic|heif)/.test(job.mime)) {
+      // HEIC/HEIF: декодируем libheif'ом напрямую (sharp prebuilt не умеет)
       const png = join(tmpdir(), `clq-${job.id}.png`);
-      await this.run(['heif-convert', rawPath, png], 60000);
+      try {
+        await this.run(['heif-convert', rawPath, png], 120000);
+      } catch {
+        // повтор: возможно файл был недокачан — перекачиваем и пробуем ещё раз
+        rmSync(rawPath, { force: true });
+        await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
+        await this.run(['heif-convert', rawPath, png], 120000);
+      }
       pipeline = sharp(png).rotate();
+    } else {
+      pipeline = sharp(rawPath).rotate();
+      await pipeline.clone().metadata().catch(() => undefined);
     }
 
     await this.setProgress(job.id, 40, true);
@@ -301,8 +307,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         clearTimeout(timer);
         if (code === 0) resolve();
         else {
-          const last = errTail.split('\n').filter(Boolean).slice(-6).join(' | ');
-          reject(new Error(`exit ${code}; ${last}`));
+          reject(new Error(`exit ${code}; ${errTail.slice(0, 1500)}`));
         }
       });
     });
@@ -330,8 +335,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         clearTimeout(timer);
         if (code === 0) resolve();
         else {
-          const last = errTail.split('\n').filter(Boolean).slice(-6).join(' | ');
-          reject(new Error(`exit ${code}; ${last}`));
+          reject(new Error(`exit ${code}; ${errTail.slice(0, 1500)}`));
         }
       });
     });
