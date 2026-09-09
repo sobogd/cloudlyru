@@ -294,79 +294,156 @@ function Photos() {
 
 // Зум только для фото (щипок/дабл-тап/пан); страница при этом не зуммится
 function PhotoZoom({ src }: { src: string }) {
-  const [ok, setOk] = useState(false);
-  const [v, setV] = useState({ s: 1, x: 0, y: 0 });
-  const cur = useRef({ s: 1, x: 0, y: 0 });
-  const pts = useRef(new Map<number, { x: number; y: number }>());
-  const pinch = useRef({ dist0: 0, s0: 1 });
-  const pan0 = useRef({ x: 0, y: 0, px: 0, py: 0 });
-  const lastTap = useRef(0);
   const box = useRef<HTMLDivElement>(null);
+  const [loaded, setLoaded] = useState(false);
+  const nat = useRef({ w: 0, h: 0 });
+  const [g, setG] = useState({ ox: 0, oy: 0, bw: 1, bh: 1, z: 1, tx: 0, ty: 0 });
+  const gcur = useRef(g);
+  const pts = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef({ d0: 0, z0: 1, ix: 0, iy: 0 });
+  const pan0 = useRef({ tx: 0, ty: 0, px: 0, py: 0 });
+  const lastTap = useRef(0);
+  const [ready, setReady] = useState(false);
 
-  const clamp = (n: number) => Math.max(1, Math.min(8, n));
-  const apply = (s: number, x: number, y: number) => {
-    s = clamp(s);
-    if (s <= 1.001) { x = 0; y = 0; }
-    cur.current = { s, x, y };
-    setV({ s, x, y });
+  const clampN = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+  const rect = () => box.current?.getBoundingClientRect() ?? { width: 0, height: 0, left: 0, top: 0 };
+
+  // геометрия: fit по контейнеру, вертикально и горизонтально по центру
+  const geometry = () => {
+    const r = rect();
+    const nw = nat.current.w || 1;
+    const nh = nat.current.h || 1;
+    const fit = Math.min(r.width / nw, r.height / nh);
+    const bw = nw * fit;
+    const bh = nh * fit;
+    const ox = (r.width - bw) / 2;
+    const oy = (r.height - bh) / 2;
+    return { w: r.width, h: r.height, ox, oy, bw, bh };
+  };
+
+  const commit = (z: number, tx: number, ty: number) => {
+    const geo = geometry();
+    z = clampN(z, 1, 8);
+    const w = geo.bw * z;
+    const h = geo.bh * z;
+    // горизонталь: панорама не дальше краёв изображения; если уже контейнера — центр
+    if (w >= geo.w) {
+      tx = clampN(tx, geo.w - w - geo.ox, -geo.ox);
+    } else {
+      tx = (geo.w - w) / 2 - geo.ox;
+    }
+    // вертикаль: та же логика
+    if (h >= geo.h) {
+      ty = clampN(ty, geo.h - h - geo.oy, -geo.oy);
+    } else {
+      ty = (geo.h - h) / 2 - geo.oy;
+    }
+    if (z <= 1.001) { z = 1; tx = 0; ty = 0; }
+    const ng = { ox: geo.ox, oy: geo.oy, bw: geo.bw, bh: geo.bh, z, tx, ty };
+    gcur.current = ng;
+    setG(ng);
   };
 
   const onTouchStart = (e: React.TouchEvent) => {
     Array.from(e.changedTouches).forEach((t) => pts.current.set(t.identifier, { x: t.clientX, y: t.clientY }));
-    if (pts.current.size === 2) {
-      const [a, b] = [...pts.current.values()];
-      pinch.current = { dist0: Math.hypot(a.x - b.x, a.y - b.y), s0: cur.current.s };
-    } else if (pts.current.size === 1) {
-      const p = pts.current.values().next().value;
-      pan0.current = { x: cur.current.x, y: cur.current.y, px: p.x, py: p.y };
+    const r = rect();
+    const arr = [...pts.current.values()];
+    if (arr.length === 2) {
+      const mx = (arr[0].x + arr[1].x) / 2 - r.left;
+      const my = (arr[0].y + arr[1].y) / 2 - r.top;
+      const cur = gcur.current;
+      pinch.current = {
+        d0: Math.hypot(arr[0].x - arr[1].x, arr[0].y - arr[1].y),
+        z0: cur.z,
+        // точка изображения под серединой пальцев (в координатах «базового» изображения)
+        ix: (mx - (cur.ox + cur.tx)) / cur.z,
+        iy: (my - (cur.oy + cur.ty)) / cur.z,
+      };
+    } else if (arr.length === 1) {
+      const p = arr[0];
+      pan0.current = { tx: gcur.current.tx, ty: gcur.current.ty, px: p.x, py: p.y };
     }
   };
+
   const onTouchMove = (e: React.TouchEvent) => {
     Array.from(e.changedTouches).forEach((t) => pts.current.set(t.identifier, { x: t.clientX, y: t.clientY }));
     const arr = [...pts.current.values()];
-    if (arr.length === 2 && pinch.current.dist0 > 0) {
+    const r = rect();
+    if (arr.length === 2 && pinch.current.d0 > 0) {
       const d = Math.hypot(arr[0].x - arr[1].x, arr[0].y - arr[1].y);
-      // непрерывный произвольный зум от начала жеста (не от текущего шага)
-      apply(pinch.current.s0 * (d / pinch.current.dist0), cur.current.x, cur.current.y);
-    } else if (arr.length === 1 && cur.current.s > 1) {
+      const z = pinch.current.z0 * (d / pinch.current.d0);
+      const mx = (arr[0].x + arr[1].x) / 2 - r.left;
+      const my = (arr[0].y + arr[1].y) / 2 - r.top;
+      const cur = gcur.current;
+      // держим точку между пальцами на месте (зум «в точку щипка»)
+      const tx = mx - cur.ox - pinch.current.ix * z;
+      const ty = my - cur.oy - pinch.current.iy * z;
+      commit(z, tx, ty);
+    } else if (arr.length === 1 && gcur.current.z > 1.001) {
       const p = arr[0];
-      apply(cur.current.s, pan0.current.x + (p.x - pan0.current.px), pan0.current.y + (p.y - pan0.current.py));
+      commit(gcur.current.z, pan0.current.tx + (p.x - pan0.current.px), pan0.current.ty + (p.y - pan0.current.py));
     }
   };
+
   const onTouchEnd = (e: React.TouchEvent) => {
     Array.from(e.changedTouches).forEach((t) => pts.current.delete(t.identifier));
     if (pts.current.size === 0) {
       const now = Date.now();
       if (now - lastTap.current < 280) {
-        if (cur.current.s > 1) apply(1, 0, 0); else apply(2.5, 0, 0);
+        const cur = gcur.current;
+        if (cur.z > 1) commit(1, 0, 0);
+        else {
+          const z = 2.5;
+          commit(z, (cur.bw * (1 - z)) / 2, (cur.bh * (1 - z)) / 2); // зум к центру
+        }
       }
       lastTap.current = now;
     }
   };
 
+  const onLoadImg = () => {
+    const img = new Image();
+    img.onload = () => {
+      nat.current = { w: img.naturalWidth, h: img.naturalHeight };
+      setLoaded(true);
+      commit(1, 0, 0);
+      setReady(true);
+    };
+    img.src = src;
+  };
+
   return (
     <div
       ref={box}
-      style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', touchAction: 'none', overflow: 'hidden', position: 'relative' }}
+      style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', touchAction: 'none', background: '#000' }}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
     >
-      {!ok && (
+      {!ready && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}><span className="spin" /></div>
       )}
-      <img
-        src={src}
-        alt=""
-        onLoad={() => setOk(true)}
-        onError={() => setOk(true)}
-        style={{
-          maxWidth: '100%', maxHeight: '100%', objectFit: 'contain',
-          transform: `translate(${v.x}px, ${v.y}px) scale(${v.s})`,
-          opacity: ok ? 1 : 0,
-          userSelect: 'none', WebkitUserSelect: 'none', touchAction: 'none',
-        }}
-      />
+      {loaded && (
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          style={{
+            position: 'absolute',
+            left: g.ox + g.tx,
+            top: g.oy + g.ty,
+            width: g.bw * g.z,
+            height: g.bh * g.z,
+            maxWidth: 'none',
+            maxHeight: 'none',
+            userSelect: 'none', WebkitUserSelect: 'none',
+            touchAction: 'none',
+          }}
+        />
+      )}
+      {/* прогрев размера */}
+      <img src={src} alt="" onLoad={onLoadImg} style={{ display: 'none' }} />
     </div>
   );
 }
