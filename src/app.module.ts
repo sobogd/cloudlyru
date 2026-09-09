@@ -9,6 +9,7 @@ import { FoldersModule } from './folders/folders.module';
 import { FilesModule } from './files/files.module';
 import { UploadsModule } from './uploads/uploads.module';
 import { TrashModule } from './trash/trash.module';
+import { SharesModule } from './shares/shares.module';
 import { HealthModule } from './health/health.module';
 
 @Module({
@@ -20,6 +21,7 @@ import { HealthModule } from './health/health.module';
     FilesModule,
     UploadsModule,
     TrashModule,
+    SharesModule,
     HealthModule,
   ],
   providers: [

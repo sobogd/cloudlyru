@@ -8,6 +8,7 @@ import {
   DeleteObjectCommand,
   DeleteObjectsCommand,
   CopyObjectCommand,
+  PutObjectCommand,
   GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -122,6 +123,17 @@ export class S3Service implements OnModuleDestroy {
   /** Server-side copy (для перекладывания tmp-объекта в content-addressed ключ). */
   async copyObject(srcKey: string, dstKey: string): Promise<void> {
     const cmd = new CopyObjectCommand({ Bucket: this.bucket, Key: dstKey, CopySource: `${this.bucket}/${srcKey}` });
+    await this.s3().send(cmd);
+  }
+
+  /** Однократная PUT-запись объекта (для file-drop и мелких файлов ≤ 5 ГБ). */
+  async putObject(key: string, body: Buffer, contentType: string): Promise<void> {
+    const cmd = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+    });
     await this.s3().send(cmd);
   }
 
