@@ -46,30 +46,80 @@ export const deleteFolder = (id: string) => request<{ ok: boolean }>(`/folders/$
 export const deleteFile = (id: string) => request<{ ok: boolean }>(`/files/${id}`, { method: 'DELETE' });
 export const fileUrl = (id: string) => `${BASE}/files/${id}/content`;
 
-export async function uploadFile(file: File, folderId: string | undefined, onProgress?: (pct: number) => void) {
-  const CHUNK = 5 * 1024 * 1024;
+const CHUNK_BYTES = 5 * 1024 * 1024;
+
+/** mime по расширению, если браузер не отдал type (HEIC/RAW и т.п.). */
+export function guessMime(file: { name: string; type: string }): string {
+  if (file.type) return file.type;
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  const map: Record<string, string> = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+    heic: 'image/heic', heif: 'image/heif', tif: 'image/tiff', tiff: 'image/tiff',
+    mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/x-m4v', webm: 'video/webm',
+    mkv: 'video/x-matroska', avi: 'video/avi', '3gp': 'video/3gpp', ogv: 'video/ogg',
+    pdf: 'application/pdf', txt: 'text/plain', zip: 'application/zip',
+  };
+  return map[ext] ?? 'application/octet-stream';
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** PUT чанка с ретраями: сеть/5xx — повтор до 3 раз; ответ сервера на дубликат — 200 (идемпотентно). */
+async function putChunk(uploadId: string, part: number, buf: ArrayBuffer, signal?: AbortSignal): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/uploads/${uploadId}/chunks/${part}`, {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: buf,
+        signal,
+      });
+    } catch (e) {
+      if (signal?.aborted) throw new Error('загрузка отменена');
+      if (attempt >= 3) throw new Error(`часть ${part}: сеть недоступна — ${(e as Error).message}`);
+      await sleep(700 * attempt);
+      continue;
+    }
+    if (res.ok) return;
+    if (res.status >= 500 && attempt < 3) {
+      await sleep(700 * attempt);
+      continue;
+    }
+    let msg = `часть ${part}: HTTP ${res.status}`;
+    try { const b = await res.clone().json(); if (b?.message) msg = `часть ${part}: ${b.message}`; } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+}
+
+export async function uploadFile(
+  file: File,
+  folderId: string | undefined,
+  onProgress?: (pct: number) => void,
+  signal?: AbortSignal,
+): Promise<{ entry: { id: string }; deduped: boolean }> {
+  const mime = guessMime(file);
   const init = await request<{ uploadId: string; chunkMaxBytes: number }>('/uploads', {
     method: 'POST',
-    body: JSON.stringify({ folderId, name: file.name, size: file.size, mime: file.type || 'application/octet-stream' }),
+    body: JSON.stringify({ folderId, name: file.name, size: file.size, mime }),
   });
-  const parts = Math.max(1, Math.ceil(file.size / CHUNK));
-  for (let i = 0; i < parts; i++) {
-    const start = i * CHUNK;
-    const buf = await file.slice(start, Math.min(file.size, start + CHUNK)).arrayBuffer();
-    const res = await fetch(`${BASE}/uploads/${init.uploadId}/chunks/${i + 1}`, {
-      method: 'PUT',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: buf,
-    });
-    if (!res.ok) {
-      let msg = `chunk ${i + 1} failed: HTTP ${res.status}`;
-      try { const b = await res.clone().json(); if (b?.message) msg = `chunk ${i + 1}: ${b.message}`; } catch { /* ignore */ }
-      throw new Error(msg);
+  const uploadId = init.uploadId;
+  const parts = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
+  try {
+    for (let part = 1; part <= parts; part++) {
+      const start = (part - 1) * CHUNK_BYTES;
+      const end = Math.min(file.size, start + CHUNK_BYTES);
+      const buf = await file.slice(start, end).arrayBuffer();
+      await putChunk(uploadId, part, buf, signal);
+      onProgress?.(Math.round((part / parts) * 100));
     }
-    onProgress?.(Math.round(((i + 1) / parts) * 100));
+    return await request<{ entry: { id: string }; deduped: boolean }>(`/uploads/${uploadId}/complete`, { method: 'POST' });
+  } catch (e) {
+    // подчистить незавершённую сессию на сервере (multipart abort), если она осталась
+    try { await fetch(`${BASE}/uploads/${uploadId}`, { method: 'DELETE', credentials: 'include' }); } catch { /* ignore */ }
+    throw e;
   }
-  return request<{ entry: { id: string }; deduped: boolean }>(`/uploads/${init.uploadId}/complete`, { method: 'POST' });
 }
 
 // ===== trash =====

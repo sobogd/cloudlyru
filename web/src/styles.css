@@ -48,15 +48,57 @@ body { background: #0f1115; }
 @keyframes sp { to { transform: rotate(360deg); } }
 .navbtn { font-size: 20px; }
 html, body { overscroll-behavior: none; }
-.full { height: calc(100dvh - 128px); overflow: hidden; display: flex; flex-direction: column; }
-.mediaarea { flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden; touch-action: none; background: #000; border-radius: 10px; position: relative; }
+/* Деталка: канвас ровно от верха экрана до нижнего нав-бара (без «мёртвых» полос),
+   чтобы фото/видео в позиции по умолчанию было отцентрировано по вертикали. */
+.full { position: relative; margin: -12px -12px 0; overflow: hidden; background: #000;
+  display: flex; flex-direction: column;
+  height: calc(100dvh - 39px);
+  height: calc(100dvh - 39px - env(safe-area-inset-bottom)); }
+.mediaarea { flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden;
+  touch-action: none; background: #000; }
 .zoomed { transform-origin: 0 0; will-change: transform; max-width: none; max-height: none; }
-.tbar { display: flex; align-items: center; gap: 2px; background: #161b24; border: 1px solid #262b33; border-radius: 14px; padding: 4px 8px; margin: 0 0 8px; }
-.iconbtn { border: 0; background: none; color: #e6e8eb; font-size: 20px; line-height: 1; padding: 4px 8px; cursor: pointer; border-radius: 10px; }
+/* шапка поверх медиа (прозрачная, тач сквозь неё проходит к зуму) */
+.tbar { position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+  display: flex; align-items: center; gap: 2px; padding: 8px 10px;
+  background: linear-gradient(to bottom, rgba(0,0,0,.6), rgba(0,0,0,0));
+  pointer-events: none; }
+.tbar button, .tbar a { pointer-events: auto; }
+.iconbtn { border: 0; background: none; color: #fff; font-size: 20px; line-height: 1;
+  padding: 6px 8px; cursor: pointer; border-radius: 8px; text-decoration: none; }
 .iconbtn:disabled { opacity: 0.3; }
-.iconbtn:active { background: #262c37; }
-/* Деталка — полноэкранно, без «островов» */
-.full { margin: 0 -12px; height: calc(100dvh - 116px); }
-.tbar { margin: 0; border-radius: 0; border: 0; border-bottom: 1px solid #22282f; background: #10141b; padding: 6px 12px; }
-.mediaarea { border-radius: 0; }
-.mediaarea video { border-radius: 0 !important; }
+.iconbtn:active { background: rgba(255,255,255,.18); }
+.det-info { position: absolute; top: 50px; left: 12px; z-index: 5; pointer-events: none;
+  max-width: calc(100% - 24px); font-size: 13px; color: #e6e8eb; word-break: break-all;
+  background: rgba(0,0,0,.55); border-radius: 8px; padding: 6px 10px; }
+
+/* Шапка разделов (Файлы / Фото / страница загрузки) — действия-иконки здесь */
+.filehead { position: sticky; top: 0; z-index: 6; display: flex; align-items: center; gap: 6px;
+  margin: -12px -12px 10px; padding: 9px 8px 9px 10px; background: rgba(15,17,21,.94);
+  backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }
+.filehead strong { font-size: 16px; white-space: nowrap; }
+.crumbs { display: flex; align-items: center; gap: 3px; overflow-x: auto; scrollbar-width: none;
+  flex: 1; min-width: 0; }
+.crumbs::-webkit-scrollbar { display: none; }
+.crumbs .crumb { white-space: nowrap; }
+
+/* Страница загрузки */
+.updrop { border: 1px dashed #333c49; border-radius: 12px; padding: 18px 10px; text-align: center;
+  background: #12161d; margin: 0 0 10px; }
+.upgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 12px; }
+.upbtn { border: 1px solid #2a313c; background: #14181f; border-radius: 12px; padding: 14px 6px 10px;
+  text-align: center; cursor: pointer; display: block; }
+.upbtn:active { background: #1a202b; border-color: #3a4250; }
+.upbtn input { display: none; }
+.upbtn-ico { font-size: 26px; line-height: 1.2; }
+.upbtn-label { font-size: 14px; color: #e6e8eb; margin-top: 4px; }
+.upbtn .meta { font-size: 11px; margin-top: 2px; }
+.uprow { display: flex; align-items: flex-start; gap: 10px; padding: 9px 2px; border-bottom: 1px solid #1f242c; }
+.uprow:last-child { border-bottom: 0; }
+.uprow .icon { line-height: 1.6; }
+.upmain { flex: 1; min-width: 0; }
+.upname { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upname .meta { margin-left: 8px; }
+.upmeta { font-size: 12px; color: #6d7889; margin: 2px 0 4px; word-break: break-word; }
+.uprow progress { height: 6px; }
+.ubar { height: 5px; background: #262c37; border-radius: 3px; overflow: hidden; margin: 3px 0; }
+.ubar i { display: block; height: 100%; background: #2b6cff; border-radius: 3px; }
