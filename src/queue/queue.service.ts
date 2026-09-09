@@ -7,6 +7,7 @@ import sharp from 'sharp';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { IMAGE_MIMES, MediaService, VIDEO_MIMES } from '../media/media.service';
+import { ZONE_FILES } from '../common/zones';
 import { env } from '../config/env';
 
 const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 1 ГБ)
@@ -130,8 +131,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       else if (job.kind === 'video') await this.convertVideo(job, rawPath);
       else throw new Error('unknown kind');
 
-      // успех: удаляем сырьё из S3 и помечаем мастер
-      await this.s3.deleteObject(S3Service.assetKey(job.sha256)).catch(() => undefined);
+      // успех: помечаем мастер. Сырьё из S3 удаляем, только если ни одна живая копия
+      // не лежит в зоне «Файлы» — там файл должен оставаться оригиналом как есть.
+      const filesRefs = await this.prisma.fileEntry.count({
+        where: { assetId: job.assetId, zone: ZONE_FILES, deletedAt: null },
+      });
+      if (filesRefs === 0) {
+        await this.s3.deleteObject(S3Service.assetKey(job.sha256)).catch(() => undefined);
+      }
       await this.prisma.job.update({ where: { id: job.id }, data: { state: 'done', finishedAt: new Date() } });
       this.logger.log(`✓ ${tag}`);
     } catch (e) {

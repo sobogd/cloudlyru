@@ -15,24 +15,24 @@ const NAV: Array<{ id: Tab; icon: string; label: string }> = [
 ];
 
 export default function App() {
-  const [user, setUser] = useState<{ login: string } | null>(null);
+  const [user, setUser] = useState<api.UserInfo | null>(null);
   const [checking, setChecking] = useState(true);
   useEffect(() => {
     api.me().then(setUser).catch(() => setUser(null)).finally(() => setChecking(false));
   }, []);
   if (checking) return <div className="app">…</div>;
   if (!user) return <Login onLogin={(u) => setUser(u)} />;
-  return <Shell user={user.login} onLogout={() => setUser(null)} />;
+  return <Shell user={user} onLogout={() => setUser(null)} />;
 }
 
-function Login({ onLogin }: { onLogin: (u: { login: string }) => void }) {
+function Login({ onLogin }: { onLogin: (u: api.UserInfo) => void }) {
   const [login, setLogin] = useState('');
   const [password, setPassword] = useState('');
   const [err, setErr] = useState('');
   const submit = async () => {
     try {
-      const r = await api.login(login, password);
-      onLogin(r.user);
+      await api.login(login, password);
+      onLogin(await api.me());
     } catch (e) {
       setErr((e as Error).message);
     }
@@ -49,17 +49,17 @@ function Login({ onLogin }: { onLogin: (u: { login: string }) => void }) {
   );
 }
 
-function Shell({ user, onLogout }: { user: string; onLogout: () => void }) {
+function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void }) {
   const [tab, setTab] = useState<Tab>('files');
   return (
     <div className="app">
       <main className="content">
-        {tab === 'files' && <Files />}
-        {tab === 'photos' && <Photos />}
+        {tab === 'files' && <Files photoFolderId={user.photoFolderId} />}
+        {tab === 'photos' && <Photos photoFolderId={user.photoFolderId} />}
         {tab === 'shares' && <Shares />}
         {tab === 'albums' && <Albums />}
         {tab === 'trash' && <TrashPage />}
-        {tab === 'settings' && <Settings login={user} onLogout={onLogout} />}
+        {tab === 'settings' && <Settings login={user.login} onLogout={onLogout} />}
       </main>
       <nav className="nav">
         {NAV.map((n) => (
@@ -81,7 +81,7 @@ function fileIcon(mime?: string): string {
   return '📄';
 }
 
-function Files() {
+function Files({ photoFolderId }: { photoFolderId: string | null }) {
   const [stack, setStack] = useState<Array<{ id?: string; name: string }>>([{ name: 'Главная' }]);
   const [view, setView] = useState<api.FolderView | null>(null);
   const [err, setErr] = useState('');
@@ -114,6 +114,7 @@ function Files() {
       <UploadPage
         folderId={currentId}
         folderName={currentName}
+        photoFolderId={photoFolderId}
         onClose={() => { setPage('list'); void load(currentId); }}
       />
     );
@@ -140,7 +141,9 @@ function Files() {
           <div className="item" key={f.id}>
             <span className="icon">📁</span>
             <span className="fname" onClick={() => setStack((s) => [...s, { id: f.id, name: f.name }])}>{f.name}</span>
-            <button className="btn ghost" onClick={() => rm('folder', f.id, f.name)}>🗑</button>
+            {f.id !== photoFolderId && (
+              <button className="btn ghost" onClick={() => rm('folder', f.id, f.name)}>🗑</button>
+            )}
           </div>
         ))}
         {(view?.entries || []).map((e) => (
@@ -180,8 +183,11 @@ const UP_META: Record<UpKind, { icon: string; label: string; accept: string; hin
 };
 let upKey = 0;
 
-function UploadPage({ folderId, folderName, onClose }: { folderId?: string; folderName: string; onClose: () => void }) {
+function UploadPage({ folderId, folderName, photoFolderId, onClose }: { folderId?: string; folderName: string; photoFolderId?: string | null; onClose: () => void }) {
   const rows = useRef<UpRow[]>([]);
+  // «Фото» (медиа-зона): файлы конвертируются в AVIF/AV1 и появляются в разделе «Фото»;
+  // обычные папки: файлы ложатся как есть, без конвертации
+  const isPhotoLibrary = Boolean(folderId && photoFolderId && folderId === photoFolderId);
   const [, force] = useState(0);
   const running = useRef(false);
   const stopped = useRef(false);
@@ -275,7 +281,11 @@ function UploadPage({ folderId, folderName, onClose }: { folderId?: string; fold
       </div>
 
       <div className="copy" style={{ margin: '10px 2px' }}>
-        Куда: <b>{folderName}</b> — сюда лягут все файлы. Фото и видео после конвертации появятся и в разделе «Фото».
+        {isPhotoLibrary ? (
+          <>Куда: <b>{folderName}</b> — фото/видео будут оптимизированы (AVIF/AV1 + превью) и появятся в разделе «Фото».</>
+        ) : (
+          <>Куда: <b>{folderName}</b> — файлы сохранятся как есть, без конвертации. Чтобы медиа попало в «Фото», загружайте в папку «Фото».</>
+        )}
       </div>
 
       <div
@@ -319,7 +329,7 @@ function UploadPage({ folderId, folderName, onClose }: { folderId?: string; fold
                 <div className="upmeta">
                   {r.state === 'queued' && 'в очереди…'}
                   {r.state === 'uploading' && `загрузка ${r.pct}%`}
-                  {r.state === 'done' && `загружено${r.kind !== 'doc' ? ' · конвертация в фоне' : ''}`}
+                  {r.state === 'done' && (isPhotoLibrary && r.kind !== 'doc' ? 'загружено · конвертация в фоне' : 'загружено')}
                   {r.state === 'failed' && `ошибка: ${r.error}`}
                 </div>
                 {r.state === 'uploading' && <progress value={r.pct} max={100} />}
@@ -349,7 +359,9 @@ function UploadPage({ folderId, folderName, onClose }: { folderId?: string; fold
           </div>
           <progress value={pct} max={100} />
           {!running.current && busyN === 0 && doneN === all.length && doneN > 0 && (
-            <div className="notice" style={{ margin: '10px 0 4px' }}>✅ Готово: {doneN} файлов загружено в «{folderName}»</div>
+            <div className="notice" style={{ margin: '10px 0 4px' }}>
+              ✅ Готово: {doneN} файлов загружено в «{folderName}»{isPhotoLibrary ? ' — конвертация выполняется в фоне' : ''}
+            </div>
           )}
           {!running.current && busyN === 0 && failN > 0 && (
             <div className="err" style={{ margin: '10px 0 4px' }}>Не загрузилось файлов: {failN}</div>
@@ -367,15 +379,17 @@ function UploadPage({ folderId, folderName, onClose }: { folderId?: string; fold
   );
 }
 
-// ================= Фото (умный вид: таймлайн + поездки + карта) =================
-// Только просмотр: загрузка медиа — из раздела «Файлы» (страница загрузки).
+// ================= Фото (медиатека: таймлайн + поездки + карта) =================
+// Показывает только содержимое системной папки «Фото» (зона PHOTOS) — загрузка через ⬆️
+// или в папку «Фото» на диске; медиа в обычных папках («Файлы») не оптимизируется и сюда не попадает.
 
-function Photos() {
+function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   type Screen = { kind: 'grid' } | { kind: 'view'; idx: number };
   const [items, setItems] = useState<api.TimelineItem[]>([]);
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
   const [screen, setScreen] = useState<Screen>({ kind: 'grid' });
+  const [upload, setUpload] = useState(false);
   const [info, setInfo] = useState(false);
   const isImg = (m: string) => /^image\//.test(m || '');
   const isVid = (m: string) => /^video\//.test(m || '');
@@ -389,6 +403,18 @@ function Photos() {
     const t = setInterval(() => { void load(); }, 3000);
     return () => clearInterval(t);
   }, []);
+
+  // ===== Прямая загрузка в медиатеку «Фото» =====
+  if (upload) {
+    return (
+      <UploadPage
+        folderId={photoFolderId ?? undefined}
+        folderName="Фото"
+        photoFolderId={photoFolderId}
+        onClose={() => { setUpload(false); void load(); api.trips().then(setTrips).catch(() => undefined); }}
+      />
+    );
+  }
 
   const media = items.filter((it) => isImg(it.mime) || isVid(it.mime));
   const current = screen.kind === 'view' ? media[screen.idx] : null;
@@ -445,7 +471,9 @@ function Photos() {
       <div className="filehead">
         <strong>Фото</strong>
         <span style={{ flex: 1 }} />
-        <span className="meta">загрузка — в «Файлы»</span>
+        {photoFolderId && (
+          <button className="iconbtn" title="Загрузить фото/видео в «Фото» (с оптимизацией)" onClick={() => setUpload(true)}>⬆️</button>
+        )}
       </div>
       {trips.length > 0 && (
         <div className="panel">
@@ -480,7 +508,7 @@ function Photos() {
             )}
           </div>
         ))}
-        {!media.length && <div className="copy">Нет фото и видео. Загрузите их в разделе «Файлы» — здесь они появятся автоматически.</div>}
+        {!media.length && <div className="copy">Нет фото и видео. Загрузите их через ⬆️ или в папку «Фото» на диске — медиа оптимизируется и появится здесь автоматически.</div>}
       </div>
     </div>
   );

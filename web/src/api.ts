@@ -19,7 +19,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 // ===== типы =====
-export interface UserInfo { id: string; login: string; rootFolderId: string | null }
 export interface FolderEntry { id: string; name: string; createdAt?: string; size?: number; mime?: string }
 export interface FolderView { parentId: string; folders: FolderEntry[]; entries: FolderEntry[] }
 export interface ShareInfo {
@@ -30,9 +29,15 @@ export interface TrashItem { id: string; name: string; deletedAt: string; kind: 
 export interface TrashView { folders: TrashItem[]; entries: TrashItem[] }
 
 // ===== auth =====
+export interface UserInfo {
+  id: string;
+  login: string;
+  rootFolderId: string | null;
+  photoFolderId: string | null; // системная папка «Фото» (медиа-зона)
+}
 export const login = (login: string, password: string) =>
   request<{ user: UserInfo }>('/auth/login', { method: 'POST', body: JSON.stringify({ login, password }) });
-export const me = () => request<{ id: string; login: string; rootFolderId: string | null }>('/auth/me');
+export const me = () => request<UserInfo>('/auth/me');
 export const logout = () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' });
 
 // ===== folders/files =====

@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { MediaService } from '../media/media.service';
 import { assertSafeName } from '../common/utils';
+import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { conflict, notFound } from '../common/errors';
 
 @Injectable()
@@ -41,9 +42,9 @@ export class FilesService {
     }
   }
 
-  /** Создание FileEntry (после того, как объект в S3 готов или найден по хэшу). */
-  async createEntry(folderId: string, name: string, assetId: string): Promise<{ id: string; deduped: boolean }> {
-    await this.ensureFolder(folderId);
+  /** Создание FileEntry (после того, как объект в S3 готов или найден по хэшу). Возвращает зону записи. */
+  async createEntry(folderId: string, name: string, assetId: string): Promise<{ id: string; deduped: boolean; zone: string }> {
+    const folder = await this.ensureFolder(folderId);
     assertSafeName(name);
     await this.assertNameFree(folderId, name);
 
@@ -52,11 +53,12 @@ export class FilesService {
       where: { folderId, assetId, deletedAt: null, name: { not: name } },
     });
 
+    const zone = folder.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
     const entry = await this.prisma.fileEntry.create({
-      data: { folderId, assetId, name },
+      data: { folderId, assetId, name, zone },
       select: { id: true },
     });
-    return { id: entry.id, deduped: Boolean(sameAssetLive) };
+    return { id: entry.id, deduped: Boolean(sameAssetLive), zone };
   }
 
   async getEntryMeta(entryId: string) {
@@ -76,20 +78,24 @@ export class FilesService {
     };
   }
 
-  /** Presigned-URL для скачивания оригинала. */
+  /** Presigned-URL для скачивания. Фото-зона: оптимизированный мастер; файлы-зона: оригинал как есть. */
   async presignedUrl(entryId: string): Promise<string> {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
       include: { asset: true },
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
-    if (entry.asset.masterMime === 'image/avif' && entry.asset.masterReadyAt) {
-      return this.s3.presignedInline(MediaService.photoMasterKey(entry.asset.sha256), 'image/avif');
+    const { asset } = entry;
+    const masterMime = entry.asset.masterMime === 'image/avif' || entry.asset.masterMime === 'video/mp4' ? entry.asset.masterMime : null;
+
+    if (masterMime && asset.masterReadyAt) {
+      const masterKey = masterMime === 'image/avif' ? MediaService.photoMasterKey(asset.sha256) : MediaService.videoMasterKey(asset.sha256);
+      // фото-зона: мастер; файлы-зона: оригинал, если жив в S3 (у легаси-медиа сырьё могло быть удалено)
+      if (entry.zone === ZONE_PHOTOS) return this.s3.presignedInline(masterKey, masterMime);
+      const rawAlive = await this.s3.headObject(S3Service.assetKey(asset.sha256)).catch(() => false);
+      if (!rawAlive) return this.s3.presignedInline(masterKey, masterMime);
     }
-    if (entry.asset.masterMime === 'video/mp4' && entry.asset.masterReadyAt) {
-      return this.s3.presignedInline(MediaService.videoMasterKey(entry.asset.sha256), 'video/mp4');
-    }
-    return this.s3.presignedGet(S3Service.assetKey(entry.asset.sha256), entry.asset.mime);
+    return this.s3.presignedGet(S3Service.assetKey(asset.sha256), asset.mime);
   }
 
   async softDelete(entryId: string) {

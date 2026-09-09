@@ -8,6 +8,7 @@ import { QueueService } from '../queue/queue.service';
 import { AuthService } from '../auth/auth.service';
 import { CHUNK_MAX_BYTES, MAX_FILE_BYTES } from '../config/env';
 import { assertSafeName, randomToken } from '../common/utils';
+import { ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound, payloadTooLarge } from '../common/errors';
 
 interface LiveSession {
@@ -168,18 +169,22 @@ export class UploadsService implements OnModuleInit {
     await this.prisma.uploadSession.delete({ where: { id: uploadId } });
     this.live.delete(uploadId);
 
-    // EXIF (дата съёмки/координаты) — best-effort, не валит загрузку
-    try {
-      await this.media.captureMeta(assetId, sha256, size, mime);
-    } catch {
-      /* ignore */
+    // Медиа-зона («Фото»): EXIF (дата/координаты) + очередь конвертации (best-effort, не валит загрузку).
+    // Зона «Файлы»: файл ложится как есть — без EXIF-обработки и без конвертации.
+    if (entry.zone === ZONE_PHOTOS) {
+      try {
+        await this.media.captureMeta(assetId, sha256, size, mime);
+      } catch {
+        /* ignore */
+      }
+      await this.queue.enqueue(assetId, sha256, mime);
     }
-    await this.queue.enqueue(assetId, sha256, mime);
 
     return {
       entry: { id: entry.id },
       asset: { sha256, size, mime },
       deduped,
+      zone: entry.zone,
     };
   }
 

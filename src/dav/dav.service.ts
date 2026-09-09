@@ -11,6 +11,7 @@ import { FilesService } from '../files/files.service';
 import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
 import { assertSafeName } from '../common/utils';
+import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { notFound } from '../common/errors';
 
 export class DavError extends Error {}
@@ -146,7 +147,10 @@ export class DavService {
     }
     const dup = await this.prisma.folder.findFirst({ where: { parentId, name } });
     if (dup) throw new BadRequestException('already exists');
-    await this.prisma.folder.create({ data: { parentId, name } });
+    const parent = await this.prisma.folder.findUnique({ where: { id: parentId }, select: { zone: true } });
+    await this.prisma.folder.create({
+      data: { parentId, name, zone: parent?.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES },
+    });
     return 201;
   }
 
@@ -155,6 +159,8 @@ export class DavService {
     if (parts.length === 0) throw new BadRequestException('invalid path');
     const parentId = await this.folderByPath(userId, parts.slice(0, -1));
     if (!parentId) throw notFound('parent not found');
+    const parent = await this.prisma.folder.findUnique({ where: { id: parentId }, select: { zone: true } });
+    const zone = parent?.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
     const name = decodeURIComponent(parts[parts.length - 1]);
     try {
       assertSafeName(name);
@@ -204,23 +210,25 @@ export class DavService {
     }
     await this.s3.deleteObject(tmpKey).catch(() => undefined);
 
-    // EXIF + очередь конвертации (best-effort)
-    try {
-      await this.media.captureMeta(assetId, sha256, Number(contentLength ?? 0), mime);
-    } catch { /* ignore */ }
-    await this.queue.enqueue(assetId, sha256, mime);
+    // EXIF + очередь конвертации — только для медиа-зоны («Фото»); в «Файлы» — как есть
+    if (zone === ZONE_PHOTOS) {
+      try {
+        await this.media.captureMeta(assetId, sha256, Number(contentLength ?? 0), mime);
+      } catch { /* ignore */ }
+      await this.queue.enqueue(assetId, sha256, mime);
+    }
 
     // перезапись существующего файла с тем же именем — обновляем entry на новый asset
     const dup = await this.prisma.fileEntry.findFirst({ where: { folderId: parentId, name } });
     if (dup) {
       if (dup.deletedAt) {
-        await this.prisma.fileEntry.update({ where: { id: dup.id }, data: { deletedAt: null, assetId } });
+        await this.prisma.fileEntry.update({ where: { id: dup.id }, data: { deletedAt: null, assetId, zone } });
       } else {
-        await this.prisma.fileEntry.update({ where: { id: dup.id }, data: { assetId } });
+        await this.prisma.fileEntry.update({ where: { id: dup.id }, data: { assetId, zone } });
       }
       return 204;
     }
-    await this.prisma.fileEntry.create({ data: { folderId: parentId, name, assetId } });
+    await this.prisma.fileEntry.create({ data: { folderId: parentId, name, assetId, zone } });
     return 201;
   }
 
@@ -261,6 +269,8 @@ export class DavService {
       : await this.prisma.folder.findFirst({ where: { parentId: null, name, deletedAt: null } });
     if (!folder) throw notFound('path not found');
     if (folder.name === '__root__') throw new BadRequestException('cannot delete root');
+    const photoId = await this.auth.photoRootIdOrNull(userId);
+    if (photoId && folder.id === photoId) throw new BadRequestException('cannot delete photo library root');
     // мягкое удаление поддерева
     const ids: string[] = [folder.id];
     let frontier = [folder.id];
@@ -299,6 +309,8 @@ export class DavService {
       : await this.prisma.folder.findFirst({ where: { parentId: null, name: srcParts[srcParts.length - 1], deletedAt: null } });
     if (!folder) throw notFound('path not found');
     if (folder.name === '__root__') throw new BadRequestException('cannot rename root');
+    const photoId = await this.auth.photoRootIdOrNull(userId);
+    if (photoId && folder.id === photoId) throw new BadRequestException('cannot rename photo library root');
     const dup = await this.prisma.folder.findFirst({ where: { parentId: folder.parentId ?? undefined, name: newName, id: { not: folder.id } } });
     if (dup) throw new BadRequestException('already exists');
     await this.prisma.folder.update({ where: { id: folder.id }, data: { name: newName } });

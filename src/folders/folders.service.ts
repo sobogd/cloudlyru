@@ -1,8 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
+import { MediaService } from '../media/media.service';
 import { assertSafeName } from '../common/utils';
 import { QueueService } from '../queue/queue.service';
+import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
 
 const isRoot = (f: { name: string }) => f.name === ROOT_FOLDER_NAME;
@@ -12,8 +14,15 @@ export class FoldersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auth: AuthService,
+    private readonly media: MediaService,
     private readonly queue: QueueService,
   ) {}
+
+  /** Системную папку «Фото» нельзя переименовать/переместить/удалить. */
+  private async assertNotPhotoRoot(folder: { id: string }, userId: string, action: string) {
+    const photoId = await this.auth.photoRootIdOrNull(userId);
+    if (photoId && folder.id === photoId) throw badRequest(`cannot ${action} photo library root`);
+  }
 
   private async rootId(userId: string): Promise<string> {
     return this.auth.rootFolderId(userId);
@@ -64,8 +73,10 @@ export class FoldersService {
     assertSafeName(name);
     const parent = await this.resolveAccessible(parentId, userId);
     await this.assertNameFree(parent.id, name);
+    // новые папки наследуют зону родителя: внутри «Фото» — медиа-зона, в остальном дереве — файлы
+    const zone = parent.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
     return this.prisma.folder.create({
-      data: { parentId: parent.id, name },
+      data: { parentId: parent.id, name, zone },
       select: { id: true, name: true, parentId: true, createdAt: true },
     });
   }
@@ -73,6 +84,7 @@ export class FoldersService {
   async rename(id: string, name: string, userId: string) {
     assertSafeName(name);
     const folder = await this.resolveAccessible(id, userId);
+    await this.assertNotPhotoRoot(folder, userId, 'rename');
     if (isRoot(folder)) throw badRequest('cannot rename root');
     await this.assertNameFree(folder.parentId!, name, id);
     return this.prisma.folder.update({
@@ -84,21 +96,32 @@ export class FoldersService {
 
   async move(id: string, newParentId: string, userId: string) {
     const folder = await this.resolveAccessible(id, userId);
+    await this.assertNotPhotoRoot(folder, userId, 'move');
     if (isRoot(folder)) throw badRequest('cannot move root');
     const target = await this.resolveAccessible(newParentId, userId);
     const subtree = await this.collectSubtreeIds(id);
     if (subtree.includes(target.id)) throw badRequest('cannot move folder into its own subtree');
     await this.assertNameFree(target.id, folder.name, id);
-    return this.prisma.folder.update({
+
+    const newZone = target.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    const moved = await this.prisma.folder.update({
       where: { id },
       data: { parentId: target.id },
-      select: { id: true, parentId: true },
+      select: { id: true, parentId: true, zone: true },
     });
+    // папка переехала между зонами — пересчитываем зону всего поддерева (папки + файлы)
+    if (folder.zone !== newZone) {
+      await this.prisma.folder.updateMany({ where: { id: { in: subtree } }, data: { zone: newZone } });
+      await this.prisma.fileEntry.updateMany({ where: { folderId: { in: subtree } }, data: { zone: newZone } });
+      if (newZone === ZONE_PHOTOS) void this.reprocessAsMedia(subtree);
+    }
+    return { id: moved.id, parentId: moved.parentId, zone: newZone };
   }
 
   /** Мягкое удаление папки вместе со всем поддеревом. */
   async softDelete(id: string, userId: string) {
     const folder = await this.resolveAccessible(id, userId);
+    await this.assertNotPhotoRoot(folder, userId, 'delete');
     if (isRoot(folder)) throw badRequest('cannot delete root');
     const ids = await this.collectSubtreeIds(id);
     await this.prisma.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
@@ -146,6 +169,29 @@ export class FoldersService {
   private async requeueAssetsIn(folderIds: string[]): Promise<void> {
     const assetIds = await this.assetsIn(folderIds);
     if (assetIds.length) await this.queue.requeueForAssets(assetIds);
+  }
+
+  /** Папки переехали в медиа-зону: ставим на обработку их ещё не конвертированные фото/видео (best-effort). */
+  private async reprocessAsMedia(folderIds: string[]) {
+    try {
+      const assets = await this.prisma.asset.findMany({
+        where: {
+          masterReadyAt: null,
+          entries: { some: { folderId: { in: folderIds }, deletedAt: null, zone: ZONE_PHOTOS } },
+        },
+        select: { id: true, sha256: true, mime: true, size: true },
+      });
+      for (const a of assets) {
+        try {
+          await this.media.captureMeta(a.id, a.sha256, Number(a.size), a.mime);
+        } catch {
+          /* best-effort */
+        }
+        await this.queue.enqueue(a.id, a.sha256, a.mime);
+      }
+    } catch {
+      /* best-effort: не валим перемещение из-за очереди */
+    }
   }
 
   /** BFS всех id поддерева, включая саму папку. */

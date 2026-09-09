@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import * as exifr from 'exifr';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
+import { ZONE_PHOTOS } from '../common/zones';
 
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
 export const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm', 'video/x-matroska', 'video/avi', 'video/ogg', 'video/mpeg'];
@@ -116,6 +117,7 @@ export class MediaService {
     const rows = (await this.prisma.fileEntry.findMany({
       where: {
         deletedAt: null,
+        zone: ZONE_PHOTOS, // только медиа-зона: системная папка «Фото» и её поддеревья
         asset: { media: before ? { capturedAt: { lt: new Date(before) } } : { isNot: null } },
       },
       orderBy: { asset: { media: { capturedAt: 'desc' } } },
@@ -155,7 +157,7 @@ export class MediaService {
 
   async trips(): Promise<Trip[]> {
     const rows = (await this.prisma.fileEntry.findMany({
-      where: { deletedAt: null, asset: { media: { isNot: null } } },
+      where: { deletedAt: null, zone: ZONE_PHOTOS, asset: { media: { isNot: null } } },
       orderBy: { asset: { media: { capturedAt: 'asc' } } },
       select: {
         id: true,

@@ -9,6 +9,7 @@ import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
 import { env } from '../config/env';
 import { assertSafeName, randomToken, sha256Hex } from '../common/utils';
+import { ZONE_PHOTOS } from '../common/zones';
 import { badRequest, forbidden, notFound, tooMany, unauthorized } from '../common/errors';
 
 export type ShareKind = 'FOLDER' | 'FILE';
@@ -215,7 +216,8 @@ export class SharesService {
     } else {
       if (entry.folderId !== share.targetId) throw forbidden('file not in share');
     }
-    return this.s3.presignedGet(S3Service.assetKey(entry.asset.sha256), entry.asset.mime);
+    // мастер для медиа-зоны (после конвертации сырья в S3 нет), оригинал — для зоны «Файлы»
+    return this.files.presignedUrl(entryId);
   }
 
   /** File-drop: загрузка файла в расшаренную папку без аккаунта (capability UPLOAD/RW). */
@@ -243,11 +245,14 @@ export class SharesService {
     }
     const asset = await this.prisma.asset.findUniqueOrThrow({ where: { sha256 } });
     const entry = await this.files.createEntry(folder.id, name, asset.id);
-    try {
-      await this.media.captureMeta(asset.id, sha256, body.length, mime);
-    } catch { /* ignore */ }
-    await this.queue.enqueue(asset.id, sha256, mime);
-    return { ok: true, entryId: entry.id, size: body.length, deduped: Boolean(existing) };
+    // конвертация/EXIF — только когда файл попал в медиа-зону («Фото»)
+    if (entry.zone === ZONE_PHOTOS) {
+      try {
+        await this.media.captureMeta(asset.id, sha256, body.length, mime);
+      } catch { /* ignore */ }
+      await this.queue.enqueue(asset.id, sha256, mime);
+    }
+    return { ok: true, entryId: entry.id, size: body.length, deduped: Boolean(existing), zone: entry.zone };
   }
 
   private extOf(name: string): string | undefined {

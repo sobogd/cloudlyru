@@ -22,6 +22,7 @@ model User {
   sessions     Session[]
   apiTokens    ApiToken[]
   rootFolderId String? // корневая папка пользователя (создаётся при seed)
+  photoFolderId String? // системная папка «Фото» (медиа-зона; создаётся при seed/lazy)
 }
 
 model Session {
@@ -57,6 +58,8 @@ model Folder {
   id        String     @id @default(uuid())
   parentId  String? // null = верхний уровень (корень пользователя)
   name      String
+  // зона: FILES (обычный диск, медиа хранится как есть) | PHOTOS (поддерево системной папки «Фото», медиа конвертируется)
+  zone      String     @default("FILES")
   createdAt DateTime   @default(now())
   updatedAt DateTime   @updatedAt
   deletedAt DateTime?
@@ -74,6 +77,8 @@ model FileEntry {
   folderId  String
   assetId   String
   name      String
+  // зона папки на момент создания (FILES|PHOTOS) — для фильтра таймлайна и политики конвертации
+  zone      String   @default("FILES")
   createdAt DateTime @default(now())
   deletedAt DateTime?
   folder    Folder   @relation(fields: [folderId], references: [id], onDelete: Cascade)
@@ -82,6 +87,7 @@ model FileEntry {
 
   @@unique([folderId, name])
   @@index([folderId, deletedAt])
+  @@index([zone, deletedAt])
 }
 
 // Физический объект в S3 (один на уникальное содержимое)
