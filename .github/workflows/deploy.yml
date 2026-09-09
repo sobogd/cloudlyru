@@ -37,7 +37,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec prisma generate
       - run: pnpm build
-      - name: Prepare bundle (tar: dist + prod/нативные node_modules)
+      - name: "Prepare bundle (tar: dist + node_modules)"
         run: |
           tar czf cloudlyru.tgz \
             package.json pnpm-lock.yaml prisma dist node_modules
