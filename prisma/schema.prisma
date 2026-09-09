@@ -1,0 +1,150 @@
+// CloudlyRu — Prisma-схема (PostgreSQL).
+// M0: пользователь/сессии, файловое дерево (soft delete), Asset = объект в S3 (дедуп по sha256).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===== Пользователи, сессии, токены =====
+
+model User {
+  id           String    @id @default(uuid())
+  login        String    @unique
+  passwordHash String
+  createdAt    DateTime  @default(now())
+  sessions     Session[]
+  apiTokens    ApiToken[]
+  rootFolderId String? // корневая папка пользователя (создаётся при seed)
+}
+
+model Session {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String   @unique // sha256 токена; сам токен живёт только в cookie
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model ApiToken {
+  id        String    @id @default(uuid())
+  userId    String
+  label     String
+  tokenHash String    @unique
+  scope     String    @default("files:rw") // будущее: files:ro, share:rw ...
+  lastUsedAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ===== Файловое дерево =====
+// parentId всегда не-null: верхний уровень = дети корневой папки (root).
+// Удаление — soft (deletedAt), hard delete только через purge (корзина, retention).
+
+model Folder {
+  id        String     @id @default(uuid())
+  parentId  String? // null = верхний уровень (корень пользователя)
+  name      String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  deletedAt DateTime?
+  parent    Folder?    @relation("FolderTree", fields: [parentId], references: [id])
+  children  Folder[]   @relation("FolderTree")
+  entries   FileEntry[]
+
+  // Postgres: NULL-ы в unique-индексе не конфликтуют — дубли на верхнем уровне ловим в сервисе
+  @@unique([parentId, name])
+  @@index([parentId, deletedAt])
+}
+
+model FileEntry {
+  id        String   @id @default(uuid())
+  folderId  String
+  assetId   String
+  name      String
+  createdAt DateTime @default(now())
+  deletedAt DateTime?
+  folder    Folder   @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  asset     Asset    @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@unique([folderId, name])
+  @@index([folderId, deletedAt])
+}
+
+// Физический объект в S3 (один на уникальное содержимое)
+model Asset {
+  id        String      @id @default(uuid())
+  sha256    String      @unique
+  size      BigInt
+  mime      String
+  ext       String?
+  createdAt DateTime    @default(now())
+  entries   FileEntry[]
+}
+
+// Активная чанкованная загрузка (сессия в памяти сервиса; parts-этаги в RAM)
+model UploadSession {
+  id         String   @id @default(uuid())
+  userId     String
+  s3UploadId String   @unique
+  uploadKey  String // временный ключ объекта в S3 (files/tmp/<token>) для abort/cleanup
+  folderId   String?
+  name       String
+  size       BigInt
+  mime       String
+  partCount  Int      @default(0) // сколько частей принято
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId])
+  @@index([updatedAt])
+}
+
+// ===== Шаринг (каркас M1) =====
+
+enum ShareKind {
+  FOLDER
+  FILE
+  ALBUM
+}
+
+enum ShareCapability {
+  VIEW
+  DOWNLOAD
+  UPLOAD
+  RW
+}
+
+model Share {
+  id            String          @id @default(uuid())
+  kind          ShareKind
+  targetId      String
+  token         String          @unique // 128 бит случайности
+  passwordHash  String?
+  capability    ShareCapability @default(VIEW)
+  expiresAt     DateTime?
+  createdAt     DateTime        @default(now())
+  revokedAt     DateTime?
+}
+
+// ===== Аудит =====
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  action    String
+  meta      Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
