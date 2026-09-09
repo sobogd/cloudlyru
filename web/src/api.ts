@@ -62,7 +62,11 @@ export async function uploadFile(file: File, folderId: string | undefined, onPro
       headers: { 'Content-Type': 'application/octet-stream' },
       body: buf,
     });
-    if (!res.ok) throw new Error(`chunk ${i + 1} failed: HTTP ${res.status}`);
+    if (!res.ok) {
+      let msg = `chunk ${i + 1} failed: HTTP ${res.status}`;
+      try { const b = await res.clone().json(); if (b?.message) msg = `chunk ${i + 1}: ${b.message}`; } catch { /* ignore */ }
+      throw new Error(msg);
+    }
     onProgress?.(Math.round(((i + 1) / parts) * 100));
   }
   return request<{ entry: { id: string }; deduped: boolean }>(`/uploads/${init.uploadId}/complete`, { method: 'POST' });

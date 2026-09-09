@@ -112,8 +112,13 @@ export class UploadsService implements OnModuleInit {
     if (!live) {
       throw conflict('upload session expired (server restart) — re-init upload', 'upload_session_lost');
     }
-    if (partNumber !== live.parts.length + 1) {
-      throw badRequest(`expected part ${live.parts.length + 1}, got ${partNumber}`);
+    const expected = live.parts.length + 1;
+    if (partNumber < expected) {
+      // идемпотентность: повторный/дублирующийся чанк — считаем успешным
+      return { uploadId, nextPart: expected, duplicate: true };
+    }
+    if (partNumber > expected) {
+      throw badRequest(`missing part ${expected} (got ${partNumber}) — upload out of order`);
     }
 
     const etag = await this.s3.uploadPart(live.tmpKey, live.s3UploadId, partNumber, chunk);
