@@ -37,10 +37,14 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec prisma generate
       - run: pnpm build
-      - name: "Prepare bundle (tar: dist + node_modules)"
+      - name: Build web (Vite + React SPA)
+        run: |
+          pnpm --dir web install --frozen-lockfile
+          pnpm --dir web build
+      - name: "Prepare bundle (tar: dist + web + node_modules)"
         run: |
           tar czf cloudlyru.tgz \
-            package.json pnpm-lock.yaml prisma dist node_modules
+            package.json pnpm-lock.yaml prisma dist web/dist node_modules
       - name: Prisma migrate deploy (SSH tunnel to prod Postgres)
         if: ${{ github.event_name == 'push' || inputs.run_migrations }}
         env:
@@ -91,6 +95,9 @@ jobs:
             cp incoming/package.json ./package.json
             cp incoming/pnpm-lock.yaml ./pnpm-lock.yaml
             cp -r incoming/prisma ./prisma
+            mkdir -p web
+            rm -rf web/dist
+            cp -r incoming/web/dist web/dist
             rm -rf incoming
 
             cat > .env <<EOF

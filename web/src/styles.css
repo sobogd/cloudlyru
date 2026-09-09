@@ -1,0 +1,23 @@
+body { margin: 0; font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background: #0f1115; color: #e6e8eb; }
+.app { max-width: 980px; margin: 0 auto; padding: 18px; }
+.topbar { display: flex; align-items: center; gap: 12px; padding: 8px 0 16px; border-bottom: 1px solid #262b33; }
+.topbar h1 { font-size: 18px; margin: 0 auto 0 0; }
+.tab { background: none; border: 1px solid #3a4250; color: #cfd6e0; padding: 6px 14px; border-radius: 8px; cursor: pointer; }
+.tab.active { background: #2b6cff; border-color: #2b6cff; color: #fff; }
+.btn { background: #2b6cff; border: 0; color: #fff; padding: 7px 14px; border-radius: 8px; cursor: pointer; }
+.btn.ghost { background: none; border: 1px solid #3a4250; color: #cfd6e0; }
+.btn.danger { background: #d33; }
+input, select { background: #171b22; border: 1px solid #343b46; color: #e6e8eb; padding: 7px 10px; border-radius: 8px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
+.panel { background: #14181f; border: 1px solid #262b33; border-radius: 12px; padding: 14px; margin: 12px 0; }
+.item { display: flex; align-items: center; gap: 10px; padding: 8px 6px; border-bottom: 1px solid #1f242c; }
+.item:hover { background: #191e27; }
+.icon { width: 20px; text-align: center; color: #8fa3bd; }
+.fname { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta { color: #6d7889; font-size: 12px; }
+.crumb { background: none; border: 0; color: #7ab0ff; cursor: pointer; padding: 0 4px; }
+.notice { color: #9fe6a0; font-size: 13px; }
+.err { color: #ff8a8a; font-size: 13px; }
+.loginbox { max-width: 340px; margin: 10vh auto; display: grid; gap: 10px; }
+.copy { font-size: 12px; color: #9aa7b8; word-break: break-all; }
+progress { width: 100%; }
