@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { mkdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -88,6 +88,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       .catch(() => undefined);
   }
 
+  private lastProgressUpdate = 0;
+  private async setProgress(jobId: string, value: number, force = false): Promise<void> {
+    const now = Date.now();
+    if (!force && now - this.lastProgressUpdate < 2000) return;
+    this.lastProgressUpdate = now;
+    await this.prisma.job.update({ where: { id: jobId }, data: { progress: Math.max(0, Math.min(100, Math.round(value))) } }).catch(() => undefined);
+  }
+
   private async tick() {
     if (this.stopped || this.running) return;
     this.running = true;
@@ -162,7 +170,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       pipeline = sharp(png).rotate();
     }
 
+    await this.setProgress(job.id, 40, true);
     const avif = await pipeline.clone().avif({ quality: 85 }).toBuffer();
+    await this.setProgress(job.id, 70, true);
     const grid = await pipeline.clone().resize({ width: 512, withoutEnlargement: true }).webp({ quality: 78 }).toBuffer();
     const full = await pipeline.clone().resize({ width: 2048, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
 
@@ -194,13 +204,16 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const posterRaw = join(tmpdir(), `clq-${job.id}-poster.png`);
     const previewPath = join(tmpdir(), `clq-${job.id}-720.mp4`);
 
+    const duration = this.probeDuration(rawPath);
+
     // 1) постер (кадр ~1с → WebP 512) — быстро, чтобы ролик сразу появился в ленте
     await this.run(['ffmpeg', '-y', '-ss', '1', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 180000);
+    await this.setProgress(job.id, 5, true);
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
-    // 2) 720p-превью (AV1 libaom, быстрее полного)
-    await this.run([
+    // 2) 720p-превью (AV1 libaom, быстрее полного): 5 → 60%
+    await this.runProgress(job.id, duration, 5, 55, [
       'ffmpeg', '-y', '-i', rawPath,
       '-map', '0:v:0', '-vf', 'scale=-2:720',
       '-c:v', 'libaom-av1', '-crf', '36', '-cpu-used', '8', '-row-mt', '1', '-pix_fmt', 'yuv420p',
@@ -208,12 +221,13 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       '-movflags', '+faststart',
       previewPath,
     ], 6 * 60 * 60 * 1000);
+    await this.setProgress(job.id, 60, true);
     await this.s3.putFile(MediaService.video720Key(sha), previewPath, 'video/mp4');
     // «готово для просмотра» — постер+720 уже есть; полный мастер дожимается в фоне
     await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'video/mp4', masterReadyAt: new Date() } });
 
-    // 3) мастер: AV1 полный (в конце), метаданные копируются
-    await this.run([
+    // 3) мастер: AV1 полный (в конце), метаданные копируются: 60 → 99%
+    await this.runProgress(job.id, duration, 60, 39, [
       'ffmpeg', '-y', '-i', rawPath,
       '-map_metadata', '0',
       '-map', '0:v:0',
@@ -224,6 +238,74 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     ], 6 * 60 * 60 * 1000);
 
     await this.s3.putFile(MediaService.videoMasterKey(sha), masterPath, 'video/mp4');
+    await this.setProgress(job.id, 100, true);
+  }
+
+  private probeDuration(file: string): number {
+    try {
+      const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file], { encoding: 'utf8', timeout: 30000 }).trim();
+      const d = Number(out);
+      return Number.isFinite(d) && d > 0 ? d : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** ffmpeg с прогрессом: out_time делится на длительность, пишется в Job.progress. */
+  private runProgress(
+    jobId: string,
+    durationSec: number,
+    base: number,
+    span: number,
+    args: string[],
+    timeoutMs: number,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const script = `ulimit -v ${WORKER_MEM_KB} 2>/dev/null; exec -- "$@"`;
+      const child = spawn('bash', ['-c', script, 'clq-worker', ...args, '-progress', 'pipe:1', '-nostats'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      this.activeChild = child;
+      let errTail = '';
+      let lastPct = -1;
+      let outUs = 0;
+      let acc = '';
+      const onData = (d: Buffer) => {
+        acc += d.toString();
+        let nl: number;
+        while ((nl = acc.indexOf('\n')) >= 0) {
+          const line = acc.slice(0, nl);
+          acc = acc.slice(nl + 1);
+          if (line.startsWith('out_time_us=')) outUs = parseInt(line.slice(12), 10) || 0;
+        }
+        if (durationSec > 0) {
+          const t = outUs / 1e6;
+          const pct = base + span * Math.min(1, t / durationSec);
+          if (Math.floor(pct) !== lastPct) {
+            lastPct = Math.floor(pct);
+            void this.setProgress(jobId, pct);
+          }
+        }
+      };
+      (child.stdout as NodeJS.ReadableStream).on('data', onData);
+      (child.stderr as NodeJS.ReadableStream).on('data', (c: Buffer) => {
+        errTail = (errTail + c.toString()).slice(-2000);
+      });
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error('timeout'));
+      }, timeoutMs);
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve();
+        else {
+          const last = errTail.split('\n').filter(Boolean).slice(-6).join(' | ');
+          reject(new Error(`exit ${code}; ${last}`));
+        }
+      });
+    });
   }
 
   /** Запуск бинаря под ограничением виртуальной памяти (ulimit -v). */

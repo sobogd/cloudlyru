@@ -201,6 +201,7 @@ model Job {
   state     String    @default("pending") // pending|processing|done|failed
   error     String?
   attempts  Int       @default(0)
+  progress  Int       @default(0)
   createdAt DateTime  @default(now())
   startedAt DateTime?
   finishedAt DateTime?

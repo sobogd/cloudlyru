@@ -32,6 +32,7 @@ export class QueueController {
             kind: processing.kind,
             sha256: processing.asset.sha256.slice(0, 10),
             startedMinAgo: Math.max(0, Math.round((Date.now() - (processing.startedAt?.getTime() ?? Date.now())) / 60000)),
+            progress: processing.progress,
           }
         : null,
       recent: recent.map((j) => ({
@@ -41,6 +42,7 @@ export class QueueController {
         error: j.state === 'failed' ? (j.error || '').slice(0, 220) : null,
         updatedAt: j.updatedAt,
         sha256: j.asset.sha256.slice(0, 10),
+        progress: j.progress,
         masterReady: Boolean(j.asset.masterReadyAt),
       })),
     };

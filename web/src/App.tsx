@@ -431,7 +431,12 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
             <span className="meta">✗ {q.byState.failed ?? 0} ошибок</span>
           </div>
         )}
-        {q?.processing && <div className="copy">Сейчас: {q.processing.kind} · {q.processing.sha256} · идёт {q.processing.startedMinAgo} мин</div>}
+        {q?.processing && (
+          <div>
+            <div className="copy">Сейчас: {q.processing.kind} · {q.processing.sha256} · идёт {q.processing.startedMinAgo} мин · {q.processing.progress}%</div>
+            <progress value={q.processing.progress} max={100} />
+          </div>
+        )}
         {q?.recent && q.recent.length > 0 && (
           <div>
             {q.recent.slice(0, 8).map((j) => (

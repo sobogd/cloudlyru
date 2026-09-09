@@ -102,8 +102,8 @@ export const originalUrl = (sha: string) => `/api/v1/originals/${sha}`;
 export const video720Url = (sha: string) => `/api/v1/video-preview/${sha}`;
 export interface QueueStatus {
   byState: Record<string, number>;
-  processing: { id: string; kind: string; sha256: string; startedMinAgo: number } | null;
-  recent: Array<{ id: string; kind: string; state: string; error: string | null; updatedAt: string; sha256: string; masterReady: boolean }>;
+  processing: { id: string; kind: string; sha256: string; startedMinAgo: number; progress: number } | null;
+  recent: Array<{ id: string; kind: string; state: string; error: string | null; updatedAt: string; sha256: string; progress: number; masterReady: boolean }>;
 }
 export const queueStatus = () => request<QueueStatus>('/queue/status');
 export const timeline = () => request<TimelineItem[]>('/timeline');
