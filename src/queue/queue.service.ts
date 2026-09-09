@@ -52,6 +52,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   async enqueue(assetId: string, sha256: string, mime: string): Promise<void> {
     const kind = IMAGE_MIMES.includes(mime) ? 'photo' : VIDEO_MIMES.includes(mime) ? 'video' : null;
     if (!kind) return;
+    if (kind === 'video') {
+      // без MediaMeta видео не попадает в таймлайн — создаём сразу (дата = загрузка)
+      await this.prisma.mediaMeta
+        .upsert({ where: { assetId }, create: { assetId, capturedAt: new Date() }, update: {} })
+        .catch(() => undefined);
+    }
     const exists = await this.prisma.job.findFirst({
       where: { assetId, state: { in: ['pending', 'processing'] } },
       select: { id: true },
@@ -197,8 +203,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   /** Запуск бинаря под ограничением виртуальной памяти (ulimit -v). */
   private run(args: string[], timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const script = `ulimit -v ${WORKER_MEM_KB} 2>/dev/null; exec "$@"`;
-      const child = spawn('bash', ['-c', script, 'clq-worker', ...args], { stdio: 'ignore' });
+      const script = `ulimit -v ${WORKER_MEM_KB} 2>/dev/null; exec -- "$@"`;
+      const child = spawn('bash', ['-c', script, 'clq-worker', ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let errTail = '';
+      (child.stderr || ({} as NodeJS.ReadableStream)).on('data', (chunk: Buffer) => {
+        errTail = (errTail + chunk.toString()).slice(-2000);
+      });
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
         reject(new Error('timeout'));
@@ -210,7 +220,10 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       child.on('exit', (code) => {
         clearTimeout(timer);
         if (code === 0) resolve();
-        else reject(new Error(`exit ${code} (возможно OOM/лимит памяти)`));
+        else {
+          const last = errTail.split('\n').filter(Boolean).slice(-6).join(' | ');
+          reject(new Error(`exit ${code}; ${last}`));
+        }
       });
     });
   }
