@@ -520,7 +520,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
           >📦</button>
         )}
         {meta && (
-          <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} target="_blank" rel="noreferrer">⬇️</a>
+          <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} download>⬇️</a>
         )}
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
@@ -689,7 +689,7 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
           <button className="iconbtn" title="Назад в галерею" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
           <span style={{ flex: 1 }} />
           <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(it.entryId)}>ℹ️</button>
-          <a className="iconbtn" title="Открыть оригинал" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">🖼️</a>
+          {/* Скачивание живёт только в деталке (ℹ️) — из превью его убрали */}
           <button
             className="iconbtn"
             title="Удалить (в корзину)"
@@ -1057,7 +1057,7 @@ function Albums() {
             {open.items.map((it) => (
               <div key={it.entryId} style={{ width: '31.5%' }}>
                 {/^image\//.test(it.mime) ? (
-                  <img src={api.fileUrl(it.entryId)} alt={it.name} loading="lazy" style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
+                  <img src={api.fileInlineUrl(it.entryId)} alt={it.name} loading="lazy" style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
                 ) : (
                   <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center' }}>📄</div>
                 )}

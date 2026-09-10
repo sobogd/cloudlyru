@@ -403,8 +403,10 @@ async function uploadArchiveAttempt(url, folderId, forceFresh) {
 // ---------------- верификация архива после загрузки ----------------
 // Проверяем, что файл в S3 реально целый и полный, НЕ скачивая его:
 //   1) размер в CloudlyRu == размеру из Google;
-//   2) в хвосте объекта (Range-запрос к presigned URL) есть корректная
+//   2) в хвосте объекта (Range-запрос к /files/:id/content) есть корректная
 //      запись End of Central Directory ровно в конце файла → архив не обрезан.
+// Раньше ручка отвечала 302 на presigned-ссылку S3; теперь байты идут через сервис,
+// Range пробрасывается в S3 как есть.
 async function verifyEntry(entryId, expectedSize, name) {
   try {
     const meta = await api(`/files/${entryId}`);
@@ -412,16 +414,14 @@ async function verifyEntry(entryId, expectedSize, name) {
       throw new Error(`размер не совпал: в сервисе ${meta.size}, у Google ${expectedSize}`);
     }
     const size = Number(meta.size);
-    const redirect = await fetch(`${API}/files/${entryId}/content`, {
-      headers: sessionCookie ? { Cookie: sessionCookie } : {},
-      redirect: 'manual',
-    });
-    const loc = redirect.headers.get('location');
-    if (!loc) throw new Error('не удалось получить presigned URL');
-
     const tailLen = Math.min(size, 65536);
-    const r = await fetch(loc, { headers: { Range: `bytes=${size - tailLen}-` } });
-    if (!r.ok) throw new Error(`Range-запрос к S3: HTTP ${r.status}`);
+    const r = await fetch(`${API}/files/${entryId}/content`, {
+      headers: {
+        ...(sessionCookie ? { Cookie: sessionCookie } : {}),
+        Range: `bytes=${size - tailLen}-`,
+      },
+    });
+    if (r.status !== 206) throw new Error(`Range-запрос к /files/:id/content: HTTP ${r.status} (ожидался 206)`);
     const tail = Buffer.from(await r.arrayBuffer());
 
     let pos = -1;

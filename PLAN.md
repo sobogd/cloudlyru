@@ -302,7 +302,10 @@ tmp/                          # мусор от прерванных загру�
 | POST | `/folders` | создать папку `{parentId?, name}` |
 | POST | `/folders/:id` | переименовать/перенести (soft) |
 | DELETE | `/folders/:id` | в корзину (soft) |
-| GET  | `/files/:id/content` | 302 → presigned S3 URL (download) |
+| GET  | `/files/:id/content` | скачивание: байты идут через сервис, `Content-Disposition: attachment` + имя файла |
+| GET  | `/files/:id/inline` | показ картинки в интерфейсе (белый список image/*), остальное — скачиванием |
+| GET  | `/previews/:sha`, `/video-preview/:sha` | превью фото/видео: только свои ассеты, нужна сессия (были публичными) |
+| GET  | `/originals/:sha` | оригинал на скачивание: только свой ассет, нужна сессия |
 | GET  | `/files/:id` | метаданные (включая sha256 для сверки) |
 | DELETE | `/files/:id` | в корзину (soft) |
 | POST | `/trash/restore`, `/trash/purge` | корзина |

@@ -1,11 +1,29 @@
 import { Injectable } from '@nestjs/common';
+import type { Request, Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { MediaService } from '../media/media.service';
-import { ROOT_FOLDER_NAME } from '../auth/auth.service';
+import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
+import { sendObjectOr404 } from '../common/http-object';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { conflict, notFound } from '../common/errors';
+
+/**
+ * Типы, которые безопасно показывать прямо в интерфейсе. SVG/HTML сюда не попадают
+ * намеренно: они исполняют скрипты, а отдаём мы их с нашего же домена.
+ */
+const INLINE_IMAGE_MIMES: Record<string, string> = {
+  'image/jpeg': 'image/jpeg',
+  'image/png': 'image/png',
+  'image/gif': 'image/gif',
+  'image/webp': 'image/webp',
+  'image/avif': 'image/avif',
+  'image/bmp': 'image/bmp',
+  'image/tiff': 'image/tiff',
+  'image/heic': 'image/heic',
+  'image/heif': 'image/heif',
+};
 
 @Injectable()
 export class FilesService {
@@ -13,6 +31,7 @@ export class FilesService {
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
     private readonly media: MediaService,
+    private readonly auth: AuthService,
   ) {}
 
   /** Папка-приёмник: существует и не в корзине. */
@@ -129,25 +148,21 @@ export class FilesService {
   }
 
   /**
-   * Presigned-URL для скачивания. Отдаём ВСЕГДА оригинал: он и есть мастер, отдельной
-   * оптимизированной версии в пайплайне нет. Фолбэк — производные, если у легаси-ассета
-   * оригинал был удалён прежним кодом сразу после конвертации.
+   * Самый полный доступный объект ассета: оригинал (он и есть мастер), а если его нет —
+   * лучшая из производных. У части легаси-ассетов оригинал удалялся прежним кодом сразу
+   * после конвертации. Возвращаем также признак «это оригинал»: для него S3 отдаёт
+   * content-disposition: attachment (скачивание), для производных — inline (превью).
    */
-  async presignedUrl(entryId: string): Promise<string> {
-    const entry = await this.prisma.fileEntry.findUnique({
-      where: { id: entryId },
-      include: { asset: true },
-    });
-    if (!entry || entry.deletedAt) throw notFound('file not found');
-    const { asset } = entry;
+  private async resolveContentKey(asset: {
+    sha256: string;
+    mime: string;
+  }): Promise<{ key: string; mime: string; original: boolean }> {
     const sha = asset.sha256;
     const rawKey = S3Service.assetKey(sha);
-
     if (await this.s3.headObject(rawKey).catch(() => false)) {
-      return this.s3.presignedGet(rawKey, asset.mime);
+      return { key: rawKey, mime: asset.mime, original: true };
     }
 
-    // оригинала нет (легаси) — берём самое полное из доступных производных
     const isVideo = String(asset.mime).startsWith('video/');
     const fallback = isVideo
       ? [
@@ -165,11 +180,70 @@ export class FilesService {
     for (const key of fallback) {
       if (await this.s3.headObject(key).catch(() => false)) {
         const mime = key.endsWith('.avif') ? 'image/avif' : key.endsWith('.mp4') ? 'video/mp4' : 'image/webp';
-        return this.s3.presignedInline(key, mime);
+        return { key, mime, original: false };
       }
     }
-    // ничего нет — отдаём presigned на оригинал, чтобы S3 вернул свою ошибку
-    return this.s3.presignedGet(rawKey, asset.mime);
+    // ничего нет — вернём ключ оригинала, чтобы вызывающий получил ошибку S3
+    return { key: rawKey, mime: asset.mime, original: true };
+  }
+
+  /**
+   * Presigned-URL для скачивания. Нужен там, где клиент качает мимо сервиса
+   * (публичные шаринг-ссылки, WebDAV). Для своих файлов используйте download().
+   */
+  async presignedUrl(entryId: string): Promise<string> {
+    const entry = await this.prisma.fileEntry.findUnique({
+      where: { id: entryId },
+      include: { asset: true },
+    });
+    if (!entry || entry.deletedAt) throw notFound('file not found');
+    const { key, mime, original } = await this.resolveContentKey(entry.asset);
+    return original ? this.s3.presignedGet(key, mime) : this.s3.presignedInline(key, mime);
+  }
+
+  /** Свой живой файл: вход по id с проверкой, что он в дереве этого пользователя. */
+  private async requireOwnEntry(entryId: string, userId: string) {
+    const entry = await this.prisma.fileEntry.findUnique({
+      where: { id: entryId },
+      include: { asset: true },
+    });
+    // 404, а не 403: чужой файл не должен отличаться от несуществующего
+    if (!entry || entry.deletedAt) throw notFound('file not found');
+    if (!(await this.auth.folderOwnedBy(userId, entry.folderId))) throw notFound('file not found');
+    return entry;
+  }
+
+  /**
+   * Скачивание файла: байты идут через сервис (не отдаём наружу presigned-ссылку на S3,
+   * она живёт без авторизации), тип — octet-stream, имя — из дерева, disposition: attachment.
+   * Так браузер сохраняет файл, а не открывает новую вкладку и не рендерит содержимое.
+   */
+  async download(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
+    const entry = await this.requireOwnEntry(entryId, userId);
+    const { key } = await this.resolveContentKey(entry.asset);
+    await sendObjectOr404(req, res, this.s3, key, {
+      mime: 'application/octet-stream',
+      disposition: 'attachment',
+      filename: entry.name,
+    });
+  }
+
+  /**
+   * Показ файла в интерфейсе (миниатюры альбомов): только «безопасные» картинки и только
+   * с типом из белого списка. Всё остальное (SVG, HTML, PDF, видео) уходит на скачивание.
+   */
+  async inlineImage(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
+    const entry = await this.requireOwnEntry(entryId, userId);
+    const mime = INLINE_IMAGE_MIMES[String(entry.asset.mime).toLowerCase()];
+    if (!mime) return this.download(entryId, userId, req, res);
+    const { key } = await this.resolveContentKey(entry.asset);
+    await sendObjectOr404(req, res, this.s3, key, {
+      mime,
+      disposition: 'inline',
+      filename: entry.name,
+      // содержимое неизменяемо (ключ = sha256), но приватно: кэширует только браузер
+      cache: 'private, max-age=600',
+    });
   }
 
   async softDelete(entryId: string) {
