@@ -49,7 +49,10 @@ export const renameFolder = (id: string, name: string) =>
   request<unknown>(`/folders/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
 export const deleteFolder = (id: string) => request<{ ok: boolean }>(`/folders/${id}`, { method: 'DELETE' });
 export const deleteFile = (id: string) => request<{ ok: boolean }>(`/files/${id}`, { method: 'DELETE' });
+/** Скачивание оригинала: сервис отдаёт его с Content-Disposition: attachment. */
 export const fileUrl = (id: string) => `${BASE}/files/${id}/content`;
+/** Показ файла на странице (миниатюры альбомов): сервис отдаёт только безопасные картинки. */
+export const fileInlineUrl = (id: string) => `${BASE}/files/${id}/inline`;
 
 // ===== метаданные для деталок =====
 export interface FileMedia {
@@ -177,7 +180,6 @@ export interface AlbumInfo { id: string; name: string; createdAt: string; count:
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
 export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
-export const originalUrl = (sha: string) => `/api/v1/originals/${sha}`;
 export const videoPreviewUrl = (sha: string) => `/api/v1/video-preview/${sha}`;
 export interface QueueStatus {
   byState: Record<string, number>;

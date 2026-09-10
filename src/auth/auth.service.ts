@@ -97,6 +97,55 @@ export class AuthService implements OnModuleInit {
     return user?.photoFolderId ?? null;
   }
 
+  // ===== Принадлежность файлов пользователю =====
+  // В схеме у папки нет userId: дерево пользователя — это поддерево его корневой папки
+  // (users.rootFolderId). Поэтому «свой файл» = живой FileEntry, чья папка поднимается
+  // по parentId до корня этого пользователя.
+
+  /** Корень пользователя, если он уже есть (без создания нового). */
+  private async rootIdOrNull(userId: string): Promise<string | null> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { rootFolderId: true },
+    });
+    if (!user?.rootFolderId) return null;
+    const root = await this.prisma.folder.findUnique({
+      where: { id: user.rootFolderId },
+      select: { id: true, deletedAt: true },
+    });
+    return root && !root.deletedAt ? root.id : null;
+  }
+
+  /** Папка лежит в дереве пользователя и не в корзине (сама и все её родители)? */
+  async folderOwnedBy(userId: string, folderId: string): Promise<boolean> {
+    const rootId = await this.rootIdOrNull(userId);
+    if (!rootId) return false;
+    let cur: string | null = folderId;
+    for (let depth = 0; cur && depth < 128; depth++) {
+      if (cur === rootId) return true;
+      const folder: { parentId: string | null; deletedAt: Date | null } | null =
+        await this.prisma.folder.findUnique({
+          where: { id: cur },
+          select: { parentId: true, deletedAt: true },
+        });
+      if (!folder || folder.deletedAt) return false;
+      cur = folder.parentId;
+    }
+    return false;
+  }
+
+  /** Есть ли у пользователя живой файл с этим содержимым (ассеты дедуплицируются между всеми). */
+  async ownsAsset(userId: string, assetId: string): Promise<boolean> {
+    const entries = await this.prisma.fileEntry.findMany({
+      where: { assetId, deletedAt: null },
+      select: { folderId: true },
+    });
+    for (const entry of entries) {
+      if (await this.folderOwnedBy(userId, entry.folderId)) return true;
+    }
+    return false;
+  }
+
   /**
    * Системная папка «Фото» (медиа-зона). Создаётся лениво как ребёнок корня;
    * существующую папку с таким именем «усыновляем» (делаем её медиа-корнем).

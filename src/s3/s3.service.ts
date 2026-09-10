@@ -25,6 +25,16 @@ export interface S3Part {
   ETag: string;
 }
 
+/** Открытый объект S3: тело потоком + параметры ответа (для отдачи клиенту через API). */
+export interface S3ObjectStream {
+  body: NodeJS.ReadableStream;
+  contentLength?: number;
+  contentRange?: string;
+  contentType?: string;
+  etag?: string;
+  lastModified?: Date;
+}
+
 /**
  * Обёртка над Hetzner Object Storage (S3-совместимый).
  * Ключи объектов: files/<sha256> (content-addressed, дедуп), db/* — дампы БД.
@@ -342,5 +352,28 @@ export class S3Service implements OnModuleDestroy {
       ResponseContentDisposition: 'attachment',
     });
     return getSignedUrl(this.s3(), cmd, { expiresIn: 15 * 60 });
+  }
+
+  /**
+   * Открыть объект потоком — для отдачи клиенту через сам сервис (без presigned-ссылок
+   * наружу: ссылка на S3 живёт без авторизации и утекает в историю браузера/логи).
+   * Range пробрасывается в S3 как есть: без него не работает перемотка в <video>.
+   */
+  async getObjectStream(key: string, range?: string): Promise<S3ObjectStream> {
+    const cmd = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      ...(range ? { Range: range } : {}),
+    });
+    const out = await this.s3().send(cmd);
+    if (!out.Body) throw new Error('S3: empty body');
+    return {
+      body: out.Body as NodeJS.ReadableStream,
+      contentLength: out.ContentLength,
+      contentRange: out.ContentRange,
+      contentType: out.ContentType,
+      etag: out.ETag,
+      lastModified: out.LastModified,
+    };
   }
 }
