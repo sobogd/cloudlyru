@@ -496,6 +496,8 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             // текст ошибки, а на сам факт: причин у недоступности S3 слишком много, чтобы их угадывать.
             if (relayMode()) throw e
             Log.w(TAG, "прямая загрузка не удалась (${e.message}) — пробую через сервер")
+            // Начатую сессию закрываем сами: иначе она висит на сервере и съедает лимит загрузок
+            sessionId?.let { runCatching { api.abort(it) } }
             db.putKv(KV_RELAY_MODE, System.currentTimeMillis().toString())
             db.putKv("job_note:${job.id}", "хранилище недоступно напрямую — выгрузка идёт через сервер")
             Uploader(api).upload(

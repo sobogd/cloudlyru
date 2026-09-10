@@ -169,13 +169,39 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
   private async assertSessionQuota(userId: string): Promise<void> {
     let active = await this.prisma.uploadSession.count({ where: { userId } });
     if (active < MAX_UPLOAD_SESSIONS_PER_USER) return;
+    // Сначала убираем заведомо брошенные: сессия без единой части, о которой забыли
+    // (клиент начал загрузку и не смог отправить байты — например, хранилище недоступно),
+    // не должна навсегда занимать место и блокировать новые загрузки.
+    await this.sweepAbandoned(userId);
     await this.sweepStale(userId);
     active = await this.prisma.uploadSession.count({ where: { userId } });
-    if (active >= MAX_UPLOAD_SESSIONS_PER_USER) {
-      throw tooMany(
-        `слишком много незавершённых загрузок (${active}) — завершите или отмените их (лимит ${MAX_UPLOAD_SESSIONS_PER_USER})`,
-      );
+    if (active < MAX_UPLOAD_SESSIONS_PER_USER) return;
+    // Место всё равно занято — освобождаем принудительно, начиная с самой старой сессии:
+    // блокировать клиента насмерть хуже, чем отменить чужую брошенную загрузку (части в S3
+    // всё равно не собраны и объектом не стали).
+    const oldest = await this.prisma.uploadSession.findFirst({
+      where: { userId },
+      orderBy: { updatedAt: 'asc' },
+    });
+    if (oldest) {
+      this.logger.warn(`лимит сессий загрузки: отменяю самую старую (${oldest.name}) ради новой`);
+      await this.cleanup(oldest as SessionRow);
     }
+  }
+
+  /** Сессии без принятых частей, о которых забыли: считаем брошенными через 15 минут. */
+  private async sweepAbandoned(userId: string): Promise<void> {
+    const cutoff = new Date(Date.now() - 15 * 60 * 1000);
+    const abandoned = await this.prisma.uploadSession
+      .findMany({ where: { userId, partCount: 0, updatedAt: { lt: cutoff } } })
+      .catch(() => []);
+    for (const row of abandoned) {
+      await this.s3.abortMultipartUpload(row.uploadKey, row.s3UploadId).catch(() => undefined);
+      await this.s3.deleteObject(row.uploadKey).catch(() => undefined);
+      await this.prisma.uploadSession.delete({ where: { id: row.id } }).catch(() => undefined);
+      this.live.delete(row.id);
+    }
+    if (abandoned.length) this.logger.log(`Отменено брошенных сессий загрузки: ${abandoned.length}`);
   }
 
   /** Папка-приёмник: только своя (чужой folderId — это запись в чужое дерево). */
