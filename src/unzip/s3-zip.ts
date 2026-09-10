@@ -1,0 +1,251 @@
+import { createHash } from 'crypto';
+import { createInflateRaw } from 'zlib';
+import { Readable, Transform } from 'stream';
+
+/**
+ * Чтение ZIP-архива, лежащего в S3, без скачивания на диск.
+ *
+ * ZIP-структура читается по HTTP Range-запросам к объекту:
+ *   End of Central Directory (в конце файла) → ZIP64-локатор (если есть) →
+ *   центральный каталог (имена, размеры, смещения) → по каждому файлу
+ *   локальный заголовок + сжатые данные инкрементально.
+ *
+ * Так распаковывается 53-гигабайтный архив на VPS с 5 ГБ свободного диска.
+ */
+
+/** Минимальный интерфейс источника: размер и чтение диапазона байт. */
+export interface RangeSource {
+  size(): number;
+  readRange(start: number, endInclusive: number): Promise<Buffer>;
+}
+
+export interface ZipEntryInfo {
+  name: string;
+  /** 0 = stored, 8 = deflate */
+  method: number;
+  crc32: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  localHeaderOffset: number;
+  isDirectory: boolean;
+}
+
+const SIG_EOCD = 0x06054b50;
+const SIG_EOCD64 = 0x06064b50;
+const SIG_EOCD64_LOCATOR = 0x07064b50;
+const SIG_CENTRAL = 0x02014b50;
+const SIG_LOCAL = 0x04034b50;
+
+const READ_CHUNK = 4 * 1024 * 1024;
+
+// ---- CRC32 (для самопроверки распакованных данных) ----
+let crcTable: Uint32Array | null = null;
+function crcTableOf(): Uint32Array {
+  if (crcTable) return crcTable;
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[i] = c >>> 0;
+  }
+  crcTable = t;
+  return t;
+}
+
+export function crc32(buf: Buffer, seed = 0): number {
+  const t = crcTableOf();
+  let c = (seed ^ 0xffffffff) >>> 0;
+  for (let i = 0; i < buf.length; i++) c = t[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+export class RemoteZip {
+  private readonly blockSize = 8 * 1024 * 1024;
+  private cache: { start: number; data: Buffer } | null = null;
+
+  constructor(private readonly src: RangeSource) {}
+
+  /** Последовательное чтение с буфером на blockSize: одна S3-операция на блок. */
+  private async readAt(pos: number, len: number): Promise<Buffer> {
+    if (this.cache && pos >= this.cache.start && pos + len <= this.cache.start + this.cache.data.length) {
+      const rel = pos - this.cache.start;
+      return this.cache.data.subarray(rel, rel + len);
+    }
+    const size = this.src.size();
+    if (pos + len > size) throw new Error(`чтение за границей файла: ${pos}+${len} > ${size}`);
+    const end = Math.min(size - 1, pos + Math.max(len, this.blockSize) - 1);
+    const data = await this.src.readRange(pos, end);
+    this.cache = { start: pos, data };
+    return data.subarray(0, len);
+  }
+
+  /** Список файлов архива (из центрального каталога). */
+  async entries(): Promise<ZipEntryInfo[]> {
+    const size = this.src.size();
+    const tailLen = Math.min(size, 66_000);
+    const tail = await this.src.readRange(size - tailLen, size - 1);
+
+    let eocd = -1;
+    for (let i = tail.length - 22; i >= 0; i--) {
+      if (tail.readUInt32LE(i) === SIG_EOCD) {
+        const commentLen = tail.readUInt16LE(i + 20);
+        if (i + 22 + commentLen === tail.length) { eocd = i; break; }
+      }
+    }
+    if (eocd < 0) throw new Error('EOCD не найден — это не ZIP или файл обрезан');
+
+    let totalEntries = tail.readUInt16LE(eocd + 10);
+    let cdSize = tail.readUInt32LE(eocd + 12);
+    let cdOffset = tail.readUInt32LE(eocd + 16);
+
+    // ZIP64: заглушки → настоящие значения в ZIP64 EOCD
+    if (totalEntries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+      let locator = -1;
+      for (let i = eocd - 20; i >= 0; i--) {
+        if (tail.readUInt32LE(i) === SIG_EOCD64_LOCATOR) { locator = i; break; }
+      }
+      if (locator < 0) throw new Error('ZIP64 locator не найден');
+      const z64Offset = Number(tail.readBigUInt64LE(locator + 8));
+      const z64 = await this.src.readRange(z64Offset, z64Offset + 55);
+      if (z64.readUInt32LE(0) !== SIG_EOCD64) throw new Error('ZIP64 EOCD повреждён');
+      totalEntries = Number(z64.readBigUInt64LE(32));
+      cdSize = Number(z64.readBigUInt64LE(40));
+      cdOffset = Number(z64.readBigUInt64LE(48));
+    }
+
+    const out: ZipEntryInfo[] = [];
+    let pos = cdOffset;
+    const cdEnd = cdOffset + cdSize;
+    let block: Buffer = Buffer.alloc(0);
+    let blockStart = 0;
+
+    const ensure = async (need: number): Promise<Buffer> => {
+      if (block.length && pos + need <= blockStart + block.length) return block;
+      const end = Math.min(this.src.size() - 1, pos + Math.max(need, this.blockSize) - 1);
+      block = await this.src.readRange(pos, end);
+      blockStart = pos;
+      return block;
+    };
+
+    while (pos < cdEnd && out.length < totalEntries) {
+      await ensure(46);
+      let off = pos - blockStart;
+      if (block.readUInt32LE(off) !== SIG_CENTRAL) throw new Error(`центральный каталог повреждён на ${pos}`);
+
+      const method = block.readUInt16LE(off + 10);
+      const crc = block.readUInt32LE(off + 16);
+      const compressedSize32 = block.readUInt32LE(off + 20);
+      const uncompressedSize32 = block.readUInt32LE(off + 24);
+      const nameLen = block.readUInt16LE(off + 28);
+      const extraLen = block.readUInt16LE(off + 30);
+      const commentLen = block.readUInt16LE(off + 32);
+      const localOffset32 = block.readUInt32LE(off + 42);
+
+      await ensure(46 + nameLen + extraLen + commentLen);
+      off = pos - blockStart;
+      const name = block.subarray(off + 46, off + 46 + nameLen).toString('utf8');
+      const extra = block.subarray(off + 46 + nameLen, off + 46 + nameLen + extraLen);
+
+      let compressedSize = compressedSize32;
+      let uncompressedSize = uncompressedSize32;
+      let localHeaderOffset = localOffset32;
+
+      // ZIP64 extra (0x0001): значения в порядке объявленных заглушек
+      if (compressedSize32 === 0xffffffff || uncompressedSize32 === 0xffffffff || localOffset32 === 0xffffffff) {
+        let e = 0;
+        while (e + 4 <= extra.length) {
+          const id = extra.readUInt16LE(e);
+          const len = extra.readUInt16LE(e + 2);
+          if (id === 0x0001) {
+            let p = e + 4;
+            if (uncompressedSize32 === 0xffffffff) { uncompressedSize = Number(extra.readBigUInt64LE(p)); p += 8; }
+            if (compressedSize32 === 0xffffffff) { compressedSize = Number(extra.readBigUInt64LE(p)); p += 8; }
+            if (localOffset32 === 0xffffffff) { localHeaderOffset = Number(extra.readBigUInt64LE(p)); p += 8; }
+            break;
+          }
+          e += 4 + len;
+        }
+      }
+
+      out.push({
+        name,
+        method,
+        crc32: crc,
+        compressedSize,
+        uncompressedSize,
+        localHeaderOffset,
+        isDirectory: name.endsWith('/'),
+      });
+      pos += 46 + nameLen + extraLen + commentLen;
+    }
+
+    return out;
+  }
+
+  /** Сжатые байты файла как поток (с backpressure). */
+  private async *compressedChunks(entry: ZipEntryInfo): AsyncGenerator<Buffer> {
+    const lh = await this.src.readRange(entry.localHeaderOffset, entry.localHeaderOffset + 29);
+    if (lh.readUInt32LE(0) !== SIG_LOCAL) throw new Error(`локальный заголовок повреждён: ${entry.name}`);
+    const nameLen = lh.readUInt16LE(26);
+    const extraLen = lh.readUInt16LE(28);
+    const dataStart = entry.localHeaderOffset + 30 + nameLen + extraLen;
+
+    let read = 0;
+    while (read < entry.compressedSize) {
+      const len = Math.min(READ_CHUNK, entry.compressedSize - read);
+      const buf = await this.src.readRange(dataStart + read, dataStart + read + len - 1);
+      read += buf.length;
+      yield buf;
+    }
+  }
+
+  /** Распакованное содержимое файла как поток. */
+  readEntryStream(entry: ZipEntryInfo): Readable {
+    const source = Readable.from(this.compressedChunks(entry));
+    if (entry.method === 0) return source;
+    if (entry.method === 8) {
+      const inflater = createInflateRaw();
+      source.on('error', (e) => inflater.destroy(e));
+      source.pipe(inflater);
+      return inflater;
+    }
+    throw new Error(`метод сжатия ${entry.method} не поддерживается (${entry.name})`);
+  }
+
+  /** Полностью распаковать файл в память (для небольших файлов + самопроверки CRC). */
+  async readEntryBuffer(entry: ZipEntryInfo): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const c of this.readEntryStream(entry)) chunks.push(Buffer.from(c));
+    const buf = Buffer.concat(chunks);
+    if (entry.uncompressedSize && buf.length !== entry.uncompressedSize) {
+      throw new Error(`${entry.name}: размер ${buf.length} ≠ ожидаемого ${entry.uncompressedSize}`);
+    }
+    if (entry.crc32 && crc32(buf) !== entry.crc32) throw new Error(`${entry.name}: CRC32 не совпал`);
+    return buf;
+  }
+}
+
+/** sha256 потока (для content-addressed ключа и дедупа). */
+export async function hashStream(stream: AsyncIterable<Buffer>): Promise<{ sha256: string; size: number }> {
+  const hash = createHash('sha256');
+  let size = 0;
+  for await (const b of stream) {
+    hash.update(b);
+    size += b.length;
+  }
+  return { sha256: hash.digest('hex'), size };
+}
+
+/** Трансформ: считает sha256 и размер на лету, пропуская данные дальше. */
+export function hashTee(): { transform: Transform; result: () => { sha256: string; size: number } } {
+  const hash = createHash('sha256');
+  let size = 0;
+  const transform = new Transform({
+    transform(chunk, _enc, cb) {
+      hash.update(chunk);
+      size += chunk.length;
+      cb(null, chunk);
+    },
+  });
+  return { transform, result: () => ({ sha256: hash.digest('hex'), size }) };
+}

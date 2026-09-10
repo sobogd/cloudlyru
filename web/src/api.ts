@@ -185,3 +185,28 @@ export const addAlbumItems = (id: string, entryIds: string[]) =>
 export const deleteAlbum = (id: string) => request<{ ok: boolean }>(`/albums/${id}`, { method: 'DELETE' });
 export const removeAlbumItem = (id: string, entryId: string) =>
   request<{ ok: boolean }>(`/albums/${id}/items/${entryId}`, { method: 'DELETE' });
+
+// ===== разархивирование архивов (фоновая задача в сервисе) =====
+export interface UnzipJob {
+  id: string;
+  entryId: string;
+  state: 'pending' | 'processing' | 'done' | 'failed' | 'cancelled';
+  totalEntries: number;
+  doneEntries: number;
+  totalBytes: number;
+  doneBytes: number;
+  skippedEntries: number;
+  currentName: string | null;
+  error: string | null;
+  targetFolderId: string | null;
+  percent: number;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+export const startUnzip = (entryId: string) =>
+  request<UnzipJob>('/unzip', { method: 'POST', body: JSON.stringify({ entryId }) });
+export const unzipStatus = (id: string) => request<UnzipJob>(`/unzip/${id}`);
+export const latestUnzip = (entryId: string) =>
+  request<UnzipJob | null>(`/unzip?entryId=${encodeURIComponent(entryId)}`);
+export const cancelUnzip = (id: string) => request<UnzipJob>(`/unzip/${id}/cancel`, { method: 'POST' });

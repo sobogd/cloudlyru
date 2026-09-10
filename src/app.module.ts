@@ -14,6 +14,7 @@ import { DavModule } from './dav/dav.module';
 import { MediaModule } from './media/media.module';
 import { QueueModule } from './queue/queue.module';
 import { HealthModule } from './health/health.module';
+import { UnzipModule } from './unzip/unzip.module';
 
 @Module({
   imports: [
@@ -29,6 +30,7 @@ import { HealthModule } from './health/health.module';
     MediaModule,
     QueueModule,
     HealthModule,
+    UnzipModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },

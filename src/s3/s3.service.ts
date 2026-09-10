@@ -39,6 +39,8 @@ export class S3Service implements OnModuleDestroy {
   private static readonly COPY_SINGLE_MAX = 5 * 1024 * 1024 * 1024;
   private static readonly COPY_PART_SIZE = 512 * 1024 * 1024;
   private static readonly COPY_CONCURRENCY = 4;
+  /** Размер части при потоковой загрузке (multipart). */
+  private static readonly STREAM_PART_SIZE = 32 * 1024 * 1024;
 
   constructor() {
     if (env.S3_FILES_ACCESS_KEY && env.S3_FILES_SECRET_KEY) {
@@ -202,6 +204,68 @@ export class S3Service implements OnModuleDestroy {
   async objectSize(key: string): Promise<number> {
     const out = await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
     return Number(out.ContentLength ?? 0);
+  }
+
+  /** Прочитать диапазон байт объекта (Range-запрос). Нужно для чтения ZIP из S3 без скачивания. */
+  async readRange(key: string, start: number, endInclusive: number): Promise<Buffer> {
+    const cmd = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      Range: `bytes=${start}-${endInclusive}`,
+    });
+    const out = await this.s3().send(cmd);
+    if (!out.Body) throw new Error('S3: empty body');
+    const body = out.Body as { transformToByteArray?: () => Promise<Uint8Array> };
+    if (typeof body.transformToByteArray === 'function') {
+      return Buffer.from(await body.transformToByteArray());
+    }
+    const chunks: Buffer[] = [];
+    for await (const c of out.Body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(c));
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * Залить поток в объект multipart-загрузкой (без знания размера заранее и без диска).
+   * Буфер одной части переиспользуется — копирование однократное.
+   */
+  async uploadStream(key: string, stream: NodeJS.ReadableStream, _contentType: string): Promise<number> {
+    const PART = S3Service.STREAM_PART_SIZE;
+    const uploadId = await this.createMultipartUpload(key);
+    const parts: S3Part[] = [];
+    let buf = Buffer.allocUnsafe(PART);
+    let off = 0;
+    let total = 0;
+    let partNumber = 0;
+    const push = async (body: Buffer) => {
+      partNumber += 1;
+      const etag = await this.uploadPart(key, uploadId, partNumber, body);
+      parts.push({ PartNumber: partNumber, ETag: etag });
+    };
+    try {
+      for await (const raw of stream as AsyncIterable<Buffer | string>) {
+        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+        total += chunk.length;
+        let pos = 0;
+        while (pos < chunk.length) {
+          const take = Math.min(PART - off, chunk.length - pos);
+          chunk.copy(buf, off, pos, pos + take);
+          off += take;
+          pos += take;
+          if (off === PART) {
+            await push(buf);
+            buf = Buffer.allocUnsafe(PART);
+            off = 0;
+          }
+        }
+      }
+      if (off > 0) await push(buf.subarray(0, off));
+      if (!parts.length) await push(Buffer.alloc(0));
+      await this.completeMultipartUpload(key, uploadId, parts);
+      return total;
+    } catch (e) {
+      await this.abortMultipartUpload(key, uploadId).catch(() => undefined);
+      throw e;
+    }
   }
 
   /** Однократная PUT-запись объекта (для file-drop и мелких файлов ≤ 5 ГБ). */

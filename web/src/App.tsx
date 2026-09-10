@@ -369,9 +369,34 @@ function MetaRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
 function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }) {
   const [meta, setMeta] = useState<api.FileMeta | null>(null);
   const [err, setErr] = useState('');
+  const [job, setJob] = useState<api.UnzipJob | null>(null);
+  const isZip = !!meta && (meta.mime === 'application/zip' || /\.zip$/i.test(meta.name));
+  const busy = job?.state === 'pending' || job?.state === 'processing';
+
   useEffect(() => {
     api.fileMeta(entryId).then(setMeta).catch((e) => setErr((e as Error).message));
+    // если распаковка уже идёт — подхватываем её прогресс
+    api.latestUnzip(entryId)
+      .then((j) => { if (j && (j.state === 'pending' || j.state === 'processing' || j.state === 'done')) setJob(j); })
+      .catch(() => undefined);
   }, [entryId]);
+
+  // опрос прогресса распаковки
+  useEffect(() => {
+    if (!job || (job.state !== 'pending' && job.state !== 'processing')) return;
+    const t = setInterval(() => {
+      api.unzipStatus(job.id).then(setJob).catch(() => undefined);
+    }, 2000);
+    return () => clearInterval(t);
+  }, [job?.id, job?.state]);
+
+  const startUnzip = async () => {
+    try { setJob(await api.startUnzip(entryId)); } catch (e) { alert((e as Error).message); }
+  };
+  const cancelUnzip = async () => {
+    if (!job) return;
+    try { setJob(await api.cancelUnzip(job.id)); } catch (e) { alert((e as Error).message); }
+  };
 
   const del = async () => {
     if (!confirm(`Удалить «${meta?.name ?? 'файл'}» в корзину?`)) return;
@@ -383,12 +408,46 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
         <strong className="detname">{meta?.name ?? 'Файл'}</strong>
+        {isZip && (
+          <button
+            className="iconbtn"
+            title="Разархивировать рядом с архивом"
+            disabled={busy}
+            onClick={startUnzip}
+          >📦</button>
+        )}
         {meta && (
           <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} target="_blank" rel="noreferrer">⬇️</a>
         )}
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
+      {job && (
+        <div className="panel" style={{ margin: '10px 2px' }}>
+          <div className="row">
+            <span className="icon">📦</span>
+            <strong>Распаковка</strong>
+            <span style={{ flex: 1 }} />
+            <span className="meta">
+              {job.state === 'done' ? 'готово'
+                : job.state === 'failed' ? 'ошибка'
+                : job.state === 'cancelled' ? 'отменено'
+                : `${job.percent}%`}
+            </span>
+            {busy && <button className="btn ghost" onClick={cancelUnzip}>✕</button>}
+          </div>
+          <div className="ubar"><i style={{ width: `${job.percent}%`, background: job.state === 'done' ? '#2fae5f' : undefined }} /></div>
+          <div className="copy">
+            файлов: {job.doneEntries} из {job.totalEntries || '…'} · {fmt(job.doneBytes)} из {fmt(job.totalBytes)}
+            {job.skippedEntries ? ` · уже было: ${job.skippedEntries}` : ''}
+          </div>
+          {busy && job.currentName && <div className="copy" style={{ wordBreak: 'break-all' }}>сейчас: {job.currentName}</div>}
+          {job.error && <div className="err">{job.error}</div>}
+          {job.state === 'done' && (
+            <div className="copy">Папка создана рядом с архивом — вернись в «Файлы», она появится в списке</div>
+          )}
+        </div>
+      )}
       {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
       {meta && (
         <div className="detbody">
@@ -437,6 +496,32 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
+      {job && (
+        <div className="panel" style={{ margin: '10px 2px' }}>
+          <div className="row">
+            <span className="icon">📦</span>
+            <strong>Распаковка</strong>
+            <span style={{ flex: 1 }} />
+            <span className="meta">
+              {job.state === 'done' ? 'готово'
+                : job.state === 'failed' ? 'ошибка'
+                : job.state === 'cancelled' ? 'отменено'
+                : `${job.percent}%`}
+            </span>
+            {busy && <button className="btn ghost" onClick={cancelUnzip}>✕</button>}
+          </div>
+          <div className="ubar"><i style={{ width: `${job.percent}%`, background: job.state === 'done' ? '#2fae5f' : undefined }} /></div>
+          <div className="copy">
+            файлов: {job.doneEntries} из {job.totalEntries || '…'} · {fmt(job.doneBytes)} из {fmt(job.totalBytes)}
+            {job.skippedEntries ? ` · уже было: ${job.skippedEntries}` : ''}
+          </div>
+          {busy && job.currentName && <div className="copy" style={{ wordBreak: 'break-all' }}>сейчас: {job.currentName}</div>}
+          {job.error && <div className="err">{job.error}</div>}
+          {job.state === 'done' && (
+            <div className="copy">Папка создана рядом с архивом — вернись в «Файлы», она появится в списке</div>
+          )}
+        </div>
+      )}
       {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
       {meta && (
         <div className="detbody">

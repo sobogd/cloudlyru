@@ -2,7 +2,7 @@
 // M0: пользователь/сессии, файловое дерево (soft delete), Asset = объект в S3 (дедуп по sha256).
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
   // прод-сервер — ARM64 (Hetzner aarch64, Ubuntu 22.04, OpenSSL 3); раннер GitHub — x64
   binaryTargets = ["native", "linux-arm64-openssl-3.0.x"]
 }
@@ -15,13 +15,13 @@ datasource db {
 // ===== Пользователи, сессии, токены =====
 
 model User {
-  id           String    @id @default(uuid())
-  login        String    @unique
-  passwordHash String
-  createdAt    DateTime  @default(now())
-  sessions     Session[]
-  apiTokens    ApiToken[]
-  rootFolderId String? // корневая папка пользователя (создаётся при seed)
+  id            String     @id @default(uuid())
+  login         String     @unique
+  passwordHash  String
+  createdAt     DateTime   @default(now())
+  sessions      Session[]
+  apiTokens     ApiToken[]
+  rootFolderId  String? // корневая папка пользователя (создаётся при seed)
   photoFolderId String? // системная папка «Фото» (медиа-зона; создаётся при seed/lazy)
 }
 
@@ -37,15 +37,15 @@ model Session {
 }
 
 model ApiToken {
-  id        String    @id @default(uuid())
-  userId    String
-  label     String
-  tokenHash String    @unique
-  scope     String    @default("files:rw") // будущее: files:ro, share:rw ...
+  id         String    @id @default(uuid())
+  userId     String
+  label      String
+  tokenHash  String    @unique
+  scope      String    @default("files:rw") // будущее: files:ro, share:rw ...
   lastUsedAt DateTime?
-  revokedAt DateTime?
-  createdAt DateTime  @default(now())
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
 }
@@ -55,16 +55,16 @@ model ApiToken {
 // Удаление — soft (deletedAt), hard delete только через purge (корзина, retention).
 
 model Folder {
-  id        String     @id @default(uuid())
+  id        String      @id @default(uuid())
   parentId  String? // null = верхний уровень (корень пользователя)
   name      String
   // зона: FILES (обычный диск, медиа хранится как есть) | PHOTOS (поддерево системной папки «Фото», медиа конвертируется)
-  zone      String     @default("FILES")
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
+  zone      String      @default("FILES")
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
   deletedAt DateTime?
-  parent    Folder?    @relation("FolderTree", fields: [parentId], references: [id])
-  children  Folder[]   @relation("FolderTree")
+  parent    Folder?     @relation("FolderTree", fields: [parentId], references: [id])
+  children  Folder[]    @relation("FolderTree")
   entries   FileEntry[]
 
   // Postgres: NULL-ы в unique-индексе не конфликтуют — дубли на верхнем уровне ловим в сервисе
@@ -73,16 +73,16 @@ model Folder {
 }
 
 model FileEntry {
-  id        String   @id @default(uuid())
-  folderId  String
-  assetId   String
-  name      String
+  id         String      @id @default(uuid())
+  folderId   String
+  assetId    String
+  name       String
   // зона папки на момент создания (FILES|PHOTOS) — для фильтра таймлайна и политики конвертации
-  zone      String   @default("FILES")
-  createdAt DateTime @default(now())
-  deletedAt DateTime?
-  folder    Folder   @relation(fields: [folderId], references: [id], onDelete: Cascade)
-  asset     Asset    @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  zone       String      @default("FILES")
+  createdAt  DateTime    @default(now())
+  deletedAt  DateTime?
+  folder     Folder      @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  asset      Asset       @relation(fields: [assetId], references: [id], onDelete: Restrict)
   albumItems AlbumItem[]
 
   @@unique([folderId, name])
@@ -92,17 +92,17 @@ model FileEntry {
 
 // Физический объект в S3 (один на уникальное содержимое)
 model Asset {
-  id        String      @id @default(uuid())
-  sha256    String      @unique
-  size      BigInt
-  mime      String
-  ext       String?
-  createdAt DateTime    @default(now())
+  id            String      @id @default(uuid())
+  sha256        String      @unique
+  size          BigInt
+  mime          String
+  ext           String?
+  createdAt     DateTime    @default(now())
   masterReadyAt DateTime?
-  masterMime  String?
-  entries   FileEntry[]
-  media     MediaMeta?
-  jobs      Job[]
+  masterMime    String?
+  entries       FileEntry[]
+  media         MediaMeta?
+  jobs          Job[]
 }
 
 // Активная чанкованная загрузка (сессия в памяти сервиса; parts-этаги в RAM)
@@ -139,15 +139,15 @@ enum ShareCapability {
 }
 
 model Share {
-  id            String          @id @default(uuid())
-  kind          ShareKind
-  targetId      String
-  token         String          @unique // 128 бит случайности
-  passwordHash  String?
-  capability    ShareCapability @default(VIEW)
-  expiresAt     DateTime?
-  createdAt     DateTime        @default(now())
-  revokedAt     DateTime?
+  id           String          @id @default(uuid())
+  kind         ShareKind
+  targetId     String
+  token        String          @unique // 128 бит случайности
+  passwordHash String?
+  capability   ShareCapability @default(VIEW)
+  expiresAt    DateTime?
+  createdAt    DateTime        @default(now())
+  revokedAt    DateTime?
 }
 
 // ===== Аудит =====
@@ -165,17 +165,17 @@ model AuditLog {
 // ===== M2: медиа-метаданные (EXIF), альбомы =====
 
 model MediaMeta {
-  id          String   @id @default(uuid())
-  assetId     String   @unique
-  capturedAt  DateTime?
-  latitude    Float?
-  longitude   Float?
-  make        String?
-  model       String?
-  width       Int?
-  height      Int?
-  createdAt   DateTime @default(now())
-  asset       Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  id         String    @id @default(uuid())
+  assetId    String    @unique
+  capturedAt DateTime?
+  latitude   Float?
+  longitude  Float?
+  make       String?
+  model      String?
+  width      Int?
+  height     Int?
+  createdAt  DateTime  @default(now())
+  asset      Asset     @relation(fields: [assetId], references: [id], onDelete: Cascade)
 }
 
 model Album {
@@ -187,33 +187,59 @@ model Album {
 }
 
 model AlbumItem {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   albumId   String
   entryId   String
-  createdAt DateTime @default(now())
-  album     Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+  album     Album     @relation(fields: [albumId], references: [id], onDelete: Cascade)
   entry     FileEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
 
   @@unique([albumId, entryId])
 }
 
-
 // ===== M2.5: очередь конвертации (оригинал -> AVIF/AV1 + производные) =====
 
 model Job {
-  id        String    @id @default(uuid())
-  assetId   String
-  kind      String // 'photo' | 'video'
-  state     String    @default("pending") // pending|processing|done|failed
-  error     String?
-  attempts  Int       @default(0)
-  progress  Int       @default(0)
-  createdAt DateTime  @default(now())
-  startedAt DateTime?
+  id         String    @id @default(uuid())
+  assetId    String
+  kind       String // 'photo' | 'video'
+  state      String    @default("pending") // pending|processing|done|failed
+  error      String?
+  attempts   Int       @default(0)
+  progress   Int       @default(0)
+  createdAt  DateTime  @default(now())
+  startedAt  DateTime?
   finishedAt DateTime?
-  updatedAt DateTime  @updatedAt
-  asset     Asset     @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  updatedAt  DateTime  @updatedAt
+  asset      Asset     @relation(fields: [assetId], references: [id], onDelete: Cascade)
 
   @@index([state, createdAt])
   @@index([assetId])
+}
+
+// ===== Разархивирование архивов внутри хранилища (без диска) =====
+// ZIP читается из S3 по Range-запросам, файлы кладутся обратно в S3
+// (content-addressed, с дедупом), в дерево добавляется папка с именем архива.
+
+model UnzipJob {
+  id             String    @id @default(uuid())
+  entryId        String // FileEntry архива (.zip)
+  assetId        String
+  folderId       String // папка архива (родитель будущей папки с содержимым)
+  targetFolderId String? // созданная папка-приёмник
+  state          String    @default("pending") // pending|processing|done|failed|cancelled
+  totalEntries   Int       @default(0)
+  doneEntries    Int       @default(0)
+  totalBytes     BigInt    @default(0)
+  doneBytes      BigInt    @default(0)
+  skippedEntries Int       @default(0) // уже существовали (идемпотентный перезапуск)
+  currentName    String?
+  error          String?
+  createdAt      DateTime  @default(now())
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  updatedAt      DateTime  @updatedAt
+
+  @@index([state, createdAt])
+  @@index([entryId])
 }
