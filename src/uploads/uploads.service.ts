@@ -171,17 +171,35 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Записать/перезаписать часть в сессии (идемпотентно по номеру части). */
+  /**
+   * Записать/перезаписать часть в сессии (идемпотентно по номеру части).
+   *
+   * Части приходят параллельно (клиент льёт три части в S3 сразу), а parts — одна
+   * JSON-колонка. Без блокировки строки два одновременных запроса читают один и тот же
+   * parts, и запись второго затирает часть первого: в дерево уходит «missing part N —
+   * загрузка неполная» при формально успешной загрузке (на проде так терялась часть 5
+   * у видео из 13 частей). Поэтому читаем-и-пишем под SELECT ... FOR UPDATE.
+   */
   private async savePart(row: SessionRow, part: StoredPart): Promise<StoredPart[]> {
-    const parts = storedParts(row.parts).filter((p) => p.partNumber !== part.partNumber);
-    parts.push(part);
-    parts.sort((a, b) => a.partNumber - b.partNumber);
-    await this.prisma.uploadSession.update({
-      where: { id: row.id },
-      data: { parts: parts as unknown as Prisma.InputJsonValue, partCount: parts.length },
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "UploadSession" WHERE id = ${row.id} FOR UPDATE`;
+      if (!locked.length) throw notFound('upload not found');
+
+      const fresh = await tx.uploadSession.findUnique({
+        where: { id: row.id },
+        select: { parts: true },
+      });
+      const parts = storedParts(fresh?.parts).filter((p) => p.partNumber !== part.partNumber);
+      parts.push(part);
+      parts.sort((a, b) => a.partNumber - b.partNumber);
+      await tx.uploadSession.update({
+        where: { id: row.id },
+        data: { parts: parts as unknown as Prisma.InputJsonValue, partCount: parts.length },
+      });
+      row.parts = parts;
+      return parts;
     });
-    row.parts = parts;
-    return parts;
   }
 
   /** Прервать multipart, убрать tmp-объект и сессию (при ошибке загрузки). */
