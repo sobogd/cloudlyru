@@ -1,6 +1,5 @@
 package ru.cloudly.sync.sync
 
-import ru.cloudly.sync.data.Db
 import ru.cloudly.sync.net.Api
 import java.io.File
 import java.io.RandomAccessFile
@@ -39,7 +38,7 @@ class Uploader(private val api: Api) {
      *        (обязательна при перезаписи: сервер откажет, если там уже другое содержимое).
      */
     fun upload(
-        job: Db.Job,
+        folderId: String,
         file: LocalFile,
         sha256: String,
         replace: Boolean,
@@ -51,7 +50,7 @@ class Uploader(private val api: Api) {
         val mime = Scanner.mimeOf(file.name)
         if (uploadIdFromQueue == null) {
             val init = api.initUpload(
-                folderId = job.targetFolderId,
+                folderId = folderId,
                 name = file.name,
                 size = file.size,
                 mime = mime,

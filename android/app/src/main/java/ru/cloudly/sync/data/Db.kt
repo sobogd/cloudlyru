@@ -351,6 +351,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
         const val STATE_EVICTED = "evicted"
 
         const val OP_UPLOAD = "upload"
+        const val OP_DOWNLOAD = "download"
         const val OP_DELETE = "delete"
         const val OP_MOVE = "move"
     }

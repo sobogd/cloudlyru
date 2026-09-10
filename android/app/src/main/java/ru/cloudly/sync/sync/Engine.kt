@@ -22,6 +22,9 @@ import java.io.File
  */
 class Engine(private val context: Context, private val db: Db, private val api: Api) {
 
+    /** relDir → id папки на сервере: создаём подпапки один раз за проход. */
+    private val folderCache = HashMap<String, String>()
+
     data class Stats(
         var scanned: Int = 0,
         var uploaded: Int = 0,
@@ -36,8 +39,23 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         var fatal: String? = null,
     )
 
+    /**
+     * Папка на сервере для относительного пути файла. Файловые задачи повторяют структуру
+     * подпапок как есть, поэтому адрес каталога вычисляется один раз и кэшируется на проход.
+     */
+    private fun remoteFolderFor(job: Db.Job, relDir: String): String {
+        // «Фото» ложится плоско (структура подпапок телефона не переносится), «Файлы» — как есть
+        if (job.zone == "PHOTOS") return job.targetFolderId
+        if (relDir.isEmpty()) return job.targetFolderId
+        folderCache["${job.id}:$relDir"]?.let { return it }
+        val id = api.ensurePath(relDir, job.targetFolderId)
+        folderCache["${job.id}:$relDir"] = id
+        return id
+    }
+
     fun syncAll(onProgress: (String) -> Unit = {}): Stats {
         val stats = Stats()
+        folderCache.clear()
         for (job in db.jobs(enabledOnly = true)) {
             if (job.wifiOnly && !Network.isUnmetered(context)) {
                 onProgress("${File(job.sourceDir).name}: ждём Wi-Fi")
@@ -174,9 +192,51 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             candidates.add(file to item)
         }
 
-        // Локальные удаления: было в base, локально исчезло. Незагруженное просто забываем.
+        // Хэшируем всех кандидатов одним проходом: эти же хэши нужны и для переносов, и для дедупа.
+        val hashed = ArrayList<Triple<LocalFile, Db.Item?, String>>(candidates.size)
+        for ((file, item) in candidates) {
+            if (file.size == 0L) continue
+            hashed.add(Triple(file, item, Hasher.sha256(File(file.path))))
+        }
+
+        // Переименование или перенос на телефоне — это НЕ «удалили и залили заново»: сопоставляем
+        // исчезнувшее с появившимся по содержимому и отправляем серверу move. Так сохраняется id
+        // записи, корзина не мусорится, а второе устройство видит перемещение.
+        val vanished = known.filter { it.relPath !in seen && it.state != Db.STATE_EVICTED && it.remoteEntryId != null }
+        val appeared = hashed.filter { it.second == null }
+        val movedPairs = matchMoves(vanished, appeared)
+        val movedOld = HashSet<String>()
+        val movedNew = HashSet<String>()
+        for ((old, file) in movedPairs) {
+            val newDir = file.relPath.substringBeforeLast('/', "")
+            val targetFolderId = remoteFolderFor(job, newDir)
+            try {
+                api.moveFile(old.remoteEntryId!!, targetFolderId, file.name)
+            } catch (e: Exception) {
+                stats.errors += 1
+                Log.w(TAG, "перенос ${old.relPath} → ${file.relPath} не прошёл: ${e.message}")
+                continue
+            }
+            db.deleteItem(job.id, old.relPath)
+            db.putItem(
+                old.copy(
+                    relPath = file.relPath,
+                    localPath = file.path,
+                    localSize = file.size,
+                    localMtime = file.mtime,
+                    name = file.name,
+                    remoteFolderId = targetFolderId,
+                    state = Db.STATE_SYNCED,
+                ),
+            )
+            movedOld.add(old.relPath)
+            movedNew.add(file.relPath)
+            Log.i(TAG, "перенос: ${old.relPath} → ${file.relPath}")
+        }
+
+        // Локальные удаления: было в base, локально исчезло и ни с чем не совпало по содержимому.
         for (item in known) {
-            if (item.relPath in seen) continue
+            if (item.relPath in seen || item.relPath in movedOld) continue
             if (item.state == Db.STATE_EVICTED) continue
             if (item.remoteEntryId == null) {
                 db.deleteItem(job.id, item.relPath)
@@ -189,18 +249,11 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             db.enqueueOp(job.id, item.relPath, Db.OP_DELETE)
         }
 
-        // Новые и изменённые: хэш + один батч «что уже есть в облаке».
-        val shas = ArrayList<String>(candidates.size)
-        val hashed = ArrayList<Triple<LocalFile, Db.Item?, String>>(candidates.size)
-        for ((file, item) in candidates) {
-            if (file.size == 0L) continue
-            val sha = Hasher.sha256(File(file.path))
-            hashed.add(Triple(file, item, sha))
-            if (item == null || item.sha256 != sha) shas.add(sha)
-        }
+        val shas = hashed.filter { entry -> entry.second?.sha256 != entry.third }.map { it.third }
         val present = if (shas.isEmpty()) emptySet() else runCatching { api.have(shas.distinct().take(500)) }.getOrDefault(emptySet())
 
         for ((file, item, sha) in hashed) {
+            if (file.relPath in movedNew) continue
             if (item == null) {
                 db.putItem(
                     Db.Item(
@@ -212,7 +265,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                         sha256 = sha,
                         remoteEntryId = null,
                         remoteSha256 = if (sha in present) sha else null,
-                        remoteFolderId = job.targetFolderId,
+                        remoteFolderId = remoteFolderFor(job, file.relPath.substringBeforeLast('/', "")),
                         name = file.name,
                         state = Db.STATE_NEW,
                         keepOffline = false,
@@ -242,9 +295,43 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
         runOps(job, stats, onProgress)
 
-        // Файловое зеркало вниз — только там, где нет вытеснения: иначе «скачали → удалили → скачали».
-        if (job.zone == "FILES" && job.keepDays < 0) mirrorDown(job, stats, onProgress)
-        if (job.keepDays >= 0) evict(job, onProgress)
+        // Скачивание вниз: зеркало (папка без вытеснения) либо закрепление. Закрепление перекрывает
+        // срок хранения — «держать офлайн» должно дотягивать отсутствующее, иначе оно врёт.
+        val pinnedFolders = pinned()
+        val jobPinned = job.targetFolderId in pinnedFolders
+        val mirror = job.zone == "FILES" && job.keepDays < 0
+        if (mirror || jobPinned) mirrorDown(job, stats, onProgress, onlyPinned = !mirror)
+        else downloadPinnedFiles(job, stats, onProgress)
+        if (job.keepDays >= 0 && !jobPinned) evict(job, onProgress)
+    }
+
+    /**
+     * Пары «исчезло/появилось» по совпадению sha256. Сначала ищем пары в одном каталоге
+     * (обычное переименование), потом — единственные совпадения по всему дереву задачи.
+     */
+    private fun matchMoves(
+        vanished: List<Db.Item>,
+        appeared: List<Triple<LocalFile, Db.Item?, String>>,
+    ): List<Pair<Db.Item, LocalFile>> {
+        val usedOld = HashSet<String>()
+        val pairs = ArrayList<Pair<Db.Item, LocalFile>>()
+        // Сначала пары внутри одного каталога (обычное переименование), затем — единственное
+        // совпадение по содержимому во всём дереве задачи (перенос в другую папку).
+        for (pass in 0..1) {
+            for ((file, _, sha) in appeared) {
+                if (pairs.any { it.second.relPath == file.relPath }) continue
+                val dir = file.relPath.substringBeforeLast('/', "")
+                val candidates = vanished.filter { old ->
+                    old.relPath !in usedOld && old.sha256 == sha &&
+                        (pass == 1 || old.relPath.substringBeforeLast('/', "") == dir)
+                }
+                if (candidates.size != 1 && pass == 1) continue
+                val candidate = candidates.firstOrNull() ?: continue
+                usedOld.add(candidate.relPath)
+                pairs.add(candidate to file)
+            }
+        }
+        return pairs
     }
 
     // ===== очередь операций =====
@@ -256,6 +343,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                 when (op.kind) {
                     Db.OP_UPLOAD -> handleUpload(job, op, stats, onProgress)
                     Db.OP_DELETE -> handleDelete(job, op, stats)
+                    Db.OP_DOWNLOAD -> handleDownload(job, op, stats, onProgress)
                     else -> db.deleteOp(op.id)
                 }
             } catch (e: ApiException) {
@@ -287,7 +375,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         val replace = item.remoteEntryId != null
         onProgress("загрузка: ${item.name}")
         val result = Uploader(api).upload(
-            job = job,
+            folderId = remoteFolderFor(job, item.relPath.substringBeforeLast('/', "")),
             file = LocalFile(item.relPath, item.localPath, item.name, item.localSize, item.localMtime),
             sha256 = sha,
             replace = replace,
@@ -319,6 +407,31 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         )
         db.deleteOp(op.id)
         if (result.deduped) stats.deduped += 1 else stats.uploaded += 1
+    }
+
+    /** Явный запрос «вернуть на телефон» (в том числе для вытесненного файла). */
+    private fun handleDownload(job: Db.Job, op: Db.Op, stats: Stats, onProgress: (String) -> Unit) {
+        val item = db.item(job.id, op.relPath) ?: run { db.deleteOp(op.id); return }
+        val entryId = item.remoteEntryId ?: run {
+            // записи на сервере нет — возвращать нечего
+            db.deleteOp(op.id)
+            return
+        }
+        val target = File(item.localPath.ifBlank { File(job.sourceDir, item.relPath).absolutePath })
+        onProgress("возврат: ${item.name}")
+        Downloader.download(api, entryId, target, null)
+        db.updateItem(
+            job.id,
+            op.relPath,
+            mapOf(
+                "local_path" to target.absolutePath,
+                "local_size" to target.length(),
+                "local_mtime" to target.lastModified(),
+                "state" to Db.STATE_SYNCED,
+            ),
+        )
+        db.deleteOp(op.id)
+        stats.downloaded += 1
     }
 
     private fun handleDelete(job: Db.Job, op: Db.Op, stats: Stats) {
@@ -406,14 +519,20 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
     // ===== зеркало вниз и вытеснение =====
 
-    private fun mirrorDown(job: Db.Job, stats: Stats, onProgress: (String) -> Unit) {
+    private fun mirrorDown(
+        job: Db.Job,
+        stats: Stats,
+        onProgress: (String) -> Unit,
+        onlyPinned: Boolean = false,
+    ) {
         val remote = ArrayList<Pair<String, ru.cloudly.sync.net.RemoteEntry>>()
         collectRemote(job.targetFolderId, "", remote, 0)
         val known = db.itemsOf(job.id).associateBy { it.relPath }
         for ((relPath, entry) in remote) {
+            if (onlyPinned && !entry.keepOffline) continue
             val item = known[relPath]
             if (item != null) {
-                if (item.state == Db.STATE_EVICTED) continue
+                if (item.state == Db.STATE_EVICTED && !(entry.keepOffline || onlyPinned)) continue
                 if (item.remoteSha256 == entry.sha256 && File(item.localPath).isFile) continue
             }
             val target = File(job.sourceDir, relPath)
@@ -440,6 +559,38 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                     state = Db.STATE_SYNCED,
                     keepOffline = entry.keepOffline,
                     uploadedAt = System.currentTimeMillis(),
+                ),
+            )
+            stats.downloaded += 1
+        }
+    }
+
+    /**
+     * Точечный случай: папка со сроком хранения, но отдельные файлы закреплены («держать офлайн»
+     * на файл). Их надо вернуть, остальное не трогаем.
+     */
+    private fun downloadPinnedFiles(job: Db.Job, stats: Stats, onProgress: (String) -> Unit) {
+        val pinnedItems = db.itemsOf(job.id).filter { it.keepOffline && it.remoteEntryId != null }
+        if (pinnedItems.isEmpty()) return
+        for (item in pinnedItems) {
+            val target = File(item.localPath.ifBlank { File(job.sourceDir, item.relPath).absolutePath })
+            if (target.isFile && item.state == Db.STATE_SYNCED) continue
+            onProgress("возврат закреплённого: ${item.name}")
+            try {
+                Downloader.download(api, item.remoteEntryId!!, target, null)
+            } catch (e: Exception) {
+                stats.errors += 1
+                Log.w(TAG, "не вернулся ${item.name}: ${e.message}")
+                continue
+            }
+            db.updateItem(
+                job.id,
+                item.relPath,
+                mapOf(
+                    "local_path" to target.absolutePath,
+                    "local_size" to target.length(),
+                    "local_mtime" to target.lastModified(),
+                    "state" to Db.STATE_SYNCED,
                 ),
             )
             stats.downloaded += 1
@@ -533,6 +684,24 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     fun setFolderKeepOffline(folderId: String, keepOffline: Boolean) {
         api.patchFolder(folderId, JSONObject().put("keepOffline", keepOffline))
     }
+
+    /** Закрепить или открепить отдельный файл (флаг живёт на сервере). */
+    fun setFileKeepOffline(jobId: Long, relPath: String, entryId: String, keepOffline: Boolean) {
+        api.patchFile(entryId, JSONObject().put("keepOffline", keepOffline))
+        db.updateItem(jobId, relPath, mapOf("keep_offline" to if (keepOffline) 1 else 0))
+        if (keepOffline) {
+            // закрепили — файл должен быть на телефоне, даже если он был вытеснен
+            db.enqueueOp(jobId, relPath, Db.OP_DOWNLOAD)
+        }
+    }
+
+    /** Разовое «вернуть на телефон» для вытесненного файла. */
+    fun restoreToPhone(jobId: Long, relPath: String) {
+        db.enqueueOp(jobId, relPath, Db.OP_DOWNLOAD)
+    }
+
+    /** Состояние «держать офлайн» у папки задачи (читается с сервера). */
+    fun folderPinned(folderId: String): Boolean = runCatching { api.folderMeta(folderId).second }.getOrDefault(false)
 
     companion object {
         private const val TAG = "cloudly-sync"

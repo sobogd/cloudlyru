@@ -141,6 +141,19 @@ class Api(private val prefs: Prefs) {
         return parse(request("/folders/ensure-path", "POST", body)).optString("id")
     }
 
+    /** Метаданные папки: имя, путь, флаг «держать офлайн». */
+    fun folderMeta(folderId: String): Pair<String, Boolean> {
+        val o = parse(request("/folders/$folderId/meta"))
+        return o.optString("name") to o.optBoolean("keepOffline", false)
+    }
+
+    /** Корень пользователя: от него начинается выбор папки при «поделиться». */
+    fun rootFolderId(): String = parse(request("/folders")).optString("parentId")
+
+    /** Подпапки папки: id по имени (для навигации по дереву в выборе получателя). */
+    fun subfolders(folderId: String): List<Pair<String, String>> =
+        children(folderId).folderIds.map { (name, id) -> name to id }
+
     /** Дерево папки: имена подпапок и записи (нужно для первичного сопоставления). */
     fun children(folderId: String): FolderChildren {
         val o = parse(request("/folders/$folderId/children"))

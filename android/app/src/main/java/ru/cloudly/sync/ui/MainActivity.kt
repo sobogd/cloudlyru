@@ -93,6 +93,7 @@ private fun Screen() {
     var pending by remember { mutableStateOf(app.db.ops().size) }
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     var showAdd by remember { mutableStateOf(false) }
+    var openJob by remember { mutableStateOf<Long?>(null) }
     val jobs = remember { mutableStateListOf<Db.Job>() }
 
     fun reload() {
@@ -115,6 +116,12 @@ private fun Screen() {
     }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    val open = openJob?.let { id -> jobs.firstOrNull { it.id == id } }
+    if (open != null) {
+        JobFilesScreen(job = open, app = app, onBack = { openJob = null })
+        return
+    }
 
     Scaffold { padding ->
         Column(
@@ -235,7 +242,9 @@ private fun Screen() {
             Spacer(Modifier.height(16.dp))
             Text("Папки", fontWeight = FontWeight.SemiBold)
             LazyColumn(modifier = Modifier.height(if (jobs.isEmpty()) 1.dp else 240.dp)) {
-                items(jobs, key = { it.id }) { job -> JobCard(job, app, onChange = { reload() }) }
+                items(jobs, key = { it.id }) { job ->
+                    JobCard(job, app, onChange = { reload() }, onOpenFiles = { openJob = job.id })
+                }
             }
 
             Spacer(Modifier.height(12.dp))
@@ -273,8 +282,12 @@ private fun Screen() {
 }
 
 @Composable
-private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit) {
+private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit, onOpenFiles: () -> Unit) {
     val scope = rememberCoroutineScope()
+    var pinned by remember(job.id) { mutableStateOf(false) }
+    LaunchedEffect(job.id) {
+        pinned = withContext(Dispatchers.IO) { app.engine().folderPinned(job.targetFolderId) }
+    }
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Column(Modifier.padding(12.dp)) {
             Text(job.sourceDir, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
@@ -311,17 +324,24 @@ private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit) {
                 Text("только Wi-Fi", fontSize = 12.sp)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onOpenFiles) { Text("Файлы") }
+                OutlinedButton(onClick = {
+                    val next = !pinned
+                    scope.launch {
+                        val ok = withContext(Dispatchers.IO) {
+                            runCatching {
+                                app.engine().setFolderKeepOffline(job.targetFolderId, next)
+                                if (next) SyncService.start(app)
+                                true
+                            }.getOrDefault(false)
+                        }
+                        if (ok) pinned = next
+                    }
+                }) { Text(if (pinned) "● Держать офлайн" else "Держать офлайн") }
                 OutlinedButton(onClick = {
                     app.db.deleteJob(job.id)
                     onChange()
                 }) { Text("Удалить") }
-                OutlinedButton(onClick = {
-                    scope.launch {
-                        withContext(Dispatchers.IO) {
-                            runCatching { app.engine().setFolderKeepOffline(job.targetFolderId, true) }
-                        }
-                    }
-                }) { Text("Держать офлайн") }
             }
         }
     }
