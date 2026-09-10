@@ -108,7 +108,7 @@ function fileIcon(mime?: string): string {
 // Очередь файлов с панелью прогресса над содержимым; во время загрузки остальной UI
 // блокируется оверлеем. Завершившиеся файлы появляются в списке/сетке сразу.
 
-interface UpFile { key: number; file: File; state: 'queued' | 'uploading' | 'done' | 'failed'; pct: number; error?: string; }
+interface UpFile { key: number; file: File; state: 'queued' | 'uploading' | 'done' | 'failed'; pct: number; phase?: api.UploadPhase; error?: string; }
 let upSeq = 0;
 
 function useBulkUpload(folderId: string | undefined, onUploaded?: () => void) {
@@ -136,7 +136,7 @@ function useBulkUpload(folderId: string | undefined, onUploaded?: () => void) {
         const ac = new AbortController();
         ctrl.current = ac;
         try {
-          await api.uploadFile(row.file, folderId, (p) => { row.pct = p; sync(); }, ac.signal);
+          await api.uploadFile(row.file, folderId, (p, phase) => { row.pct = p; row.phase = phase; sync(); }, ac.signal);
           row.state = 'done';
           row.pct = 100;
           sync();
@@ -244,9 +244,16 @@ function UploadPanel({ rows, busy, onCancel, onRetryFailed, onDismissFailed }: {
             {r.state === 'failed' ? (
               <div className="upmeta">{r.error}</div>
             ) : (
-              <div className="ubar">
-                <i style={{ width: `${r.state === 'done' ? 100 : r.pct}%`, background: r.state === 'done' ? '#2fae5f' : undefined }} />
-              </div>
+              <>
+                <div className="ubar">
+                  <i style={{ width: `${r.state === 'done' ? 100 : r.pct}%`, background: r.state === 'done' ? '#2fae5f' : undefined }} />
+                </div>
+                {r.state === 'uploading' && (
+                  <div className="upmeta">
+                    {r.phase === 'hash' ? `считаю sha256 · ${r.pct}%` : `загружаю · ${r.pct}%`}
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>

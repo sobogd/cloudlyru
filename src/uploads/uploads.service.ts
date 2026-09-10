@@ -1,33 +1,95 @@
 import { createHash, Hash } from 'crypto';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { S3Service, S3Part } from '../s3/s3.service';
+import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
 import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
 import { AuthService } from '../auth/auth.service';
-import { CHUNK_MAX_BYTES, MAX_FILE_BYTES } from '../config/env';
+import {
+  CHUNK_MAX_BYTES,
+  DIRECT_PART_BYTES,
+  MAX_FILE_BYTES,
+  PART_URL_TTL_SEC,
+} from '../config/env';
 import { assertSafeName, randomToken } from '../common/utils';
 import { ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound, payloadTooLarge } from '../common/errors';
 
+/** Принятая часть multipart: ETag отдаёт S3, клиент передаёт его серверу. */
+interface StoredPart {
+  partNumber: number;
+  etag: string;
+  size?: number;
+}
+
 interface LiveSession {
-  hash: Hash; // инкрементальный sha256 по порядку чанков
-  parts: S3Part[];
-  tmpKey: string;
-  s3UploadId: string;
-  /** sha256 после завершения потока: digest() можно вызвать только один раз,
-   *  а complete может повториться (сетевой ретрай клиента) — кэшируем результат. */
+  /** Инкрементальный sha256 — только для релея (чанки идут через сервер по порядку). */
+  hash: Hash;
+  /** digest() вызывается один раз, а complete может повториться (ретрай клиента) — кэшируем. */
   sha256?: string;
   /** multipart уже финализирован — повторный complete не должен финализировать снова. */
   finalized?: boolean;
 }
 
+type SessionRow = {
+  id: string;
+  userId: string;
+  s3UploadId: string;
+  uploadKey: string;
+  folderId: string | null;
+  name: string;
+  size: bigint;
+  mime: string;
+  parts: unknown;
+  declaredSha256: string | null;
+  direct: boolean;
+};
+
+/** sha256 в нижнем регистре; всё, что не 64 hex-символа, — не хэш. */
+function normalizeSha(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(s) ? s : undefined;
+}
+
+/** ETag из ответа S3 приходит в кавычках; weak-префикс и пробелы не нужны. */
+function normalizeEtag(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim().replace(/^W\//, '');
+  if (!s) return undefined;
+  return s.startsWith('"') && s.endsWith('"') ? s : `"${s.replace(/"/g, '')}"`;
+}
+
+function storedParts(raw: unknown): StoredPart[] {
+  if (!Array.isArray(raw)) return [];
+  const out: StoredPart[] = [];
+  for (const p of raw) {
+    if (!p || typeof p !== 'object') continue;
+    const partNumber = Number((p as { partNumber?: unknown }).partNumber);
+    const etag = (p as { etag?: unknown }).etag;
+    if (!Number.isInteger(partNumber) || partNumber <= 0 || typeof etag !== 'string') continue;
+    const size = (p as { size?: unknown }).size;
+    out.push({ partNumber, etag, size: typeof size === 'number' ? size : undefined });
+  }
+  return out.sort((a, b) => a.partNumber - b.partNumber);
+}
+
 /**
- * Чанкованная загрузка: каждый чанк = часть multipart-upload в S3.
- * sha256 считается инкрементально по мере поступления → на complete дедуп до финализации.
- * ВАЖНО: live-состояние (хэш/этаги) в памяти процесса; рестарт сервера = сессию надо
- * пересоздать (cleanup по старым UploadSession делает onModuleInit). TODO(M1): персистентность.
+ * Загрузка файла — прямая в S3 (браузер → S3), сервер только подписывает ссылки на части
+ * и ведёт дерево. Схема:
+ *   1. клиент считает sha256 файла (инкрементально, WASM), POST /uploads {sha256, size, ...};
+ *      сервер, если объект с таким содержимым уже есть, вообще не начинает загрузку (дедуп
+ *      0 байт) и сразу создаёт запись в дереве;
+ *   2. клиент берёт presigned-ссылку на часть (GET /uploads/:id/url/:n), льёт часть прямо в S3
+ *      и сообщает серверу ETag (PUT /uploads/:id/parts/:n). Части можно слать параллельно;
+ *   3. POST /uploads/:id/complete — сервер собирает multipart по ETag'ам, проверяет размер,
+ *      считает sha256 по факту (ключ объекта content-addressed: доверять хэшу клиента нельзя,
+ *      ошибка клиента отравила бы дедуп для всего хранилища), дедупит и кладёт запись в дерево.
+ * Релей-путь (PUT /uploads/:id/chunks/:n — чанки через сервер) сохранён как фолбэк: он нужен
+ * там, где браузер не может ходить в S3 (нет CORS и т.п.). Части в обоих путях пишутся в БД,
+ * поэтому рестарт сервиса больше не убивает сессию загрузки.
  */
 @Injectable()
 export class UploadsService implements OnModuleInit {
@@ -69,56 +131,185 @@ export class UploadsService implements OnModuleInit {
     return this.auth.rootFolderId(userId);
   }
 
-  async init(body: { folderId?: string; name: string; size: number; mime: string }, userId: string) {
+  private async requireSession(uploadId: string, userId: string): Promise<SessionRow> {
+    const row = await this.prisma.uploadSession.findUnique({ where: { id: uploadId } });
+    if (!row || row.userId !== userId) throw notFound('upload not found');
+    return row as SessionRow;
+  }
+
+  /** Сколько частей ожидается при прямой загрузке (последняя может быть короче). */
+  private partCount(size: number): number {
+    return Math.max(1, Math.ceil(size / DIRECT_PART_BYTES));
+  }
+
+  private assertPartNumber(size: number, partNumber: number): void {
+    if (!Number.isInteger(partNumber) || partNumber <= 0) throw badRequest('invalid part number');
+    const total = this.partCount(size);
+    if (partNumber > total) {
+      throw badRequest(`part ${partNumber} out of range — файл разбит на ${total} частей`);
+    }
+  }
+
+  /** Записать/перезаписать часть в сессии (идемпотентно по номеру части). */
+  private async savePart(row: SessionRow, part: StoredPart): Promise<StoredPart[]> {
+    const parts = storedParts(row.parts).filter((p) => p.partNumber !== part.partNumber);
+    parts.push(part);
+    parts.sort((a, b) => a.partNumber - b.partNumber);
+    await this.prisma.uploadSession.update({
+      where: { id: row.id },
+      data: { parts: parts as unknown as Prisma.InputJsonValue, partCount: parts.length },
+    });
+    row.parts = parts;
+    return parts;
+  }
+
+  /** Прервать multipart, убрать tmp-объект и сессию (при ошибке загрузки). */
+  private async cleanup(row: SessionRow): Promise<void> {
+    await this.s3.abortMultipartUpload(row.uploadKey, row.s3UploadId).catch(() => undefined);
+    // multipart мог быть уже собран (ошибка нашли после completeMultipartUpload) —
+    // тогда abort не сработает, и объект надо удалить явно, иначе он останется мусором
+    await this.s3.deleteObject(row.uploadKey).catch(() => undefined);
+    this.live.delete(row.id);
+    try {
+      await this.prisma.uploadSession.delete({ where: { id: row.id } });
+    } catch {
+      /* уже удалена */
+    }
+  }
+
+  async init(
+    body: { folderId?: string; name: string; size: number; mime: string; sha256?: string; mode?: string },
+    userId: string,
+  ) {
     const name = String(body.name ?? '');
     const size = Number(body.size);
     const mime = String(body.mime ?? 'application/octet-stream');
     assertSafeName(name);
     if (!Number.isFinite(size) || size <= 0) throw badRequest('invalid size');
     if (size > MAX_FILE_BYTES) throw payloadTooLarge('file too large');
+    if (Math.ceil(size / DIRECT_PART_BYTES) > 10000) {
+      // S3 не принимает multipart больше 10 000 частей — это конфиг, а не ошибка клиента
+      throw badRequest('файл слишком велик для текущего размера части: увеличьте UPLOAD_DIRECT_PART_MB');
+    }
     const folderId = await this.resolveFolder(body.folderId, userId);
+    const declared = normalizeSha(body.sha256);
+    const direct = body.mode !== 'relay' && this.s3.configured;
+
+    // Дедуп до передачи байтов: клиент посчитал sha256, объект с таким содержимым уже лежит
+    // в S3 (и размер совпадает) — заливать нечего, создаём только запись в дереве.
+    if (declared) {
+      const asset = await this.prisma.asset.findUnique({ where: { sha256: declared } });
+      if (asset && Number(asset.size) === size) {
+        const done = await this.finish({
+          userId,
+          folderId,
+          name,
+          size,
+          mime,
+          sha256: declared,
+          assetId: asset.id,
+          deduped: true,
+        });
+        return { ...done, uploadId: null, direct: false, nextPart: 1 };
+      }
+    }
 
     const tmpKey = `files/tmp/${randomToken(16)}`;
     const s3UploadId = await this.s3.createMultipartUpload(tmpKey);
     const session = await this.prisma.uploadSession.create({
-      data: { userId, s3UploadId, uploadKey: tmpKey, folderId, name, size: BigInt(size), mime },
+      data: {
+        userId,
+        s3UploadId,
+        uploadKey: tmpKey,
+        folderId,
+        name,
+        size: BigInt(size),
+        mime,
+        parts: [] as unknown as Prisma.InputJsonValue,
+        declaredSha256: declared ?? null,
+        direct,
+      },
     });
 
-    this.live.set(session.id, { hash: createHash('sha256'), parts: [], tmpKey, s3UploadId });
+    this.live.set(session.id, { hash: createHash('sha256') });
     return {
       uploadId: session.id,
       folderId,
       name,
       size,
+      deduped: false,
+      direct,
+      partSize: DIRECT_PART_BYTES,
       chunkMaxBytes: CHUNK_MAX_BYTES,
+      partUrlTtlSec: PART_URL_TTL_SEC,
       nextPart: 1,
     };
   }
 
   async status(uploadId: string, userId: string) {
-    const row = await this.prisma.uploadSession.findUnique({ where: { id: uploadId } });
-    if (!row || row.userId !== userId) throw notFound('upload not found');
-    const live = this.live.get(uploadId);
+    const row = await this.requireSession(uploadId, userId);
+    const parts = storedParts(row.parts);
     return {
       uploadId,
-      nextPart: live ? live.parts.length + 1 : row.partCount + 1,
-      receivedParts: row.partCount,
+      direct: row.direct,
+      partSize: DIRECT_PART_BYTES,
+      chunkMaxBytes: CHUNK_MAX_BYTES,
+      nextPart: parts.length + 1,
+      receivedParts: parts.length,
+      parts: parts.map((p) => p.partNumber),
       size: Number(row.size),
       name: row.name,
       folderId: row.folderId,
     };
   }
 
+  /** Presigned-ссылка на часть: клиент заливает по ней байты прямо в S3, минуя сервер. */
+  async partUrl(uploadId: string, partNumber: number, userId: string) {
+    const row = await this.requireSession(uploadId, userId);
+    this.assertPartNumber(Number(row.size), partNumber);
+    const url = await this.s3.presignedUploadPart(
+      row.uploadKey,
+      row.s3UploadId,
+      partNumber,
+      PART_URL_TTL_SEC,
+    );
+    return {
+      url,
+      partNumber,
+      expiresAt: new Date(Date.now() + PART_URL_TTL_SEC * 1000).toISOString(),
+    };
+  }
+
+  /** ETag части, залитой клиентом прямо в S3 (сервер — источник истины по частям). */
+  async registerPart(
+    uploadId: string,
+    partNumber: number,
+    etag: unknown,
+    size: unknown,
+    userId: string,
+  ) {
+    const row = await this.requireSession(uploadId, userId);
+    this.assertPartNumber(Number(row.size), partNumber);
+    const clean = normalizeEtag(etag);
+    if (!clean) throw badRequest('etag required');
+    const parts = await this.savePart(row, {
+      partNumber,
+      etag: clean,
+      size: typeof size === 'number' && Number.isFinite(size) ? size : undefined,
+    });
+    return { uploadId, partNumber, receivedParts: parts.length, parts: parts.map((p) => p.partNumber) };
+  }
+
+  /** Чанк через сервер (фолбэк, если браузер не может ходить в S3). Части строго по порядку. */
   async putChunk(uploadId: string, partNumber: number, chunk: Buffer, userId: string) {
     if (chunk.length > CHUNK_MAX_BYTES) throw payloadTooLarge('chunk too large');
-    const row = await this.prisma.uploadSession.findUnique({ where: { id: uploadId } });
-    if (!row || row.userId !== userId) throw notFound('upload not found');
+    const row = await this.requireSession(uploadId, userId);
 
     const live = this.live.get(uploadId);
     if (!live) {
       throw conflict('upload session expired (server restart) — re-init upload', 'upload_session_lost');
     }
-    const expected = live.parts.length + 1;
+    const expected = storedParts(row.parts).length + 1;
     if (partNumber < expected) {
       // идемпотентность: повторный/дублирующийся чанк — считаем успешным
       return { uploadId, nextPart: expected, duplicate: true };
@@ -127,99 +318,163 @@ export class UploadsService implements OnModuleInit {
       throw badRequest(`missing part ${expected} (got ${partNumber}) — upload out of order`);
     }
 
-    const etag = await this.s3.uploadPart(live.tmpKey, live.s3UploadId, partNumber, chunk);
+    const etag = await this.s3.uploadPart(row.uploadKey, row.s3UploadId, partNumber, chunk);
     live.hash.update(chunk);
-    live.parts.push({ PartNumber: partNumber, ETag: etag });
-    await this.prisma.uploadSession.update({
-      where: { id: uploadId },
-      data: { partCount: partNumber },
-    });
+    await this.savePart(row, { partNumber, etag, size: chunk.length });
     return { uploadId, nextPart: partNumber + 1, receivedBytes: partNumber * chunk.length };
   }
 
-  async complete(uploadId: string, userId: string) {
-    const row = await this.prisma.uploadSession.findUnique({ where: { id: uploadId } });
-    if (!row || row.userId !== userId) throw notFound('upload not found');
+  async complete(uploadId: string, userId: string, body: { sha256?: unknown } = {}) {
+    const row = await this.requireSession(uploadId, userId);
     const live = this.live.get(uploadId);
-    if (!live) throw conflict('upload session expired (server restart) — re-init upload', 'upload_session_lost');
-
-    const sha256 = live.sha256 ?? (live.sha256 = live.hash.digest('hex'));
-    const finalKey = S3Service.assetKey(sha256);
     const size = Number(row.size);
     const mime = row.mime;
 
-    // Дедуп: такой объект уже есть?
+    const parts = storedParts(row.parts);
+    if (!parts.length) throw badRequest('no parts uploaded');
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i].partNumber !== i + 1) {
+        throw badRequest(`missing part ${i + 1} — загрузка неполная`);
+      }
+    }
+
+    // 1. Собираем объект. Повторный complete (сетевой ретрай клиента или рестарт сервиса
+    //    между финализацией и записью в дерево) идемпотентен.
+    if (!live?.finalized) {
+      try {
+        await this.s3.completeMultipartUpload(
+          row.uploadKey,
+          row.s3UploadId,
+          parts.map((p) => ({ PartNumber: p.partNumber, ETag: p.etag })),
+        );
+        if (live) live.finalized = true;
+      } catch (e) {
+        // multipart уже собран (NoSuchUpload) — решает проверка размера ниже
+        if (!(await this.s3.headObject(row.uploadKey))) throw e;
+      }
+    }
+
+    // 2. Размер по факту в S3: недолитая загрузка не должна попасть в дерево.
+    const realSize = await this.s3.objectSize(row.uploadKey);
+    if (realSize !== size) {
+      await this.cleanup(row);
+      throw badRequest(`в S3 ${realSize} байт, ожидалось ${size} — загрузка неполная`);
+    }
+
+    // 3. sha256. При релее хэш посчитан по ходу чанков; при прямой загрузке сервер байтов
+    //    не видел — считаем хэш по объекту в S3. Ключ content-addressed, поэтому заявленный
+    //    клиентом хэш только проверяется, но никогда не используется «на веру».
+    const claimed = normalizeSha(body.sha256) ?? normalizeSha(row.declaredSha256);
+    let sha256 = live?.sha256 ?? live?.hash.digest('hex');
+    if (live) live.sha256 = sha256;
+    if (!sha256 || (claimed && claimed !== sha256)) {
+      const computed = await this.s3.hashObject(row.uploadKey);
+      if (claimed && claimed !== computed) {
+        await this.cleanup(row);
+        throw badRequest('содержимое не совпало с заявленным sha256', 'upload_hash_mismatch');
+      }
+      sha256 = computed;
+    }
+
+    const finalKey = S3Service.assetKey(sha256);
     const existingAsset = await this.prisma.asset.findUnique({ where: { sha256 } });
 
     let assetId: string;
     let deduped = false;
     if (existingAsset) {
-      // содержимое уже в S3 — multipart не финализируем, tmp отменяем
+      // содержимое уже в S3 — multipart не перекладываем, tmp удаляем
       deduped = true;
       assetId = existingAsset.id;
-      await this.s3.abortMultipartUpload(live.tmpKey, live.s3UploadId).catch(() => undefined);
     } else {
-      // финализируем tmp-объект и перекладываем под content-addressed ключ (server-side copy).
-      // Оба шага идемпотентны: complete может прийти повторно после сетевого ретрая клиента.
-      if (!live.finalized) {
-        await this.s3.completeMultipartUpload(live.tmpKey, live.s3UploadId, live.parts);
-        live.finalized = true;
-      }
+      // финализируем tmp-объект и перекладываем под content-addressed ключ (server-side copy)
       if (!(await this.s3.headObject(finalKey))) {
-        await this.s3.copyObject(live.tmpKey, finalKey);
+        await this.s3.copyObject(row.uploadKey, finalKey);
       }
       assetId = await this.files.ensureAsset(sha256, size, mime, this.extOf(row.name));
     }
+    await this.s3.deleteObject(row.uploadKey).catch(() => undefined);
 
-    // tmp-объект больше не нужен
-    await this.s3.deleteObject(live.tmpKey).catch(() => undefined);
+    const done = await this.finish({
+      userId,
+      folderId: row.folderId,
+      name: row.name,
+      size,
+      mime,
+      sha256,
+      assetId,
+      deduped,
+    });
 
-    const folderId = row.folderId ?? (await this.auth.rootFolderId(userId));
+    await this.prisma.uploadSession.delete({ where: { id: uploadId } });
+    this.live.delete(uploadId);
+    return done;
+  }
+
+  async abort(uploadId: string, userId: string) {
+    const row = await this.requireSession(uploadId, userId);
+    await this.cleanup(row);
+    return { ok: true };
+  }
+
+  /**
+   * Общая концовка: запись в дерево + медиа-часть. Используется и прямой загрузкой
+   * (complete), и дедупом до передачи байтов (init).
+   */
+  private async finish(params: {
+    userId: string;
+    folderId: string | null;
+    name: string;
+    size: number;
+    mime: string;
+    sha256: string;
+    assetId: string;
+    deduped: boolean;
+  }): Promise<{
+    entry: { id: string };
+    asset: { sha256: string; size: number; mime: string };
+    deduped: boolean;
+    zone: string;
+  }> {
+    const folderId = params.folderId ?? (await this.auth.rootFolderId(params.userId));
     let entry: { id: string; deduped: boolean; zone: string };
     try {
-      entry = await this.files.createEntry(folderId, row.name, assetId);
+      entry = await this.files.createEntry(folderId, params.name, params.assetId);
     } catch (e) {
       // повторный complete (после сетевого ретрая) — запись уже создана, это успех
       const existing = await this.prisma.fileEntry.findFirst({
-        where: { folderId, name: row.name, deletedAt: null },
+        where: { folderId, name: params.name, deletedAt: null },
       });
-      if (existing && existing.assetId === assetId) {
+      if (existing && existing.assetId === params.assetId) {
         entry = { id: existing.id, deduped: true, zone: existing.zone };
       } else {
         throw e;
       }
     }
 
-    await this.prisma.uploadSession.delete({ where: { id: uploadId } });
-    this.live.delete(uploadId);
-
-    // Медиа-зона («Фото»): EXIF (дата/координаты) + очередь конвертации (best-effort, не валит загрузку).
+    // Медиа-зона («Фото»): EXIF (дата/координаты) + очередь конвертации (best-effort).
     // Зона «Файлы»: файл ложится как есть — без EXIF-обработки и без конвертации.
+    // Повторную загрузку того же содержимого метаданные не пересобирают: EXIF уже разобран,
+    // а чтение объекта из S3 ради этого — лишний трафик.
     if (entry.zone === ZONE_PHOTOS) {
-      try {
-        await this.media.captureMeta(assetId, sha256, size, mime);
-      } catch {
-        /* ignore */
+      const hasMeta = await this.prisma.mediaMeta
+        .findUnique({ where: { assetId: params.assetId }, select: { assetId: true } })
+        .catch(() => null);
+      if (!hasMeta) {
+        try {
+          await this.media.captureMeta(params.assetId, params.sha256, params.size, params.mime);
+        } catch {
+          /* ignore */
+        }
       }
-      await this.queue.enqueue(assetId, sha256, mime);
+      await this.queue.enqueue(params.assetId, params.sha256, params.mime);
     }
 
     return {
       entry: { id: entry.id },
-      asset: { sha256, size, mime },
-      deduped,
+      asset: { sha256: params.sha256, size: params.size, mime: params.mime },
+      deduped: params.deduped,
       zone: entry.zone,
     };
-  }
-
-  async abort(uploadId: string, userId: string) {
-    const row = await this.prisma.uploadSession.findUnique({ where: { id: uploadId } });
-    if (!row || row.userId !== userId) throw notFound('upload not found');
-    const live = this.live.get(uploadId);
-    if (live) await this.s3.abortMultipartUpload(live.tmpKey, live.s3UploadId).catch(() => undefined);
-    await this.prisma.uploadSession.delete({ where: { id: uploadId } });
-    this.live.delete(uploadId);
-    return { ok: true };
   }
 
   private extOf(name: string): string | undefined {

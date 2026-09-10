@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      hash-wasm:
+        specifier: ^4.12.0
+        version: 4.12.0
       leaflet:
         specifier: ^1.9.4
         version: 1.9.4
@@ -496,6 +499,9 @@ packages:
   gensync@1.0.0-beta.2:
     resolution: {integrity: sha512-3hN7NaskYvMDLQY55gnW3NQ+mesEAepTqlg+VEbj7zzqEMBVNhzcGYYeqFo/TlYz6eQiFcp1HcsCZO+nGgS8zg==}
     engines: {node: '>=6.9.0'}
+
+  hash-wasm@4.12.0:
+    resolution: {integrity: sha512-+/2B2rYLb48I/evdOIhP+K/DD2ca2fgBjp6O+GBEnCDk2e4rpeXIK8GvIyRPjTezgmWn9gmKwkQjjx6BtqDHVQ==}
 
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
@@ -1001,6 +1007,8 @@ snapshots:
     optional: true
 
   gensync@1.0.0-beta.2: {}
+
+  hash-wasm@4.12.0: {}
 
   js-tokens@4.0.0: {}
 

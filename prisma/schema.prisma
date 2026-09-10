@@ -105,7 +105,9 @@ model Asset {
   jobs          Job[]
 }
 
-// Активная чанкованная загрузка (сессия в памяти сервиса; parts-этаги в RAM)
+// Активная загрузка файла: multipart-сессия в S3. Принятые части (partNumber + ETag)
+// лежат в БД, а не в RAM: рестарт сервиса больше не теряет сессию, а complete может
+// собрать объект по ETag'ам, пришедшим с клиента (прямая загрузка в S3).
 model UploadSession {
   id         String   @id @default(uuid())
   userId     String
@@ -116,6 +118,11 @@ model UploadSession {
   size       BigInt
   mime       String
   partCount  Int      @default(0) // сколько частей принято
+  parts      Json? // [{ partNumber, etag, size }] — принятые части multipart
+  // sha256, объявленный клиентом (браузер считает инкрементально до загрузки):
+  // нужен для дедупа до передачи байтов и как ожидаемое значение при верификации.
+  declaredSha256 String?
+  direct     Boolean  @default(false) // части льются клиентом прямо в S3 (без релея через сервер)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 

@@ -9,14 +9,22 @@ import { badRequest, payloadTooLarge } from '../common/errors';
 export class UploadsController {
   constructor(private readonly uploads: UploadsService) {}
 
+  /**
+   * Начать загрузку. Если клиент прислал sha256 уже существующего объекта, сервер сразу
+   * создаёт запись в дереве (`deduped: true`, `uploadId: null`) — байты не передаются вообще.
+   */
   @Post()
-  init(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
+  init(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {
     return this.uploads.init(
       {
         folderId: typeof body.folderId === 'string' ? body.folderId : undefined,
         name: typeof body.name === 'string' ? body.name : '',
         size: typeof body.size === 'number' ? body.size : NaN,
         mime: typeof body.mime === 'string' ? body.mime : 'application/octet-stream',
+        sha256: typeof body.sha256 === 'string' ? body.sha256 : undefined,
+        // Клиенты, не знающие про прямую загрузку (скрипты, старые версии), льют чанки
+        // через сервер — это релей-режим, он и остаётся поведением по умолчанию.
+        mode: body.mode === 'direct' ? 'direct' : 'relay',
       },
       user.id,
     );
@@ -27,7 +35,32 @@ export class UploadsController {
     return this.uploads.status(id, user.id);
   }
 
-  /** PUT сырого чанка (application/octet-stream). Части строго последовательны, с resume по статусу. */
+  /** Presigned-ссылка на одну часть: по ней браузер заливает байты прямо в S3. */
+  @Get(':id/url/:part')
+  partUrl(
+    @Param('id') id: string,
+    @Param('part') part: string,
+    @CurrentUser() user: RequestUser,
+  ) {
+    const partNumber = Number(part);
+    if (!Number.isInteger(partNumber) || partNumber <= 0) throw badRequest('invalid part number');
+    return this.uploads.partUrl(id, partNumber, user.id);
+  }
+
+  /** ETag части, залитой напрямую в S3 (сервер собирает multipart по этим ETag'ам). */
+  @Put(':id/parts/:part')
+  registerPart(
+    @Param('id') id: string,
+    @Param('part') part: string,
+    @Body() body: Record<string, unknown> = {},
+    @CurrentUser() user: RequestUser,
+  ) {
+    const partNumber = Number(part);
+    if (!Number.isInteger(partNumber) || partNumber <= 0) throw badRequest('invalid part number');
+    return this.uploads.registerPart(id, partNumber, body.etag, body.size, user.id);
+  }
+
+  /** Чанк через сервер (application/octet-stream) — фолбэк, если браузер не может ходить в S3. */
   @Put(':id/chunks/:part')
   async chunk(
     @Param('id') id: string,
@@ -56,8 +89,14 @@ export class UploadsController {
   }
 
   @Post(':id/complete')
-  complete(@Param('id') id: string, @CurrentUser() user: RequestUser) {
-    return this.uploads.complete(id, user.id);
+  complete(
+    @Param('id') id: string,
+    @Body() body: Record<string, unknown> = {},
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.uploads.complete(id, user.id, {
+      sha256: typeof body.sha256 === 'string' ? body.sha256 : undefined,
+    });
   }
 
   @Delete(':id')

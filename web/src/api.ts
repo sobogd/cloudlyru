@@ -1,3 +1,5 @@
+import { createSHA256 } from 'hash-wasm';
+
 const BASE = '/api/v1';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -76,6 +78,13 @@ export interface FolderMeta {
 export const folderMeta = (id: string) => request<FolderMeta>(`/folders/${id}/meta`);
 
 const CHUNK_BYTES = 5 * 1024 * 1024;
+/** Часть при прямой загрузке в S3 (сервер уточняет размер в init). */
+const FALLBACK_PART_BYTES = 16 * 1024 * 1024;
+/** Сколько частей льём в S3 одновременно (память: concurrency × partSize). */
+const DIRECT_CONCURRENCY = 3;
+const HASH_CHUNK_BYTES = 8 * 1024 * 1024;
+
+export type UploadPhase = 'hash' | 'upload';
 
 /** mime по расширению, если браузер не отдал type (HEIC/RAW и т.п.). */
 export function guessMime(file: { name: string; type: string }): string {
@@ -125,29 +134,200 @@ async function putChunk(uploadId: string, part: number, buf: ArrayBuffer, signal
 export async function uploadFile(
   file: File,
   folderId: string | undefined,
-  onProgress?: (pct: number) => void,
+  onProgress?: (pct: number, phase: UploadPhase) => void,
   signal?: AbortSignal,
 ): Promise<{ entry: { id: string }; deduped: boolean }> {
   const mime = guessMime(file);
-  const init = await request<{ uploadId: string; chunkMaxBytes: number }>('/uploads', {
-    method: 'POST',
-    body: JSON.stringify({ folderId, name: file.name, size: file.size, mime }),
-  });
-  const uploadId = init.uploadId;
-  const parts = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
+
+  // sha256 считаем ДО загрузки: сервер по нему либо вообще не начнёт передачу
+  // (объект с таким содержимым уже есть), либо использует его как ключ объекта в S3.
+  const sha256 = await hashFile(file, signal, (p) => onProgress?.(p, 'hash'));
+
+  let init = await initUpload(file, folderId, mime, sha256, 'direct');
+  if (init.deduped && init.entry) return { entry: init.entry, deduped: true };
+  let uploadId = init.uploadId as string;
+
   try {
-    for (let part = 1; part <= parts; part++) {
-      const start = (part - 1) * CHUNK_BYTES;
-      const end = Math.min(file.size, start + CHUNK_BYTES);
-      const buf = await file.slice(start, end).arrayBuffer();
-      await putChunk(uploadId, part, buf, signal);
-      onProgress?.(Math.round((part / parts) * 100));
+    if (init.direct) {
+      try {
+        await uploadDirect(file, uploadId, init.partSize ?? FALLBACK_PART_BYTES, signal, onProgress);
+      } catch (e) {
+        // Браузер не смог ходить в S3 напрямую (нет CORS, сеть режет) — пересоздаём сессию
+        // и льём чанки через сервер: медленнее, но работает.
+        if (!(e instanceof DirectUnavailable) || signal?.aborted) throw e;
+        await abortUpload(uploadId);
+        init = await initUpload(file, folderId, mime, sha256, 'relay');
+        if (init.deduped && init.entry) return { entry: init.entry, deduped: true };
+        uploadId = init.uploadId as string;
+        await uploadChunks(file, uploadId, signal, onProgress);
+      }
+    } else {
+      await uploadChunks(file, uploadId, signal, onProgress);
     }
-    return await request<{ entry: { id: string }; deduped: boolean }>(`/uploads/${uploadId}/complete`, { method: 'POST' });
+    return await request<{ entry: { id: string }; deduped: boolean }>(`/uploads/${uploadId}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({ sha256 }),
+    });
   } catch (e) {
     // подчистить незавершённую сессию на сервере (multipart abort), если она осталась
-    try { await fetch(`${BASE}/uploads/${uploadId}`, { method: 'DELETE', credentials: 'include' }); } catch { /* ignore */ }
+    await abortUpload(uploadId);
     throw e;
+  }
+}
+
+/** Прямая загрузка в S3 не удалась так, что имеет смысл уйти на релей через сервер. */
+class DirectUnavailable extends Error {}
+
+interface UploadInit {
+  uploadId: string | null;
+  deduped: boolean;
+  direct: boolean;
+  partSize?: number;
+  entry?: { id: string };
+}
+
+function initUpload(
+  file: File,
+  folderId: string | undefined,
+  mime: string,
+  sha256: string,
+  mode: 'direct' | 'relay',
+): Promise<UploadInit> {
+  return request<UploadInit>('/uploads', {
+    method: 'POST',
+    body: JSON.stringify({ folderId, name: file.name, size: file.size, mime, sha256, mode }),
+  });
+}
+
+async function abortUpload(uploadId: string): Promise<void> {
+  try {
+    await fetch(`${BASE}/uploads/${uploadId}`, { method: 'DELETE', credentials: 'include' });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** sha256 файла инкрементально (hash-wasm, WASM ~ГБ/с) — файл целиком в память не читаем. */
+async function hashFile(
+  file: File,
+  signal?: AbortSignal,
+  onProgress?: (pct: number) => void,
+): Promise<string> {
+  const hasher = await createSHA256();
+  hasher.init();
+  for (let off = 0; off < file.size; off += HASH_CHUNK_BYTES) {
+    if (signal?.aborted) throw new Error('загрузка отменена');
+    const end = Math.min(file.size, off + HASH_CHUNK_BYTES);
+    hasher.update(new Uint8Array(await file.slice(off, end).arrayBuffer()));
+    onProgress?.(Math.round((end / file.size) * 100));
+  }
+  return hasher.digest('hex');
+}
+
+/** Presigned-ссылка на часть (подписывает сервер, байты идут мимо него). */
+async function presignPart(uploadId: string, part: number): Promise<string> {
+  try {
+    const r = await request<{ url: string }>(`/uploads/${uploadId}/url/${part}`);
+    return r.url;
+  } catch (e) {
+    const status = (e as { status?: number }).status;
+    if (status === 404 || status === 405) {
+      throw new DirectUnavailable('сервер не поддерживает прямую загрузку в S3');
+    }
+    throw e;
+  }
+}
+
+/** PUT части прямо в S3 по presigned-ссылке. Возвращает ETag (нужен для complete). */
+async function putPartDirect(url: string, buf: ArrayBuffer, signal?: AbortSignal): Promise<string> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (signal?.aborted) throw new Error('загрузка отменена');
+    try {
+      const res = await fetch(url, {
+        method: 'PUT',
+        body: buf,
+        signal,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+      if (res.ok) {
+        const etag = res.headers.get('etag');
+        if (!etag) {
+          throw new DirectUnavailable('S3 не отдал ETag — в CORS-правиле бакета нет ExposeHeaders: ETag');
+        }
+        return etag;
+      }
+      if (res.status >= 500 && attempt < 3) {
+        await sleep(700 * attempt);
+        continue;
+      }
+      last = new Error(`S3 ответил HTTP ${res.status}`);
+    } catch (e) {
+      if (e instanceof DirectUnavailable || signal?.aborted) throw e;
+      // сюда попадает и TypeError от fetch: CORS/сеть — прямая загрузка в S3 недоступна
+      last = e;
+      if (attempt >= 3) break;
+      await sleep(700 * attempt);
+      continue;
+    }
+    if (attempt >= 3) break;
+    await sleep(700 * attempt);
+  }
+  throw new DirectUnavailable(`прямая загрузка в S3 не удалась: ${(last as Error)?.message ?? last}`);
+}
+
+/** Части льём в S3 параллельно; ETag каждой части сообщаем серверу. */
+async function uploadDirect(
+  file: File,
+  uploadId: string,
+  partSize: number,
+  signal?: AbortSignal,
+  onProgress?: (pct: number, phase: UploadPhase) => void,
+): Promise<void> {
+  const total = Math.max(1, Math.ceil(file.size / partSize));
+  let done = 0;
+  let next = 1;
+
+  const worker = async () => {
+    for (;;) {
+      const part = next++;
+      if (part > total) return;
+      if (signal?.aborted) throw new Error('загрузка отменена');
+
+      const start = (part - 1) * partSize;
+      const end = Math.min(file.size, start + partSize);
+      const url = await presignPart(uploadId, part);
+      const buf = await file.slice(start, end).arrayBuffer();
+      const etag = await putPartDirect(url, buf, signal);
+      await request<unknown>(`/uploads/${uploadId}/parts/${part}`, {
+        method: 'PUT',
+        body: JSON.stringify({ etag, size: buf.byteLength }),
+      });
+
+      done++;
+      onProgress?.(Math.round((done / total) * 100), 'upload');
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(DIRECT_CONCURRENCY, total) }, () => worker()),
+  );
+}
+
+/** Фолбэк: чанки через сервер (сервер сам пишет их в S3 multipart-частями). */
+async function uploadChunks(
+  file: File,
+  uploadId: string,
+  signal?: AbortSignal,
+  onProgress?: (pct: number, phase: UploadPhase) => void,
+): Promise<void> {
+  const parts = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
+  for (let part = 1; part <= parts; part++) {
+    const start = (part - 1) * CHUNK_BYTES;
+    const end = Math.min(file.size, start + CHUNK_BYTES);
+    const buf = await file.slice(start, end).arrayBuffer();
+    await putChunk(uploadId, part, buf, signal);
+    onProgress?.(Math.round((part / parts) * 100), 'upload');
   }
 }
 

@@ -15,6 +15,7 @@ import {
 } from '@aws-sdk/client-s3';
 import { createWriteStream } from 'fs';
 import { createReadStream } from 'fs';
+import { createHash } from 'crypto';
 import { stat } from 'fs/promises';
 import { pipeline } from 'stream/promises';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -41,6 +42,9 @@ export class S3Service implements OnModuleDestroy {
   private static readonly COPY_CONCURRENCY = 4;
   /** Размер части при потоковой загрузке (multipart). */
   private static readonly STREAM_PART_SIZE = 32 * 1024 * 1024;
+  /** Окно чтения при подсчёте sha256 объекта: 4 × 16 МБ в полёте (~64 МБ памяти). */
+  private static readonly HASH_RANGE = 16 * 1024 * 1024;
+  private static readonly HASH_CONCURRENCY = 4;
 
   constructor() {
     if (env.S3_FILES_ACCESS_KEY && env.S3_FILES_SECRET_KEY) {
@@ -52,6 +56,10 @@ export class S3Service implements OnModuleDestroy {
           accessKeyId: env.S3_FILES_ACCESS_KEY,
           secretAccessKey: env.S3_FILES_SECRET_KEY,
         },
+        // Без этого SDK добавляет в presigned-URL контрольную сумму (x-amz-checksum-crc32),
+        // посчитанную от пустого тела: браузер, заливающий в эту ссылку реальные байты,
+        // получает от S3 отказ по checksum. Для presigned-загрузок checksum не нужен.
+        requestChecksumCalculation: 'WHEN_REQUIRED',
       });
     } else {
       this.client = null;
@@ -66,6 +74,11 @@ export class S3Service implements OnModuleDestroy {
   private s3(): S3Client {
     if (!this.client) throw new Error('S3 not configured: set S3_FILES_ACCESS_KEY / S3_FILES_SECRET_KEY');
     return this.client;
+  }
+
+  /** Настроен ли S3 (иначе прямая загрузка и файловые операции невозможны). */
+  get configured(): boolean {
+    return this.client !== null;
   }
 
   bucket = env.S3_FILES_BUCKET;
@@ -342,5 +355,60 @@ export class S3Service implements OnModuleDestroy {
       ResponseContentDisposition: 'attachment',
     });
     return getSignedUrl(this.s3(), cmd, { expiresIn: 15 * 60 });
+  }
+
+  /**
+   * Presigned-ссылка на загрузку ОДНОЙ части multipart напрямую из браузера в S3.
+   * Подписаны конкретный ключ, uploadId и номер части, срок — минуты: утечка ссылки
+   * даёт возможность записать одну часть одного ещё не собранного файла, и не более.
+   */
+  async presignedUploadPart(
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    expiresInSec: number,
+  ): Promise<string> {
+    const cmd = new UploadPartCommand({
+      Bucket: this.bucket,
+      Key: key,
+      UploadId: uploadId,
+      PartNumber: partNumber,
+    });
+    return getSignedUrl(this.s3(), cmd, { expiresIn: expiresInSec });
+  }
+
+  /**
+   * sha256 объекта, посчитанный чтением из S3. Нужен для прямой загрузки: сервер байтов
+   * не видел, а ключ объекта content-addressed — поэтому хэш берётся из самих данных, а не
+   * из того, что объявил клиент.
+   *
+   * Читаем не одним потоком, а окном параллельных Range-запросов: sha256 последователен,
+   * но байты можно возить заранее. Один поток из Hetzner идёт десятками МБ/с, из-за чего
+   * на десятках ГБ запрос complete вылезал за таймауты nginx (300 с).
+   */
+  async hashObject(key: string): Promise<string> {
+    const size = await this.objectSize(key);
+    const hash = createHash('sha256');
+    if (size <= 0) return hash.digest('hex');
+
+    const ranges = Math.ceil(size / S3Service.HASH_RANGE);
+    const fetchRange = (i: number): Promise<Buffer> => {
+      const start = i * S3Service.HASH_RANGE;
+      const end = Math.min(size, start + S3Service.HASH_RANGE) - 1;
+      return this.readRange(key, start, end);
+    };
+
+    const inFlight = new Map<number, Promise<Buffer>>();
+    const window = Math.min(S3Service.HASH_CONCURRENCY, ranges);
+    for (let i = 0; i < window; i++) inFlight.set(i, fetchRange(i));
+
+    for (let i = 0; i < ranges; i++) {
+      const buf = await inFlight.get(i)!;
+      inFlight.delete(i);
+      hash.update(buf);
+      const next = i + window;
+      if (next < ranges) inFlight.set(next, fetchRange(next));
+    }
+    return hash.digest('hex');
   }
 }

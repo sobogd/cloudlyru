@@ -25,6 +25,11 @@ const envSchema = z.object({
   S3_FILES_FORCE_PATH_STYLE: booleanish.default('true'),
 
   UPLOAD_CHUNK_MAX_MB: z.coerce.number().positive().default(20),
+  // Размер части при прямой загрузке в S3 (браузер → S3 мимо сервера). Части идут
+  // параллельно, поэтому крупная часть = меньше round-trip'ов на высоком пинге.
+  UPLOAD_DIRECT_PART_MB: z.coerce.number().positive().default(16),
+  // Срок жизни presigned-ссылки на часть, минуты.
+  UPLOAD_PART_URL_TTL_MIN: z.coerce.number().positive().default(15),
   MAX_FILE_SIZE_MB: z.coerce.number().positive().default(51200),
   TRASH_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
 
@@ -60,5 +65,7 @@ function load(): Env {
 export const env: Env = load();
 
 export const CHUNK_MAX_BYTES = Math.floor(env.UPLOAD_CHUNK_MAX_MB * 1024 * 1024);
+export const DIRECT_PART_BYTES = Math.floor(env.UPLOAD_DIRECT_PART_MB * 1024 * 1024);
+export const PART_URL_TTL_SEC = Math.floor(env.UPLOAD_PART_URL_TTL_MIN * 60);
 export const MAX_FILE_BYTES = Math.floor(env.MAX_FILE_SIZE_MB * 1024 * 1024);
 export const TRASH_RETENTION_MS = env.TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
