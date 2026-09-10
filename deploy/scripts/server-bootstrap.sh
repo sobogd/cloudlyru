@@ -29,11 +29,33 @@ if [[ -z "$DB_USER" || -z "$DB_PASS" || -z "$DB_NAME" ]]; then
   exit 1
 fi
 
-echo "==> 1/3 Каталог приложения"
+echo "==> 1/4 Каталог приложения"
 mkdir -p "$APP_DIR"
 chown -R deployer:deployer "$APP_DIR"
 
-echo "==> 2/3 Postgres: роль '$DB_USER' и БД '$DB_NAME'"
+echo "==> 2/4 Медиа-инструменты (ffmpeg / ffprobe / heif-convert)"
+# Конвертация медиа в зоне «Фото» требует этих бинарей. Без них задачи очереди падают
+# с ENOENT, а /api/v1/healthz отдаёт media.ok=false (раньше это выяснялось только
+# по «навсегда зависшим» задачам). exiftool приложению больше не нужен: метаданные
+# сохраняет sharp (keepExif/keepIccProfile), а видео разбирает ffprobe.
+if ! command -v heif-convert >/dev/null 2>&1; then
+  apt-get update -qq || true
+  apt-get install -y --no-install-recommends libheif-examples \
+    || echo "  ВНИМАНИЕ: libheif-examples не установился — HEIC не будет конвертироваться"
+fi
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  apt-get install -y --no-install-recommends ffmpeg \
+    || echo "  ВНИМАНИЕ: ffmpeg не установился — видео не будет конвертироваться"
+fi
+for b in ffmpeg ffprobe heif-convert; do
+  if command -v "$b" >/dev/null 2>&1; then
+    echo "  ok: $b → $(command -v "$b")"
+  else
+    echo "  НЕТ: $b"
+  fi
+done
+
+echo "==> 3/4 Postgres: роль '$DB_USER' и БД '$DB_NAME'"
 if ! command -v psql >/dev/null 2>&1; then
   echo "psql не найден — установите postgresql-client или postgres" >&2
   exit 1
@@ -53,7 +75,7 @@ else
   echo "БД уже есть — пропуск"
 fi
 
-echo "==> 3/3 nginx ($DOMAIN)"
+echo "==> 4/4 nginx ($DOMAIN)"
 # HTTP-only server block: SSL-секцию добавляет certbot --nginx (см. DEPLOY.md)
 cat > /etc/nginx/sites-available/cloudlyru.conf <<'NGINX'
 server {

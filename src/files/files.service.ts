@@ -128,7 +128,12 @@ export class FilesService {
     return ['Главная', ...names].join(' / ');
   }
 
-  /** Presigned-URL для скачивания. Фото-зона: оптимизированный мастер; файлы-зона: оригинал как есть. */
+  /**
+   * Presigned-URL для скачивания. Фото-зона: оптимизированный мастер; файлы-зона: оригинал как есть.
+   * masterReadyAt у видео выставляется РАНЬШЕ, чем появляется полный AV1-мастер (постер и 720p
+   * уже готовы, а мастер дожимается часами и может не собраться вообще), поэтому мастер
+   * обязательно проверяем через headObject — иначе отдаём presigned-URL на несуществующий объект.
+   */
   async presignedUrl(entryId: string): Promise<string> {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
@@ -140,10 +145,20 @@ export class FilesService {
 
     if (masterMime && asset.masterReadyAt) {
       const masterKey = masterMime === 'image/avif' ? MediaService.photoMasterKey(asset.sha256) : MediaService.videoMasterKey(asset.sha256);
-      // фото-зона: мастер; файлы-зона: оригинал, если жив в S3 (у легаси-медиа сырьё могло быть удалено)
-      if (entry.zone === ZONE_PHOTOS) return this.s3.presignedInline(masterKey, masterMime);
-      const rawAlive = await this.s3.headObject(S3Service.assetKey(asset.sha256)).catch(() => false);
-      if (!rawAlive) return this.s3.presignedInline(masterKey, masterMime);
+      const masterAlive = await this.s3.headObject(masterKey).catch(() => false);
+      if (masterAlive) {
+        // фото-зона: мастер; файлы-зона: оригинал, если жив в S3 (у легаси-медиа сырьё могло быть удалено)
+        if (entry.zone === ZONE_PHOTOS) return this.s3.presignedInline(masterKey, masterMime);
+        const rawAlive = await this.s3.headObject(S3Service.assetKey(asset.sha256)).catch(() => false);
+        if (!rawAlive) return this.s3.presignedInline(masterKey, masterMime);
+      } else if (masterMime === 'video/mp4') {
+        // мастер не собрался (например 4K упёрся в CONVERT_MEM_MB) — отдаём 720p-превью,
+        // оно публикуется одновременно с masterReadyAt
+        const previewKey = MediaService.video720Key(asset.sha256);
+        if (await this.s3.headObject(previewKey).catch(() => false)) {
+          return this.s3.presignedInline(previewKey, 'video/mp4');
+        }
+      }
     }
     return this.s3.presignedGet(S3Service.assetKey(asset.sha256), asset.mime);
   }

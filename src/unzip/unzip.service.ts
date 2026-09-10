@@ -3,6 +3,7 @@ import { createHash } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
+import { QueueService } from '../queue/queue.service';
 import { RemoteZip, ZipEntryInfo, hashStream } from './s3-zip';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
@@ -57,6 +58,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
     private readonly files: FilesService,
+    private readonly queue: QueueService,
   ) {}
 
   async onModuleInit() {
@@ -305,6 +307,8 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       doneBytes += files[i].uncompressedSize;
     }
     let skipped = job.skippedEntries;
+    /** Медиа зоны «Фото» — ставим в очередь конвертации после распаковки (см. конец цикла). */
+    const pendingMedia: Array<{ assetId: string; sha256: string; mime: string }> = [];
     if (startIndex > 0) {
       this.logger.log(
         `распаковка ${jobId}: продолжаем с файла ${startIndex + 1} из ${files.length} (${(doneBytes / 1e9).toFixed(1)} ГБ уже сделано)`,
@@ -384,9 +388,20 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
         await this.prisma.fileEntry.create({ data: { folderId, name: fileName, assetId, zone: entry.zone } });
       }
 
+      // Медиа-зона: запоминаем для очереди конвертации. Ставим её ПОСЛЕ распаковки —
+      // вызов здесь блокировал бы разбор архива, а EXIF воркер возьмёт из локального файла.
+      if (entry.zone === ZONE_PHOTOS) pendingMedia.push({ assetId, sha256, mime });
+
       doneEntries += 1;
       doneBytes += e.uncompressedSize;
       await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, fileName);
+    }
+
+    if (pendingMedia.length) {
+      this.logger.log(`«Фото»: ставим в очередь конвертации ${pendingMedia.length} файлов из архива`);
+      for (const m of pendingMedia) {
+        await this.queue.enqueue(m.assetId, m.sha256, m.mime).catch(() => undefined);
+      }
     }
 
     await this.checkpoint(jobId, files.length, doneEntries, doneBytes, skipped, null, true);

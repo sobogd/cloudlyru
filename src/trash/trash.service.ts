@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
+import { MediaService } from '../media/media.service';
 import { FoldersService } from '../folders/folders.service';
 import { FilesService } from '../files/files.service';
 import { conflict } from '../common/errors';
@@ -90,9 +91,14 @@ export class TrashService {
       select: { id: true, sha256: true },
     });
     if (orphanAssets.length) {
-      await this.s3
-        .deleteObjects(orphanAssets.map((a) => S3Service.assetKey(a.sha256)))
-        .catch(() => undefined);
+      // Удаляем и сырьё, и ВСЕ производные (view/*): мастер AVIF/AV1, превью и постер.
+      // Раньше удалялось только files/<sha>, поэтому деривативы оставались в S3 навсегда
+      // (а для зоны «Фото», где сырьё уже удалено после конвертации, не удалялось вообще ничего).
+      const keys = orphanAssets.flatMap((a) => [
+        S3Service.assetKey(a.sha256),
+        ...MediaService.derivativeKeys(a.sha256),
+      ]);
+      await this.s3.deleteObjects(keys).catch(() => undefined);
       await this.prisma.asset.deleteMany({
         where: { id: { in: orphanAssets.map((a) => a.id) } },
       });
