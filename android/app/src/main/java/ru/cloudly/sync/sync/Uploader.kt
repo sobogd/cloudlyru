@@ -73,8 +73,17 @@ class Uploader(private val api: Api) {
             return sendParts(init.uploadId, init.direct, init.partSize, File(file.path), sha256, onProgress)
         }
         // сессия осталась с прошлого прохода: продолжаем с последней принятой части
-        val (nextPart, size) = api.uploadStatus(uploadIdFromQueue)
-        return sendParts(uploadIdFromQueue, direct = true, partSize = size, file = File(file.path), sha256 = sha256, onProgress = onProgress, startPart = nextPart)
+        // (способ берём у сервера: релей-сессию нельзя продолжать presigned-ссылками)
+        val status = api.uploadStatus(uploadIdFromQueue)
+        return sendParts(
+            uploadIdFromQueue,
+            direct = status.direct,
+            partSize = status.partSize,
+            file = File(file.path),
+            sha256 = sha256,
+            onProgress = onProgress,
+            startPart = status.nextPart,
+        )
     }
 
     private fun sendParts(

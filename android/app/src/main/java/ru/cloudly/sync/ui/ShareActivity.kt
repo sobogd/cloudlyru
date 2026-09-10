@@ -200,11 +200,20 @@ private fun uploadShared(
     onProgress: (Float) -> Unit,
 ): String {
     val cacheDir = File(app.cacheDir, "share").apply { mkdirs() }
+    // остатки прошлых неудачных попыток не должны копиться
+    cacheDir.listFiles()?.forEach { it.delete() }
     var done = 0
     val errors = ArrayList<String>()
-    uris.forEachIndexed { index, uri ->
-        val name = displayName(app, uri) ?: "shared-${System.currentTimeMillis()}"
+    for ((index, uri) in uris.withIndex()) {
+        val name = safeName(displayName(app, uri) ?: "shared-${System.currentTimeMillis()}")
         val tmp = File(cacheDir, name)
+        // Имя приходит от чужого приложения: без проверки канонического пути «../../databases/…»
+        // записал бы или удалил файл вне кэша.
+        val canonicalCache = cacheDir.canonicalPath + File.separator
+        if (!tmp.canonicalPath.startsWith(canonicalCache)) {
+            errors.add("$name: недопустимое имя файла")
+            continue
+        }
         try {
             app.contentResolver.openInputStream(uri)?.use { input ->
                 tmp.outputStream().use { output -> input.copyTo(output, bufferSize = 1 shl 20) }
@@ -257,6 +266,20 @@ private fun uploadShared(
         "загружено: $done из ${uris.size}"
     } else {
         "загружено: $done из ${uris.size}; ошибки: ${errors.joinToString("; ")}"
+    }
+}
+
+/**
+ * Имя файла от чужого приложения: только базовое имя, без разделителей и «..»,
+ * с ограничением длины — иначе получился бы выход за пределы каталога кэша.
+ */
+private fun safeName(raw: String): String {
+    val base = raw.substringAfterLast('/').substringAfterLast('\\').trim().trimStart('.')
+    val cleaned = base.replace(Regex("[\\u0000-\\u001f]"), "_")
+    return when {
+        cleaned.isEmpty() -> "shared-${System.currentTimeMillis()}"
+        cleaned.length > 200 -> cleaned.take(200)
+        else -> cleaned
     }
 }
 
