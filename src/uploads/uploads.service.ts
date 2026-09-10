@@ -16,6 +16,11 @@ interface LiveSession {
   parts: S3Part[];
   tmpKey: string;
   s3UploadId: string;
+  /** sha256 после завершения потока: digest() можно вызвать только один раз,
+   *  а complete может повториться (сетевой ретрай клиента) — кэшируем результат. */
+  sha256?: string;
+  /** multipart уже финализирован — повторный complete не должен финализировать снова. */
+  finalized?: boolean;
 }
 
 /**
@@ -138,7 +143,7 @@ export class UploadsService implements OnModuleInit {
     const live = this.live.get(uploadId);
     if (!live) throw conflict('upload session expired (server restart) — re-init upload', 'upload_session_lost');
 
-    const sha256 = live.hash.digest('hex');
+    const sha256 = live.sha256 ?? (live.sha256 = live.hash.digest('hex'));
     const finalKey = S3Service.assetKey(sha256);
     const size = Number(row.size);
     const mime = row.mime;
@@ -154,9 +159,15 @@ export class UploadsService implements OnModuleInit {
       assetId = existingAsset.id;
       await this.s3.abortMultipartUpload(live.tmpKey, live.s3UploadId).catch(() => undefined);
     } else {
-      // финализируем tmp-объект и перекладываем под content-addressed ключ (server-side copy)
-      await this.s3.completeMultipartUpload(live.tmpKey, live.s3UploadId, live.parts);
-      await this.s3.copyObject(live.tmpKey, finalKey);
+      // финализируем tmp-объект и перекладываем под content-addressed ключ (server-side copy).
+      // Оба шага идемпотентны: complete может прийти повторно после сетевого ретрая клиента.
+      if (!live.finalized) {
+        await this.s3.completeMultipartUpload(live.tmpKey, live.s3UploadId, live.parts);
+        live.finalized = true;
+      }
+      if (!(await this.s3.headObject(finalKey))) {
+        await this.s3.copyObject(live.tmpKey, finalKey);
+      }
       assetId = await this.files.ensureAsset(sha256, size, mime, this.extOf(row.name));
     }
 
@@ -164,7 +175,20 @@ export class UploadsService implements OnModuleInit {
     await this.s3.deleteObject(live.tmpKey).catch(() => undefined);
 
     const folderId = row.folderId ?? (await this.auth.rootFolderId(userId));
-    const entry = await this.files.createEntry(folderId, row.name, assetId);
+    let entry: { id: string; deduped: boolean; zone: string };
+    try {
+      entry = await this.files.createEntry(folderId, row.name, assetId);
+    } catch (e) {
+      // повторный complete (после сетевого ретрая) — запись уже создана, это успех
+      const existing = await this.prisma.fileEntry.findFirst({
+        where: { folderId, name: row.name, deletedAt: null },
+      });
+      if (existing && existing.assetId === assetId) {
+        entry = { id: existing.id, deduped: true, zone: existing.zone };
+      } else {
+        throw e;
+      }
+    }
 
     await this.prisma.uploadSession.delete({ where: { id: uploadId } });
     this.live.delete(uploadId);

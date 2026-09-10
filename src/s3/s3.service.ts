@@ -11,6 +11,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  UploadPartCopyCommand,
 } from '@aws-sdk/client-s3';
 import { createWriteStream } from 'fs';
 import { createReadStream } from 'fs';
@@ -33,6 +34,11 @@ export interface S3Part {
 export class S3Service implements OnModuleDestroy {
   private readonly logger = new Logger(S3Service.name);
   private readonly client: S3Client | null;
+
+  /** Одиночный CopyObject в S3 работает только до 5 ГБ — больше копируем частями. */
+  private static readonly COPY_SINGLE_MAX = 5 * 1024 * 1024 * 1024;
+  private static readonly COPY_PART_SIZE = 512 * 1024 * 1024;
+  private static readonly COPY_CONCURRENCY = 4;
 
   constructor() {
     if (env.S3_FILES_ACCESS_KEY && env.S3_FILES_SECRET_KEY) {
@@ -140,10 +146,62 @@ export class S3Service implements OnModuleDestroy {
     return Buffer.concat(chunks);
   }
 
-  /** Server-side copy (для перекладывания tmp-объекта в content-addressed ключ). */
+  /**
+   * Server-side copy (для перекладывания tmp-объекта в content-addressed ключ).
+   *
+   * ВАЖНО: одиночный CopyObject в S3 работает только до 5 ГБ (иначе EntityTooLarge) —
+   * из-за этого падали загрузки крупных файлов (например архивов Takeout по 53 ГБ).
+   * Объекты больше порога копируем частями через UploadPartCopy.
+   */
   async copyObject(srcKey: string, dstKey: string): Promise<void> {
-    const cmd = new CopyObjectCommand({ Bucket: this.bucket, Key: dstKey, CopySource: `${this.bucket}/${srcKey}` });
-    await this.s3().send(cmd);
+    const size = await this.objectSize(srcKey);
+    if (size <= S3Service.COPY_SINGLE_MAX) {
+      const cmd = new CopyObjectCommand({ Bucket: this.bucket, Key: dstKey, CopySource: `${this.bucket}/${srcKey}` });
+      await this.s3().send(cmd);
+      return;
+    }
+
+    const partCount = Math.ceil(size / S3Service.COPY_PART_SIZE);
+    const uploadId = await this.createMultipartUpload(dstKey);
+    try {
+      const parts: S3Part[] = new Array(partCount);
+      let next = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = next++;
+          if (i >= partCount) return;
+          const start = i * S3Service.COPY_PART_SIZE;
+          const end = Math.min(size, start + S3Service.COPY_PART_SIZE) - 1;
+          const out = await this.s3().send(
+            new UploadPartCopyCommand({
+              Bucket: this.bucket,
+              Key: dstKey,
+              UploadId: uploadId,
+              PartNumber: i + 1,
+              CopySource: `${this.bucket}/${srcKey}`,
+              CopySourceRange: `bytes=${start}-${end}`,
+            }),
+          );
+          const etag = out.CopyPartResult?.ETag;
+          if (!etag) throw new Error(`S3: no ETag on copy part ${i + 1}`);
+          parts[i] = { PartNumber: i + 1, ETag: etag };
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(S3Service.COPY_CONCURRENCY, partCount) }, () => worker()),
+      );
+      await this.completeMultipartUpload(dstKey, uploadId, parts);
+      this.logger.log(`[s3] multipart-copy ${srcKey} → ${dstKey} (${(size / 1e9).toFixed(2)} ГБ, частей ${partCount})`);
+    } catch (e) {
+      await this.abortMultipartUpload(dstKey, uploadId).catch(() => undefined);
+      throw e;
+    }
+  }
+
+  /** Размер объекта (HeadObject); 0 — если объекта нет. */
+  async objectSize(key: string): Promise<number> {
+    const out = await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+    return Number(out.ContentLength ?? 0);
   }
 
   /** Однократная PUT-запись объекта (для file-drop и мелких файлов ≤ 5 ГБ). */
