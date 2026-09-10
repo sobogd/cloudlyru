@@ -357,11 +357,6 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
 
 // ===== Деталка файла: назад / скачать / удалить + вся метадата на фоне =====
 
-/** Секция в деталке: заголовок раздела метаданных. */
-function DetSection({ title }: { title: string }) {
-  return <div className="detsec">{title}</div>;
-}
-
 const rawNum = (v: unknown): number | undefined => {
   const n = Number(v);
   return Number.isFinite(n) && v !== null && v !== '' ? n : undefined;
@@ -414,6 +409,56 @@ function MetaRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   );
 }
 
+/** Строки метаданных, извлечённых из самого файла (EXIF для фото / ffprobe для видео). */
+function mediaRows(raw: Record<string, unknown> | null): Array<[string, string]> {
+  const rows: Array<[string, string]> = [];
+  if (!raw) return rows;
+  const push = (k: string, v: unknown, f?: (x: never) => string | undefined) => {
+    if (v === undefined || v === null || v === '') return;
+    const val = f ? f(v as never) : String(v);
+    if (val && !rows.some(([kk]) => kk === k)) rows.push([k, val]);
+  };
+  const num1 = (v: number) => String(Number(v).toFixed(1)).replace(/\.0$/, '');
+
+  if (raw.kind === 'image') {
+    push('Дата съёмки', raw.dateTimeOriginal, fmtExifDate);
+    push('Создан (EXIF)', raw.createDate, fmtExifDate);
+    push('Изменён (EXIF)', raw.modifyDate, fmtExifDate);
+    push('Часовой пояс', raw.offsetTime);
+    push('Камера', [raw.make, raw.model].filter(Boolean).join(' '));
+    push('Объектив', raw.lens);
+    push('Выдержка', raw.exposureTime);
+    push('Диафрагма', raw.fNumber, (v: number) => `f/${num1(v)}`);
+    push('ISO', raw.iso);
+    push('Фокусное', raw.focalLength, (v: number) => `${num1(v)} мм`);
+    push('Фокусное (35 мм)', raw.focalLength35, (v: number) => `${v} мм`);
+    push('Программа съёмки', raw.exposureProgram, (v: number) => EXPOSURE_PROGRAM[v] ?? String(v));
+    push('Ориентация', raw.orientation, (v: number) => ORIENTATION[v] ?? String(v));
+    push('Цвет. пространство', raw.colorSpace, (v: number) => COLOR_SPACE[v] ?? String(v));
+    if (rawNum(raw.width) && rawNum(raw.height)) push('Кадр', `${raw.width} × ${raw.height}`);
+    if (rawNum(raw.latitude) != null && rawNum(raw.longitude) != null) {
+      push('Координаты', `${Number(raw.latitude).toFixed(6)}, ${Number(raw.longitude).toFixed(6)}`);
+    }
+    push('Высота', raw.altitude, (v: number) => `${Math.round(v)} м`);
+    push('Описание', raw.description);
+    push('Автор', raw.artist);
+    push('Copyright', raw.copyright);
+    push('ПО', raw.software);
+  } else if (raw.kind === 'video') {
+    push('Длительность', raw.durationSec, fmtDuration);
+    push('Контейнер', raw.container);
+    push('Видеокодек', raw.videoCodec);
+    push('Аудиокодек', raw.audioCodec);
+    if (rawNum(raw.width) && rawNum(raw.height)) push('Кадр', `${raw.width} × ${raw.height}`);
+    push('Кадров/с', raw.fps, (v: number) => v.toFixed(2));
+    push('Битрейт', raw.bitrate, fmtBitrate);
+    push('Каналы', raw.audioChannels);
+    push('Частота дискретизации', raw.audioSampleRate, (v: number) => `${v} Гц`);
+    push('Создан', raw.createdAt, fmtLocal);
+  }
+  return rows;
+}
+
 function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }) {
   const [meta, setMeta] = useState<api.FileMeta | null>(null);
   const [err, setErr] = useState('');
@@ -445,6 +490,9 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
     if (!job) return;
     try { setJob(await api.cancelUnzip(job.id)); } catch (e) { alert((e as Error).message); }
   };
+
+  // метаданные из самого файла — одним списком, без разделов
+  const rows = mediaRows((meta?.media?.raw ?? null) as Record<string, unknown> | null);
 
   const del = async () => {
     if (!confirm(`Удалить «${meta?.name ?? 'файл'}» в корзину?`)) return;
@@ -505,7 +553,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
           <MetaRow k="Расположение" v={meta.path} />
           <MetaRow k="Создан" v={new Date(meta.createdAt).toLocaleString()} />
           {meta.masterMime && <MetaRow k="Оптимизирован" v={meta.masterMime} />}
-          {meta.media && !meta.media.raw && (
+          {rows.length === 0 && meta.media && (
             <>
               {meta.media.capturedAt && <MetaRow k="Дата съёмки" v={new Date(meta.media.capturedAt).toLocaleString()} />}
               {meta.media.make || meta.media.model ? <MetaRow k="Камера" v={[meta.media.make, meta.media.model].filter(Boolean).join(' ')} /> : null}
@@ -515,66 +563,8 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
               ) : null}
             </>
           )}
+          {rows.map(([k, v]) => <MetaRow key={k} k={k} v={v} />)}
           <MetaRow k="SHA-256" v={meta.sha256} mono />
-
-          {(() => {
-            const raw = (meta.media?.raw ?? null) as Record<string, unknown> | null;
-            const rows: Array<[string, string]> = [];
-            const push = (k: string, v: unknown, f?: (x: never) => string | undefined) => {
-              if (v === undefined || v === null || v === '') return;
-              const val = f ? f(v as never) : String(v);
-              if (val) rows.push([k, val]);
-            };
-            const dt = fmtExifDate; // EXIF без таймзоны — показываем как в файле
-
-            if (raw?.kind === 'image') {
-              push('Дата съёмки', raw.dateTimeOriginal, dt);
-              push('Создан (EXIF)', raw.createDate, dt);
-              push('Изменён (EXIF)', raw.modifyDate, dt);
-              push('Часовой пояс', raw.offsetTime);
-              push('Камера', [raw.make, raw.model].filter(Boolean).join(' '));
-              push('Объектив', raw.lens);
-              push('Выдержка', raw.exposureTime);
-              push('Диафрагма', raw.fNumber, (v: number) => `f/${Number(v).toFixed(1).replace(/\.0$/, '')}`);
-              push('ISO', raw.iso);
-              push('Фокусное', raw.focalLength, (v: number) => `${Number(v).toFixed(1).replace(/\.0$/, '')} мм`);
-              push('Фокусное (35 мм)', raw.focalLength35, (v: number) => `${v} мм`);
-              push('Программа съёмки', raw.exposureProgram, (v: number) => EXPOSURE_PROGRAM[v] ?? String(v));
-              push('Ориентация', raw.orientation, (v: number) => ORIENTATION[v] ?? String(v));
-              push('Цвет. пространство', raw.colorSpace, (v: number) => COLOR_SPACE[v] ?? String(v));
-              if (rawNum(raw.width) && rawNum(raw.height)) push('Кадр', `${raw.width} × ${raw.height}`);
-              if (rawNum(raw.latitude) != null && rawNum(raw.longitude) != null) {
-                push('Координаты', `${Number(raw.latitude).toFixed(6)}, ${Number(raw.longitude).toFixed(6)}`);
-              }
-              push('Высота', raw.altitude, (v: number) => `${Math.round(v)} м`);
-              push('Описание', raw.description);
-              push('Автор', raw.artist);
-              push('Copyright', raw.copyright);
-              push('ПО', raw.software);
-            } else if (raw?.kind === 'video') {
-              push('Длительность', raw.durationSec, fmtDuration);
-              push('Контейнер', raw.container);
-              push('Видеокодек', raw.videoCodec);
-              push('Аудиокодек', raw.audioCodec);
-              if (rawNum(raw.width) && rawNum(raw.height)) push('Кадр', `${raw.width} × ${raw.height}`);
-              push('Кадров/с', raw.fps, (v: number) => v.toFixed(2));
-              push('Битрейт', raw.bitrate, fmtBitrate);
-              push('Дорожки', raw.audioChannels, (v: number) => `${v} канал(а)`);
-              push('Частота дискретизации', raw.audioSampleRate, (v: number) => `${v} Гц`);
-              push('Создан', raw.createdAt, fmtLocal);
-            }
-
-            return (
-              <>
-                {rows.length > 0 && (
-                  <>
-                    <DetSection title={raw?.kind === 'video' ? 'Метаданные файла (видео)' : 'Метаданные файла (EXIF)'} />
-                    {rows.map(([k, v]) => <MetaRow key={k} k={k} v={v} />)}
-                  </>
-                )}
-              </>
-            );
-          })()}
         </div>
       )}
     </div>
