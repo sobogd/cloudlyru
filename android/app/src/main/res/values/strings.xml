@@ -4,4 +4,6 @@
     <string name="channel_sync">Синхронизация</string>
     <string name="channel_sync_desc">Загрузка файлов в облако</string>
     <string name="share_title">Загрузить в облако</string>
+    <string name="channel_problems">Проблемы синхронизации</string>
+    <string name="channel_problems_desc">Что не уехало в облако и где нужна проверка</string>
 </resources>

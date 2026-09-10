@@ -14,6 +14,7 @@ import ru.cloudly.sync.data.Prefs
 import ru.cloudly.sync.net.Api
 import ru.cloudly.sync.sync.Engine
 import ru.cloudly.sync.work.SyncWorker
+import ru.cloudly.sync.work.VerifyWorker
 import java.util.concurrent.TimeUnit
 
 /**
@@ -46,6 +47,10 @@ class App : Application() {
             NotificationChannel(CHANNEL_SYNC, getString(R.string.channel_sync), NotificationManager.IMPORTANCE_LOW)
                 .apply { description = getString(R.string.channel_sync_desc) },
         )
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_PROBLEMS, getString(R.string.channel_problems), NotificationManager.IMPORTANCE_DEFAULT)
+                .apply { description = getString(R.string.channel_problems_desc) },
+        )
     }
 
     /**
@@ -58,10 +63,19 @@ class App : Application() {
             .build()
         WorkManager.getInstance(this)
             .enqueueUniquePeriodicWork(SyncWorker.PERIODIC, ExistingPeriodicWorkPolicy.KEEP, request)
+
+        // Недельная сверка: диск и файловая система молча портят файлы, а объект на сервере мог
+        // исчезнуть. Проверяем порциями по кругу, поэтому большая библиотека обходится за несколько недель.
+        val verify = PeriodicWorkRequestBuilder<VerifyWorker>(7, TimeUnit.DAYS)
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .build()
+        WorkManager.getInstance(this)
+            .enqueueUniquePeriodicWork(VerifyWorker.PERIODIC, ExistingPeriodicWorkPolicy.KEEP, verify)
     }
 
     companion object {
         const val CHANNEL_SYNC = "sync"
+        const val CHANNEL_PROBLEMS = "problems"
         fun of(context: Context): App = context.applicationContext as App
     }
 }

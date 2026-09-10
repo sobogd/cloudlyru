@@ -55,6 +55,7 @@ import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Db
 import ru.cloudly.sync.net.Api
 import ru.cloudly.sync.work.SyncService
+import ru.cloudly.sync.work.VerifyWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -90,6 +91,7 @@ private fun Screen() {
     var checkResult by remember { mutableStateOf("") }
     var lastRun by remember { mutableStateOf(app.db.kv("last_run_stats").orEmpty()) }
     var lastError by remember { mutableStateOf(app.db.kv("last_run_error").orEmpty()) }
+    var lastVerify by remember { mutableStateOf(app.db.kv("last_verify_stats").orEmpty()) }
     var pending by remember { mutableStateOf(app.db.ops().size) }
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     var showAdd by remember { mutableStateOf(false) }
@@ -101,6 +103,7 @@ private fun Screen() {
         jobs.addAll(app.db.jobs())
         lastRun = app.db.kv("last_run_stats").orEmpty()
         lastError = app.db.kv("last_run_error").orEmpty()
+        lastVerify = app.db.kv("last_verify_stats").orEmpty()
         pending = app.db.ops().size
         allFiles = hasAllFilesAccess()
     }
@@ -111,6 +114,7 @@ private fun Screen() {
             delay(2000)
             lastRun = app.db.kv("last_run_stats").orEmpty()
             lastError = app.db.kv("last_run_error").orEmpty()
+            lastVerify = app.db.kv("last_verify_stats").orEmpty()
             pending = app.db.ops().size
         }
     }
@@ -252,6 +256,21 @@ private fun Screen() {
                 Button(onClick = { SyncService.start(context) }) { Text("Синхронизировать сейчас") }
                 OutlinedButton(onClick = { SyncService.stop(context) }) { Text("Стоп") }
             }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    scope.launch {
+                        status = "сверяю…"
+                        val text = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val st = VerifyWorker.verify(app)
+                                "сверка: проверено ${st.checked}, изменилось ${st.changed}, нет на сервере ${st.missing}, ошибок ${st.errors}"
+                            }.getOrElse { "сверка не прошла: ${it.message}" }
+                        }
+                        status = text
+                        lastVerify = app.db.kv("last_verify_stats").orEmpty()
+                    }
+                }) { Text("Проверить сейчас") }
+            }
             Spacer(Modifier.height(12.dp))
             Text("В очереди: $pending", fontSize = 13.sp)
             val failed = remember(pending) { app.db.failedOps().take(5) }
@@ -262,6 +281,7 @@ private fun Screen() {
                 }
             }
             if (lastRun.isNotEmpty()) Text("Прошлый проход: $lastRun", fontSize = 13.sp)
+            if (lastVerify.isNotEmpty()) Text("Сверка: $lastVerify", fontSize = 13.sp)
             if (lastError.isNotEmpty()) Text("Ошибка: $lastError", fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
             status.takeIf { it.isNotEmpty() }?.let { Text(it, fontSize = 12.sp, fontFamily = FontFamily.Monospace) }
             Spacer(Modifier.height(24.dp))

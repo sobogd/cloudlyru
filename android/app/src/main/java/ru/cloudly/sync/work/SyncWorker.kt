@@ -25,6 +25,19 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
                 "удалено ${stats.deleted}, конфликтов ${stats.conflicts}, ошибок ${stats.errors}",
         )
         stats.fatal?.let { app.db.putKv("last_run_error", it) }
+        // молчаливая синхронизация — плохая: об ошибках и конфликтах сообщаем уведомлением
+        val problems = stats.errors + stats.conflicts
+        if (stats.fatal != null || problems > 0) {
+            val detail = buildString {
+                append("ошибок ${stats.errors}, конфликтов ${stats.conflicts}")
+                stats.fatal?.let { append("; $it") }
+                val first = app.db.failedOps().firstOrNull()
+                first?.let { append("; например: ${it.relPath} — ${it.lastError}") }
+            }
+            Notifications.notifyProblems(applicationContext, detail)
+        } else {
+            Notifications.clearProblems(applicationContext)
+        }
         return if (stats.fatal != null) Result.retry() else Result.success()
     }
 
