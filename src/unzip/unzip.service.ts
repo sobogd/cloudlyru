@@ -294,14 +294,22 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       return folder.id;
     };
 
-    // Чекпойнт: сколько файлов уже обработано в прошлых заходах (рестарт сервиса
-    // не должен начинать архив заново — деплой иначе откатывает прогресс).
+    // Чекпойнт: сколько файлов уже обработано в прошлых заходах. Счётчики считаем
+    // ИЗ КУРСОРА, а не накапливаем из прошлых значений — иначе после рестарта
+    // (рестарт сервиса при деплое) уже пройденное зачитывалось повторно.
     const startIndex = Math.min(job.cursorIndex ?? 0, files.length);
-    let doneEntries = job.doneEntries;
-    let doneBytes = Number(job.doneBytes);
-    let skipped = job.skippedEntries;
+    let doneEntries = 0;
+    let doneBytes = 0;
+    for (let i = 0; i < startIndex; i++) {
+      doneEntries += 1;
+      doneBytes += files[i].uncompressedSize;
+    }
+    const skipped = job.skippedEntries;
     if (startIndex > 0) {
-      this.logger.log(`распаковка ${jobId}: продолжаем с файла ${startIndex + 1} из ${files.length}`);
+      this.logger.log(
+        `распаковка ${jobId}: продолжаем с файла ${startIndex + 1} из ${files.length} (${(doneBytes / 1e9).toFixed(1)} ГБ уже сделано)`,
+      );
+      await this.checkpoint(jobId, startIndex, doneEntries, doneBytes, skipped, null, true);
     }
 
     for (let idx = startIndex; idx < files.length; idx++) {
