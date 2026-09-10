@@ -4,26 +4,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { MediaService } from '../media/media.service';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
-import { sendObjectOr404 } from '../common/http-object';
+import { safeInlineImageMime, sendObjectOr404 } from '../common/http-object';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { conflict, notFound } from '../common/errors';
-
-/**
- * Типы, которые безопасно показывать прямо в интерфейсе. SVG/HTML сюда не попадают
- * намеренно: они исполняют скрипты, а отдаём мы их с нашего же домена.
- */
-const INLINE_IMAGE_MIMES: Record<string, string> = {
-  'image/jpeg': 'image/jpeg',
-  'image/png': 'image/png',
-  'image/gif': 'image/gif',
-  'image/webp': 'image/webp',
-  'image/avif': 'image/avif',
-  'image/bmp': 'image/bmp',
-  'image/tiff': 'image/tiff',
-  'image/heic': 'image/heic',
-  'image/heif': 'image/heif',
-};
 
 @Injectable()
 export class FilesService {
@@ -83,12 +67,14 @@ export class FilesService {
   }
 
   /** Полные метаданные файла для деталки: путь, размер/тип/хэш, EXIF/видео и метаданные Google. */
-  async getEntryMeta(entryId: string) {
+  async getEntryMeta(entryId: string, userId: string) {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
       include: { asset: { include: { media: true } }, folder: true },
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
+    // чужой файл не должен отличаться от несуществующего (внутри ещё и ленивый EXIF/ffprobe)
+    if (!(await this.auth.folderOwnedBy(userId, entry.folderId))) throw notFound('file not found');
 
     // Подробные метаданные извлекаем лениво при первом открытии деталки и кэшируем в БД.
     // Раньше EXIF парсился только для зоны «Фото», поэтому у файлов в «Файлах» деталка была пустой.
@@ -153,7 +139,7 @@ export class FilesService {
    * после конвертации. Возвращаем также признак «это оригинал»: для него S3 отдаёт
    * content-disposition: attachment (скачивание), для производных — inline (превью).
    */
-  private async resolveContentKey(asset: {
+  async resolveContentKey(asset: {
     sha256: string;
     mime: string;
   }): Promise<{ key: string; mime: string; original: boolean }> {
@@ -188,17 +174,18 @@ export class FilesService {
   }
 
   /**
-   * Presigned-URL для скачивания. Нужен там, где клиент качает мимо сервиса
-   * (публичные шаринг-ссылки, WebDAV). Для своих файлов используйте download().
+   * Содержимое записи для отдачи клиенту: ключ в S3, тип и имя файла.
+   * Presigned-ссылки наружу больше не выдаём (см. download/inlineImage) — их
+   * получатель работает без авторизации, поэтому и шаринг стримится через сервис.
    */
-  async presignedUrl(entryId: string): Promise<string> {
+  async contentForEntry(entryId: string): Promise<{ key: string; mime: string; name: string }> {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
       include: { asset: true },
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
-    const { key, mime, original } = await this.resolveContentKey(entry.asset);
-    return original ? this.s3.presignedGet(key, mime) : this.s3.presignedInline(key, mime);
+    const { key, mime } = await this.resolveContentKey(entry.asset);
+    return { key, mime, name: entry.name };
   }
 
   /** Свой живой файл: вход по id с проверкой, что он в дереве этого пользователя. */
@@ -234,7 +221,7 @@ export class FilesService {
    */
   async inlineImage(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
     const entry = await this.requireOwnEntry(entryId, userId);
-    const mime = INLINE_IMAGE_MIMES[String(entry.asset.mime).toLowerCase()];
+    const mime = safeInlineImageMime(entry.asset.mime);
     if (!mime) return this.download(entryId, userId, req, res);
     const { key } = await this.resolveContentKey(entry.asset);
     await sendObjectOr404(req, res, this.s3, key, {
@@ -246,16 +233,19 @@ export class FilesService {
     });
   }
 
-  async softDelete(entryId: string) {
-    const entry = await this.prisma.fileEntry.findUnique({ where: { id: entryId } });
-    if (!entry || entry.deletedAt) throw notFound('file not found');
+  async softDelete(entryId: string, userId: string) {
+    const owned = await this.auth.ownEntry(userId, entryId);
+    if (!owned) throw notFound('file not found');
     await this.prisma.fileEntry.update({ where: { id: entryId }, data: { deletedAt: new Date() } });
     return { ok: true };
   }
 
-  async restore(entryId: string) {
+  async restore(entryId: string, userId: string) {
+    // проверяем по дереву с удалёнными папками: запись из корзины может лежать
+    // внутри уже удалённой папки, и тогда нужен понятный конфликт, а не 404
+    const tree = await this.auth.subtreeIds(userId, { includeDeleted: true });
     const entry = await this.prisma.fileEntry.findUnique({ where: { id: entryId } });
-    if (!entry) throw notFound('file not found');
+    if (!entry || !tree.includes(entry.folderId)) throw notFound('file not found');
     if (entry.deletedAt) {
       const folder = await this.prisma.folder.findUnique({ where: { id: entry.folderId } });
       if (!folder || folder.deletedAt) throw conflict('parent folder is deleted — restore folder first');

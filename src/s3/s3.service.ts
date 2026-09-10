@@ -333,12 +333,6 @@ export class S3Service implements OnModuleDestroy {
     await this.s3().send(cmd);
   }
 
-  /** presigned GET inline (для превью/мастеров в браузере). */
-  async presignedInline(key: string, mime: string): Promise<string> {
-    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: key, ResponseContentType: mime });
-    return getSignedUrl(this.s3(), cmd, { expiresIn: 15 * 60 });
-  }
-
   /** Стримовая PUT-запись (WebDAV, большие файлы). */
   async putObjectStream(
     key: string,

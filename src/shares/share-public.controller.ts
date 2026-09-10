@@ -1,7 +1,9 @@
 import { Controller, Get, Param, Put, Query, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { SharesService } from './shares.service';
+import { S3Service } from '../s3/s3.service';
 import { Public } from '../common/decorators';
+import { sendObjectOr404 } from '../common/http-object';
 import { CHUNK_MAX_BYTES } from '../config/env';
 import { badRequest, payloadTooLarge } from '../common/errors';
 
@@ -17,14 +19,20 @@ function passwordOf(req: Request): string | undefined {
 @Public()
 @Controller('s')
 export class SharePublicController {
-  constructor(private readonly shares: SharesService) {}
+  constructor(
+    private readonly shares: SharesService,
+    private readonly s3: S3Service,
+  ) {}
 
   @Get(':token')
   view(@Param('token') token: string, @Req() req: Request) {
     return this.shares.view(token, req.ip ?? 'unknown', passwordOf(req));
   }
 
-  /** 302 → presigned URL (скачивание оригинала). */
+  /**
+   * Скачивание файла из шаринга. Стримим через сервис: раньше здесь был 302 на
+   * presigned-ссылку S3, а такая ссылка ещё 15 минут работает вообще без токена.
+   */
   @Get(':token/content/:entryId')
   async content(
     @Param('token') token: string,
@@ -32,8 +40,12 @@ export class SharePublicController {
     @Req() req: Request,
     @Res() res: Response,
   ) {
-    const url = await this.shares.content(token, entryId, req.ip ?? 'unknown', passwordOf(req));
-    return res.redirect(302, url);
+    const { key, name } = await this.shares.content(token, entryId, req.ip ?? 'unknown', passwordOf(req));
+    return sendObjectOr404(req, res, this.s3, key, {
+      mime: 'application/octet-stream',
+      disposition: 'attachment',
+      filename: name,
+    });
   }
 
   /** File-drop: PUT сырого тела (≤20 МБ) в расшаренную папку. */

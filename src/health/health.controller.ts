@@ -1,4 +1,4 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, Logger } from '@nestjs/common';
 import { execFileSync } from 'child_process';
 import { PrismaService } from '../prisma/prisma.service';
 import { Public } from '../common/decorators';
@@ -15,6 +15,7 @@ interface Toolchain {
 
 @Controller()
 export class HealthController {
+  private readonly logger = new Logger(HealthController.name);
   private tools: (Toolchain & { at: number }) | null = null;
 
   constructor(private readonly prisma: PrismaService) {}
@@ -23,13 +24,11 @@ export class HealthController {
   @Get('healthz')
   async healthz() {
     await this.prisma.$queryRaw`SELECT 1`;
-    return {
-      ok: true,
-      ts: new Date().toISOString(),
-      // Раньше healthz проверял только Postgres, поэтому отсутствие ffmpeg/heif-convert
-      // на новом сервере обнаруживалось лишь по «навсегда зависшим» задачам конвертации.
-      media: this.mediaToolchain(),
-    };
+    // Наружу — только факт работоспособности: версии бинарей и их наличие это карта
+    // окружения, которую незачем отдавать без авторизации (подробности идут в лог).
+    const tools = this.mediaToolchain();
+    if (!tools.ok) this.logger.warn(`нет бинарей для медиа: ${tools.missing.join(', ')}`);
+    return { ok: true, ts: new Date().toISOString() };
   }
 
   /** Тулчейн с кэшем: спавнить ffmpeg на каждый health-запрос не нужно. */

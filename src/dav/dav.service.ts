@@ -27,16 +27,16 @@ export class DavService {
     private readonly queue: QueueService,
   ) {}
 
-  /** Проверка Authorization: Basic login:apptoken. */
-  async authenticate(req: { headers: Record<string, unknown> }): Promise<string> {
+  /** Проверка Authorization: Basic login:apptoken → владелец и scope токена. */
+  async authenticate(req: { headers: Record<string, unknown> }): Promise<{ userId: string; scope: string }> {
     const h = req.headers['authorization'];
     if (typeof h !== 'string' || !h.startsWith('Basic ')) throw new UnauthorizedException('Basic auth required');
     const decoded = Buffer.from(h.slice(6), 'base64').toString('utf8');
     const idx = decoded.indexOf(':');
     const token = idx >= 0 ? decoded.slice(idx + 1) : decoded;
-    const userId = await this.auth.resolveApiToken(token);
-    if (!userId) throw new UnauthorizedException('invalid token');
-    return userId;
+    const auth = await this.auth.resolveApiToken(token);
+    if (!auth) throw new UnauthorizedException('invalid token');
+    return auth;
   }
 
   // ---- path → сущность ----
@@ -237,16 +237,24 @@ export class DavService {
     return 201;
   }
 
-  async getUrl(userId: string, davPath: string): Promise<{ url: string; mime: string; size: number }> {
+  /**
+   * Содержимое файла для GET: ключ в S3 и имя. Байты отдаёт контроллер потоком —
+   * раньше здесь выдавалась presigned-ссылка, которая живёт 15 минут без авторизации.
+   */
+  async getContent(
+    userId: string,
+    davPath: string,
+  ): Promise<{ key: string; mime: string; size: number; name: string }> {
     const parts = davPath.split('/').filter(Boolean);
     const entry = await this.entryByPath(userId, parts);
     if (!entry) throw notFound('file not found');
     const asset = await this.prisma.asset.findUnique({ where: { id: entry.assetId } });
     if (!asset) throw notFound('file not found');
     return {
-      url: await this.s3.presignedGet(S3Service.assetKey(asset.sha256), asset.mime),
+      key: S3Service.assetKey(asset.sha256),
       mime: asset.mime,
       size: Number(asset.size),
+      name: entry.name,
     };
   }
 

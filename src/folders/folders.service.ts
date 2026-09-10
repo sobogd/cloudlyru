@@ -28,11 +28,17 @@ export class FoldersService {
     return this.auth.rootFolderId(userId);
   }
 
-  /** Папка доступна (существует, не удалена). Если id — null/undefined → корень. */
+  /**
+   * Папка доступна (существует, не удалена И принадлежит этому пользователю).
+   * Если id — null/undefined → корень. Без проверки владельца сюда ходить нельзя:
+   * раньше `PATCH /folders/:id {parentId: свой корень}` переносил чужое поддерево
+   * в своё дерево, и после этого все проверки владения начинали пропускать чужие файлы.
+   */
   private async resolveAccessible(id: string | undefined | null, userId: string) {
     if (!id) return this.prisma.folder.findUniqueOrThrow({ where: { id: await this.rootId(userId) } });
     const folder = await this.prisma.folder.findUnique({ where: { id } });
     if (!folder || folder.deletedAt) throw notFound('folder not found');
+    if (!(await this.auth.folderOwnedBy(userId, folder.id))) throw notFound('folder not found');
     return folder;
   }
 
@@ -174,9 +180,10 @@ export class FoldersService {
     return { ok: true, affected: ids.length };
   }
 
-  private async resolveAccessibleOrDeleted(id: string, _userId: string) {
+  private async resolveAccessibleOrDeleted(id: string, userId: string) {
     const folder = await this.prisma.folder.findUnique({ where: { id } });
     if (!folder) throw notFound('folder not found');
+    await this.auth.assertFolderOwned(userId, folder.id, { deletedOk: true });
     return folder;
   }
 

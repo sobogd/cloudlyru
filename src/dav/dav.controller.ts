@@ -1,7 +1,9 @@
 import { All, Controller, Headers, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { DavService } from './dav.service';
+import { S3Service } from '../s3/s3.service';
 import { Public } from '../common/decorators';
+import { safeInlineImageMime, sendObjectOr404 } from '../common/http-object';
 
 const PREFIX = '/api/v1/dav';
 
@@ -15,7 +17,10 @@ function davPathOf(req: Request): string {
 /** WebDAV поверх файлового дерева (Finder/Mac). Basic auth = app-password. */
 @Controller('dav')
 export class DavController {
-  constructor(private readonly dav: DavService) {}
+  constructor(
+    private readonly dav: DavService,
+    private readonly s3: S3Service,
+  ) {}
 
   @Public()
   @All('*')
@@ -23,7 +28,11 @@ export class DavController {
     const davPath = davPathOf(req);
     const method = (req.method || 'GET').toUpperCase();
     try {
-      const userId = await this.dav.authenticate(req);
+      const { userId, scope } = await this.dav.authenticate(req);
+      const WRITE = ['MKCOL', 'PUT', 'DELETE', 'MOVE', 'COPY', 'PROPPATCH'];
+      if (WRITE.includes(method) && !scope.endsWith(':rw')) {
+        return res.status(403).end();
+      }
 
       switch (method) {
         case 'OPTIONS': {
@@ -48,8 +57,13 @@ export class DavController {
           return res.status(status).end();
         }
         case 'GET': {
-          const { url } = await this.dav.getUrl(userId, davPath);
-          return res.redirect(302, url);
+          const { key, mime, name } = await this.dav.getContent(userId, davPath);
+          // inline только для безопасных картинок: HTML/SVG, отданный inline с нашего
+          // домена, исполнился бы в браузере с сохранёнными Basic-кредами
+          const safe = safeInlineImageMime(mime);
+          return sendObjectOr404(req, res, this.s3, key, safe
+            ? { mime: safe, disposition: 'inline', filename: name }
+            : { mime: 'application/octet-stream', disposition: 'attachment', filename: name });
         }
         case 'HEAD': {
           const meta = await this.dav.headMeta(userId, davPath);

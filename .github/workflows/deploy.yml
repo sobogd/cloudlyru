@@ -108,6 +108,7 @@ jobs:
             DATABASE_URL=$DATABASE_URL
             SESSION_SECRET=$SESSION_SECRET
             SESSION_TTL_DAYS=30
+            API_TOKEN_TTL_DAYS=180
             COOKIE_NAME=cl_session
             ADMIN_LOGIN=$ADMIN_LOGIN
             ADMIN_PASSWORD=$ADMIN_PASSWORD

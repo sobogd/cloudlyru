@@ -23,6 +23,28 @@ export function contentDisposition(kind: 'inline' | 'attachment', filename?: str
   return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`;
 }
 
+/**
+ * Типы, которые безопасно показывать прямо в браузере (на нашем домене).
+ * SVG/HTML/PDF сюда не входят намеренно: они исполняют скрипты или открывают
+ * сторонний рендер, а отдаём мы их со своего origin.
+ */
+const INLINE_IMAGE_MIMES: Record<string, string> = {
+  'image/jpeg': 'image/jpeg',
+  'image/png': 'image/png',
+  'image/gif': 'image/gif',
+  'image/webp': 'image/webp',
+  'image/avif': 'image/avif',
+  'image/bmp': 'image/bmp',
+  'image/tiff': 'image/tiff',
+  'image/heic': 'image/heic',
+  'image/heif': 'image/heif',
+};
+
+/** Безопасный для inline тип или null (тогда файл отдаём только на скачивание). */
+export function safeInlineImageMime(mime: unknown): string | null {
+  return INLINE_IMAGE_MIMES[String(mime ?? '').toLowerCase()] ?? null;
+}
+
 export interface SendObjectOptions {
   /**
    * Content-Type для браузера. Всегда задаётся сервером, а не берётся из S3/из того,

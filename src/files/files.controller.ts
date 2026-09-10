@@ -8,8 +8,8 @@ export class FilesController {
   constructor(private readonly files: FilesService) {}
 
   @Get(':id')
-  meta(@Param('id') id: string) {
-    return this.files.getEntryMeta(id);
+  meta(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.files.getEntryMeta(id, user.id);
   }
 
   /**
@@ -39,7 +39,7 @@ export class FilesController {
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.files.softDelete(id);
+  remove(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.files.softDelete(id, user.id);
   }
 }

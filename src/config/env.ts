@@ -12,6 +12,8 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   SESSION_SECRET: z.string().min(16).default('dev-only-secret-change-me'),
   SESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
+  // Срок жизни app-токена (WebDAV/клиенты), дней. Раньше токены были бессрочными.
+  API_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(180),
   COOKIE_NAME: z.string().default('cl_session'),
 
   ADMIN_LOGIN: z.string().default('admin'),

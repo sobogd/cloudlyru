@@ -1,10 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuthService } from '../auth/auth.service';
 import { badRequest, notFound } from '../common/errors';
 
 @Injectable()
 export class AlbumsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auth: AuthService,
+  ) {}
 
   async create(userId: string, name: string) {
     const clean = String(name ?? '').trim();
@@ -33,8 +37,10 @@ export class AlbumsService {
     if (!album) throw notFound('album not found');
     const ids = Array.isArray(entryIds) ? entryIds.slice(0, 500).filter((x) => typeof x === 'string') : [];
     if (!ids.length) throw badRequest('entryIds required');
+    // в альбом можно положить только свои файлы: чужой entryId не должен даже утекать метаданными
+    const tree = await this.auth.subtreeIds(userId);
     const existing = await this.prisma.fileEntry.findMany({
-      where: { id: { in: ids }, deletedAt: null },
+      where: { id: { in: ids }, deletedAt: null, folderId: { in: tree } },
       select: { id: true },
     });
     const valid = new Set(existing.map((e) => e.id));
@@ -49,8 +55,9 @@ export class AlbumsService {
   async get(userId: string, albumId: string) {
     const album = await this.prisma.album.findFirst({ where: { id: albumId, userId } });
     if (!album) throw notFound('album not found');
+    const tree = await this.auth.subtreeIds(userId);
     const items = await this.prisma.albumItem.findMany({
-      where: { albumId },
+      where: { albumId, entry: { folderId: { in: tree } } },
       orderBy: { createdAt: 'desc' },
       include: {
         entry: {

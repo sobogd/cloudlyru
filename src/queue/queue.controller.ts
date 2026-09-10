@@ -1,21 +1,31 @@
 import { Controller, Get } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuthService } from '../auth/auth.service';
+import { CurrentUser, RequestUser } from '../common/decorators';
 
 @Controller('queue')
 export class QueueController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auth: AuthService,
+  ) {}
 
-  /** Статус очереди конвертации (для UI-монитора). */
+  /** Статус очереди конвертации (для UI-монитора) — только по своим файлам. */
   @Get('status')
-  async status() {
+  async status(@CurrentUser() user: RequestUser) {
+    const tree = await this.auth.subtreeIds(user.id);
+    // job'ы привязаны к ассету, а ассеты дедуплицируются между всеми: показываем те,
+    // на которые у пользователя есть живая запись в его дереве
+    const mine = { entries: { some: { folderId: { in: tree }, deletedAt: null } } };
     const [groups, processing, recent] = await Promise.all([
-      this.prisma.job.groupBy({ by: ['state'], _count: true }),
+      this.prisma.job.groupBy({ by: ['state'], _count: true, where: { asset: mine } }),
       this.prisma.job.findFirst({
-        where: { state: 'processing' },
+        where: { state: 'processing', asset: mine },
         orderBy: { startedAt: 'asc' },
         include: { asset: true },
       }),
       this.prisma.job.findMany({
+        where: { asset: mine },
         orderBy: { updatedAt: 'desc' },
         take: 15,
         include: { asset: { select: { sha256: true, masterReadyAt: true } } },

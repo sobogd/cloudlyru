@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
 import { QueueService } from '../queue/queue.service';
+import { AuthService } from '../auth/auth.service';
 import { RemoteZip, ZipEntryInfo, hashStream } from './s3-zip';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
@@ -59,6 +60,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     private readonly s3: S3Service,
     private readonly files: FilesService,
     private readonly queue: QueueService,
+    private readonly auth: AuthService,
   ) {}
 
   async onModuleInit() {
@@ -76,10 +78,18 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
 
   // ================= API =================
 
-  private async entryOf(entryId: string) {
-    const entry = await this.prisma.fileEntry.findUnique({ where: { id: entryId }, include: { asset: true } });
-    if (!entry || entry.deletedAt) throw notFound('файл не найден');
+  private async entryOf(entryId: string, userId: string) {
+    const entry = await this.auth.ownEntry(userId, entryId);
+    if (!entry) throw notFound('файл не найден');
     return entry;
+  }
+
+  /** Задача принадлежит пользователю, если её архив лежит в его дереве. */
+  private async ownJob(id: string, userId: string) {
+    const job = await this.prisma.unzipJob.findUnique({ where: { id } });
+    if (!job) throw notFound('задача не найдена');
+    await this.auth.assertFolderOwned(userId, job.folderId, { deletedOk: true });
+    return job;
   }
 
   private assertZip(entry: { name: string; asset: { mime: string } }) {
@@ -88,8 +98,8 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Поставить архив в очередь на распаковку (или вернуть уже идущую задачу). */
-  async start(entryId: string) {
-    const entry = await this.entryOf(entryId);
+  async start(entryId: string, userId: string) {
+    const entry = await this.entryOf(entryId, userId);
     this.assertZip(entry);
     const active = await this.prisma.unzipJob.findFirst({
       where: { entryId, state: { in: ['pending', 'processing'] } },
@@ -104,21 +114,20 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Статус задачи. */
-  async status(id: string) {
-    const job = await this.prisma.unzipJob.findUnique({ where: { id } });
-    if (!job) throw notFound('задача не найдена');
-    return this.view(job);
+  async status(id: string, userId: string) {
+    return this.view(await this.ownJob(id, userId));
   }
 
   /** Последняя задача по архиву (чтобы UI показал прогресс после перезагрузки страницы). */
-  async latestForEntry(entryId: string) {
+  async latestForEntry(entryId: string, userId: string) {
+    const entry = await this.auth.ownEntry(userId, entryId);
+    if (!entry) throw notFound('файл не найден');
     const job = await this.prisma.unzipJob.findFirst({ where: { entryId }, orderBy: { createdAt: 'desc' } });
     return job ? this.view(job) : null;
   }
 
-  async cancel(id: string) {
-    const job = await this.prisma.unzipJob.findUnique({ where: { id } });
-    if (!job) throw notFound('задача не найдена');
+  async cancel(id: string, userId: string) {
+    const job = await this.ownJob(id, userId);
     if (job.state === 'pending') {
       await this.prisma.unzipJob.update({
         where: { id },
@@ -127,7 +136,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     } else if (job.state === 'processing') {
       this.cancelled.add(id);
     }
-    return this.status(id);
+    return this.status(id, userId);
   }
 
   private view(job: {

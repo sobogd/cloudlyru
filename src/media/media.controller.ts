@@ -139,14 +139,22 @@ export class MediaController {
   }
 
   @Get('timeline')
-  timeline(@Query('limit') limit?: string, @Query('before') before?: string) {
+  timeline(
+    @CurrentUser() user: RequestUser,
+    @Query('limit') limit?: string,
+    @Query('before') before?: string,
+  ) {
     const lim = limit ? Number(limit) : 300;
-    return this.media.timeline(Number.isFinite(lim) ? lim : 300, typeof before === 'string' ? before : undefined);
+    return this.media.timeline(
+      user.id,
+      Number.isFinite(lim) ? lim : 300,
+      typeof before === 'string' ? before : undefined,
+    );
   }
 
   @Get('trips')
-  trips() {
-    return this.media.trips();
+  trips(@CurrentUser() user: RequestUser) {
+    return this.media.trips(user.id);
   }
 
   @Get('albums')

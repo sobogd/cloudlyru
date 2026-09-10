@@ -21,6 +21,7 @@ model User {
   createdAt     DateTime   @default(now())
   sessions      Session[]
   apiTokens     ApiToken[]
+  shares        Share[]
   rootFolderId  String? // корневая папка пользователя (создаётся при seed)
   photoFolderId String? // системная папка «Фото» (медиа-зона; создаётся при seed/lazy)
 }
@@ -41,7 +42,8 @@ model ApiToken {
   userId     String
   label      String
   tokenHash  String    @unique
-  scope      String    @default("files:rw") // будущее: files:ro, share:rw ...
+  scope      String    @default("files:rw") // files:rw | files:ro (проверяется в resolveApiToken)
+  expiresAt  DateTime? // null = бессрочный (легаси-токены)
   lastUsedAt DateTime?
   revokedAt  DateTime?
   createdAt  DateTime  @default(now())
@@ -147,6 +149,10 @@ enum ShareCapability {
 
 model Share {
   id           String          @id @default(uuid())
+  // владелец ссылки: без него list/update/revoke работали по одному токену,
+  // то есть любой залогиненный мог увидеть и отозвать чужой шаринг
+  userId       String?
+  user         User?           @relation(fields: [userId], references: [id], onDelete: Cascade)
   kind         ShareKind
   targetId     String
   token        String          @unique // 128 бит случайности
@@ -155,6 +161,8 @@ model Share {
   expiresAt    DateTime?
   createdAt    DateTime        @default(now())
   revokedAt    DateTime?
+
+  @@index([userId])
 }
 
 // ===== Аудит =====
@@ -193,6 +201,8 @@ model Album {
   name      String
   createdAt DateTime    @default(now())
   items     AlbumItem[]
+
+  @@index([userId])
 }
 
 model AlbumItem {

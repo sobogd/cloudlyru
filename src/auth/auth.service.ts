@@ -5,7 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { randomToken, sha256Hex } from '../common/utils';
 import { PHOTO_FOLDER_NAME, ZONE_PHOTOS } from '../common/zones';
 import { AuditService } from '../audit/audit.service';
-import { badRequest, unauthorized } from '../common/errors';
+import { badRequest, notFound, unauthorized } from '../common/errors';
 
 export const ROOT_FOLDER_NAME = '__root__';
 
@@ -147,6 +147,49 @@ export class AuthService implements OnModuleInit {
   }
 
   /**
+   * Все папки дерева пользователя одним запросом (рекурсивный CTE).
+   * includeDeleted=true нужен корзине: удалённая папка со всем поддеревом тоже «своя».
+   * Нужен там, где фильтровать надо не по одной записи, а по всему дереву
+   * (лента фото, поездки, корзина, очередь).
+   */
+  async subtreeIds(userId: string, opts: { includeDeleted?: boolean } = {}): Promise<string[]> {
+    const rootId = await this.rootIdOrNull(userId);
+    if (!rootId) return [];
+    const sql = opts.includeDeleted
+      ? `WITH RECURSIVE t AS (
+           SELECT f.id, f."parentId" FROM "Folder" f WHERE f.id = $1
+           UNION ALL
+           SELECT f.id, f."parentId" FROM "Folder" f JOIN t ON f."parentId" = t.id
+         ) SELECT id FROM t`
+      : `WITH RECURSIVE t AS (
+           SELECT f.id, f."parentId" FROM "Folder" f WHERE f.id = $1
+           UNION ALL
+           SELECT f.id, f."parentId" FROM "Folder" f JOIN t ON f."parentId" = t.id WHERE f."deletedAt" IS NULL
+         ) SELECT id FROM t`;
+    const rows = await this.prisma.$queryRawUnsafe<Array<{ id: string }>>(sql, rootId);
+    return rows.map((r) => r.id);
+  }
+
+  /** Своя папка или 404 (deletedOk — для восстановления из корзины). */
+  async assertFolderOwned(userId: string, folderId: string, opts: { deletedOk?: boolean } = {}): Promise<void> {
+    if (opts.deletedOk) {
+      const ids = await this.subtreeIds(userId, { includeDeleted: true });
+      if (!ids.includes(folderId)) throw notFound('folder not found');
+      return;
+    }
+    if (!(await this.folderOwnedBy(userId, folderId))) throw notFound('folder not found');
+  }
+
+  /** Своя запись файла или null (deletedOk — для восстановления из корзины). */
+  async ownEntry(userId: string, entryId: string, opts: { deletedOk?: boolean } = {}) {
+    const entry = await this.prisma.fileEntry.findUnique({ where: { id: entryId }, include: { asset: true } });
+    if (!entry) return null;
+    if (!opts.deletedOk && entry.deletedAt) return null;
+    if (!(await this.folderOwnedBy(userId, entry.folderId))) return null;
+    return entry;
+  }
+
+  /**
    * Системная папка «Фото» (медиа-зона). Создаётся лениво как ребёнок корня;
    * существующую папку с таким именем «усыновляем» (делаем её медиа-корнем).
    * Её нельзя переименовать/переместить/удалить (гарды в Folders/Dav).
@@ -203,7 +246,13 @@ export class AuthService implements OnModuleInit {
     const clean = String(label ?? 'app').slice(0, 64) || 'app';
     const token = randomToken(32);
     const t = await this.prisma.apiToken.create({
-      data: { userId, label: clean, tokenHash: sha256Hex(token), scope: 'files:rw' },
+      data: {
+        userId,
+        label: clean,
+        tokenHash: sha256Hex(token),
+        scope: 'files:rw',
+        expiresAt: new Date(Date.now() + env.API_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000),
+      },
     });
     // plain-токен показывается один раз
     return { id: t.id, token, label: t.label };
@@ -213,7 +262,7 @@ export class AuthService implements OnModuleInit {
     const rows = await this.prisma.apiToken.findMany({
       where: { userId, revokedAt: null },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, label: true, scope: true, lastUsedAt: true, createdAt: true },
+      select: { id: true, label: true, scope: true, expiresAt: true, lastUsedAt: true, createdAt: true },
     });
     return rows;
   }
@@ -227,14 +276,19 @@ export class AuthService implements OnModuleInit {
     return { ok: true };
   }
 
-  /** Проверка Basic-токена (WebDAV): возвращает userId или null. */
-  async resolveApiToken(token: string): Promise<string | null> {
+  /**
+   * Проверка Basic-токена (WebDAV). Возвращает владельца и scope или null.
+   * Раньше поле scope было декоративным и не читалось, а срок жизни отсутствовал.
+   */
+  async resolveApiToken(token: string): Promise<{ userId: string; scope: string } | null> {
     if (!token) return null;
     const t = await this.prisma.apiToken.findUnique({ where: { tokenHash: sha256Hex(token) } });
     if (!t || t.revokedAt) return null;
+    if (t.expiresAt && t.expiresAt.getTime() <= Date.now()) return null;
+    if (!String(t.scope).startsWith('files:')) return null;
     await this.prisma.apiToken
       .update({ where: { id: t.id }, data: { lastUsedAt: new Date() } })
       .catch(() => undefined);
-    return t.userId;
+    return { userId: t.userId, scope: t.scope };
   }
 }

@@ -4,6 +4,7 @@ import { S3Service } from '../s3/s3.service';
 import { MediaService } from '../media/media.service';
 import { FoldersService } from '../folders/folders.service';
 import { FilesService } from '../files/files.service';
+import { AuthService } from '../auth/auth.service';
 import { conflict } from '../common/errors';
 
 @Injectable()
@@ -13,12 +14,15 @@ export class TrashService {
     private readonly s3: S3Service,
     private readonly folders: FoldersService,
     private readonly files: FilesService,
+    private readonly auth: AuthService,
   ) {}
 
-  async list() {
+  /** Корзина ТОЛЬКО этого пользователя: папки и файлы внутри его дерева. */
+  async list(userId: string) {
+    const tree = await this.auth.subtreeIds(userId, { includeDeleted: true });
     // «корни» удалённых папок: папка удалена, а её родитель — нет
     const deletedFolders = await this.prisma.folder.findMany({
-      where: { deletedAt: { not: null } },
+      where: { deletedAt: { not: null }, id: { in: tree } },
       select: { id: true, name: true, deletedAt: true, parent: { select: { deletedAt: true } } },
       orderBy: { deletedAt: 'desc' },
     });
@@ -27,7 +31,7 @@ export class TrashService {
       .map((f) => ({ id: f.id, name: f.name, deletedAt: f.deletedAt, kind: 'folder' as const }));
 
     const deletedEntries = await this.prisma.fileEntry.findMany({
-      where: { deletedAt: { not: null } },
+      where: { deletedAt: { not: null }, folderId: { in: tree } },
       select: {
         id: true,
         name: true,
@@ -51,10 +55,10 @@ export class TrashService {
     return { folders, entries };
   }
 
-  async restore(type: 'folder' | 'file', id: string) {
-    if (type === 'folder') return this.folders.restore(id, 'unused'); // userId не используется
+  async restore(type: 'folder' | 'file', id: string, userId: string) {
+    if (type === 'folder') return this.folders.restore(id, userId);
     try {
-      return await this.files.restore(id);
+      return await this.files.restore(id, userId);
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === 'P2002') {
@@ -64,16 +68,25 @@ export class TrashService {
     }
   }
 
-  /** Полная очистка корзины (hard delete) с удалением осиротевших объектов из S3. */
-  async purge(olderThanDays?: number) {
+  /** Полная очистка СВОЕЙ корзины (hard delete) с удалением осиротевших объектов из S3. */
+  async purge(userId: string, olderThanDays?: number) {
     const cutoff = olderThanDays ? new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000) : undefined;
+    const tree = await this.auth.subtreeIds(userId, { includeDeleted: true });
 
     const deletedEntries = await this.prisma.fileEntry.findMany({
-      where: { deletedAt: { not: null }, ...(cutoff ? { deletedAt: { lt: cutoff } } : {}) },
+      where: {
+        deletedAt: { not: null },
+        folderId: { in: tree },
+        ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
+      },
       select: { id: true },
     });
     const deletedFolders = await this.prisma.folder.findMany({
-      where: { deletedAt: { not: null }, ...(cutoff ? { deletedAt: { lt: cutoff } } : {}) },
+      where: {
+        deletedAt: { not: null },
+        id: { in: tree },
+        ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
+      },
       select: { id: true },
     });
     const entryIds = deletedEntries.map((e) => e.id);

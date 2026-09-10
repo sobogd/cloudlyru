@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
 import { SharesService } from './shares.service';
+import { CurrentUser, RequestUser } from '../common/decorators';
 import { asOptionalString, asString, isPlainObject } from '../common/utils';
 import { badRequest } from '../common/errors';
 
@@ -8,7 +9,7 @@ export class SharesController {
   constructor(private readonly shares: SharesService) {}
 
   @Post()
-  create(@Body() body: Record<string, unknown>) {
+  create(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
     if (!isPlainObject(body)) throw badRequest('invalid body');
     const kind = body.kind === 'file' || body.kind === 'FILE' ? ('FILE' as const) : ('FOLDER' as const);
     const targetId = asString(body.targetId, 'targetId');
@@ -26,16 +27,20 @@ export class SharesController {
       if (Number.isNaN(d.getTime())) throw badRequest('invalid expiresAt');
       expiresAt = d;
     }
-    return this.shares.create({ kind, targetId, password, capability, expiresAt });
+    return this.shares.create({ kind, targetId, password, capability, expiresAt }, user.id);
   }
 
   @Get()
-  list() {
-    return this.shares.list();
+  list(@CurrentUser() user: RequestUser) {
+    return this.shares.list(user.id);
   }
 
   @Patch(':token')
-  update(@Param('token') token: string, @Body() body: Record<string, unknown>) {
+  update(
+    @Param('token') token: string,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: RequestUser,
+  ) {
     if (!isPlainObject(body)) throw badRequest('invalid body');
     let password: string | null | undefined;
     if (body.password !== undefined) {
@@ -58,11 +63,11 @@ export class SharesController {
       | 'UPLOAD'
       | 'RW'
       | undefined;
-    return this.shares.update(token, { password, expiresAt, capability });
+    return this.shares.update(token, { password, expiresAt, capability }, user.id);
   }
 
   @Delete(':token')
-  revoke(@Param('token') token: string) {
-    return this.shares.revoke(token);
+  revoke(@Param('token') token: string, @CurrentUser() user: RequestUser) {
+    return this.shares.revoke(token, user.id);
   }
 }

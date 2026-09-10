@@ -4,6 +4,7 @@ import { readFile } from 'fs/promises';
 import * as exifr from 'exifr';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
+import { AuthService } from '../auth/auth.service';
 import { ZONE_PHOTOS } from '../common/zones';
 
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
@@ -124,6 +125,7 @@ export class MediaService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
+    private readonly auth: AuthService,
   ) {}
 
   static viewKey(sha256: string, suffix: string): string {
@@ -396,11 +398,14 @@ export class MediaService {
 
   // ============ Таймлайн ============
 
-  async timeline(limit = 300, before?: string): Promise<TimelineItem[]> {
+  async timeline(userId: string, limit = 300, before?: string): Promise<TimelineItem[]> {
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return [];
     const rows = (await this.prisma.fileEntry.findMany({
       where: {
         deletedAt: null,
         zone: ZONE_PHOTOS, // только медиа-зона: системная папка «Фото» и её поддеревья
+        folderId: { in: tree }, // и только дерево этого пользователя
         asset: { media: before ? { capturedAt: { lt: new Date(before) } } : { isNot: null } },
       },
       orderBy: { asset: { media: { capturedAt: 'desc' } } },
@@ -438,9 +443,11 @@ export class MediaService {
     }));
   }
 
-  async trips(): Promise<Trip[]> {
+  async trips(userId: string): Promise<Trip[]> {
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return [];
     const rows = (await this.prisma.fileEntry.findMany({
-      where: { deletedAt: null, zone: ZONE_PHOTOS, asset: { media: { isNot: null } } },
+      where: { deletedAt: null, zone: ZONE_PHOTOS, folderId: { in: tree }, asset: { media: { isNot: null } } },
       orderBy: { asset: { media: { capturedAt: 'asc' } } },
       select: {
         id: true,

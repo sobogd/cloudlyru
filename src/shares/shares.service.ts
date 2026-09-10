@@ -5,6 +5,7 @@ import type { ShareKind as PrismaShareKind, ShareCapability as PrismaShareCapabi
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
+import { AuthService } from '../auth/auth.service';
 import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
 import { env } from '../config/env';
@@ -37,6 +38,7 @@ export class SharesService {
     private readonly files: FilesService,
     private readonly media: MediaService,
     private readonly queue: QueueService,
+    private readonly auth: AuthService,
   ) {}
 
   // ============ Владелец ============
@@ -47,31 +49,34 @@ export class SharesService {
     password?: string;
     capability?: ShareCapability;
     expiresAt?: Date | null;
-  }) {
+  }, userId: string) {
     const kind = opts.kind === KIND.FILE ? KIND.FILE : KIND.FOLDER;
     const capability: ShareCapability = opts.capability ?? CAP.VIEW;
     if (opts.capability && !['VIEW', 'DOWNLOAD', 'UPLOAD', 'RW'].includes(opts.capability)) {
       throw badRequest('invalid capability');
     }
-    if (opts.password && (opts.password.length < 4 || opts.password.length > 128)) {
-      throw badRequest('password length 4..128');
+    if (opts.password && (opts.password.length < 8 || opts.password.length > 128)) {
+      throw badRequest('password length 8..128');
     }
     if (opts.expiresAt && opts.expiresAt.getTime() <= Date.now()) {
       throw badRequest('expiresAt must be in the future');
     }
 
-    // цель должна существовать и не быть в корзине
+    // цель должна существовать, не быть в корзине И принадлежать тому, кто выдаёт ссылку:
+    // без этой проверки любой залогиненный мог расшарить чужую папку с capability RW
     if (kind === KIND.FILE) {
-      const entry = await this.prisma.fileEntry.findUnique({ where: { id: opts.targetId } });
-      if (!entry || entry.deletedAt) throw notFound('file not found');
+      const entry = await this.auth.ownEntry(userId, opts.targetId);
+      if (!entry) throw notFound('file not found');
     } else {
       const folder = await this.prisma.folder.findUnique({ where: { id: opts.targetId } });
       if (!folder || folder.deletedAt) throw notFound('folder not found');
+      if (!(await this.auth.folderOwnedBy(userId, folder.id))) throw notFound('folder not found');
     }
 
     const token = randomToken(24);
     const share = await this.prisma.share.create({
       data: {
+        userId,
         kind: kind as PrismaShareKind,
         targetId: opts.targetId,
         capability: capability as PrismaShareCapability,
@@ -83,27 +88,31 @@ export class SharesService {
     return this.toPublic(share);
   }
 
-  async list() {
+  async list(userId: string) {
     const rows = await this.prisma.share.findMany({
-      where: { revokedAt: null },
+      where: { userId, revokedAt: null },
       orderBy: { createdAt: 'desc' },
       take: 200,
     });
     return rows.map((r) => this.toPublic(r));
   }
 
-  async revoke(token: string) {
+  async revoke(token: string, userId: string) {
     const res = await this.prisma.share.updateMany({
-      where: { token, revokedAt: null },
+      where: { token, userId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
     if (res.count === 0) throw notFound('share not found');
     return { ok: true };
   }
 
-  async update(token: string, patch: { password?: string | null; expiresAt?: Date | null; capability?: ShareCapability }) {
+  async update(
+    token: string,
+    patch: { password?: string | null; expiresAt?: Date | null; capability?: ShareCapability },
+    userId: string,
+  ) {
     const share = await this.prisma.share.findUnique({ where: { token } });
-    if (!share || share.revokedAt) throw notFound('share not found');
+    if (!share || share.revokedAt || share.userId !== userId) throw notFound('share not found');
     if (patch.capability && !['VIEW', 'DOWNLOAD', 'UPLOAD', 'RW'].includes(patch.capability)) {
       throw badRequest('invalid capability');
     }
@@ -197,8 +206,16 @@ export class SharesService {
     };
   }
 
-  /** presigned-URL для скачивания файла из шаринга. */
-  async content(token: string, entryId: string, ip: string, password?: string): Promise<string> {
+  /**
+   * Содержимое файла из шаринга. Возвращаем ключ в S3 и имя: байты отдаёт контроллер
+   * потоком. Раньше здесь выдавалась presigned-ссылка, которая работала уже без токена.
+   */
+  async content(
+    token: string,
+    entryId: string,
+    ip: string,
+    password?: string,
+  ): Promise<{ key: string; mime: string; name: string }> {
     const share = await this.resolve(token);
     await this.checkPassword(share, ip, password);
     if (!['DOWNLOAD', 'RW'].includes(share.capability)) {
@@ -217,7 +234,7 @@ export class SharesService {
       if (entry.folderId !== share.targetId) throw forbidden('file not in share');
     }
     // мастер для медиа-зоны (после конвертации сырья в S3 нет), оригинал — для зоны «Файлы»
-    return this.files.presignedUrl(entryId);
+    return this.files.contentForEntry(entryId);
   }
 
   /** File-drop: загрузка файла в расшаренную папку без аккаунта (capability UPLOAD/RW). */

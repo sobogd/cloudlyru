@@ -122,10 +122,12 @@ export class UploadsService implements OnModuleInit {
     }
   }
 
+  /** Папка-приёмник: только своя (чужой folderId — это запись в чужое дерево). */
   private async resolveFolder(folderId: string | undefined, userId: string): Promise<string> {
     if (folderId) {
       const folder = await this.prisma.folder.findUnique({ where: { id: folderId } });
       if (!folder || folder.deletedAt) throw notFound('folder not found');
+      if (!(await this.auth.folderOwnedBy(userId, folder.id))) throw notFound('folder not found');
       return folder.id;
     }
     return this.auth.rootFolderId(userId);
@@ -197,9 +199,12 @@ export class UploadsService implements OnModuleInit {
 
     // Дедуп до передачи байтов: клиент посчитал sha256, объект с таким содержимым уже лежит
     // в S3 (и размер совпадает) — заливать нечего, создаём только запись в дереве.
+    // ВАЖНО: дедуп разрешён только для содержимого, которое у пользователя уже есть.
+    // Иначе по чужому sha256+size (их раздают /timeline и листинги) можно было получить
+    // ссылку на чужой файл, не передав ни одного байта.
     if (declared) {
       const asset = await this.prisma.asset.findUnique({ where: { sha256: declared } });
-      if (asset && Number(asset.size) === size) {
+      if (asset && Number(asset.size) === size && (await this.auth.ownsAsset(userId, asset.id))) {
         const done = await this.finish({
           userId,
           folderId,
