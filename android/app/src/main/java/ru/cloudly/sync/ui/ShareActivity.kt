@@ -84,91 +84,23 @@ private fun ShareScreen(uris: List<Uri>) {
 
     var currentFolderId by remember { mutableStateOf(app.db.kv("share_folder_id").orEmpty()) }
     var currentPath by remember { mutableStateOf(app.db.kv("share_folder_path").orEmpty().ifEmpty { "Главная" }) }
-    var folderNameField by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var cancelRequested by remember { mutableStateOf(false) }
     var lastError by remember { mutableStateOf("") }
     var progress by remember { mutableStateOf(0f) }
-    val folders = remember { mutableStateListOf<RemoteFolder>() }
-
-    fun loadFolders() {
-        scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    val parent = if (currentFolderId.isBlank()) app.api.rootFolderId() else currentFolderId
-                    if (currentFolderId.isBlank()) currentFolderId = parent
-                    app.api.subfolders(parent).map { (name, id) -> RemoteFolder(id, name) }
-                }
-            }
-            folders.clear()
-            result.getOrNull()?.let { folders.addAll(it) }
-            result.exceptionOrNull()?.let { status = "не прочитал папки: ${it.message}" }
-        }
-    }
-
-    LaunchedEffect(currentFolderId) { loadFolders() }
+    var pickFolder by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Загрузить в облако", fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Text("Файлов: ${uris.size} · папка: $currentPath", fontSize = 13.sp)
         Spacer(Modifier.height(10.dp))
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(enabled = !busy, onClick = {
-                currentPath = "Главная"
-                currentFolderId = ""
-                app.db.putKv("share_folder_path", currentPath)
-                app.db.putKv("share_folder_id", "")
-            }) { Text("В корень") }
-            OutlinedButton(enabled = !busy, onClick = { loadFolders() }) { Text("Обновить") }
-        }
-        Spacer(Modifier.height(8.dp))
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-                value = folderNameField,
-                onValueChange = { folderNameField = it },
-                label = { Text("Новая папка здесь") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(0.7f),
-            )
-            OutlinedButton(enabled = !busy && folderNameField.isNotBlank(), onClick = {
-                scope.launch {
-                    val created = withContext(Dispatchers.IO) {
-                        runCatching {
-                            val id = app.api.ensurePath(folderNameField.trim(), currentFolderId)
-                            currentFolderId = id
-                            currentPath = "$currentPath/${folderNameField.trim()}"
-                            app.db.putKv("share_folder_id", currentFolderId)
-                            app.db.putKv("share_folder_path", currentPath)
-                            folderNameField = ""
-                        }
-                    }
-                    created.exceptionOrNull()?.let { status = "не создал папку: ${it.message}" }
-                    loadFolders()
-                }
-            }) { Text("Создать") }
-        }
-        Spacer(Modifier.height(8.dp))
-
-        LazyColumn(modifier = Modifier.fillMaxWidth().height(240.dp)) {
-            items(folders, key = { it.id }) { folder ->
-                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-                    Row(Modifier.padding(10.dp)) {
-                        Text("📁 ${folder.name}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.fillMaxWidth(0.06f))
-                        OutlinedButton(onClick = {
-                            currentFolderId = folder.id
-                            currentPath = "$currentPath/${folder.name}"
-                            app.db.putKv("share_folder_id", currentFolderId)
-                            app.db.putKv("share_folder_path", currentPath)
-                        }) { Text("Войти", fontSize = 12.sp) }
-                    }
-                }
-            }
-        }
-
+        OutlinedButton(
+            enabled = !busy,
+            onClick = { pickFolder = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Изменить папку: $currentPath", fontSize = 13.sp) }
         Spacer(Modifier.height(10.dp))
         if (busy) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
         if (status.isNotEmpty()) Text(status, fontSize = 12.sp)
@@ -203,6 +135,21 @@ private fun ShareScreen(uris: List<Uri>) {
                 Text("не уехало: $lastError", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
             }
         }
+    }
+
+    if (pickFolder) {
+        CloudFolderPicker(
+            title = "Куда загрузить",
+            initialFolderId = currentFolderId.ifBlank { null },
+            onDismiss = { pickFolder = false },
+            onPicked = { id, path, _ ->
+                currentFolderId = id
+                currentPath = path
+                app.db.putKv("share_folder_id", id)
+                app.db.putKv("share_folder_path", path)
+                pickFolder = false
+            },
+        )
     }
 }
 

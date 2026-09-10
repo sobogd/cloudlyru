@@ -415,76 +415,128 @@ private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit, onOpenFiles: ()
 @Composable
 private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) -> Unit) {
     val scope = rememberCoroutineScope()
-    var dir by remember { mutableStateOf("/storage/emulated/0/DCIM/Camera") }
+    var dir by remember { mutableStateOf("") }
     var zone by remember { mutableStateOf("PHOTOS") }
-    var remote by remember { mutableStateOf("Фото/Камера") }
+    var remoteId by remember { mutableStateOf("") }
+    var remoteCrumbs by remember { mutableStateOf(listOf<Pair<String, String>>()) }
+    var remotePath by remember { mutableStateOf("") }
     var keepDays by remember { mutableStateOf(-1) }
     var wifiOnly by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
+    var pickLocal by remember { mutableStateOf(false) }
+    var pickRemote by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Новая папка") },
         text = {
             Column {
-                OutlinedTextField(
-                    value = dir,
-                    onValueChange = { dir = it },
-                    label = { Text("Папка на телефоне") },
-                    singleLine = true,
+                Text("Что синхронизировать", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                OutlinedButton(
+                    onClick = { pickLocal = true },
                     modifier = Modifier.fillMaxWidth(),
-                )
-                Text(
-                    if (File(dir).isDirectory) "папка найдена" else "папки нет — проверьте путь",
-                    fontSize = 12.sp,
-                    color = if (File(dir).isDirectory) MaterialTheme.colorScheme.onSurfaceVariant
-                    else MaterialTheme.colorScheme.error,
-                )
-                Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = zone == "PHOTOS", onCheckedChange = { zone = if (it) "PHOTOS" else "FILES" })
-                    Text(if (zone == "PHOTOS") "Фото (превью и таймлайн)" else "Файлы (как есть)", fontSize = 13.sp)
+                ) {
+                    Text(if (dir.isBlank()) "Выбрать папку на телефоне" else dir, fontSize = 13.sp)
                 }
-                OutlinedTextField(
-                    value = remote,
-                    onValueChange = { remote = it },
-                    label = { Text("Папка в облаке") },
-                    singleLine = true,
+                if (dir.isNotBlank()) {
+                    val exists = File(dir).isDirectory
+                    val fileCount = remember(dir) { File(dir).listFiles()?.count { it.isFile } ?: 0 }
+                    Text(
+                        if (exists) "файлов в папке: $fileCount" else "папки больше нет — выберите заново",
+                        fontSize = 11.sp,
+                        color = if (exists) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+
+                Text("Куда в облаке", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                OutlinedButton(
+                    onClick = { pickRemote = true },
                     modifier = Modifier.fillMaxWidth(),
-                )
-                Text("Хранить на телефоне", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                ) {
+                    Text(
+                        if (remoteId.isBlank()) "Выбрать папку в облаке" else "Главная / $remotePath",
+                        fontSize = 13.sp,
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+
+                Text("Как хранить", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf(-1 to "всегда", 0 to "сразу", 7 to "7 дн", 30 to "30 дн").forEach { (days, label) ->
-                        OutlinedButton(onClick = { keepDays = days }) {
-                            Text(if (keepDays == days) "• $label" else label, fontSize = 12.sp)
-                        }
+                    OutlinedButton(onClick = { zone = "PHOTOS" }, modifier = Modifier.fillMaxWidth(0.5f)) {
+                        Text(if (zone == "PHOTOS") "● Фото" else "Фото", fontSize = 13.sp)
+                    }
+                    OutlinedButton(onClick = { zone = "FILES" }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (zone == "FILES") "● Файлы" else "Файлы", fontSize = 13.sp)
                     }
                 }
+                Text(
+                    if (zone == "PHOTOS") "Фото и видео: сервер сделает превью и покажет в таймлайне"
+                    else "Как есть: без конвертации, обычное хранилище",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+
+                RetentionPicker(days = keepDays, onChange = { keepDays = it })
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Switch(checked = wifiOnly, onCheckedChange = { wifiOnly = it })
-                    Text("только Wi-Fi", fontSize = 13.sp)
+                    Text("загружать только по Wi-Fi", fontSize = 13.sp)
                 }
                 if (error.isNotEmpty()) Text(error, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
             }
         },
         confirmButton = {
-            TextButton(enabled = !busy, onClick = {
-                busy = true
-                error = ""
-                scope.launch {
-                    val message = withContext(Dispatchers.IO) {
-                        runCatching {
-                            val folderId = app.api.ensurePath(remote)
-                            app.db.addJob(dir.trimEnd('/'), folderId, remote, zone, keepDays, wifiOnly)
-                            "добавлено: $dir → $remote"
-                        }.getOrElse { "не получилось: ${it.message}" }
+            TextButton(
+                enabled = !busy && dir.isNotBlank() && remoteId.isNotBlank(),
+                onClick = {
+                    busy = true
+                    error = ""
+                    scope.launch {
+                        val message = withContext(Dispatchers.IO) {
+                            runCatching {
+                                app.db.addJob(
+                                    dir.trimEnd('/'),
+                                    remoteId,
+                                    remotePath.ifBlank { "Главная" },
+                                    zone,
+                                    keepDays,
+                                    wifiOnly,
+                                )
+                                "добавлено: $dir → $remotePath"
+                            }.getOrElse { "не получилось: ${it.message}" }
+                        }
+                        busy = false
+                        if (message.startsWith("добавлено")) onCreated(message) else error = message
                     }
-                    busy = false
-                    if (message.startsWith("добавлено")) onCreated(message) else error = message
-                }
-            }) { Text(if (busy) "…" else "Добавить") }
+                },
+            ) { Text(if (busy) "…" else "Добавить") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
+
+    if (pickLocal) {
+        LocalFolderPicker(
+            initial = dir,
+            onDismiss = { pickLocal = false },
+            onPicked = { picked ->
+                dir = picked
+                pickLocal = false
+            },
+        )
+    }
+    if (pickRemote) {
+        CloudFolderPicker(
+            initialFolderId = remoteId.ifBlank { null },
+            initialPath = remoteCrumbs,
+            onDismiss = { pickRemote = false },
+            onPicked = { id, path, crumbs ->
+                remoteId = id
+                remotePath = path
+                remoteCrumbs = crumbs
+                pickRemote = false
+            },
+        )
+    }
 }
