@@ -23,7 +23,16 @@ class Uploader(private val api: Api) {
      * Итог заливки. `stale` — сервер отказал из-за расхождения версий: файл на сервере
      * уже другой, клиент должен сохранить локальную копию как конфликтную.
      */
-    data class Result(val entryId: String, val name: String, val sha256: String, val deduped: Boolean, val stale: Boolean, val currentSha256: String?)
+    data class Result(
+        val entryId: String,
+        val name: String,
+        val sha256: String,
+        val deduped: Boolean,
+        val stale: Boolean,
+        val currentSha256: String?,
+        /** Имя занято корзиной сервера: сами не воскрешаем, решает пользователь. */
+        val inTrash: Boolean = false,
+    )
 
     /**
      * @param expectedSha256 версия файла на сервере, которую клиент считает актуальной
@@ -36,6 +45,7 @@ class Uploader(private val api: Api) {
         replace: Boolean,
         expectedSha256: String?,
         uploadIdFromQueue: String?,
+        onSession: (String) -> Unit,
         onProgress: (sent: Long, total: Long) -> Unit,
     ): Result {
         val mime = Scanner.mimeOf(file.name)
@@ -51,10 +61,16 @@ class Uploader(private val api: Api) {
                 expectedSha256 = expectedSha256,
             )
             if (init.stale) return Result("", file.name, sha256, false, stale = true, currentSha256 = init.currentSha256)
+            if (init.inTrash) return Result("", file.name, sha256, false, stale = false, currentSha256 = null, inTrash = true)
+            if (init.nameTaken) {
+                // имя занято — движок разберётся: сверит хэш и либо зафиксирует, либо зальёт замену
+                throw ru.cloudly.sync.net.ApiException(409, "conflict", "file name already exists", null)
+            }
             if (init.deduped || init.uploadId == null) {
                 // содержимое уже в облаке: запись создана, байты не передавались
                 return Result(init.uploadId ?: "", file.name, sha256, deduped = true, stale = false, currentSha256 = null)
             }
+            onSession(init.uploadId)
             return sendParts(init.uploadId, init.direct, init.partSize, File(file.path), sha256, onProgress)
         }
         // сессия осталась с прошлого прохода: продолжаем с последней принятой части
@@ -76,11 +92,13 @@ class Uploader(private val api: Api) {
         val parts = max(1, ((total + partSize - 1) / partSize).toInt())
         var sent = ((startPart - 1).toLong() * partSize).coerceAtMost(total)
         onProgress(sent, total)
+        // релей-режим (байты идут через сервер) требует строгого порядка частей
+        val width = if (direct) parallelism else 1
 
         RandomAccessFile(file, "r").use { raf ->
             var part = startPart
             while (part <= parts) {
-                val batchEnd = min(parts, part + parallelism - 1)
+                val batchEnd = min(parts, part + width - 1)
                 val batch = (part..batchEnd).toList()
                 val lock = Object()
                 var failure: Throwable? = null

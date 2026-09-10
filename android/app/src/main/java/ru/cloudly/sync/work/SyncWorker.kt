@@ -3,6 +3,8 @@ package ru.cloudly.sync.work
 import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 
 /**
@@ -14,7 +16,8 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     override suspend fun doWork(): Result {
         val app = App.of(applicationContext)
         if (!app.prefs.configured) return Result.success()
-        val stats = app.engine().syncAll()
+        // сеть и диск — на IO: воркер по умолчанию крутится на Dispatchers.Default
+        val stats = withContext(Dispatchers.IO) { app.engine().syncAll() }
         app.db.putKv("last_run_at", System.currentTimeMillis().toString())
         app.db.putKv(
             "last_run_stats",

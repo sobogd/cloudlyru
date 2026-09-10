@@ -28,7 +28,9 @@ class Prefs(context: Context) {
     var serverUrl: String
         get() = prefs.getString(KEY_URL, DEFAULT_URL) ?: DEFAULT_URL
         set(value) {
-            val normalized = value.trim().trimEnd('/')
+            var normalized = value.trim().trimEnd('/')
+            // OkHttp требует схему: «files.example.com» без неё просто не соберётся в URL
+            if (normalized.isNotEmpty() && !normalized.contains("://")) normalized = "https://$normalized"
             prefs.edit().putString(KEY_URL, normalized).apply()
         }
 

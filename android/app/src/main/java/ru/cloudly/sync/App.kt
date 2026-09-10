@@ -29,7 +29,7 @@ class App : Application() {
         private set
 
     /** Движок создаётся по требованию: он лёгкий, но держать его в Application незачем. */
-    fun engine(): Engine = Engine(db, api)
+    fun engine(): Engine = Engine(this, db, api)
 
     override fun onCreate() {
         super.onCreate()

@@ -52,8 +52,12 @@ data class UploadInit(
     val partSize: Int,
     val nextPart: Int,
     val partUrlTtlSec: Int,
-    /** Сервер ответил 409 stale_version: клиент должен сделать конфликтную копию. */
+    /** 409 stale_version: на сервере другая версия — клиент делает конфликтную копию. */
     val stale: Boolean = false,
+    /** 409 in_trash: имя занято записью из корзины — сами не воскрешаем. */
+    val inTrash: Boolean = false,
+    /** 409 «имя уже существует»: запись есть, движок сверит хэш и решит. */
+    val nameTaken: Boolean = false,
     val currentSha256: String? = null,
 )
 
@@ -67,6 +71,8 @@ data class RemoteEntry(
     val sha256: String,
     val keepOffline: Boolean,
     val clientMtime: Long?,
+    /** Папка, в которой лежит запись — нужна для сопоставления при зеркале вниз. */
+    val folderId: String? = null,
 )
 
 data class FolderChildren(val folderIds: Map<String, String>, val entries: List<RemoteEntry>)

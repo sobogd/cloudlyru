@@ -62,6 +62,53 @@ class Api(private val prefs: Prefs) {
     /** Проверка токена и адреса сервера. */
     fun me(): String = parse(request("/auth/me")).optJSONObject("user")?.optString("login").orEmpty()
 
+    /**
+     * Первичная настройка: вход логином и паролем, затем выпуск device-токена.
+     * Пароль на телефоне не сохраняется — сохраняется только выпущенный токен, который
+     * можно отозвать в вебе, не меняя пароль владельца.
+     */
+    fun loginAndCreateToken(login: String, password: String, deviceLabel: String): String {
+        val cookies = okhttp3.CookieJar.NO_COOKIES.let { _ -> mutableListOf<okhttp3.Cookie>() }
+        val jar = object : okhttp3.CookieJar {
+            override fun saveFromResponse(url: okhttp3.HttpUrl, list: List<okhttp3.Cookie>) {
+                cookies.addAll(list)
+            }
+
+            override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> = cookies
+        }
+        val session = OkHttpClient.Builder()
+            .cookieJar(jar)
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+        val base = prefs.serverUrl.trimEnd('/') + "/api/v1"
+        val loginBody = JSONObject().put("login", login).put("password", password).toString()
+            .toRequestBody(json)
+        session.newCall(
+            Request.Builder().url("$base/auth/login").post(loginBody).build(),
+        ).execute().use { res ->
+            val text = res.body?.string().orEmpty()
+            if (!res.isSuccessful) {
+                val obj = runCatching { JSONObject(text) }.getOrNull()
+                throw ApiException(res.code, obj?.optString("code").orEmpty(), obj?.optString("message").orEmpty().ifBlank { "не удалось войти" }, obj)
+            }
+        }
+        val tokenBody = JSONObject().put("label", deviceLabel.ifBlank { "android" }).toString().toRequestBody(json)
+        session.newCall(
+            Request.Builder().url("$base/auth/tokens")
+                .post(tokenBody)
+                .header("Origin", prefs.serverUrl.trimEnd('/'))
+                .build(),
+        ).execute().use { res ->
+            val text = res.body?.string().orEmpty()
+            if (!res.isSuccessful) {
+                val obj = runCatching { JSONObject(text) }.getOrNull()
+                throw ApiException(res.code, obj?.optString("code").orEmpty(), obj?.optString("message").orEmpty().ifBlank { "не удалось выпустить токен" }, obj)
+            }
+            return JSONObject(text).optString("token")
+        }
+    }
+
     fun changes(since: String, limit: Int = 200): ChangesPage {
         val o = parse(request("/sync/changes?since=$since&limit=$limit"))
         val arr = o.optJSONArray("changes") ?: JSONArray()
@@ -150,6 +197,8 @@ class Api(private val prefs: Prefs) {
         val response = request("/uploads", "POST", body)
         if (response.code == 409) {
             val obj = runCatching { JSONObject(response.body?.string().orEmpty()) }.getOrNull()
+            // 409 бывает трёх видов: расхождение версий, имя в корзине, имя просто занято
+            val code = obj?.optString("code").orEmpty()
             return UploadInit(
                 uploadId = null,
                 deduped = false,
@@ -158,7 +207,9 @@ class Api(private val prefs: Prefs) {
                 partSize = 0,
                 nextPart = 0,
                 partUrlTtlSec = 0,
-                stale = true,
+                stale = code == "stale_version",
+                inTrash = code == "in_trash",
+                nameTaken = code != "stale_version" && code != "in_trash",
                 currentSha256 = obj?.optString("sha256")?.takeIf { it.isNotBlank() && it != "null" },
             )
         }
@@ -236,13 +287,23 @@ class Api(private val prefs: Prefs) {
     }
 
     fun downloadStream(entryId: String): InputStream {
-        val response = request("/files/$entryId/content")
+        // отдельный клиент: чтение тела большого файла может идти минутами
+        val req = Request.Builder()
+            .url(url("/files/$entryId/content"))
+            .header("Authorization", "Bearer ${prefs.token}")
+            .build()
+        val response = downloadClient.newCall(req).execute()
         if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
         return response.body!!.byteStream()
     }
 
     fun ping(): Boolean = runCatching { me(); true }.getOrDefault(false)
 }
+
+private val downloadClient = OkHttpClient.Builder()
+    .connectTimeout(20, TimeUnit.SECONDS)
+    .readTimeout(0, TimeUnit.MILLISECONDS)
+    .build()
 
 private object Oks3 {
     val client: OkHttpClient = OkHttpClient.Builder()

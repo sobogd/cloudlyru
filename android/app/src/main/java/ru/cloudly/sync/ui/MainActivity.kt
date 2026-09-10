@@ -84,6 +84,8 @@ private fun Screen() {
 
     var serverUrl by remember { mutableStateOf(app.prefs.serverUrl) }
     var token by remember { mutableStateOf(app.prefs.token) }
+    var login by remember { mutableStateOf("admin") }
+    var password by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
     var checkResult by remember { mutableStateOf("") }
     var lastRun by remember { mutableStateOf(app.db.kv("last_run_stats").orEmpty()) }
@@ -180,8 +182,44 @@ private fun Screen() {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            OutlinedTextField(
+                value = login,
+                onValueChange = { login = it },
+                label = { Text("Логин владельца") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("Пароль (не сохраняется)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = {
+                    app.prefs.serverUrl = serverUrl
+                    checkResult = "вхожу…"
+                    scope.launch {
+                        checkResult = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val fresh = app.api.loginAndCreateToken(
+                                    login.trim(),
+                                    password,
+                                    "android-${android.os.Build.MODEL}",
+                                )
+                                app.prefs.token = fresh
+                                token = fresh
+                                password = ""
+                                "токен выпущен и сохранён"
+                            }.getOrElse { "ошибка: ${it.message}" }
+                        }
+                    }
+                }) { Text("Войти и создать токен") }
+                OutlinedButton(onClick = { showAdd = true }) { Text("Добавить папку") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
                     app.prefs.serverUrl = serverUrl
                     app.prefs.token = token
                     checkResult = "проверяю…"
@@ -190,8 +228,7 @@ private fun Screen() {
                             runCatching { "подключено: ${app.api.me()}" }.getOrElse { "ошибка: ${it.message}" }
                         }
                     }
-                }) { Text("Сохранить и проверить") }
-                OutlinedButton(onClick = { showAdd = true }) { Text("Добавить папку") }
+                }) { Text("Проверить токен") }
             }
             if (checkResult.isNotEmpty()) Text(checkResult, fontSize = 12.sp)
 
@@ -208,6 +245,13 @@ private fun Screen() {
             }
             Spacer(Modifier.height(12.dp))
             Text("В очереди: $pending", fontSize = 13.sp)
+            val failed = remember(pending) { app.db.failedOps().take(5) }
+            if (failed.isNotEmpty()) {
+                Text("Не прошло:", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                failed.forEach { op ->
+                    Text("• ${op.relPath}: ${op.lastError}", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                }
+            }
             if (lastRun.isNotEmpty()) Text("Прошлый проход: $lastRun", fontSize = 13.sp)
             if (lastError.isNotEmpty()) Text("Ошибка: $lastError", fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
             status.takeIf { it.isNotEmpty() }?.let { Text(it, fontSize = 12.sp, fontFamily = FontFamily.Monospace) }
@@ -235,7 +279,18 @@ private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit) {
         Column(Modifier.padding(12.dp)) {
             Text(job.sourceDir, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             Text("→ ${job.targetPath}  ·  ${if (job.zone == "PHOTOS") "Фото" else "Файлы"}", fontSize = 12.sp)
-            Text("файлов в базе: ${app.db.itemsOf(job.id).size}", fontSize = 12.sp)
+            val counts = app.db.stateCounts(job.id)
+            Text(
+                "файлов: ${counts.values.sum()}  ·  выгружено ${counts["synced"] ?: 0}  ·  " +
+                    "вытеснено ${counts["evicted"] ?: 0}  ·  новых ${counts["new"] ?: 0}",
+                fontSize = 12.sp,
+            )
+            Text(
+                if (job.keepDays < 0) "хранение: не удалять (зеркало)"
+                else if (job.keepDays == 0) "хранение: удалять сразу после выгрузки"
+                else "хранение: ${job.keepDays} дн.",
+                fontSize = 12.sp,
+            )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
                     checked = job.enabled,
@@ -278,6 +333,8 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
     var dir by remember { mutableStateOf("/storage/emulated/0/DCIM/Camera") }
     var zone by remember { mutableStateOf("PHOTOS") }
     var remote by remember { mutableStateOf("Фото/Камера") }
+    var keepDays by remember { mutableStateOf(-1) }
+    var wifiOnly by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
 
@@ -311,6 +368,18 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Text("Хранить на телефоне", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(-1 to "всегда", 0 to "сразу", 7 to "7 дн", 30 to "30 дн").forEach { (days, label) ->
+                        OutlinedButton(onClick = { keepDays = days }) {
+                            Text(if (keepDays == days) "• $label" else label, fontSize = 12.sp)
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = wifiOnly, onCheckedChange = { wifiOnly = it })
+                    Text("только Wi-Fi", fontSize = 13.sp)
+                }
                 if (error.isNotEmpty()) Text(error, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
             }
         },
@@ -322,7 +391,7 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
                     val message = withContext(Dispatchers.IO) {
                         runCatching {
                             val folderId = app.api.ensurePath(remote)
-                            app.db.addJob(dir.trimEnd('/'), folderId, remote, zone)
+                            app.db.addJob(dir.trimEnd('/'), folderId, remote, zone, keepDays, wifiOnly)
                             "добавлено: $dir → $remote"
                         }.getOrElse { "не получилось: ${it.message}" }
                     }

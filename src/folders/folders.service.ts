@@ -60,6 +60,8 @@ export class FoldersService {
           id: true,
           name: true,
           createdAt: true,
+          keepOffline: true,
+          clientMtime: true,
           asset: { select: { size: true, mime: true, sha256: true } },
         },
       }),
@@ -74,6 +76,10 @@ export class FoldersService {
         size: Number(e.asset.size),
         mime: e.asset.mime,
         sha256: e.asset.sha256,
+        // нужны клиенту синхронизации: mtime восстанавливается у скачанного файла,
+        // а «держать офлайн» перекрывает вытеснение на телефоне
+        keepOffline: e.keepOffline,
+        clientMtime: e.clientMtime ? e.clientMtime.toISOString() : null,
       })),
     };
   }

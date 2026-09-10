@@ -89,7 +89,14 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
 
     // ===== задачи =====
 
-    fun addJob(sourceDir: String, targetFolderId: String, targetPath: String, zone: String): Long {
+    fun addJob(
+        sourceDir: String,
+        targetFolderId: String,
+        targetPath: String,
+        zone: String,
+        keepDays: Int = -1,
+        wifiOnly: Boolean = false,
+    ): Long {
         val now = System.currentTimeMillis()
         return writableDatabase.insertOrThrow(
             "jobs",
@@ -99,10 +106,22 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
                 put("target_folder_id", targetFolderId)
                 put("target_path", targetPath)
                 put("zone", zone)
+                put("keep_days", keepDays)
+                put("wifi_only", if (wifiOnly) 1 else 0)
                 put("created_at", now)
             },
         )
     }
+
+    /** Сколько файлов в каком состоянии: нужно для понятного экрана статуса. */
+    fun stateCounts(jobId: Long): Map<String, Int> {
+        val out = HashMap<String, Int>()
+        for (item in itemsOf(jobId)) out[item.state] = (out[item.state] ?: 0) + 1
+        return out
+    }
+
+    /** Операции, которые не прошли: показываем текст последней ошибки. */
+    fun failedOps(): List<Op> = ops().filter { !it.lastError.isNullOrBlank() }
 
     fun jobs(enabledOnly: Boolean = false): List<Job> {
         val where = if (enabledOnly) " WHERE enabled = 1" else ""
