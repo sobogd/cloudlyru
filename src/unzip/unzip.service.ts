@@ -304,7 +304,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       doneEntries += 1;
       doneBytes += files[i].uncompressedSize;
     }
-    const skipped = job.skippedEntries;
+    let skipped = job.skippedEntries;
     if (startIndex > 0) {
       this.logger.log(
         `распаковка ${jobId}: продолжаем с файла ${startIndex + 1} из ${files.length} (${(doneBytes / 1e9).toFixed(1)} ГБ уже сделано)`,
