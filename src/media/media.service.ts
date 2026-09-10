@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { execFileSync } from 'child_process';
+import { readFile } from 'fs/promises';
 import * as exifr from 'exifr';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
@@ -13,6 +14,82 @@ const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 export const FULL_SIZE = 2048;
 const MAX_PARSE_BYTES = 150 * 1024 * 1024;
 /** Сколько байт читать из начала файла для EXIF (метаданные лежат в начале JPEG/HEIC). */
+
+const MS_PER_MIN = 60_000;
+
+/** Миллисекунды из EXIF SubSecTimeOriginal («381» → 381 мс). */
+function subSecMs(v: unknown): number {
+  const digits = typeof v === 'string' ? v.replace(/\D/g, '') : '';
+  if (!digits) return 0;
+  return Math.round(Number(`0.${digits}`) * 1000) || 0;
+}
+
+/**
+ * Корректный UTC-момент съёмки из EXIF-даты.
+ *
+ * EXIF хранит «настенное» время камеры без зоны, а exifr возвращает Date, у которого
+ * локальные поля равны этому wall-clock (то есть на UTC-проде он трактует его как UTC).
+ * Без поправки на OffsetTime* момент уезжает ровно на часовой пояс съёмки: фото с
+ * OffsetTimeOriginal=+03:00 попадало в таймлайн на 3 часа позже — ломая порядок ленты
+ * и группировку поездок.
+ */
+export function exifInstant(revived: unknown, offset: unknown, subSec?: unknown): Date | undefined {
+  const off = typeof offset === 'string' ? /^([+-])(\d{2}):?(\d{2})$/.exec(offset.trim()) : null;
+  if (off && revived instanceof Date && !Number.isNaN(revived.getTime())) {
+    const sign = off[1] === '-' ? -1 : 1;
+    const offsetMin = sign * (Number(off[2]) * 60 + Number(off[3]));
+    const wall = Date.UTC(
+      revived.getFullYear(),
+      revived.getMonth(),
+      revived.getDate(),
+      revived.getHours(),
+      revived.getMinutes(),
+      revived.getSeconds(),
+      subSecMs(subSec),
+    );
+    return new Date(wall - offsetMin * MS_PER_MIN);
+  }
+  return revived instanceof Date && !Number.isNaN(revived.getTime()) ? revived : undefined;
+}
+
+/** ISO 6709 из Apple Keys видео: «+36.9150+030.8025+076.387/» → широта/долгота. */
+export function parseIso6709(v: unknown): { latitude: number; longitude: number } | undefined {
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  const m = /^([+-]\d{1,2}(?:\.\d+)?)([+-]\d{1,3}(?:\.\d+)?)/.exec(v.trim());
+  if (!m) return undefined;
+  const latitude = Number(m[1]);
+  const longitude = Number(m[2]);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return undefined;
+  if (Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return undefined;
+  return { latitude, longitude };
+}
+
+/** Дата видео: com.apple.quicktime.creationdate (со смещением) либо utc creation_time. */
+export function videoInstant(tags: Record<string, string> | undefined): Date | undefined {
+  if (!tags) return undefined;
+  const apple = tags['com.apple.quicktime.creationdate'];
+  if (apple) {
+    // «2023-11-18T12:24:00+0300» → «...+03:00» (не всякий движок парсит смещение без двоеточия)
+    const d = new Date(apple.replace(/([+-]\d{2})(\d{2})$/, '$1:$2'));
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  const utc = tags['creation_time'];
+  if (utc) {
+    const d = new Date(utc);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  return undefined;
+}
+
+function asNum(v: unknown): number | undefined {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function asStr(v: unknown): string | undefined {
+  const t = typeof v === 'string' ? v.trim() : v == null ? '' : String(v);
+  return t ? t.slice(0, 300) : undefined;
+}
 
 export interface TimelineItem {
   entryId: string;
@@ -73,6 +150,21 @@ export class MediaService {
     return MediaService.viewKey(sha256, '-720.mp4');
   }
 
+  /**
+   * Все производные ассета (мастер + превью). Нужно для полного удаления: до этого
+   * осиротевшие view/* не удалял никто, и они оставались в S3 навсегда.
+   */
+  static derivativeKeys(sha256: string): string[] {
+    return [
+      MediaService.photoMasterKey(sha256),
+      MediaService.gridKey(sha256),
+      MediaService.fullKey(sha256),
+      MediaService.videoMasterKey(sha256),
+      MediaService.video720Key(sha256),
+      MediaService.videoPosterKey(sha256),
+    ];
+  }
+
   /** EXIF → MediaMeta (дата/GPS/камера); тяжёлые производные делает очередь. */
   async captureMeta(assetId: string, sha256: string, size: number, mime: string): Promise<void> {
     if (size <= 0 || size > MAX_PARSE_BYTES) return;
@@ -90,31 +182,56 @@ export class MediaService {
     if (!IMAGE_MIMES.includes(mime)) return;
     try {
       const buf = await this.s3.getObjectBytes(S3Service.assetKey(sha256), MAX_PARSE_BYTES);
-      const [gps, core] = await Promise.all([
-        exifr.gps(buf).catch(() => null),
-        exifr.parse(buf, { segments: ['exif', 'ifd0'], mergeOutput: true } as never).catch(() => null),
-      ]);
-      const capturedAt = core?.DateTimeOriginal instanceof Date ? core.DateTimeOriginal : undefined;
-      const width = Number(core?.ExifImageWidth ?? core?.ImageWidth) || undefined;
-      const height = Number(core?.ExifImageHeight ?? core?.ImageHeight) || undefined;
-      let latitude: number | undefined;
-      let longitude: number | undefined;
-      if (gps?.latitude != null && gps?.longitude != null) {
-        const la = Number(gps.latitude);
-        const lo = Number(gps.longitude);
-        if (Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
-          latitude = la;
-          longitude = lo;
-        }
-      }
-      await this.prisma.mediaMeta.upsert({
-        where: { assetId },
-        create: { assetId, capturedAt, latitude, longitude, make: core?.Make || null, model: core?.Model || null, width, height },
-        update: {},
-      });
+      await this.parseAndStoreImageMeta(assetId, buf);
     } catch (e) {
       this.logger.debug(`EXIF skip: ${(e as Error).message}`);
     }
+  }
+
+  /**
+   * То же, но из ЛОКАЛЬНОГО файла. Воркер очереди уже скачал сырьё, поэтому повторный
+   * трафик S3 не нужен. Нужно для медиа из архивов: при распаковке captureMeta() не
+   * вызывается, и без этого фото из ZIP не попадали бы в таймлайн.
+   */
+  async captureMetaFromFile(assetId: string, filePath: string, size: number, mime: string): Promise<void> {
+    if (size <= 0 || size > MAX_PARSE_BYTES) return;
+    if (!IMAGE_MIMES.includes(mime)) return; // видео разберёт воркер (storeVideoMeta из ffprobe)
+    try {
+      const buf = await readFile(filePath);
+      await this.parseAndStoreImageMeta(assetId, buf);
+    } catch (e) {
+      this.logger.debug(`EXIF skip (local): ${(e as Error).message}`);
+    }
+  }
+
+  /** EXIF фото → MediaMeta. Первичный проход: существующие значения не перетираем. */
+  private async parseAndStoreImageMeta(assetId: string, buf: Buffer): Promise<void> {
+    const [gps, core] = await Promise.all([
+      exifr.gps(buf).catch(() => null),
+      exifr.parse(buf, { segments: ['exif', 'ifd0'], mergeOutput: true } as never).catch(() => null),
+    ]);
+    const capturedAt = exifInstant(
+      core?.DateTimeOriginal,
+      core?.OffsetTimeOriginal ?? core?.OffsetTime,
+      core?.SubSecTimeOriginal,
+    );
+    const width = Number(core?.ExifImageWidth ?? core?.ImageWidth) || undefined;
+    const height = Number(core?.ExifImageHeight ?? core?.ImageHeight) || undefined;
+    let latitude: number | undefined;
+    let longitude: number | undefined;
+    if (gps?.latitude != null && gps?.longitude != null) {
+      const la = Number(gps.latitude);
+      const lo = Number(gps.longitude);
+      if (Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
+        latitude = la;
+        longitude = lo;
+      }
+    }
+    await this.prisma.mediaMeta.upsert({
+      where: { assetId },
+      create: { assetId, capturedAt, latitude, longitude, make: core?.Make || null, model: core?.Model || null, width, height },
+      update: {},
+    });
   }
 
   /**
@@ -140,14 +257,8 @@ export class MediaService {
         const gps = await exifr.gps(head).catch(() => null);
         if (!core) return;
 
-        const num = (v: unknown): number | undefined => {
-          const n = Number(v);
-          return Number.isFinite(n) ? n : undefined;
-        };
-        const str = (v: unknown): string | undefined => {
-          const t = typeof v === 'string' ? v.trim() : v == null ? '' : String(v);
-          return t ? t.slice(0, 300) : undefined;
-        };
+        const num = asNum;
+        const str = asStr;
         const latitude = gps?.latitude != null && Math.abs(Number(gps.latitude)) <= 90 ? Number(gps.latitude) : undefined;
         const longitude = gps?.longitude != null && Math.abs(Number(gps.longitude)) <= 180 ? Number(gps.longitude) : undefined;
 
@@ -179,19 +290,24 @@ export class MediaService {
           copyright: str(core.Copyright),
         };
 
+        // capturedAt считаем через exifInstant (с поправкой на OffsetTime*): exifr отдаёт
+        // EXIF-время как локальное для сервера, из-за чего момент уезжал на пояс съёмки.
+        const capturedAt = exifInstant(
+          core.DateTimeOriginal,
+          core.OffsetTimeOriginal ?? core.OffsetTime,
+          core.SubSecTimeOriginal,
+        );
+        const width = num(core.ExifImageWidth ?? core.ImageWidth);
+        const height = num(core.ExifImageHeight ?? core.ImageHeight);
+        const make = str(core.Make) ?? null;
+        const model = str(core.Model) ?? null;
+
         await this.prisma.mediaMeta.upsert({
           where: { assetId },
-          create: {
-            assetId,
-            capturedAt: core.DateTimeOriginal instanceof Date ? core.DateTimeOriginal : undefined,
-            latitude, longitude,
-            make: str(core.Make) ?? null,
-            model: str(core.Model) ?? null,
-            width: num(core.ExifImageWidth ?? core.ImageWidth),
-            height: num(core.ExifImageHeight ?? core.ImageHeight),
-            raw: raw as never,
-          },
-          update: { raw: raw as never },
+          create: { assetId, capturedAt, latitude, longitude, make, model, width, height, raw: raw as never },
+          // update тоже правит колонки: строку мог создать captureMeta/enqueue (дата загрузки,
+          // без GPS), и тогда таймлайн оставался с неверным моментом съёмки навсегда.
+          update: { raw: raw as never, capturedAt, latitude, longitude, make, model, width, height },
         });
         return;
       }
@@ -211,8 +327,15 @@ export class MediaService {
         const audio = (parsed.streams ?? []).find((st) => st.codec_type === 'audio');
         const fpsRaw = typeof video?.r_frame_rate === 'string' ? video.r_frame_rate.split('/') : [];
         const fps = fpsRaw.length === 2 && Number(fpsRaw[1]) ? Number(fpsRaw[0]) / Number(fpsRaw[1]) : undefined;
-        const createdIso = parsed.format?.tags?.creation_time ?? (video?.tags as Record<string, string> | undefined)?.creation_time;
-        const created = createdIso ? new Date(createdIso) : undefined;
+        const tags = parsed.format?.tags ?? {};
+        const created = videoInstant(tags);
+        // iPhone/Samsung держат геолокацию, камеру и идентификатор Live Photo в Apple Keys (mdta),
+        // а не в EXIF — без этого видео не попадало на карту и в поездки.
+        const pos = parseIso6709(tags['com.apple.quicktime.location.ISO6709']);
+        const make = asStr(tags['com.apple.quicktime.make']) ?? asStr(tags.make) ?? null;
+        const model = asStr(tags['com.apple.quicktime.model']) ?? asStr(tags.model) ?? null;
+        const width = asNum(video?.width);
+        const height = asNum(video?.height);
 
         const raw: Record<string, unknown> = {
           kind: 'video',
@@ -220,25 +343,34 @@ export class MediaService {
           bitrate: parsed.format?.bit_rate ? Number(parsed.format.bit_rate) : undefined,
           container: parsed.format?.format_name,
           videoCodec: video?.codec_name,
-          width: video?.width,
-          height: video?.height,
+          width,
+          height,
           fps,
           audioCodec: audio?.codec_name,
           audioChannels: audio?.channels,
           audioSampleRate: audio?.sample_rate ? Number(audio.sample_rate) : undefined,
-          createdAt: createdIso,
+          createdAt: tags['com.apple.quicktime.creationdate'] ?? tags['creation_time'],
+          make,
+          model,
+          latitude: pos?.latitude,
+          longitude: pos?.longitude,
         };
 
         await this.prisma.mediaMeta.upsert({
           where: { assetId },
-          create: {
-            assetId,
-            capturedAt: created && !Number.isNaN(created.getTime()) ? created : undefined,
-            width: Number(video?.width) || undefined,
-            height: Number(video?.height) || undefined,
+          create: { assetId, capturedAt: created, latitude: pos?.latitude, longitude: pos?.longitude, make, model, width, height, raw: raw as never },
+          // update тоже правит колонки: строку уже создал queue.enqueue с датой загрузки,
+          // поэтому create-ветка не выполнялась и видео навсегда оставалось в конце ленты.
+          update: {
             raw: raw as never,
+            capturedAt: created,
+            latitude: pos?.latitude,
+            longitude: pos?.longitude,
+            make,
+            model,
+            width,
+            height,
           },
-          update: { raw: raw as never },
         });
       }
     } catch (e) {

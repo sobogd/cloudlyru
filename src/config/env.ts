@@ -30,6 +30,10 @@ const envSchema = z.object({
 
   CONVERT_ENABLED: z.string().default('false'),
   CONVERT_MEM_MB: z.coerce.number().int().positive().default(1536),
+  // Хранить оригинал в S3 после успешной конвертации (по умолчанию — да).
+  // Оригинал нужен, чтобы пересобрать мастер с лучшими параметрами/метаданными:
+  // сами метаданные (ICC, gain map, MPF, MakerNotes) после конвертации невосстановимы.
+  KEEP_ORIGINALS: booleanish.default('true'),
 });
 
 export type Env = z.infer<typeof envSchema>;

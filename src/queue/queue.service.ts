@@ -1,18 +1,51 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { execFileSync, spawn } from 'child_process';
-import { mkdirSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import sharp from 'sharp';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
-import { IMAGE_MIMES, MediaService, VIDEO_MIMES } from '../media/media.service';
+import { IMAGE_MIMES, MediaService, VIDEO_MIMES, parseIso6709, videoInstant } from '../media/media.service';
 import { ZONE_FILES } from '../common/zones';
 import { env } from '../config/env';
 
 const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 1 ГБ)
-const STALE_MS = 30 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
+/** Сколько символов stderr кладём в Job.error (раньше в БД уезжал дамп настроек libaom на 1.5 КБ). */
+const MAX_ERROR_CHARS = 600;
+/** Префикс временных каталогов задач — для чистки осиротевших после SIGKILL/pm2 reload. */
+const TMP_PREFIX = 'clq-';
+/** Каталог старше этого возраста считаем мусором (мастер 4K может идти часами). */
+const TMP_STALE_MS = 12 * 60 * 60 * 1000;
+
+/** Параметры источника, влияющие на команду ffmpeg (HDR/10 бит/каналы/длительность). */
+interface SourceProbe {
+  duration: number;
+  width?: number;
+  height?: number;
+  pixFmt?: string;
+  colorPrimaries?: string;
+  colorTrc?: string;
+  colorSpace?: string;
+  colorRange?: string;
+  channels?: number;
+  /** Теги контейнера: com.apple.quicktime.* (GPS, камера, дата) и creation_time. */
+  tags?: Record<string, string>;
+  /** 10 бит и/или HDR-трансфер: 8-битный выход потеряет точность (полосы/пересветы). */
+  hdr: boolean;
+}
+
+/** Результат конвертации: warn — мастер не собрался, keepRaw — оригинал обязателен. */
+interface ConvertResult {
+  warn?: string;
+  keepRaw?: boolean;
+}
+
+function truncErr(msg: string): string {
+  const s = String(msg ?? '');
+  return s.length > MAX_ERROR_CHARS ? `${s.slice(0, MAX_ERROR_CHARS)}…` : s;
+}
 
 interface JobRow {
   id: string;
@@ -34,14 +67,39 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
+    private readonly media: MediaService,
   ) {}
 
   async onModuleInit() {
     if ((env.CONVERT_ENABLED ?? 'true') !== 'true') return;
     // после рестарта все processing возвращаем в очередь (рестарт = прерванный воркер)
     await this.prisma.job.updateMany({ where: { state: 'processing' }, data: { state: 'pending' } }).catch(() => undefined);
+    this.cleanupTmp();
     this.timer = setInterval(() => void this.tick(), 2000);
-    this.logger.log(`конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB)`);
+    this.logger.log(`конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB, оригиналы ${env.KEEP_ORIGINALS ? 'храним' : 'удаляем'})`);
+  }
+
+  /** Осиротевшие каталоги задач: процесс убит (SIGKILL/pm2 reload), поэтому finally не отработал. */
+  private cleanupTmp(): void {
+    try {
+      const dir = tmpdir();
+      let removed = 0;
+      for (const name of readdirSync(dir)) {
+        if (!name.startsWith(TMP_PREFIX)) continue;
+        const full = join(dir, name);
+        try {
+          // активных задач на старте нет, поэтому старый каталог гарантированно мусорный
+          if (Date.now() - statSync(full).mtimeMs < TMP_STALE_MS) continue;
+          rmSync(full, { recursive: true, force: true });
+          removed += 1;
+        } catch {
+          /* занят/нет прав — не повод падать */
+        }
+      }
+      if (removed) this.logger.log(`очищено осиротевших временных каталогов: ${removed}`);
+    } catch (e) {
+      this.logger.warn(`cleanup tmp: ${(e as Error).message}`);
+    }
   }
 
   onModuleDestroy() {
@@ -53,6 +111,18 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   async enqueue(assetId: string, sha256: string, mime: string): Promise<void> {
     const kind = IMAGE_MIMES.includes(mime) ? 'photo' : VIDEO_MIMES.includes(mime) ? 'video' : null;
     if (!kind) return;
+    // Мастер уже есть, а сырьё удалено (KEEP_ORIGINALS=false) — задача обречена на три
+    // падения при скачивании files/<sha>. Ставим её только если мастера на самом деле нет.
+    const asset = await this.prisma.asset
+      .findUnique({ where: { id: assetId }, select: { masterReadyAt: true } })
+      .catch(() => null);
+    if (asset?.masterReadyAt) {
+      const rawAlive = await this.s3.headObject(S3Service.assetKey(sha256)).catch(() => false);
+      if (!rawAlive) {
+        const masterKey = kind === 'photo' ? MediaService.photoMasterKey(sha256) : MediaService.videoMasterKey(sha256);
+        if (await this.s3.headObject(masterKey).catch(() => false)) return;
+      }
+    }
     if (kind === 'video') {
       // без MediaMeta видео не попадает в таймлайн — создаём сразу (дата = загрузка)
       await this.prisma.mediaMeta
@@ -84,8 +154,19 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   /** Вернуть в очередь отменённые задачи (файл восстановлен из корзины). */
   async requeueForAssets(assetIds: string[]): Promise<void> {
     if (!assetIds.length) return;
+    const rows = await this.prisma.job.findMany({
+      where: { assetId: { in: assetIds }, state: 'failed', error: { contains: 'cancelled' } },
+      select: { id: true, asset: { select: { sha256: true } } },
+    });
+    // Возвращаем только те, для которых сырьё действительно на месте: иначе задача
+    // просто трижды упадёт на downloadToFile (оригинал мог быть удалён после конвертации).
+    const alive: string[] = [];
+    for (const r of rows) {
+      if (await this.s3.headObject(S3Service.assetKey(r.asset.sha256)).catch(() => false)) alive.push(r.id);
+    }
+    if (!alive.length) return;
     await this.prisma.job
-      .updateMany({ where: { assetId: { in: assetIds }, state: 'failed', error: { contains: 'cancelled' } }, data: { state: 'pending', error: null, attempts: 0 } })
+      .updateMany({ where: { id: { in: alive } }, data: { state: 'pending', error: null, attempts: 0 } })
       .catch(() => undefined);
   }
 
@@ -127,20 +208,42 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const tag = `${job.kind} ${job.sha256.slice(0, 8)}`;
     try {
       await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
-      if (job.kind === 'photo') await this.convertPhoto(job, rawPath);
-      else if (job.kind === 'video') await this.convertVideo(job, rawPath);
+      // EXIF из локального файла, если MediaMeta ещё нет: так помечаются фото из архивов
+      // (при распаковке captureMeta не вызывается) и не тратится повторный трафик S3.
+      const hasMeta = await this.prisma.mediaMeta
+        .findUnique({ where: { assetId: job.assetId }, select: { id: true } })
+        .catch(() => null);
+      if (!hasMeta) {
+        await this.media
+          .captureMetaFromFile(job.assetId, rawPath, statSync(rawPath).size, job.mime)
+          .catch(() => undefined);
+      }
+      let res: ConvertResult = {};
+      if (job.kind === 'photo') res = await this.convertPhoto(job, rawPath);
+      else if (job.kind === 'video') res = await this.convertVideo(job, rawPath);
       else throw new Error('unknown kind');
 
-      // успех: помечаем мастер. Сырьё из S3 удаляем, только если ни одна живая копия
+      // Сырьё из S3 удаляем, только если это разрешено конфигом и ни одна живая копия
       // не лежит в зоне «Файлы» — там файл должен оставаться оригиналом как есть.
-      const filesRefs = await this.prisma.fileEntry.count({
-        where: { assetId: job.assetId, zone: ZONE_FILES, deletedAt: null },
-      });
-      if (filesRefs === 0) {
-        await this.s3.deleteObject(S3Service.assetKey(job.sha256)).catch(() => undefined);
+      // keepRaw: мастер не создан (анимация/несжатый вариант) — оригинал обязан остаться.
+      if (env.KEEP_ORIGINALS || res.keepRaw) {
+        this.logger.log(`оригинал сохранён: ${tag}${res.keepRaw && !env.KEEP_ORIGINALS ? ' (нужен как есть)' : ''}`);
+      } else {
+        const filesRefs = await this.prisma.fileEntry.count({
+          where: { assetId: job.assetId, zone: ZONE_FILES, deletedAt: null },
+        });
+        if (filesRefs === 0) {
+          await this.s3.deleteObject(S3Service.assetKey(job.sha256)).catch(() => undefined);
+        }
       }
-      await this.prisma.job.update({ where: { id: job.id }, data: { state: 'done', finishedAt: new Date() } });
-      this.logger.log(`✓ ${tag}`);
+      // res.warn = мастер-версия не собрана, но производные готовы: задача не «failed»,
+      // иначе UI показывал бы ошибку конвертации, хотя медиа доступно для просмотра.
+      await this.prisma.job.update({
+        where: { id: job.id },
+        data: { state: 'done', error: res.warn ? truncErr(res.warn) : null, progress: 100, finishedAt: new Date() },
+      });
+      if (res.warn) this.logger.warn(`△ ${tag}: ${res.warn}`);
+      else this.logger.log(`✓ ${tag}`);
     } catch (e) {
       const msg = (e as Error).message || 'error';
       this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)}`);
@@ -149,9 +252,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       if (!cancelled) {
         const attempts = row?.attempts ?? 1;
         if (attempts < MAX_ATTEMPTS) {
-          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: msg } });
+          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: truncErr(msg) } });
         } else {
-          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: msg, finishedAt: new Date() } });
+          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } });
         }
       }
     } finally {
@@ -163,11 +266,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   // ============ Фото → AVIF мастер + WebP 512/2048 ============
 
-  private async convertPhoto(job: JobRow, rawPath: string) {
+  private async convertPhoto(job: JobRow, rawPath: string): Promise<ConvertResult> {
     const sha = job.sha256;
-    let pipeline: any; // sharp pipeline
+    let base: any; // sharp pipeline (источник пикселей)
+    let decodedPath = rawPath;
     if (/^image\/(heic|heif)/.test(job.mime)) {
-      // HEIC/HEIF: декодируем libheif'ом напрямую (sharp prebuilt не умеет)
+      // HEIC/HEIF: декодируем libheif'ом напрямую (sharp prebuilt умеет только AVIF:
+      // format.heif.input.fileSuffix = ['.avif']). heif-convert отдаёт 8-битный PNG,
+      // поэтому 10-битные HEIC и gain map (HDR) здесь теряются безвозвратно.
       const png = join(tmpdir(), `clq-${job.id}.png`);
       try {
         await this.run(['heif-convert', rawPath, png], 120000);
@@ -177,91 +283,247 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
         await this.run(['heif-convert', rawPath, png], 120000);
       }
-      pipeline = sharp(png).rotate();
+      base = sharp(png, { animated: true }).rotate();
+      decodedPath = png;
     } else {
-      pipeline = sharp(rawPath).rotate();
-      await pipeline.clone().metadata().catch(() => undefined);
+      // animated: true — чтобы многостраничные GIF/WebP не превратились в статику (см. ниже)
+      base = sharp(rawPath, { animated: true }).rotate();
     }
+
+    const meta = await sharp(decodedPath, { animated: true }).metadata().catch(() => null);
+    const animated = (meta?.pages ?? 1) > 1;
+
+    // Метаданные сохраняем НА ЭТАПЕ КОДИРОВАНИЯ, а не через exiftool после:
+    //  - sharp по умолчанию вырезает EXIF/ICC/XMP целиком;
+    //  - exiftool в AVIF умеет ICC только «block write» (заменить существующий блок),
+    //    но не создать его, поэтому после кодирования ICC вернуть уже нельзя.
+    //  - keepExif() заодно нормализует Orientation: libvips сбрасывает тег после
+    //    авто-поворота, иначе в мастере остаётся Orientation=6 при повёрнутых пикселях.
+    const keepAll = () => base.clone().keepExif().keepIccProfile();
 
     await this.setProgress(job.id, 40, true);
-    const avif = await pipeline.clone().avif({ quality: 85 }).toBuffer();
-    await this.setProgress(job.id, 70, true);
-    const grid = await pipeline.clone().resize({ width: 512, withoutEnlargement: true }).webp({ quality: 78 }).toBuffer();
-    const full = await pipeline.clone().resize({ width: 2048, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
+    // Превью всегда с ICC: без профиля Display P3-фото выглядят блёкло в браузере.
+    const grid = await base
+      .clone()
+      .keepIccProfile()
+      .resize({ width: 512, withoutEnlargement: true })
+      .webp({ quality: 78 })
+      .toBuffer();
+    const full = await base
+      .clone()
+      .keepIccProfile()
+      .resize({ width: 2048, withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toBuffer();
 
-    const avifPath = join(tmpdir(), `clq-${job.id}.avif`);
-    const { writeFileSync } = await import('fs');
-    writeFileSync(avifPath, avif);
-    // метаданные (EXIF/GPS) — из сырья в мастер
-    try {
-      await this.run(['exiftool', '-overwrite_original', '-TagsFromFile', rawPath, '-all:all', avifPath], 60000);
-    } catch {
-      /* метаданные некритичны */
+    if (animated) {
+      // Анимированный источник (GIF/WebP): AVIF-мастер = только первый кадр, поэтому
+      // вместо мастера отдаём оригинал как есть, а «полный экран» — анимированным WebP.
+      await this.setProgress(job.id, 70, true);
+      await Promise.all([
+        this.s3.putObject(MediaService.gridKey(sha), grid, 'image/webp'),
+        this.s3.putObject(MediaService.fullKey(sha), full, 'image/webp'),
+      ]);
+      await this.prisma.asset.update({
+        where: { id: job.assetId },
+        data: { masterMime: null, masterReadyAt: new Date() },
+      });
+      return { keepRaw: true };
     }
+
+    const avif = await keepAll().avif({ quality: 85 }).toBuffer();
+    await this.setProgress(job.id, 85, true);
 
     await Promise.all([
       this.s3.putObject(MediaService.photoMasterKey(sha), avif, 'image/avif'),
       this.s3.putObject(MediaService.gridKey(sha), grid, 'image/webp'),
       this.s3.putObject(MediaService.fullKey(sha), full, 'image/webp'),
     ]);
-    rmSync(avifPath, { force: true });
 
     await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'image/avif', masterReadyAt: new Date() } });
+    return {};
   }
 
   // ============ Видео → AV1 mp4 мастер + постер + 720p ============
 
-  private async convertVideo(job: JobRow, rawPath: string) {
+  private async convertVideo(job: JobRow, rawPath: string): Promise<ConvertResult> {
     const sha = job.sha256;
     const masterPath = join(tmpdir(), `clq-${job.id}.mp4`);
     const posterRaw = join(tmpdir(), `clq-${job.id}-poster.png`);
     const previewPath = join(tmpdir(), `clq-${job.id}-720.mp4`);
 
-    const duration = this.probeDuration(rawPath);
+    const src = this.probeSource(rawPath);
+    // Метаданные пишем здесь, из ЛОКАЛЬНОГО файла: extractDetail() ходит в ffprobe по
+    // presigned-URL, а резолвер статической сборки ffmpeg не разрешает хост Hetzner S3
+    // ("Failed to resolve hostname") — по ссылке видео-метаданные не достаются вообще.
+    await this.storeVideoMeta(job.assetId, src);
 
-    // 1) постер (кадр ~1с → WebP 512) — быстро, чтобы ролик сразу появился в ленте
-    await this.run(['ffmpeg', '-y', '-ss', '1', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 180000);
+    // 1) постер — быстро, чтобы ролик сразу появился в ленте.
+    // -ss 1 за концом ролика (видео короче ~1 с) не даёт ни одного кадра: ffmpeg
+    // завершается с кодом 0, но файла не создаёт — нужен фолбэк на первый кадр.
+    const seek = src.duration > 1.5 ? '1' : '0';
+    await this.run(['ffmpeg', '-y', '-ss', seek, '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 180000);
+    if (!existsSync(posterRaw)) {
+      await this.run(['ffmpeg', '-y', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 180000);
+    }
     await this.setProgress(job.id, 5, true);
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
-    // 2) 720p-превью (AV1 libaom, быстрее полного): 5 → 60%
-    await this.runProgress(job.id, duration, 5, 55, [
+    // 2) 720p-превью (AV1 libaom, быстрее полного): 5 → 60%.
+    // -map_metadata 0 + use_metadata_tags: без них у превью creation_time = 0, а Apple
+    // Keys (GPS, Make/Model, ContentIdentifier) не переносятся вообще — проверено на проде.
+    await this.runProgress(job.id, src.duration, 5, 55, [
       'ffmpeg', '-y', '-i', rawPath,
+      '-map_metadata', '0',
       '-map', '0:v:0', '-vf', 'scale=-2:720',
-      '-c:v', 'libaom-av1', '-crf', '36', '-cpu-used', '8', '-row-mt', '1', '-pix_fmt', 'yuv420p',
-      '-map', '0:a?', '-c:a', 'aac', '-b:a', '96k',
-      '-movflags', '+faststart',
+      ...this.videoEncodeArgs(src, 36, false),
+      '-map', '0:a?', '-c:a', 'aac', '-b:a', this.audioBitrate(src, '96k'),
+      '-movflags', '+faststart+use_metadata_tags',
       previewPath,
     ], 6 * 60 * 60 * 1000);
     await this.setProgress(job.id, 60, true);
     await this.s3.putFile(MediaService.video720Key(sha), previewPath, 'video/mp4');
-    // «готово для просмотра» — постер+720 уже есть; полный мастер дожимается в фоне
+    // «готово для просмотра»: постер+720 уже есть, полный мастер дожимается в фоне.
+    // ВАЖНО: masterReadyAt здесь = «есть чем показать», а НЕ «есть view/<sha>.mp4».
+    // Поэтому files.service.presignedUrl обязан проверять мастер через headObject,
+    // иначе отдаёт presigned-URL на несуществующий объект (404 от S3).
     await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'video/mp4', masterReadyAt: new Date() } });
 
-    // 3) мастер: AV1 полный (в конце), метаданные копируются: 60 → 99%
-    await this.runProgress(job.id, duration, 60, 39, [
-      'ffmpeg', '-y', '-i', rawPath,
-      '-map_metadata', '0',
-      '-map', '0:v:0',
-      '-c:v', 'libaom-av1', '-crf', '32', '-cpu-used', '8', '-row-mt', '1', '-pix_fmt', 'yuv420p',
-      '-map', '0:a?', '-c:a', 'aac', '-b:a', '128k',
-      '-movflags', '+faststart',
-      masterPath,
-    ], 6 * 60 * 60 * 1000);
-
-    await this.s3.putFile(MediaService.videoMasterKey(sha), masterPath, 'video/mp4');
-    await this.setProgress(job.id, 100, true);
+    // 3) мастер: AV1 полный. Падение этого прохода задачу НЕ валит: постер и 720p уже
+    // опубликованы и медиа смотрится. Так падает, например, 4K/10-бит — libaom упирается
+    // в RLIMIT_AS (ulimit -v из CONVERT_MEM_MB):
+    //   "Failed to initialize encoder: Memory allocation error"
+    try {
+      await this.runProgress(job.id, src.duration, 60, 39, [
+        'ffmpeg', '-y', '-i', rawPath,
+        '-map_metadata', '0',
+        '-map', '0:v:0',
+        ...this.videoEncodeArgs(src, 32, true),
+        '-map', '0:a?', '-c:a', 'aac', '-b:a', this.audioBitrate(src, '128k'),
+        '-movflags', '+faststart+use_metadata_tags',
+        masterPath,
+      ], 6 * 60 * 60 * 1000);
+      await this.s3.putFile(MediaService.videoMasterKey(sha), masterPath, 'video/mp4');
+      await this.setProgress(job.id, 100, true);
+      return {};
+    } catch (e) {
+      return { warn: `мастер не собран (${(e as Error).message}); доступны постер и 720p` };
+    }
   }
 
-  private probeDuration(file: string): number {
-    try {
-      const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file], { encoding: 'utf8', timeout: 30000 }).trim();
-      const d = Number(out);
-      return Number.isFinite(d) && d > 0 ? d : 0;
-    } catch {
-      return 0;
+  /**
+   * Аргументы кодирования AV1.
+   * allow10bit: для мастера сохраняем 10 бит и пробрасываем color-теги, если источник
+   * HDR/10-битный — иначе -pix_fmt yuv420p обрезает точность (полосы) и теряет HDR.
+   * Превью всегда 8-битное: так проход гарантированно проходит по памяти.
+   */
+  private videoEncodeArgs(src: SourceProbe, crf: number, allow10bit: boolean): string[] {
+    const args = ['-c:v', 'libaom-av1', '-crf', String(crf), '-cpu-used', '8', '-row-mt', '1'];
+    if (allow10bit && src.hdr) {
+      args.push('-pix_fmt', 'yuv420p10le');
+      const c = (v?: string) => v && v !== 'unknown' && v !== 'unspecified';
+      if (c(src.colorPrimaries)) args.push('-color_primaries', src.colorPrimaries!);
+      if (c(src.colorTrc)) args.push('-color_trc', src.colorTrc!);
+      if (c(src.colorSpace)) args.push('-colorspace', src.colorSpace!);
+      if (c(src.colorRange)) args.push('-color_range', src.colorRange!);
+    } else {
+      args.push('-pix_fmt', 'yuv420p');
     }
+    return args;
+  }
+
+  /** AAC на 6 каналах при 128k звучит плохо — для многоканальных поднимаем битрейт. */
+  private audioBitrate(src: SourceProbe, stereo: string): string {
+    const ch = src.channels ?? 2;
+    if (ch > 2) return ch > 6 ? '384k' : '256k';
+    return stereo;
+  }
+
+  /** Параметры источника одним вызовом ffprobe: длительность, 10 бит/HDR, каналы. */
+  private probeSource(file: string): SourceProbe {
+    const res: SourceProbe = { duration: 0, hdr: false };
+    try {
+      const out = execFileSync(
+        'ffprobe',
+        [
+          '-v', 'error',
+          '-show_entries', 'format=duration',
+          '-show_entries', 'format_tags',
+          '-show_entries', 'stream=codec_type,pix_fmt,color_primaries,color_transfer,color_space,color_range,channels,width,height',
+          '-of', 'json',
+          file,
+        ],
+        { encoding: 'utf8', timeout: 30000 },
+      );
+      const j = JSON.parse(out) as {
+        format?: { duration?: string; tags?: Record<string, string> };
+        streams?: Array<Record<string, unknown>>;
+      };
+      const d = Number(j.format?.duration);
+      if (Number.isFinite(d) && d > 0) res.duration = d;
+      if (j.format?.tags) res.tags = j.format.tags;
+      const streams = j.streams ?? [];
+      const v = streams.find((s) => s.codec_type === 'video');
+      const a = streams.find((s) => s.codec_type === 'audio');
+      if (v) {
+        res.width = Number(v.width) || undefined;
+        res.height = Number(v.height) || undefined;
+        res.pixFmt = typeof v.pix_fmt === 'string' ? v.pix_fmt : undefined;
+        res.colorPrimaries = typeof v.color_primaries === 'string' ? v.color_primaries : undefined;
+        res.colorTrc = typeof v.color_transfer === 'string' ? v.color_transfer : undefined;
+        res.colorSpace = typeof v.color_space === 'string' ? v.color_space : undefined;
+        res.colorRange = typeof v.color_range === 'string' ? v.color_range : undefined;
+      }
+      if (a) res.channels = Number(a.channels) || undefined;
+      res.hdr =
+        /10le|10be|p010/i.test(res.pixFmt ?? '') ||
+        /smpte2084|arib-std-b67/i.test(res.colorTrc ?? '') ||
+        /bt2020/i.test(res.colorPrimaries ?? '');
+    } catch {
+      /* ffprobe недоступен или файл битый — работаем с безопасными значениями */
+    }
+    return res;
+  }
+
+  /**
+   * Метаданные видео из локального файла → MediaMeta (дата съёмки, GPS, камера, размеры).
+   * Иначе видео навсегда остаётся в таймлайне датой загрузки и не попадает на карту/в поездки:
+   * строка MediaMeta создаётся queue.enqueue() сразу, а extractDetail() по presigned-URL
+   * на этом сервере не работает (резолвер ffmpeg не разрешает хост S3).
+   */
+  private async storeVideoMeta(assetId: string, src: SourceProbe): Promise<void> {
+    const tags = src.tags;
+    if (!tags) return;
+    const created = videoInstant(tags);
+    const pos = parseIso6709(tags['com.apple.quicktime.location.ISO6709']);
+    const make = tags['com.apple.quicktime.make'] ?? tags.make ?? null;
+    const model = tags['com.apple.quicktime.model'] ?? tags.model ?? null;
+    if (!created && !pos && !make && !model && !src.width) return;
+    await this.prisma.mediaMeta
+      .upsert({
+        where: { assetId },
+        create: {
+          assetId,
+          capturedAt: created,
+          latitude: pos?.latitude,
+          longitude: pos?.longitude,
+          make,
+          model,
+          width: src.width,
+          height: src.height,
+        },
+        update: {
+          capturedAt: created,
+          latitude: pos?.latitude,
+          longitude: pos?.longitude,
+          make,
+          model,
+          width: src.width,
+          height: src.height,
+        },
+      })
+      .catch(() => undefined);
   }
 
   /** ffmpeg с прогрессом: out_time делится на длительность, пишется в Job.progress. */
