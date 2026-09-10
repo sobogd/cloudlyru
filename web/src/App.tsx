@@ -357,6 +357,29 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
 
 // ===== Деталка файла: назад / скачать / удалить + вся метадата на фоне =====
 
+/** Секция в деталке: заголовок раздела метаданных. */
+function DetSection({ title }: { title: string }) {
+  return <div className="detsec">{title}</div>;
+}
+
+const rawNum = (v: unknown): number | undefined => {
+  const n = Number(v);
+  return Number.isFinite(n) && v !== null && v !== '' ? n : undefined;
+};
+
+function fmtDuration(sec?: number): string | undefined {
+  if (!sec || !Number.isFinite(sec)) return undefined;
+  const total = Math.round(sec);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s2 = total % 60;
+  return h ? `${h} ч ${m} мин ${s2} с` : `${m}:${String(s2).padStart(2, '0')}`;
+}
+function fmtBitrate(bps?: number): string | undefined {
+  if (!bps || !Number.isFinite(bps)) return undefined;
+  return bps >= 1e6 ? `${(bps / 1e6).toFixed(1)} Мбит/с` : `${Math.round(bps / 1e3)} кбит/с`;
+}
+
 function MetaRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   return (
     <div className="metarow">
@@ -468,6 +491,89 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
             </>
           )}
           <MetaRow k="SHA-256" v={meta.sha256} mono />
+
+          {(() => {
+            const raw = (meta.media?.raw ?? null) as Record<string, unknown> | null;
+            const rows: Array<[string, string]> = [];
+            const push = (k: string, v: unknown, f?: (x: never) => string | undefined) => {
+              if (v === undefined || v === null || v === '') return;
+              const val = f ? f(v as never) : String(v);
+              if (val) rows.push([k, val]);
+            };
+            const dt = (v: unknown) => (typeof v === 'string' ? new Date(v).toLocaleString() : undefined);
+
+            if (raw?.kind === 'image') {
+              push('Дата съёмки', raw.dateTimeOriginal, dt);
+              push('Создан (EXIF)', raw.createDate, dt);
+              push('Изменён', raw.modifyDate, dt);
+              push('Часовой пояс', raw.offsetTime);
+              push('Камера', [raw.make, raw.model].filter(Boolean).join(' '));
+              push('Объектив', raw.lens);
+              push('Выдержка', raw.exposureTime);
+              push('Диафрагма', raw.fNumber, (v: number) => `f/${v}`);
+              push('ISO', raw.iso);
+              push('Фокусное', raw.focalLength, (v: number) => `${v} мм`);
+              push('Фокусное (35 мм)', raw.focalLength35, (v: number) => `${v} мм`);
+              push('Программа', raw.exposureProgram);
+              push('Ориентация', raw.orientation);
+              push('Цвет. пространство', raw.colorSpace);
+              if (rawNum(raw.width) && rawNum(raw.height)) push('Кадр', `${raw.width} × ${raw.height}`);
+              if (rawNum(raw.latitude) != null && rawNum(raw.longitude) != null) {
+                push('Координаты', `${Number(raw.latitude).toFixed(6)}, ${Number(raw.longitude).toFixed(6)}`);
+              }
+              push('Высота', raw.altitude, (v: number) => `${Math.round(v)} м`);
+              push('Описание', raw.description);
+              push('Автор', raw.artist);
+              push('Copyright', raw.copyright);
+              push('ПО', raw.software);
+            } else if (raw?.kind === 'video') {
+              push('Длительность', raw.durationSec, fmtDuration);
+              push('Контейнер', raw.container);
+              push('Видеокодек', raw.videoCodec);
+              push('Аудиокодек', raw.audioCodec);
+              if (rawNum(raw.width) && rawNum(raw.height)) push('Кадр', `${raw.width} × ${raw.height}`);
+              push('Кадров/с', raw.fps, (v: number) => v.toFixed(2));
+              push('Битрейт', raw.bitrate, fmtBitrate);
+              push('Дорожки', raw.audioChannels, (v: number) => `${v} канал(а)`);
+              push('Частота дискретизации', raw.audioSampleRate, (v: number) => `${v} Гц`);
+              push('Создан', raw.createdAt, dt);
+            }
+
+            const sc = meta.sidecar;
+            return (
+              <>
+                {rows.length > 0 && (
+                  <>
+                    <DetSection title={raw?.kind === 'video' ? 'Видео (из файла)' : 'Медиа (из файла)'} />
+                    {rows.map(([k, v]) => <MetaRow key={k} k={k} v={v} />)}
+                  </>
+                )}
+                {sc && (
+                  <>
+                    <DetSection title="Метаданные Google (файл .json рядом)" />
+                    <MetaRow k="Файл метаданных" v={sc.name} mono />
+                    {sc.photoTakenTimeIso && (
+                      <MetaRow k="Время съёмки (Google, UTC)" v={new Date(sc.photoTakenTimeIso).toLocaleString()} />
+                    )}
+                    {sc.creationTimeIso && (
+                      <MetaRow k="Загружено в Google" v={new Date(sc.creationTimeIso).toLocaleString()} />
+                    )}
+                    {sc.title && <MetaRow k="Название" v={sc.title} />}
+                    {sc.description && <MetaRow k="Описание (Google)" v={sc.description} />}
+                    {sc.imageViews != null && <MetaRow k="Просмотров" v={String(sc.imageViews)} />}
+                    {(() => {
+                      const g = sc.geoData as { latitude?: number; longitude?: number } | null;
+                      if (g && (g.latitude || g.longitude)) {
+                        return <MetaRow k="Координаты (Google)" v={`${g.latitude}, ${g.longitude}`} />;
+                      }
+                      return null;
+                    })()}
+                    {sc.url && <MetaRow k="Ссылка Google" v={sc.url} mono />}
+                  </>
+                )}
+              </>
+            );
+          })()}
         </div>
       )}
     </div>

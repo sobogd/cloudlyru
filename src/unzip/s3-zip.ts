@@ -182,9 +182,15 @@ export class RemoteZip {
     return out;
   }
 
-  /** Сжатые байты файла как поток (с backpressure). */
+  /**
+   * Сжатые байты файла как поток (с backpressure).
+   * ВАЖНО: читаем через readAt (кэш на 8 МБ), а не напрямую в S3 — файлы в
+   * архиве лежат подряд, поэтому один Range-запрос обслуживает десятки мелких
+   * файлов. Без кэша на каждый файл уходило 2 запроса (заголовок + данные),
+   * и распаковка упиралась в latency S3 (~270 файлов/мин).
+   */
   private async *compressedChunks(entry: ZipEntryInfo): AsyncGenerator<Buffer> {
-    const lh = await this.src.readRange(entry.localHeaderOffset, entry.localHeaderOffset + 29);
+    const lh = await this.readAt(entry.localHeaderOffset, 30);
     if (lh.readUInt32LE(0) !== SIG_LOCAL) throw new Error(`локальный заголовок повреждён: ${entry.name}`);
     const nameLen = lh.readUInt16LE(26);
     const extraLen = lh.readUInt16LE(28);
@@ -193,7 +199,7 @@ export class RemoteZip {
     let read = 0;
     while (read < entry.compressedSize) {
       const len = Math.min(READ_CHUNK, entry.compressedSize - read);
-      const buf = await this.src.readRange(dataStart + read, dataStart + read + len - 1);
+      const buf = await this.readAt(dataStart + read, len);
       read += buf.length;
       yield buf;
     }

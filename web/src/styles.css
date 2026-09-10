@@ -126,3 +126,12 @@ html, body { overscroll-behavior: none; }
 .metak { color: #6d7889; font-size: 13px; }
 .metav { font-size: 13px; color: #e6e8eb; word-break: break-all; white-space: pre-wrap; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+
+/* Заголовок раздела метаданных в деталке файла */
+.detsec {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}

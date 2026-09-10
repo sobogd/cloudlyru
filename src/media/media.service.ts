@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { execFileSync } from 'child_process';
 import * as exifr from 'exifr';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
@@ -7,8 +8,11 @@ import { ZONE_PHOTOS } from '../common/zones';
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
 export const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm', 'video/x-matroska', 'video/avi', 'video/ogg', 'video/mpeg'];
 export const GRID_SIZE = 512;
+/** Сколько байт читать из начала файла для EXIF. */
+const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 export const FULL_SIZE = 2048;
 const MAX_PARSE_BYTES = 150 * 1024 * 1024;
+/** Сколько байт читать из начала файла для EXIF (метаданные лежат в начале JPEG/HEIC). */
 
 export interface TimelineItem {
   entryId: string;
@@ -63,6 +67,8 @@ export class MediaService {
   static videoPosterKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-poster.webp');
   }
+  private static readonly EXIF_HEAD_BYTES = EXIF_HEAD_BYTES;
+
   static video720Key(sha256: string): string {
     return MediaService.viewKey(sha256, '-720.mp4');
   }
@@ -108,6 +114,135 @@ export class MediaService {
       });
     } catch (e) {
       this.logger.debug(`EXIF skip: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Подробные метаданные для деталки файла: EXIF фото или ffprobe видео.
+   * Читается только начало объекта (EXIF лежит в начале JPEG/HEIC), видео
+   * пробуется по presigned-ссылке — без скачивания. Результат кэшируется в MediaMeta.
+   */
+  async extractDetail(assetId: string, sha256: string, size: number, mime: string): Promise<void> {
+    try {
+      if (IMAGE_MIMES.includes(mime)) {
+        const head = await this.s3.readRange(
+          S3Service.assetKey(sha256),
+          0,
+          Math.min(size, MediaService.EXIF_HEAD_BYTES) - 1,
+        );
+        const core: Record<string, unknown> | null = await exifr
+          .parse(head, {
+            tiff: true, ifd0: true, exif: true, gps: true, interop: true,
+            translateKeys: true, translateValues: true, reviveValues: true,
+            mergeOutput: true, sanitize: true,
+          } as never)
+          .catch(() => null);
+        const gps = await exifr.gps(head).catch(() => null);
+        if (!core) return;
+
+        const num = (v: unknown): number | undefined => {
+          const n = Number(v);
+          return Number.isFinite(n) ? n : undefined;
+        };
+        const str = (v: unknown): string | undefined => {
+          const t = typeof v === 'string' ? v.trim() : v == null ? '' : String(v);
+          return t ? t.slice(0, 300) : undefined;
+        };
+        const latitude = gps?.latitude != null && Math.abs(Number(gps.latitude)) <= 90 ? Number(gps.latitude) : undefined;
+        const longitude = gps?.longitude != null && Math.abs(Number(gps.longitude)) <= 180 ? Number(gps.longitude) : undefined;
+
+        const raw: Record<string, unknown> = {
+          kind: 'image',
+          dateTimeOriginal: core.DateTimeOriginal instanceof Date ? core.DateTimeOriginal.toISOString() : str(core.DateTimeOriginal),
+          createDate: core.CreateDate instanceof Date ? core.CreateDate.toISOString() : str(core.CreateDate),
+          modifyDate: core.ModifyDate instanceof Date ? core.ModifyDate.toISOString() : str(core.ModifyDate),
+          offsetTime: str(core.OffsetTimeOriginal) ?? str(core.OffsetTime),
+          make: str(core.Make),
+          model: str(core.Model),
+          lens: str(core.LensModel) ?? str(core.Lens),
+          software: str(core.Software),
+          fNumber: num(core.FNumber),
+          exposureTime: core.ExposureTime != null ? (Number(core.ExposureTime) < 1 ? `1/${Math.round(1 / Number(core.ExposureTime))}` : `${num(core.ExposureTime)} с`) : undefined,
+          iso: num(core.ISO),
+          focalLength: num(core.FocalLength),
+          focalLength35: num(core.FocalLengthIn35mmFormat),
+          exposureProgram: str(core.ExposureProgram),
+          orientation: num(core.Orientation),
+          colorSpace: str(core.ColorSpace),
+          width: num(core.ExifImageWidth ?? core.ImageWidth),
+          height: num(core.ExifImageHeight ?? core.ImageHeight),
+          latitude,
+          longitude,
+          altitude: num((gps as { altitude?: number } | null)?.altitude),
+          description: str(core.ImageDescription) ?? str(core['Caption-Abstract']),
+          artist: str(core.Artist),
+          copyright: str(core.Copyright),
+        };
+
+        await this.prisma.mediaMeta.upsert({
+          where: { assetId },
+          create: {
+            assetId,
+            capturedAt: core.DateTimeOriginal instanceof Date ? core.DateTimeOriginal : undefined,
+            latitude, longitude,
+            make: str(core.Make) ?? null,
+            model: str(core.Model) ?? null,
+            width: num(core.ExifImageWidth ?? core.ImageWidth),
+            height: num(core.ExifImageHeight ?? core.ImageHeight),
+            raw: raw as never,
+          },
+          update: { raw: raw as never },
+        });
+        return;
+      }
+
+      if (VIDEO_MIMES.includes(mime)) {
+        const url = await this.s3.presignedGet(S3Service.assetKey(sha256), mime);
+        const out = execFileSync(
+          'ffprobe',
+          ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', url],
+          { encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+        );
+        const parsed = JSON.parse(out) as {
+          format?: { duration?: string; bit_rate?: string; format_name?: string; tags?: Record<string, string> };
+          streams?: Array<Record<string, unknown>>;
+        };
+        const video = (parsed.streams ?? []).find((st) => st.codec_type === 'video');
+        const audio = (parsed.streams ?? []).find((st) => st.codec_type === 'audio');
+        const fpsRaw = typeof video?.r_frame_rate === 'string' ? video.r_frame_rate.split('/') : [];
+        const fps = fpsRaw.length === 2 && Number(fpsRaw[1]) ? Number(fpsRaw[0]) / Number(fpsRaw[1]) : undefined;
+        const createdIso = parsed.format?.tags?.creation_time ?? (video?.tags as Record<string, string> | undefined)?.creation_time;
+        const created = createdIso ? new Date(createdIso) : undefined;
+
+        const raw: Record<string, unknown> = {
+          kind: 'video',
+          durationSec: parsed.format?.duration ? Number(parsed.format.duration) : undefined,
+          bitrate: parsed.format?.bit_rate ? Number(parsed.format.bit_rate) : undefined,
+          container: parsed.format?.format_name,
+          videoCodec: video?.codec_name,
+          width: video?.width,
+          height: video?.height,
+          fps,
+          audioCodec: audio?.codec_name,
+          audioChannels: audio?.channels,
+          audioSampleRate: audio?.sample_rate ? Number(audio.sample_rate) : undefined,
+          createdAt: createdIso,
+        };
+
+        await this.prisma.mediaMeta.upsert({
+          where: { assetId },
+          create: {
+            assetId,
+            capturedAt: created && !Number.isNaN(created.getTime()) ? created : undefined,
+            width: Number(video?.width) || undefined,
+            height: Number(video?.height) || undefined,
+            raw: raw as never,
+          },
+          update: { raw: raw as never },
+        });
+      }
+    } catch (e) {
+      this.logger.debug(`extractDetail skip: ${(e as Error).message}`);
     }
   }
 

@@ -1,0 +1,25 @@
+[Meta] PrimaryItemReference
+[QuickTime] AV1ConfigurationVersion
+[QuickTime] ChromaFormat
+[QuickTime] ChromaSamplePosition
+[QuickTime] CompatibleBrands
+[QuickTime] HandlerType
+[QuickTime] ImagePixelDepth
+[QuickTime] ImageSpatialExtent
+[QuickTime] MajorBrand
+[QuickTime] MediaDataOffset
+[QuickTime] MediaDataSize
+[QuickTime] MinorVersion
+[System] Directory
+[System] FileAccessDate
+[System] FileInodeChangeDate
+[System] FileModifyDate
+[System] FileName
+[System] FilePermissions
+[System] FileSize
+=== MakerNote tags ===
+[Apple]         RunTimeFlags                    : Valid
+[Apple]         RunTimeValue                    : 121778253415583
+[Apple]         RunTimeScale                    : 1000000000
+[Apple]         RunTimeEpoch                    : 0
+[Apple]         AccelerationVector              : -0.006074224594 -0.8143638372 -0.5747569798

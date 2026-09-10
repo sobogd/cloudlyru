@@ -12,6 +12,7 @@ export class FilesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
+    private readonly media: MediaService,
   ) {}
 
   /** Папка-приёмник: существует и не в корзине. */
@@ -62,13 +63,61 @@ export class FilesService {
     return { id: entry.id, deduped: Boolean(sameAssetLive), zone };
   }
 
-  /** Полные метаданные файла для деталки: путь, размер/тип/хэш, EXIF и статус оптимизации. */
+  /**
+   * Метаданные Google Takeout рядом с файлом: <имя>.supplemental-metadata.json
+   * (или <имя>.json в старых экспортах) — дата съёмки, описание, источник.
+   */
+  private async findSidecar(folderId: string, name: string) {
+    const row = await this.prisma.fileEntry.findFirst({
+      where: { folderId, deletedAt: null, name: { in: [`${name}.supplemental-metadata.json`, `${name}.json`] } },
+      include: { asset: { select: { sha256: true, size: true } } },
+    });
+    if (!row) return null;
+    try {
+      const buf = await this.s3.getObjectBytes(S3Service.assetKey(row.asset.sha256), 1024 * 1024);
+      const j = JSON.parse(buf.toString('utf8')) as Record<string, any>;
+      const iso = (t: any): string | null =>
+        t && t.timestamp ? new Date(Number(t.timestamp) * 1000).toISOString() : null;
+      return {
+        name: row.name,
+        entryId: row.id,
+        title: j.title ?? null,
+        description: j.description ?? null,
+        photoTakenTime: j.photoTakenTime?.formatted ?? null,
+        photoTakenTimeIso: iso(j.photoTakenTime),
+        creationTime: j.creationTime?.formatted ?? null,
+        creationTimeIso: iso(j.creationTime),
+        imageViews: typeof j.imageViews === 'string' ? Number(j.imageViews) : (j.imageViews ?? null),
+        geoData: j.geoData ?? null,
+        origin: j.googlePhotosOrigin ?? null,
+        url: j.url ?? null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Полные метаданные файла для деталки: путь, размер/тип/хэш, EXIF/видео и метаданные Google. */
   async getEntryMeta(entryId: string) {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
       include: { asset: { include: { media: true } }, folder: true },
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
+
+    // Подробные метаданные извлекаем лениво при первом открытии деталки и кэшируем в БД.
+    // Раньше EXIF парсился только для зоны «Фото», поэтому у файлов в «Файлах» деталка была пустой.
+    if (!entry.asset.media?.raw) {
+      await this.media.extractDetail(
+        entry.assetId,
+        entry.asset.sha256,
+        Number(entry.asset.size),
+        entry.asset.mime,
+      );
+      entry.asset.media = await this.prisma.mediaMeta.findUnique({ where: { assetId: entry.assetId } });
+    }
+
+    const sidecar = await this.findSidecar(entry.folderId, entry.name);
     const m = entry.asset.media;
     return {
       id: entry.id,
@@ -91,8 +140,10 @@ export class FilesService {
             model: m.model ?? undefined,
             width: m.width ?? undefined,
             height: m.height ?? undefined,
+            raw: (m.raw as Record<string, unknown> | null) ?? null,
           }
         : null,
+      sidecar,
     };
   }
 
