@@ -123,8 +123,17 @@ jobs:
             S3_FILES_FORCE_PATH_STYLE=true
             UPLOAD_CHUNK_MAX_MB=20
             MAX_FILE_SIZE_MB=65536
+            # Потолок незавершённых загрузок: телефон с ретраями иначе копит сессии в S3
+            MAX_UPLOAD_SESSIONS_PER_USER=16
+            # Часть прямой загрузки в S3 и срок жизни presigned-ссылки на неё
+            UPLOAD_DIRECT_PART_MB=16
+            UPLOAD_PART_URL_TTL_MIN=15
+            # Префикс ключей в бакете: прод живёт без префикса (менять только вместе с бакетом)
+            S3_FILES_PREFIX=
             TRASH_RETENTION_DAYS=30
             CONVERT_ENABLED=true
+            # Оригинал — мастер: выключение молча удаляло бы сырьё после конвертации
+            KEEP_ORIGINALS=true
             CONVERT_MEM_MB=1536
             EOF
             chmod 600 .env

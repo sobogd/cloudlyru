@@ -77,14 +77,22 @@ fi
 
 echo "==> 4/4 nginx ($DOMAIN)"
 # HTTP-only server block: SSL-секцию добавляет certbot --nginx (см. DEPLOY.md)
+if [ -f /etc/nginx/sites-available/cloudlyru.conf ]; then
+  # Идемпотентность по-честному: существующий конфиг не переписываем, иначе повторный
+  # запуск снёс бы ужесточённые лимиты и SSL-блок, который добавил certbot.
+  echo "nginx: конфиг уже есть — не трогаю (правки вносить в deploy/nginx/cloudlyru.conf)"
+else
 cat > /etc/nginx/sites-available/cloudlyru.conf <<'NGINX'
 server {
     listen 80;
     server_name files.iq-factura.com;
 
-    client_max_body_size 0;
+    # Лимиты как в deploy/nginx/cloudlyru.conf: сверка sha256 на больших файлах идёт минутами,
+    # а безлимитное тело — лишний риск
+    client_max_body_size 64g;
     client_body_buffer_size 512k;
     proxy_request_buffering off;
+    proxy_max_temp_file_size 0;
 
     proxy_set_header Host              $host;
     proxy_set_header X-Real-IP         $remote_addr;
@@ -94,12 +102,13 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8305;
         proxy_http_version 1.1;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-        send_timeout       300s;
+        proxy_read_timeout 1800s;
+        proxy_send_timeout 1800s;
+        send_timeout       1800s;
     }
 }
 NGINX
+fi
 ln -sf /etc/nginx/sites-available/cloudlyru.conf /etc/nginx/sites-enabled/cloudlyru.conf
 nginx -t && systemctl reload nginx
 echo "nginx ok. Дальше: sudo certbot --nginx -d $DOMAIN"

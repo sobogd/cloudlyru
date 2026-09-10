@@ -164,6 +164,19 @@ private fun Screen() {
             )
             Spacer(Modifier.height(12.dp))
 
+            if (!app.prefs.secure) {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Токен хранится без шифрования", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Системное хранилище ключей недоступно, поэтому токен лежит в обычных настройках приложения. " +
+                                "Полный доступ к облаку в этом случае защищён только правами Android на файлы приложения.",
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
             if (!allFiles) {
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {

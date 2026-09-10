@@ -25,12 +25,18 @@ object Downloader {
         expectSize: Long = -1,
     ) {
         target.parentFile?.mkdirs()
-        val tmp = File(target.parentFile, ".${target.name}.${System.nanoTime()}.cloudly-tmp")
+        // имя части стабильно: обрыв на большом файле не должен означать «качать сначала»
+        val tmp = File(target.parentFile, ".${target.name}.cloudly-part")
         val backup = File(target.parentFile, "${target.name}.cloudly-old")
         var replaced = false
         try {
-            api.downloadStream(entryId).use { input ->
-                tmp.outputStream().use { output -> input.copyTo(output, bufferSize = 1 shl 20) }
+            var offset = if (tmp.exists()) tmp.length() else 0L
+            if (expectSize in 0 until offset) offset = 0L // часть больше ожидаемого — начинаем заново
+            api.downloadStream(entryId, offset).use { input ->
+                tmp.outputStream().use { output ->
+                    if (offset > 0) output.channel.position(offset)
+                    input.copyTo(output, bufferSize = 1 shl 20)
+                }
             }
             if (expectSize >= 0 && tmp.length() != expectSize) {
                 throw IllegalStateException("скачано ${tmp.length()} байт вместо $expectSize")

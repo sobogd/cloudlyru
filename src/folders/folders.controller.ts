@@ -1,4 +1,6 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { RateLimit } from '../common/decorators';
+import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { FoldersService } from './folders.service';
 import { CurrentUser, RequestUser } from '../common/decorators';
 import { asOptionalString, asString, isPlainObject } from '../common/utils';
@@ -10,14 +12,25 @@ export class FoldersController {
 
   /** Список верхнего уровня: GET /folders ; вложенные: GET /folders?parentId= */
   @Get()
-  list(@Query('parentId') parentId: string | undefined, @CurrentUser() user: RequestUser) {
-    return this.folders.listChildren(parentId || undefined, user.id);
+  list(
+    @Query('parentId') parentId: string | undefined,
+    @Query('after') after: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.folders.listChildren(parentId || undefined, user.id, after || undefined, Number(limit) || undefined);
   }
 
   /** Список содержимого папки: GET /folders/:id/children */
+  /** Содержимое папки порциями: `?after=<последнее имя>&limit=1000` (keyset-пагинация). */
   @Get(':id/children')
-  children(@Param('id') id: string, @CurrentUser() user: RequestUser) {
-    return this.folders.listChildren(id, user.id);
+  children(
+    @Param('id') id: string,
+    @Query('after') after: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.folders.listChildren(id, user.id, after || undefined, Number(limit) || undefined);
   }
 
   /** Метаданные папки: GET /folders/:id/meta */
@@ -37,6 +50,8 @@ export class FoldersController {
    * Идемпотентный mkdir по пути: `{ path: "Files/2025/07", parentId? }`.
    * Нужен клиенту синхронизации, чтобы не строить дерево руками.
    */
+  @UseGuards(RateLimitGuard)
+  @RateLimit(60, 60_000)
   @Post('ensure-path')
   ensurePath(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {
     if (!isPlainObject(body)) throw badRequest('invalid body');

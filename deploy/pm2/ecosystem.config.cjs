@@ -1,11 +1,14 @@
-// pm2 ecosystem: pm2 start deploy/pm2/ecosystem.config.cjs
-// env берётся из /opt/cloudlyru/.env (main.ts подключает dotenv/config из cwd)
+// pm2 ecosystem (ручной запуск): pm2 start deploy/pm2/ecosystem.config.cjs
+// Пути соответствуют реальному размещению на проде и сервисному пользователю deployer
+// (тот же каталог, что использует автодеплой из .github/workflows/deploy.yml):
+//   /home/deploy/apps/cloudlyru  — код и .env (main.ts читает dotenv из cwd)
+//   логи — рядом с приложением, чтобы deployer мог их читать без root
 module.exports = {
   apps: [
     {
       name: 'cloudlyru',
       script: 'dist/main.js',
-      cwd: '/opt/cloudlyru',
+      cwd: '/home/deploy/apps/cloudlyru',
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
@@ -13,8 +16,8 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
       },
-      out_file: '/var/log/cloudlyru.out.log',
-      error_file: '/var/log/cloudlyru.err.log',
+      out_file: '/home/deploy/apps/cloudlyru/logs/out.log',
+      error_file: '/home/deploy/apps/cloudlyru/logs/err.log',
       merge_logs: true,
       time: true,
     },

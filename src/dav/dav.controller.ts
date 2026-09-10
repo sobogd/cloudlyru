@@ -76,7 +76,16 @@ export class DavController {
         case 'MOVE': {
           const dest = req.headers['destination'];
           if (typeof dest !== 'string') throw new Error('no destination');
-          const dstPath = '/' + decodeURIComponent(dest.split('/').slice(4).join('/'));
+          // Destination — абсолютный URL (RFC 4918): разбираем путь, а не режем сегменты наугад
+          let rawPath: string;
+          try {
+            rawPath = new URL(dest).pathname;
+          } catch {
+            rawPath = dest;
+          }
+          const prefixIdx = rawPath.indexOf(PREFIX);
+          const davPart = prefixIdx >= 0 ? rawPath.slice(prefixIdx + PREFIX.length) : rawPath;
+          const dstPath = '/' + decodeURIComponent(davPart.replace(/^\/+/, ''));
           return res.status(await this.dav.move(userId, davPath, dstPath)).end();
         }
         case 'LOCK':

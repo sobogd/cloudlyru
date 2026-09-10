@@ -133,6 +133,21 @@ export class FilesService {
     );
   }
 
+  /** Конфликт имени: корзина и занятое имя — разные ситуации, клиент реагирует по-разному. */
+  private nameConflict(entryId: string, inTrash: boolean, name: string, inTarget = false): Error {
+    if (inTrash) {
+      return conflict('file with this name is in trash — restore or purge it first', 'in_trash', {
+        entryId,
+        name,
+      });
+    }
+    return conflict(
+      inTarget ? 'file name already exists in the target folder' : 'file name already exists',
+      'conflict',
+      { entryId, name },
+    );
+  }
+
   /** Единый ответ на расхождение версий: клиенту нужен снимок фактической версии. */
   private staleVersionError(current: {
     entryId: string | null;
@@ -263,7 +278,10 @@ export class FilesService {
           if (existing.deletedAt && !opts.restoreDeleted) {
             // молча воскрешать удалённое нельзя: корзина — единственная точка восстановления,
             // решение «вернуть» принимает пользователь (или явный флаг от WebDAV-клиента)
-            throw conflict('file with this name is in trash — restore or purge it first', 'in_trash');
+            throw conflict('file with this name is in trash — restore or purge it first', 'in_trash', {
+              entryId: existing.id,
+              name,
+            });
           }
           if (!existing.deletedAt && !opts.replace) {
             throw conflict('file name already exists');
@@ -615,7 +633,7 @@ export class FilesService {
       const clash = await this.prisma.fileEntry.findFirst({
         where: { folderId: entry.folderId, name: body.name, id: { not: entryId } },
       });
-      if (clash) throw conflict('file name already exists');
+      if (clash) throw this.nameConflict(clash.id, clash.deletedAt !== null, body.name);
       data.name = body.name;
     }
 
@@ -626,7 +644,7 @@ export class FilesService {
       const clash = await this.prisma.fileEntry.findFirst({
         where: { folderId: target.id, name: data.name ?? entry.name },
       });
-      if (clash) throw conflict('file name already exists in the target folder');
+      if (clash) throw this.nameConflict(clash.id, clash.deletedAt !== null, data.name ?? entry.name, true);
       data.folderId = target.id;
       data.zone = target.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
       op = 'move';

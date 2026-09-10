@@ -328,23 +328,49 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       let folder = found;
       let op: 'create' | 'restore' | null = null;
       if (!found) {
-        folder = await this.prisma.folder.create({ data: { parentId, name, zone } });
-        op = 'create';
+        folder = await this.prisma.$transaction(async (tx) => {
+          const row = await tx.folder.create({ data: { parentId, name, zone } });
+          if (ownerId) {
+            await this.changes.record(
+              {
+                userId: ownerId,
+                target: 'folder',
+                op: 'create',
+                targetId: row.id,
+                folderId: parentId,
+                name,
+                zone,
+                keepOffline: row.keepOffline,
+              },
+              tx,
+            );
+            journaledFolders.add(row.id);
+          }
+          return row;
+        });
+        op = null;
       }
       if (!folder) throw notFound(`folder ${name} not found after create`);
       // одно событие на папку за проход; ошибку журнала не глотаем — распаковка идемпотентна
       // (чекпойнт + проверка уже распакованных записей), повторный заход безопасен
       if (op && ownerId && !journaledFolders.has(folder.id)) {
         journaledFolders.add(folder.id);
-        await this.changes.record({
-          userId: ownerId,
-          target: 'folder',
-          op,
-          targetId: folder.id,
-          folderId: parentId,
-          name,
-          zone: folder.zone,
-          keepOffline: folder.keepOffline,
+        const target = folder;
+        // создание и событие — одной транзакцией: раньше падение между ними теряло событие
+        await this.prisma.$transaction(async (tx) => {
+          await this.changes.record(
+            {
+              userId: ownerId,
+              target: 'folder',
+              op,
+              targetId: target.id,
+              folderId: parentId,
+              name,
+              zone: target.zone,
+              keepOffline: target.keepOffline,
+            },
+            tx,
+          );
         });
       }
       folderCache.set(key, folder.id);

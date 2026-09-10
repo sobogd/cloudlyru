@@ -1,7 +1,11 @@
 # CloudlyRu — деплой runbook
 
-Автодеплой: **push в main** (по путям `src/**`, `prisma/**`, `package.json`, `pnpm-lock.yaml`, `.env.example`)
+Автодеплой: **push в main** (по путям `src/**`, `prisma/**`, `web/**`, `package.json`, `pnpm-lock.yaml`, `.env.example`)
 → GitHub Actions собирает → `deployer@<SERVER_IP>` → pm2 `cloudlyru` (:8305, 127.0.0.1) → nginx `files.iq-factura.com`.
+
+Чего автодеплой НЕ делает: не накатывает `deploy/nginx/cloudlyru.conf` (конфиг nginx живёт на сервере
+отдельно, см. ниже) и не трогает `deploy/` на сервере как конфиг системы — только кладёт каталог
+в бандл приложения (скрипты cron берутся оттуда).
 
 Ручной запуск: `gh workflow run deploy.yml -f run_migrations=true` (в репо `sobogd/cloudlyru`).
 
@@ -27,6 +31,12 @@
 grep '^CLOUDLY_DATABASE_URL=' ~/work/.env | cut -d= -f2- | \
   ssh root@46.225.143.221 'CLOUDLY_DATABASE_URL=$(cat) bash -s' \
     < /Users/sobogd/work/iq-rest/cloudlyru/deploy/scripts/server-bootstrap.sh
+
+# nginx: bootstrap создаёт конфиг только если его ещё нет. Актуальные лимиты
+# (client_max_body_size 64g, proxy_read_timeout 1800s, proxy_max_temp_file_size 0)
+# лежат в deploy/nginx/cloudlyru.conf — накатывать вручную:
+#   sudo cp deploy/nginx/cloudlyru.conf /etc/nginx/sites-available/cloudlyru.conf
+#   sudo nginx -t && sudo systemctl reload nginx   (SSL-блок добавит/сохранит certbot)
 
 # TLS (если ещё не выпущен):
 ssh root@46.225.143.221 'certbot --nginx -d files.iq-factura.com'

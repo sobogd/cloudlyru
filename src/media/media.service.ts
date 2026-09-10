@@ -13,6 +13,8 @@ export const GRID_SIZE = 512;
 /** Сколько байт читать из начала файла для EXIF. */
 const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 export const FULL_SIZE = 2048;
+/** Сколько байт читаем из начала файла, прежде чем тянуть объект целиком. */
+const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 const MAX_PARSE_BYTES = 150 * 1024 * 1024;
 /** Сколько байт читать из начала файла для EXIF (метаданные лежат в начале JPEG/HEIC). */
 
@@ -199,6 +201,12 @@ export class MediaService {
     }
     if (!IMAGE_MIMES.includes(mime)) return;
     try {
+      // Метаданные лежат в начале файла, поэтому сначала читаем только голову: полный объект
+      // (до 150 МБ) на каждое фото — это лишний трафик из S3 и память на VPS, а на пути complete
+      // клиент ещё и ждёт ответа.
+      const head = await this.s3.readRange(S3Service.assetKey(sha256), 0, HEAD_PARSE_BYTES - 1).catch(() => null);
+      if (head && (await this.parseAndStoreImageMeta(assetId, head))) return;
+      // не получилось из головы (метаданные в конце или формат хитрый) — читаем целиком
       const buf = await this.s3.getObjectBytes(S3Service.assetKey(sha256), MAX_PARSE_BYTES);
       await this.parseAndStoreImageMeta(assetId, buf);
     } catch (e) {
@@ -217,13 +225,14 @@ export class MediaService {
     try {
       const buf = await readFile(filePath);
       await this.parseAndStoreImageMeta(assetId, buf);
+
     } catch (e) {
       this.logger.debug(`EXIF skip (local): ${(e as Error).message}`);
     }
   }
 
   /** EXIF фото → MediaMeta. Первичный проход: существующие значения не перетираем. */
-  private async parseAndStoreImageMeta(assetId: string, buf: Buffer): Promise<void> {
+  private async parseAndStoreImageMeta(assetId: string, buf: Buffer): Promise<boolean> {
     const [gps, core] = await Promise.all([
       exifr.gps(buf).catch(() => null),
       exifr.parse(buf, { segments: ['exif', 'ifd0'], mergeOutput: true } as never).catch(() => null),
@@ -250,6 +259,8 @@ export class MediaService {
       create: { assetId, capturedAt, latitude, longitude, make: core?.Make || null, model: core?.Model || null, width, height },
       update: {},
     });
+    // «что-то нашли» — сигнал вызывающему, что читать объект целиком не нужно
+    return Boolean(capturedAt || latitude != null || width != null || core?.Make || core?.Model);
   }
 
   /**

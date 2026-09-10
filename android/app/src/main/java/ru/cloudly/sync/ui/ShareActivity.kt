@@ -87,6 +87,8 @@ private fun ShareScreen(uris: List<Uri>) {
     var folderNameField by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
+    var cancelRequested by remember { mutableStateOf(false) }
+    var lastError by remember { mutableStateOf("") }
     var progress by remember { mutableStateOf(0f) }
     val folders = remember { mutableStateListOf<RemoteFolder>() }
 
@@ -175,36 +177,52 @@ private fun ShareScreen(uris: List<Uri>) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(enabled = !busy, onClick = {
                 busy = true
+                cancelRequested = false
                 status = ""
+                lastError = ""
                 scope.launch {
-                    val result = withContext(Dispatchers.IO) { uploadShared(app, currentFolderId, uris) { p -> progress = p } }
+                    val result = withContext(Dispatchers.IO) {
+                        uploadShared(app, currentFolderId, uris, { cancelRequested }) { p -> progress = p }
+                    }
                     busy = false
-                    status = result
-                    if (result.startsWith("загружено")) {
-                        // закрываемся сами: файлы уехали, пользователю тут делать нечего
+                    status = result.text
+                    lastError = result.failed.joinToString("; ")
+                    // закрываемся сами только если всё уехало: иначе пользователю нужен «Повторить»
+                    if (result.failed.isEmpty() && !result.cancelled) {
                         kotlinx.coroutines.delay(1200)
                         (context as? ComponentActivity)?.finish()
                     }
                 }
-            }) { Text("Загрузить сюда") }
-            OutlinedButton(enabled = !busy, onClick = { (context as? ComponentActivity)?.finish() }) { Text("Отмена") }
+            }) { Text(if (lastError.isEmpty()) "Загрузить сюда" else "Повторить неудавшиеся") }
+            OutlinedButton(
+                onClick = {
+                    if (busy) cancelRequested = true else (context as? ComponentActivity)?.finish()
+                },
+            ) { Text(if (busy) "Стоп" else "Закрыть") }
+            if (lastError.isNotEmpty()) {
+                Text("не уехало: $lastError", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+            }
         }
     }
 }
+
+private data class ShareResult(val text: String, val failed: List<String>, val cancelled: Boolean)
 
 /** Копирование content:// в кэш, хэш, заливка, удаление временного файла. */
 private fun uploadShared(
     app: App,
     folderId: String,
     uris: List<Uri>,
+    isCancelled: () -> Boolean,
     onProgress: (Float) -> Unit,
-): String {
+): ShareResult {
     val cacheDir = File(app.cacheDir, "share").apply { mkdirs() }
     // остатки прошлых неудачных попыток не должны копиться
     cacheDir.listFiles()?.forEach { it.delete() }
     var done = 0
     val errors = ArrayList<String>()
     for ((index, uri) in uris.withIndex()) {
+        if (isCancelled()) return ShareResult("остановлено: загружено $done из ${uris.size}", errors, true)
         val name = safeName(displayName(app, uri) ?: "shared-${System.currentTimeMillis()}")
         val tmp = File(cacheDir, name)
         // Имя приходит от чужого приложения: без проверки канонического пути «../../databases/…»
@@ -262,11 +280,11 @@ private fun uploadShared(
         }
     }
     onProgress(1f)
-    return if (errors.isEmpty()) {
-        "загружено: $done из ${uris.size}"
-    } else {
-        "загружено: $done из ${uris.size}; ошибки: ${errors.joinToString("; ")}"
-    }
+    return ShareResult(
+        text = if (errors.isEmpty()) "загружено: $done из ${uris.size}" else "загружено: $done из ${uris.size}",
+        failed = errors,
+        cancelled = false,
+    )
 }
 
 /**

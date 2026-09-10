@@ -71,4 +71,7 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.10.0")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Юнит-тесты чистой логики: правила синхронизации проверяются без устройства
+    testImplementation("junit:junit:4.13.2")
 }

@@ -36,6 +36,8 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         var conflicts: Int = 0,
         var errors: Int = 0,
         var empty: Int = 0,
+        var depthSkipped: Int = 0,
+        var retryExhausted: Int = 0,
         var pending: Int = 0,
         var fatal: String? = null,
     )
@@ -62,12 +64,14 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                 onProgress("${File(job.sourceDir).name}: ждём Wi-Fi")
                 continue
             }
+            var journal = JournalResult(0, false)
             try {
-                if (applyJournal(job, onProgress)) {
+                journal = applyJournal(job, onProgress)
+                if (journal.reset) {
                     // курсор устарел (журнал подрезали или БД восстановили): состояние пересоберём сканом
                     for (item in db.itemsOf(job.id)) db.deleteItem(job.id, item.relPath)
                 }
-                syncJob(job, stats, onProgress)
+                syncJob(job, stats, onProgress, journal.applied)
             } catch (e: Exception) {
                 stats.errors += 1
                 stats.fatal = "${File(job.sourceDir).name}: ${e.message}"
@@ -81,10 +85,13 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
     // ===== журнал сервера =====
 
-    /** @return true, если нужен полный рескан (курсор старше журнала). */
-    private fun applyJournal(job: Db.Job, onProgress: (String) -> Unit): Boolean {
+    private data class JournalResult(val applied: Int, val reset: Boolean)
+
+    /** @return сколько событий применено и нужен ли полный рескан (курсор старше журнала). */
+    private fun applyJournal(job: Db.Job, onProgress: (String) -> Unit): JournalResult {
         var cursor = (db.kv(cursorKey(job.id)) ?: "0").toLongOrNull() ?: 0L
         var reset = false
+        var applied = 0
         // Состояние читаем один раз и держим в памяти: применять событие запросом к базе на каждый
         // файл — это O(n²) на первой синхронизации большой библиотеки.
         val items = db.itemsOf(job.id)
@@ -95,6 +102,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             if (page.resetRequired) reset = true
             for (change in page.changes) {
                 cursor = change.seq
+                applied += 1
                 if (change.target == "folder") {
                     applyFolderChange(change)
                     continue
@@ -133,11 +141,13 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             if (!page.hasMore) break
             onProgress("журнал: ${page.changes.size} событий")
         }
-        return reset
+        return JournalResult(applied, reset)
     }
 
     /** Курсор у каждой задачи свой: журнал общий для пользователя, а состояние — по папкам. */
     private fun cursorKey(jobId: Long) = "journal_cursor:$jobId"
+
+    private fun remoteScanKey(jobId: Long) = "remote_scan_at:$jobId"
 
     private fun applyFolderChange(change: ru.cloudly.sync.net.Change) {
         if (change.op == "pin") {
@@ -163,7 +173,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
     // ===== проход по папке задачи =====
 
-    private fun syncJob(job: Db.Job, stats: Stats, onProgress: (String) -> Unit) {
+    private fun syncJob(job: Db.Job, stats: Stats, onProgress: (String) -> Unit, journalApplied: Int = 0) {
         val root = File(job.sourceDir)
         val known = db.itemsOf(job.id)
         if (!root.isDirectory) {
@@ -325,8 +335,19 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         val pinnedFolders = pinned()
         val jobPinned = job.targetFolderId in pinnedFolders
         val mirror = job.zone == "FILES" && job.keepDays < 0
-        if (mirror || jobPinned) mirrorDown(job, stats, onProgress)
-        else downloadPinnedFiles(job, stats, onProgress)
+        if (mirror || jobPinned) {
+            // Обход дерева на сервере — самый дорогой шаг прохода. Если журнал ничего не принёс
+            // и с прошлого обхода прошло меньше получаса, пропускаем его: изменения всё равно
+            // приедут событиями, а не только листингом.
+            val lastScan = (db.kv(remoteScanKey(job.id)) ?: "0").toLongOrNull() ?: 0L
+            val stale = System.currentTimeMillis() - lastScan > REMOTE_SCAN_INTERVAL_MS
+            if (journalApplied > 0 || stale) {
+                mirrorDown(job, stats, onProgress, folderPinned = jobPinned)
+                db.putKv(remoteScanKey(job.id), System.currentTimeMillis().toString())
+            }
+        } else {
+            downloadPinnedFiles(job, stats, onProgress)
+        }
         if (job.keepDays >= 0 && !jobPinned) evict(job, onProgress)
     }
 
@@ -606,16 +627,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     }
 
     /** Свободное имя с суффиксом: `IMG_0001 (2).jpg`, `(3)`… — как принято в плане. */
-    private fun freeName(name: String, taken: Set<String>): String {
-        val dot = name.lastIndexOf('.')
-        val base = if (dot > 0) name.substring(0, dot) else name
-        val ext = if (dot > 0) name.substring(dot) else ""
-        for (i in 2 until 1000) {
-            val candidate = "$base ($i)$ext"
-            if (candidate !in taken && !File(candidate).exists()) return candidate
-        }
-        return "$base (${System.currentTimeMillis()})$ext"
-    }
+    private fun freeName(name: String, taken: Set<String>): String = Decisions.freeName(name, taken)
 
     // ===== зеркало вниз и вытеснение =====
 
@@ -627,20 +639,30 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
     private val minFreeBytes = 500L * 1024 * 1024
 
-    private fun mirrorDown(job: Db.Job, stats: Stats, onProgress: (String) -> Unit) {
+    private fun mirrorDown(job: Db.Job, stats: Stats, onProgress: (String) -> Unit, folderPinned: Boolean = false) {
         if (freeBytes(job.sourceDir) < minFreeBytes) {
             stats.fatal = "мало свободного места (${freeBytes(job.sourceDir) / 1024 / 1024} МБ) — скачивание остановлено"
             Log.w(TAG, stats.fatal!!)
             return
         }
         val remote = ArrayList<Pair<String, ru.cloudly.sync.net.RemoteEntry>>()
-        collectRemote(job.targetFolderId, "", remote, 0)
+        collectRemote(job.targetFolderId, "", remote, 0, stats)
         val known = db.itemsOf(job.id).associateBy { it.relPath }
         for ((relPath, entry) in remote) {
             val item = known[relPath]
             if (item != null) {
-                // вытесненное обратно не тянем — иначе смысл вытеснения теряется; исключение — закреплённое
-                if (item.state == Db.STATE_EVICTED && !entry.keepOffline && !item.keepOffline) continue
+                // вытесненное обратно не тянем — иначе смысл вытеснения теряется;
+                // исключение — закреплённый файл или закреплённая папка
+                if (!Decisions.shouldDownload(
+                        item.state,
+                        entry.keepOffline,
+                        item.keepOffline,
+                        mirror = !folderPinned,
+                        jobPinned = folderPinned,
+                    ) && item.state == Db.STATE_EVICTED
+                ) {
+                    continue
+                }
                 if (item.remoteSha256 == entry.sha256 && File(item.localPath).isFile) continue
             }
             if (freeBytes(job.sourceDir) - entry.size < minFreeBytes) {
@@ -715,8 +737,14 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         prefix: String,
         out: MutableList<Pair<String, ru.cloudly.sync.net.RemoteEntry>>,
         depth: Int,
+        stats: Stats? = null,
     ) {
-        if (depth > 32) return
+        if (depth > MAX_MIRROR_DEPTH) {
+            // молча обрезать нельзя: файлы глубоких уровней тогда никогда не вернутся на телефон
+            stats?.let { it.depthSkipped += 1 }
+            Log.w(TAG, "зеркало: глубина больше $MAX_MIRROR_DEPTH — ветка пропущена ($prefix)")
+            return
+        }
         val children = api.children(folderId)
         for (entry in children.entries) {
             if (entry.size == 0L) continue
@@ -724,7 +752,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             out.add(rel to entry.copy(folderId = folderId))
         }
         for ((name, id) in children.folderIds) {
-            collectRemote(id, if (prefix.isEmpty()) name else "$prefix/$name", out, depth + 1)
+            collectRemote(id, if (prefix.isEmpty()) name else "$prefix/$name", out, depth + 1, stats)
         }
     }
 
@@ -762,18 +790,25 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     private fun pinned(): Set<String> =
         (db.kv(KV_PINNED_FOLDERS) ?: "").split(',').filter { it.isNotBlank() }.toSet()
 
-    private fun buildConflictName(name: String, stamp: String): String {
-        val dot = name.lastIndexOf('.')
-        return if (dot > 0) {
-            "${name.substring(0, dot)} (конфликт $stamp)${name.substring(dot)}"
-        } else {
-            "$name (конфликт $stamp)"
-        }
-    }
+    private fun buildConflictName(name: String, stamp: String): String = Decisions.conflictName(name, stamp)
 
     /** 30 с, 2 мин, 10 мин, 1 ч, дальше — раз в 6 часов. */
     private fun retry(op: Db.Op, message: String, stats: Stats) {
         val attempts = op.attempts + 1
+        if (attempts > MAX_ATTEMPTS) {
+            // не крутим одно и то же вечно: помечаем и показываем пользователю
+            db.updateOp(
+                op.id,
+                mapOf(
+                    "attempts" to attempts,
+                    "last_error" to message.take(300),
+                    "next_attempt_at" to Long.MAX_VALUE / 2,
+                ),
+            )
+            stats.retryExhausted += 1
+            Log.w(TAG, "операция ${op.kind} ${op.relPath} сдалась после $attempts попыток: $message")
+            return
+        }
         val delayMs = when (attempts) {
             1 -> 30_000L
             2 -> 120_000L
@@ -818,6 +853,12 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
     companion object {
         private const val TAG = "cloudly-sync"
+        /** Насколько глубоко зеркалим структуру папок на телефоне. */
+        private const val MAX_MIRROR_DEPTH = 64
+        /** Как часто переобходить дерево на сервере, если журнал молчит. */
+        private const val REMOTE_SCAN_INTERVAL_MS = 30 * 60 * 1000L
+        /** После стольких попыток операция помечается как «требует внимания» и больше не долбится. */
+        private const val MAX_ATTEMPTS = 20
         private const val KV_PINNED_FOLDERS = "pinned_folders"
     }
 }

@@ -11,7 +11,7 @@ import { FilesService } from '../files/files.service';
 import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
 import { ChangesService } from '../sync/changes.service';
-import { assertSafeName } from '../common/utils';
+import { assertSafeName, randomToken } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { notFound } from '../common/errors';
 
@@ -212,9 +212,9 @@ export class DavService {
       throw e;
     });
 
-    const key = S3Service.assetKey('pending'); // временно; финальный ключ по хэшу ниже
-    // читаем во временный S3-объект, затем перекладываем — используем tmp key
-    const tmpKey = `files/tmp/${createHash('sha256').update(name + Date.now()).digest('hex').slice(0, 16)}`;
+    // случайный ключ: хэш от имени и времени у двух параллельных PUT одного имени совпадал,
+    // и клиенты писали в один объект, портя друг другу байты
+    const tmpKey = `files/tmp/${randomToken(16)}`;
     const mime = contentType || 'application/octet-stream';
 
     await this.s3.putObjectStream(tmpKey, tee, mime, contentLength ?? undefined);
@@ -332,6 +332,20 @@ export class DavService {
     return 204;
   }
 
+  /** Находится ли папка внутри поддерева другой (защита от перемещения папки в саму себя). */
+  private async isInside(folderId: string, candidateId: string): Promise<boolean> {
+    let current: string | null = candidateId;
+    for (let i = 0; i < 64 && current; i++) {
+      if (current === folderId) return true;
+      const row: { parentId: string | null } | null = await this.prisma.folder.findUnique({
+        where: { id: current },
+        select: { parentId: true },
+      });
+      current = row?.parentId ?? null;
+    }
+    return false;
+  }
+
   async move(userId: string, srcPath: string, dstPath: string) {
     // rename/move в пределах дерева: переименование конечного сегмента (папки или файла)
     const srcParts = srcPath.split('/').filter(Boolean);
@@ -343,13 +357,25 @@ export class DavService {
     } catch {
       throw new BadRequestException('invalid name');
     }
+    // Папка назначения: MOVE может быть не только переименованием, но и переносом в другой
+    // каталог — раньше она игнорировалась и rclone/Finder получали «переименовал» вместо переноса.
+    const dstParentId = await this.folderByPath(userId, dstParts.slice(0, -1));
+    if (!dstParentId) throw notFound('destination folder not found');
+
     const entry = await this.entryByPath(userId, srcParts);
     if (entry) {
-      const dup = await this.prisma.fileEntry.findFirst({ where: { folderId: entry.folderId, name: newName, id: { not: entry.id } } });
+      const targetFolderId = dstParentId;
+      const dup = await this.prisma.fileEntry.findFirst({
+        where: { folderId: targetFolderId, name: newName, id: { not: entry.id } },
+      });
       if (dup) throw new BadRequestException('already exists');
+      const moved = entry.folderId !== targetFolderId;
       await this.prisma.$transaction(async (tx) => {
-        await tx.fileEntry.update({ where: { id: entry.id }, data: { name: newName } });
-        await this.changes.recordEntry(userId, entry.id, 'update', tx);
+        await tx.fileEntry.update({
+          where: { id: entry.id },
+          data: { name: newName, folderId: targetFolderId },
+        });
+        await this.changes.recordEntry(userId, entry.id, moved ? 'move' : 'update', tx);
       });
       return 204;
     }
@@ -358,15 +384,21 @@ export class DavService {
       ? await this.prisma.folder.findFirst({ where: { parentId, name: srcParts[srcParts.length - 1], deletedAt: null } })
       : await this.prisma.folder.findFirst({ where: { parentId: null, name: srcParts[srcParts.length - 1], deletedAt: null } });
     if (!folder) throw notFound('path not found');
-    if (folder.name === '__root__') throw new BadRequestException('cannot rename root');
+    if (folder.name === ROOT_FOLDER_NAME) throw new BadRequestException('cannot rename root');
     const photoId = await this.auth.photoRootIdOrNull(userId);
     if (photoId && folder.id === photoId) throw new BadRequestException('cannot rename photo library root');
-    const dup = await this.prisma.folder.findFirst({ where: { parentId: folder.parentId ?? undefined, name: newName, id: { not: folder.id } } });
+    const dup = await this.prisma.folder.findFirst({ where: { parentId: dstParentId, name: newName, id: { not: folder.id } } });
     if (dup) throw new BadRequestException('already exists');
     if (newName === ROOT_FOLDER_NAME) throw new BadRequestException('reserved name');
+    if (dstParentId === folder.id) throw new BadRequestException('cannot move folder into itself');
+    const subtree = await this.auth.subtreeIds(userId, { includeDeleted: true });
+    if (subtree.includes(folder.id) && (await this.isInside(folder.id, dstParentId))) {
+      throw new BadRequestException('cannot move folder into its own subtree');
+    }
+    const moved = folder.parentId !== dstParentId;
     await this.prisma.$transaction(async (tx) => {
-      await tx.folder.update({ where: { id: folder.id }, data: { name: newName } });
-      await this.changes.recordFolder(userId, folder.id, 'update', tx);
+      await tx.folder.update({ where: { id: folder.id }, data: { name: newName, parentId: dstParentId } });
+      await this.changes.recordFolder(userId, folder.id, moved ? 'move' : 'update', tx);
     });
     return 204;
   }

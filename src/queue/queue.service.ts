@@ -270,11 +270,20 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         if (at <= now) this.retryAfter.delete(id);
         else delayed.push(id);
       }
-      const row = await tx.job.findFirst({
-        where: { state: 'pending', ...(delayed.length ? { id: { notIn: delayed } } : {}) },
-        orderBy: { createdAt: 'asc' },
-        include: { asset: true },
-      });
+      // Приоритет по виду задачи: фото (секунды на кадр) обгоняют видео (часы AV1), иначе одно
+      // длинное видео держало бы превью всех фото, залитых после него, — а их ждёт телефон.
+      const baseWhere = { state: 'pending', ...(delayed.length ? { id: { notIn: delayed } } : {}) };
+      const row =
+        (await tx.job.findFirst({
+          where: { ...baseWhere, kind: 'photo' },
+          orderBy: { createdAt: 'asc' },
+          include: { asset: true },
+        })) ??
+        (await tx.job.findFirst({
+          where: baseWhere,
+          orderBy: { createdAt: 'asc' },
+          include: { asset: true },
+        }));
       if (!row) return null;
       await tx.job.update({ where: { id: row.id }, data: { state: 'processing', startedAt: new Date(), attempts: { increment: 1 }, error: null } });
       return { id: row.id, assetId: row.assetId, kind: row.kind, sha256: row.asset.sha256, mime: row.asset.mime };

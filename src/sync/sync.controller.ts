@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { SyncService } from './sync.service';
-import { CurrentUser, ReadOnlyAllowed, RequestUser } from '../common/decorators';
+import { CurrentUser, RateLimit, ReadOnlyAllowed, RequestUser } from '../common/decorators';
 import { isPlainObject } from '../common/utils';
+import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { badRequest } from '../common/errors';
 
 /** API синхронизации для клиентов (Android). Авторизация — ApiToken в Bearer. */
@@ -10,6 +11,8 @@ export class SyncController {
   constructor(private readonly sync: SyncService) {}
 
   /** Изменения дерева после курсора: `GET /sync/changes?since=123&limit=200`. */
+  @UseGuards(RateLimitGuard)
+  @RateLimit(240, 60_000)
   @Get('changes')
   changes(
     @Query('since') since: string | undefined,
@@ -20,6 +23,8 @@ export class SyncController {
   }
 
   /** Что из перечисленного содержимого уже есть: `{ sha256: [...] }`. Только чтение. */
+  @UseGuards(RateLimitGuard)
+  @RateLimit(120, 60_000)
   @ReadOnlyAllowed()
   @Post('have')
   have(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {

@@ -11,6 +11,10 @@ import { badRequest, conflict, notFound } from '../common/errors';
 
 const isRoot = (f: { name: string }) => f.name === ROOT_FOLDER_NAME;
 
+/** Порция содержимого папки по умолчанию и её потолок (keyset-пагинация по имени). */
+const CHILDREN_PAGE = 1000;
+const CHILDREN_PAGE_MAX = 5000;
+
 @Injectable()
 export class FoldersService {
   constructor(
@@ -45,17 +49,26 @@ export class FoldersService {
     return folder;
   }
 
-  async listChildren(parentId: string | undefined, userId: string) {
+  /**
+   * Список содержимого папки. `after` — keyset-пагинация по имени: плоская «Фото» на десятки
+   * тысяч записей иначе отдавалась бы одним ответом в десятки мегабайт (клиент синхронизации
+   * читает это на каждом проходе). Без `after` отдаём первую порцию и признак `hasMore`.
+   */
+  async listChildren(parentId: string | undefined, userId: string, after?: string, limit?: number) {
     const parent = await this.resolveAccessible(parentId, userId);
+    const take = Math.min(Math.max(limit ?? CHILDREN_PAGE, 1), CHILDREN_PAGE_MAX);
+    const nameFilter = after ? { gt: after } : {};
     const [folders, entries] = await Promise.all([
       this.prisma.folder.findMany({
-        where: { parentId: parent.id, deletedAt: null },
+        where: { parentId: parent.id, deletedAt: null, name: nameFilter },
         orderBy: { name: 'asc' },
+        take,
         select: { id: true, name: true, createdAt: true, updatedAt: true },
       }),
       this.prisma.fileEntry.findMany({
-        where: { folderId: parent.id, deletedAt: null },
+        where: { folderId: parent.id, deletedAt: null, name: nameFilter },
         orderBy: { name: 'asc' },
+        take,
         select: {
           id: true,
           name: true,
@@ -66,8 +79,26 @@ export class FoldersService {
         },
       }),
     ]);
+    // «есть ли ещё» считаем по общему числу за страницей, а не по размеру порции каждого списка
+    const lastFolder = folders.length ? folders[folders.length - 1].name : null;
+    const lastEntry = entries.length ? entries[entries.length - 1].name : null;
+    const last = [lastFolder, lastEntry].filter((n): n is string => n !== null).sort().pop() ?? null;
+    const hasMore =
+      folders.length === take ||
+      entries.length === take ||
+      (last !== null &&
+        (await this.prisma.fileEntry.count({
+          where: { folderId: parent.id, deletedAt: null, name: { gt: last } },
+        })) +
+          (await this.prisma.folder.count({
+            where: { parentId: parent.id, deletedAt: null, name: { gt: last } },
+          })) >
+          0);
+
     return {
       parentId: parent.id,
+      hasMore,
+      nextAfter: hasMore ? last : null,
       folders,
       entries: entries.map((e) => ({
         id: e.id,
@@ -195,7 +226,8 @@ export class FoldersService {
       }
     }
     // запросы с других клиентов могут прислать системный корень первым сегментом — он не создаётся
-    const wanted = segments.filter((s) => s !== ROOT_FOLDER_NAME);
+    // системный корень может прийти только первым сегментом; в середине пути это обычное имя
+    const wanted = segments[0] === ROOT_FOLDER_NAME ? segments.slice(1) : segments;
 
     let current = await this.resolveAccessible(parentId, userId);
     let createdCount = 0;
@@ -388,14 +420,21 @@ export class FoldersService {
    * про саму папку и не может восстановить её содержимое.
    */
   async restore(id: string, userId: string) {
-    await this.resolveAccessibleOrDeleted(id, userId);
+    const root = await this.resolveAccessibleOrDeleted(id, userId);
     const ids = await this.collectSubtreeIds(id);
+    // Возвращаем только то, что удалили вместе с папкой: подпапки, удалённые пользователем
+    // отдельно (раньше), остаются в корзине, иначе они воскресали бы без спроса.
+    const cutoff = root.deletedAt ? new Date(root.deletedAt.getTime() - 1000) : null;
     const folders = await this.prisma.folder.findMany({
-      where: { id: { in: ids } },
+      where: {
+        id: { in: ids },
+        ...(cutoff ? { OR: [{ deletedAt: null }, { deletedAt: { gte: cutoff } }] } : {}),
+      },
       select: { id: true, parentId: true, name: true, zone: true, keepOffline: true },
     });
+    const restoreIds = folders.map((f) => f.id);
     const entries = await this.prisma.fileEntry.findMany({
-      where: { folderId: { in: ids }, deletedAt: null },
+      where: { folderId: { in: restoreIds }, deletedAt: null },
       select: {
         id: true,
         folderId: true,
@@ -407,7 +446,7 @@ export class FoldersService {
       },
     });
     await this.prisma.$transaction(async (tx) => {
-      await tx.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: null } });
+      await tx.folder.updateMany({ where: { id: { in: restoreIds } }, data: { deletedAt: null } });
       for (const f of folders) {
         await this.changes.record(
           {

@@ -154,9 +154,10 @@ class Api(private val prefs: Prefs) {
     fun subfolders(folderId: String): List<Pair<String, String>> =
         children(folderId).folderIds.map { (name, id) -> name to id }
 
-    /** Дерево папки: имена подпапок и записи (нужно для первичного сопоставления). */
-    fun children(folderId: String): FolderChildren {
-        val o = parse(request("/folders/$folderId/children"))
+    /** Содержимое папки одной страницей: сервер отдаёт порциями по 1000 записей. */
+    private fun childrenPage(folderId: String, after: String?): Pair<FolderChildren, String?> {
+        val suffix = if (after.isNullOrBlank()) "" else "?after=${java.net.URLEncoder.encode(after, "UTF-8")}"
+        val o = parse(request("/folders/$folderId/children$suffix"))
         val folders = o.optJSONArray("folders") ?: JSONArray()
         val map = HashMap<String, String>()
         for (i in 0 until folders.length()) {
@@ -179,7 +180,27 @@ class Api(private val prefs: Prefs) {
                 ),
             )
         }
-        return FolderChildren(map, list)
+        val next = if (o.optBoolean("hasMore", false)) o.optString("nextAfter").takeIf { it.isNotBlank() } else null
+        return FolderChildren(map, list) to next
+    }
+
+    /**
+     * Всё содержимое папки, с обходом страниц: большая папка приходит порциями,
+     * и без этого зеркало видело бы только первую тысячу записей.
+     */
+    fun children(folderId: String): FolderChildren {
+        val folders = HashMap<String, String>()
+        val entries = ArrayList<RemoteEntry>()
+        var after: String? = null
+        var guard = 0
+        while (guard++ < 1000) {
+            val (page, next) = childrenPage(folderId, after)
+            folders.putAll(page.folderIds)
+            entries.addAll(page.entries)
+            if (next == null) break
+            after = next
+        }
+        return FolderChildren(folders, entries)
     }
 
     /**
@@ -304,13 +325,15 @@ class Api(private val prefs: Prefs) {
         parse(request("/files/$entryId", "PATCH", JSONObject().put("folderId", folderId).put("name", name)))
     }
 
-    fun downloadStream(entryId: String): InputStream {
+    /** Скачивание с докачкой: `from` — с какого байта продолжать (сервер умеет Range). */
+    fun downloadStream(entryId: String, from: Long = 0): InputStream {
         // отдельный клиент: чтение тела большого файла может идти минутами
-        val req = Request.Builder()
+        val builder = Request.Builder()
             .url(url("/files/$entryId/content"))
             .header("Authorization", "Bearer ${prefs.token}")
-            .build()
-        val response = downloadClient.newCall(req).execute()
+            .header("Accept-Encoding", "identity")
+        if (from > 0) builder.header("Range", "bytes=$from-")
+        val response = downloadClient.newCall(builder.build()).execute()
         if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
         return response.body!!.byteStream()
     }

@@ -100,8 +100,13 @@ class Uploader(private val api: Api) {
         val parts = max(1, ((total + partSize - 1) / partSize).toInt())
         var sent = ((startPart - 1).toLong() * partSize).coerceAtMost(total)
         onProgress(sent, total)
-        // релей-режим (байты идут через сервер) требует строгого порядка частей
-        val width = if (direct) parallelism else 1
+        // релей-режим (байты идут через сервер) требует строгого порядка частей;
+        // на очень больших файлах ужимаем параллелизм: буферы частей держатся в памяти целиком
+        val width = when {
+            !direct -> 1
+            total > 1024L * 1024 * 1024 -> 2
+            else -> parallelism
+        }
 
         RandomAccessFile(file, "r").use { raf ->
             var part = startPart

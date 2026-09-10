@@ -10,19 +10,26 @@ import androidx.security.crypto.MasterKey
  * он даёт полный доступ к облаку, а телефон — потеряемая вещь.
  */
 class Prefs(context: Context) {
-    private val prefs: SharedPreferences = runCatching {
-        val key = MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
-        EncryptedSharedPreferences.create(
-            context,
-            "cloudly-secure",
-            key,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        ) as SharedPreferences
-    }.getOrElse {
+    /** false — шифрованное хранилище не поднялось, токен лежит в обычных настройках. */
+    val secure: Boolean
+
+    private val prefs: SharedPreferences
+
+    init {
+        val encrypted = runCatching {
+            val key = MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
+            EncryptedSharedPreferences.create(
+                context,
+                "cloudly-secure",
+                key,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+            ) as SharedPreferences
+        }.getOrNull()
         // Keystore на некоторых прошивках капризен; без хранилища приложение бесполезно,
-        // поэтому деградируем до обычных настроек, но не падаем
-        context.getSharedPreferences("cloudly-plain", Context.MODE_PRIVATE)
+        // поэтому деградируем до обычных настроек, но не падаем — и говорим об этом в интерфейсе
+        secure = encrypted != null
+        prefs = encrypted ?: context.getSharedPreferences("cloudly-plain", Context.MODE_PRIVATE)
     }
 
     var serverUrl: String
