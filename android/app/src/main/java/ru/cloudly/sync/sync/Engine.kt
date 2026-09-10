@@ -491,13 +491,11 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                 forceRelay = relayMode(),
             )
         }.getOrElse { e ->
-            // Хранилище с телефона недоступно (DNS, блокировщик, VPN) — это не повод не выгрузить
-            // файл: переключаемся на заливку через сервер и запоминаем режим для следующих файлов.
-            val dnsLike = (e.message ?: "").let {
-                it.contains("Unable to resolve host", true) || it.contains("No address associated", true)
-            }
-            if (!dnsLike || relayMode()) throw e
-            Log.w(TAG, "хранилище недоступно с телефона (${e.message}) — переключаюсь на заливку через сервер")
+            // Прямая загрузка в хранилище не удалась (DNS, блокировщик, VPN, TLS, закрытый порт) —
+            // это не повод не выгрузить файл: пробуем через сервер и запоминаем режим. Смотрим не на
+            // текст ошибки, а на сам факт: причин у недоступности S3 слишком много, чтобы их угадывать.
+            if (relayMode()) throw e
+            Log.w(TAG, "прямая загрузка не удалась (${e.message}) — пробую через сервер")
             db.putKv(KV_RELAY_MODE, System.currentTimeMillis().toString())
             db.putKv("job_note:${job.id}", "хранилище недоступно напрямую — выгрузка идёт через сервер")
             Uploader(api).upload(
@@ -897,9 +895,13 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     }
 
     /** Режим «через сервер»: включён, если прямое подключение к хранилищу не сработало. */
-    fun relayMode(): Boolean = db.kv(KV_RELAY_MODE) != null
+    fun relayMode(): Boolean = !db.kv(KV_RELAY_MODE).isNullOrBlank()
 
-    fun resetRelayMode() = db.putKv(KV_RELAY_MODE, "")
+    /** Вернуться к прямой загрузке (например, после смены сети). */
+    fun resetRelayMode() {
+        db.putKv(KV_RELAY_MODE, "")
+        db.putKv("relay_mode", "")
+    }
 
     /** Служебное: пометить папку на сервере как «держать офлайн». */
     fun setFolderKeepOffline(folderId: String, keepOffline: Boolean) {
