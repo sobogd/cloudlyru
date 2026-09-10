@@ -59,6 +59,21 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 # логин: ADMIN_LOGIN/CLOUDLY_ADMIN_PASSWORD из ~/work/.env
 ```
 
+## Отдать файл по ссылке (APK, дамп и т.п.)
+
+```bash
+cd /home/deploy/apps/cloudlyru   # или локально, где есть node_modules приложения
+set -a; . .env; set +a
+export S3_FILES_BUCKET=cloudlyru S3_FILES_ENDPOINT=https://nbg1.your-objectstorage.com S3_FILES_REGION=nbg1
+
+# загрузить и получить временную ссылку (максимум 7 суток — ограничение S3)
+node deploy/scripts/s3-upload.mjs app-release.apk dist/cloudlyru-sync.apk application/vnd.android.package-archive
+node deploy/scripts/s3-presign.mjs dist/cloudlyru-sync.apk 604800
+```
+
+Ссылка подписанная: кто её получил — скачает файл, пока не истёк срок. Бакет при этом остаётся
+закрытым, публичного доступа к префиксу `dist/` нет.
+
 ## Бэкап БД (cron на сервере)
 
 Дампы кладутся в тот же бакет, префикс `db/` (`db/cloudly-<штамп>.sql.gz`), retention —

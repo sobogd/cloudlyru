@@ -1,12 +1,15 @@
 // Загрузка файла в S3 (Hetzner Object Storage) для бэкапа БД CloudlyRu.
 // Запуск из каталога приложения (там же лежат node_modules с @aws-sdk):
-//   node deploy/scripts/s3-upload.mjs <локальный файл> <ключ в бакете>
+//   node deploy/scripts/s3-upload.mjs <локальный файл> <ключ в бакете> [content-type]
+// Пример для APK:
+//   node deploy/scripts/s3-upload.mjs android/app/build/outputs/apk/release/app-release.apk \
+//     dist/cloudlyru-sync.apk application/vnd.android.package-archive
 // Ключи берутся из окружения (S3_FILES_*), в аргументы процесса не попадают.
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
-const [file, key] = process.argv.slice(2);
+const [file, key, contentType] = process.argv.slice(2);
 if (!file || !key) {
   console.error('[s3-upload] usage: s3-upload.mjs <file> <key>');
   process.exit(2);
@@ -34,7 +37,7 @@ await s3.send(
     Key: key,
     Body: createReadStream(file),
     ContentLength: size,
-    ContentType: 'application/gzip',
+    ContentType: contentType || 'application/gzip',
   }),
 );
 console.log(`[s3-upload] s3://${bucket}/${key} (${(size / 1e6).toFixed(1)} МБ)`);
