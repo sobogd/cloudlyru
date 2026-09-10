@@ -539,36 +539,12 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
               push('Создан', raw.createdAt, dt);
             }
 
-            const sc = meta.sidecar;
             return (
               <>
                 {rows.length > 0 && (
                   <>
                     <DetSection title={raw?.kind === 'video' ? 'Видео (из файла)' : 'Медиа (из файла)'} />
                     {rows.map(([k, v]) => <MetaRow key={k} k={k} v={v} />)}
-                  </>
-                )}
-                {sc && (
-                  <>
-                    <DetSection title="Метаданные Google (файл .json рядом)" />
-                    <MetaRow k="Файл метаданных" v={sc.name} mono />
-                    {sc.photoTakenTimeIso && (
-                      <MetaRow k="Время съёмки (Google, UTC)" v={new Date(sc.photoTakenTimeIso).toLocaleString()} />
-                    )}
-                    {sc.creationTimeIso && (
-                      <MetaRow k="Загружено в Google" v={new Date(sc.creationTimeIso).toLocaleString()} />
-                    )}
-                    {sc.title && <MetaRow k="Название" v={sc.title} />}
-                    {sc.description && <MetaRow k="Описание (Google)" v={sc.description} />}
-                    {sc.imageViews != null && <MetaRow k="Просмотров" v={String(sc.imageViews)} />}
-                    {(() => {
-                      const g = sc.geoData as { latitude?: number; longitude?: number } | null;
-                      if (g && (g.latitude || g.longitude)) {
-                        return <MetaRow k="Координаты (Google)" v={`${g.latitude}, ${g.longitude}`} />;
-                      }
-                      return null;
-                    })()}
-                    {sc.url && <MetaRow k="Ссылка Google" v={sc.url} mono />}
                   </>
                 )}
               </>

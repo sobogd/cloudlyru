@@ -63,25 +63,10 @@ export interface FileMedia {
   /** Полный набор извлечённых тегов: EXIF для фото, ffprobe для видео */
   raw?: Record<string, unknown> | null;
 }
-export interface FileSidecar {
-  name: string;
-  entryId: string;
-  title: string | null;
-  description: string | null;
-  photoTakenTime: string | null;
-  photoTakenTimeIso: string | null;
-  creationTime: string | null;
-  creationTimeIso: string | null;
-  imageViews: number | null;
-  geoData: unknown;
-  origin: unknown;
-  url: string | null;
-}
 export interface FileMeta {
   id: string; name: string; createdAt: string; folderId: string; zone: string; path: string;
   size: number; mime: string; ext?: string; sha256: string; masterMime?: string | null;
   media?: FileMedia | null;
-  sidecar?: FileSidecar | null;
 }
 export const fileMeta = (id: string) => request<FileMeta>(`/files/${id}`);
 export interface FolderMeta {
