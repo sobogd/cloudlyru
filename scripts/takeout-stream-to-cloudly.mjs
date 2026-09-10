@@ -20,7 +20,8 @@
 // Требования: Node 20+ (global fetch). Зависимостей нет.
 // ============================================================================
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 // ---------------- config ----------------
 const args = process.argv.slice(2);
@@ -37,6 +38,8 @@ const BASE = process.env.CLOUDLY_BASE || 'http://127.0.0.1:8305';
 const ADMIN = process.env.CLOUDLY_ADMIN || 'admin';
 const PASSWORD = process.env.CLOUDLY_PASSWORD || '';
 const API = `${BASE}/api/v1`;
+const GOOGLE_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
 
 class CookieExpired extends Error {}
 
@@ -66,6 +69,15 @@ const doneSet = new Set(state.done);
 console.log(`[config] архивов в списке: ${urls.length}; уже готово: ${doneSet.size}`);
 console.log(`[config] целевая папка: ${TARGET_FOLDER}; чанк: ${CHUNK_BYTES / 1024 / 1024} МБ`);
 
+// Маркеры для сторожа (watchdog): он перезапускает перенос, только если процесс
+// умер не из-за протухшей cookie и не потому, что всё уже готово.
+const MARKER_DIR = dirname(STATE_FILE);
+const COOKIE_DEAD_MARKER = `${MARKER_DIR}/COOKIE_DEAD`;
+const ALL_DONE_MARKER = `${MARKER_DIR}/ALL_DONE`;
+for (const m of [COOKIE_DEAD_MARKER, ALL_DONE_MARKER]) {
+  try { unlinkSync(m); } catch { /* нет файла — ок */ }
+}
+
 function saveState() {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
@@ -80,6 +92,49 @@ function nameFromUrl(u) {
 }
 
 const gb = (b) => (b / 1e9).toFixed(2);
+
+/** «2 ч 15 м» из секунд. */
+function humanTime(sec) {
+  if (!Number.isFinite(sec) || sec <= 0) return '—';
+  const h = Math.floor(sec / 3600);
+  const m = Math.round((sec % 3600) / 60);
+  return h ? `${h} ч ${String(m).padStart(2, '0')} м` : `${m} м`;
+}
+
+// ---- учёт прогресса по всему переносу (для строки прогресса) ----
+const sizes = new Map(Object.entries(state.sizes || {})); // url → полный размер, байт
+const inFlight = new Map(); // url → сколько байт уже принято сервером
+let speedBps = 0;
+let lastTickBytes = 0;
+let lastTickAt = Date.now();
+
+function totalBytes() {
+  let sum = 0;
+  for (const url of urls) sum += sizes.get(url) || 0;
+  return sum;
+}
+function doneBytes() {
+  let sum = 0;
+  for (const url of doneSet) sum += sizes.get(url) || 0;
+  return sum;
+}
+function currentBytes() {
+  let sum = doneBytes();
+  for (const v of inFlight.values()) sum += v;
+  return sum;
+}
+
+function progressLine() {
+  const total = totalBytes();
+  const cur = currentBytes();
+  const pct = total ? ((cur / total) * 100).toFixed(1) : '?';
+  const left = speedBps > 0 ? humanTime((total - cur) / speedBps) : '—';
+  const speed = speedBps > 0 ? `${(speedBps / 1e6).toFixed(1)} МБ/с` : '—';
+  const active = [...inFlight.entries()]
+    .map(([u, b]) => `${nameFromUrl(u).replace(/^takeout-\d+T\d+Z-\d+-/, '').replace('.zip', '')}:${((b / (sizes.get(u) || 1)) * 100).toFixed(0)}%`)
+    .join(' ');
+  return `[прогресс] готово ${doneSet.size}/${urls.length} · в работе ${inFlight.size}${active ? ` (${active})` : ''} · ${gb(cur)}/${gb(total)} ГБ (${pct}%) · ${speed} · осталось ~${left}`;
+}
 
 // ---------------- CloudlyRu API helpers ----------------
 let sessionCookie = '';
@@ -147,8 +202,7 @@ async function googleStream(url, fromByte = 0) {
   const headers = {
     Cookie: googleCookie,
     Referer: 'https://takeout.google.com/',
-    'User-Agent':
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+    'User-Agent': GOOGLE_UA,
   };
   if (fromByte > 0) headers.Range = `bytes=${fromByte}-`;
 
@@ -243,6 +297,7 @@ async function uploadArchiveAttempt(url, folderId, forceFresh) {
   }
   if (sizeFromRange !== total) throw new Error(`размер не совпал: ${sizeFromRange} != ${total}`);
 
+  inFlight.set(url, received);
   const reader = gres.body.getReader();
   let part = serverParts;
 
@@ -302,10 +357,12 @@ async function uploadArchiveAttempt(url, folderId, forceFresh) {
       part += 1;
       await putChunk(uploadId, part, chunk);
       received += chunk.length;
-      if (part % 64 === 0) {
+      inFlight.set(url, received);
+      if (part % 128 === 0) {
         state.progress[url] = { uploadId, received, total };
         saveState();
-        console.log(`[upload] ${gb(received)}/${gb(total)} ГБ (часть ${part})`);
+        const pct = ((received / total) * 100).toFixed(0);
+        console.log(`  [${name.replace(/^takeout-\d+T\d+Z-\d+-/, '').replace('.zip', '')}] ${gb(received)}/${gb(total)} ГБ (${pct}%)`);
       }
     }
   })();
@@ -316,9 +373,11 @@ async function uploadArchiveAttempt(url, folderId, forceFresh) {
 
     const done = await api(`/uploads/${uploadId}/complete`, { method: 'POST' });
     delete state.progress[url];
+    inFlight.delete(url);
     saveState();
-    console.log(`[upload] ✔ готово: ${name} (deduped=${done.deduped})`);
-    await verifyEntry(done.entry.id, total, name);
+    const ok = await verifyEntry(done.entry.id, total, name);
+    console.log(`  ✔ [${doneSet.size + 1}/${urls.length}] ${name} · ${gb(total)} ГБ · проверка: ${ok ? 'целый' : 'ПОДОЗРИТЕЛЬНЫЙ'}`);
+    console.log(progressLine());
   } catch (e) {
     consumerFailed = true;
     notify();
@@ -415,13 +474,61 @@ async function putChunk(uploadId, part, chunk) {  for (let attempt = 1; ; attemp
   }
 }
 
+// ---------------- опрос размеров (и ранняя проверка cookie) ----------------
+async function probeSizes() {
+  const todo = urls.filter((u) => !sizes.has(u));
+  if (!todo.length) return;
+  console.log(`[config] опрашиваю размеры архивов (${todo.length} шт) — заодно проверяю cookie...`);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= todo.length) return;
+      const u = todo[i];
+      const res = await fetch(u, {
+        headers: { Cookie: googleCookie, Referer: 'https://takeout.google.com/', 'User-Agent': GOOGLE_UA, Range: 'bytes=0-0' },
+        redirect: 'follow',
+      });
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('text/html')) {
+        await res.body?.cancel().catch(() => undefined);
+        throw new CookieExpired('Google вернул HTML на запрос размера — cookie протухла');
+      }
+      const cr = res.headers.get('content-range') || '';
+      const size = Number(cr.split('/')[1] || res.headers.get('content-length') || 0);
+      await res.body?.cancel().catch(() => undefined);
+      if (size > 0) sizes.set(u, size);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, todo.length) }, () => worker()));
+  state.sizes = Object.fromEntries(sizes);
+  saveState();
+  console.log(`[config] суммарный объём: ${gb(totalBytes())} ГБ в ${urls.length} архивах`);
+}
+
 // ---------------- main ----------------
 await login();
+
+try {
+  await probeSizes();
+} catch (e) {
+  if (e instanceof CookieExpired) {
+    console.error(`\n[СТОП] ${e.message}`);
+    console.error('Обнови cookie.txt (CurlWget) и запусти скрипт снова.');
+    try { writeFileSync(COOKIE_DEAD_MARKER, new Date().toISOString()); } catch { /* ignore */ }
+    process.exit(3);
+  }
+  throw e;
+}
+
 const targetFolderId = await ensureTargetFolder();
 
 let okCount = 0;
 let failCount = 0;
 let cookieDead = false;
+let stopRequested = false;
+let consecutiveFails = 0;
+const MAX_CONSECUTIVE_FAILS = 3; // защита: не проходить весь список впустую, если сервис лежит
 
 // Параллельная загрузка нескольких архивов: внутри архива части строго
 // последовательны (требование сервера), но между архивами round-trip'ы к S3
@@ -436,11 +543,28 @@ const pending = urls.filter((u) => {
   return true;
 });
 console.log(`[config] параллельных архивов: ${CONCURRENCY}; к переносу: ${pending.length}`);
+console.log(progressLine());
 let cursor = 0;
+
+lastTickBytes = currentBytes();
+lastTickAt = Date.now();
+const ticker = setInterval(() => {
+  const now = Date.now();
+  const cur = currentBytes();
+  const dt = (now - lastTickAt) / 1000;
+  if (dt > 0) {
+    const inst = (cur - lastTickBytes) / dt;
+    speedBps = speedBps > 0 ? speedBps * 0.6 + inst * 0.4 : inst;
+  }
+  lastTickBytes = cur;
+  lastTickAt = now;
+  console.log(progressLine());
+}, 20000);
+ticker.unref?.();
 
 async function worker(id) {
   for (;;) {
-    if (cookieDead) return;
+    if (cookieDead || stopRequested) return;
     const i = cursor++;
     if (i >= pending.length) return;
     const url = pending[i];
@@ -448,24 +572,42 @@ async function worker(id) {
       await uploadArchive(url, targetFolderId);
       doneSet.add(url);
       state.done = [...doneSet];
+      consecutiveFails = 0;
       saveState();
       okCount += 1;
-      console.log(`[worker ${id}] архивов готово: ${okCount}`);
+      console.log(`[worker ${id}] архивов готово: ${okCount} из ${pending.length}`);
     } catch (e) {
       if (e instanceof CookieExpired) {
         console.error(`\n[СТОП] ${e.message}`);
         console.error('Прогресс сохранён — после обновления cookie.txt запусти скрипт снова, он продолжит с места обрыва.');
         cookieDead = true;
+        try { writeFileSync(COOKIE_DEAD_MARKER, new Date().toISOString()); } catch { /* ignore */ }
         return;
       }
       failCount += 1;
+      consecutiveFails += 1;
       console.error(`[FAIL] ${nameFromUrl(url)}: ${e.message}`);
+      if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
+        console.error(
+          `\n[СТОП] ${MAX_CONSECUTIVE_FAILS} архива подряд не загрузились — похоже, CloudlyRu/сеть недоступны. ` +
+            'Останавливаюсь, чтобы не проходить весь список впустую. Прогресс сохранён, повторный запуск продолжит с места.',
+        );
+        stopRequested = true;
+        return;
+      }
     }
   }
 }
 
 await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pending.length) }, (_, k) => worker(k + 1)));
+clearInterval(ticker);
 
-console.log(`\nИтог: готово ${okCount}, ошибок ${failCount} из ${urls.length}${cookieDead ? ' (остановлено: нужна свежая cookie)' : ''}`);
+if (!cookieDead && !stopRequested && failCount === 0) {
+  try { writeFileSync(ALL_DONE_MARKER, new Date().toISOString()); } catch { /* ignore */ }
+  console.log('[done] все архивы перенесены — маркер ALL_DONE записан');
+}
+
+console.log(`\nИтог: готово ${okCount}, ошибок ${failCount} из ${urls.length}${cookieDead ? ' (остановлено: нужна свежая cookie)' : ''}${stopRequested ? ' (остановлено: сервис недоступен)' : ''}`);
 if (cookieDead) process.exit(3);
+if (stopRequested) process.exit(4);
 if (failCount) process.exit(1);
