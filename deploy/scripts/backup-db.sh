@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 #
-# Ежедневный дамп БД CloudlyRu → S3 (prefix db/), retention 30 дней — правилом lifecycle
-# на бакете (или чистить lifecycle-правилом по префиксу db/).
+# Ежедневный дамп БД CloudlyRu → S3 (префикс db/).
+# Retention — lifecycle-правилом бакета на префикс db/ (30 дней), см. DEPLOY.md.
 #
-# Требования на сервере: rclone (или aws cli). Скрипт читает /opt/cloudlyru/.env (chmod 600).
-# Cron:  0 3 * * * /opt/cloudlyru/deploy/scripts/backup-db.sh >> /var/log/cloudlyru-backup.log 2>&1
+# Требуется: pg_dump (любой версии ≥ сервера БД) и node с модулями приложения
+# (@aws-sdk/client-s3 лежит в node_modules рядом). Конфигурация — из .env приложения.
+#
+# Cron (пользователь deployer, от которого работает приложение):
+#   0 3 * * * CLOUDLY_ENV_FILE=/home/deploy/apps/cloudlyru/.env \
+#     /home/deploy/apps/cloudlyru/deploy/scripts/backup-db.sh >> /home/deploy/cloudlyru-backup.log 2>&1
 #
 set -euo pipefail
 
-ENV_FILE="${CLOUDLY_ENV_FILE:-/opt/cloudlyru/.env}"
+APP_DIR="${CLOUDLY_APP_DIR:-/home/deploy/apps/cloudlyru}"
+ENV_FILE="${CLOUDLY_ENV_FILE:-$APP_DIR/.env}"
+
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "[backup] .env не найден: $ENV_FILE" >&2
   exit 1
@@ -16,26 +22,38 @@ fi
 # shellcheck disable=SC1090
 set -a && . "$ENV_FILE" && set +a
 
+if [[ -z "${DATABASE_URL:-}" ]]; then
+  echo "[backup] DATABASE_URL пуст" >&2
+  exit 1
+fi
+
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="$(mktemp /tmp/cloudly-dump-XXXXXX.sql.gz)"
-RCONF="$(mktemp /tmp/cloudly-rclone-XXXXXX.conf)"
-trap 'rm -f "$OUT" "$RCONF"' EXIT
-chmod 600 "$RCONF"
+trap 'rm -f "$OUT"' EXIT
 
-# Дамп (одной транзакцией) -> gzip
-pg_dump "$DATABASE_URL" --clean --if-exists --no-owner --single-transaction | gzip > "$OUT"
+# Дамп согласованным снимком (pg_dump сам берёт repeatable read), без владельца,
+# чтобы восстанавливалось в любую роль. Внимание: --single-transaction — опция
+# pg_restore, а не pg_dump: с ней этот скрипт раньше падал и бэкапов не было вообще.
+pg_dump "$DATABASE_URL" --clean --if-exists --no-owner | gzip > "$OUT"
 
-# rclone remote из env (значения не светятся в аргументах процесса)
-cat > "$RCONF" <<EOF
-[s3]
-type = s3
-provider = Other
-access_key_id = $S3_FILES_ACCESS_KEY
-secret_access_key = $S3_FILES_SECRET_KEY
-endpoint = $S3_FILES_ENDPOINT
-region = $S3_FILES_REGION
-force_path_style = true
-EOF
+# Проверяем, что дамп не пустой и целый: иначе «успешный» бэкап может оказаться мусором
+if ! gzip -t "$OUT"; then
+  echo "[backup] дамп повреждён (gzip -t)" >&2
+  exit 1
+fi
+# имя таблицы идёт со схемой — CREATE TABLE public."FileEntry".
+# Важно: именно zgrep, а не `zcat | grep -q` — при pipefail короткое замыкание grep
+# даёт SIGPIPE для zcat, и проверка ложно срабатывает.
+if ! zgrep -qE 'CREATE TABLE[^;]*"FileEntry"' "$OUT"; then
+  echo "[backup] в дампе нет таблиц приложения — не загружаю" >&2
+  exit 1
+fi
 
-rclone --config "$RCONF" copyto "$OUT" "s3:$S3_FILES_BUCKET/db/cloudly-$STAMP.sql.gz"
-echo "[backup] OK $(date -Is) -> s3://$S3_FILES_BUCKET/db/cloudly-$STAMP.sql.gz"
+SIZE="$(stat -c %s "$OUT")"
+if (( SIZE < 10000 )); then
+  echo "[backup] дамп подозрительно мал ($SIZE байт) — не загружаю" >&2
+  exit 1
+fi
+
+node "$APP_DIR/deploy/scripts/s3-upload.mjs" "$OUT" "db/cloudly-$STAMP.sql.gz"
+echo "[backup] OK $(date -Is) → s3://${S3_FILES_BUCKET:-cloudlyru}/db/cloudly-$STAMP.sql.gz ($((SIZE / 1024)) КиБ)"

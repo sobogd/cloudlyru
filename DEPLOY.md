@@ -49,13 +49,33 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 # логин: ADMIN_LOGIN/CLOUDLY_ADMIN_PASSWORD из ~/work/.env
 ```
 
-## Бэкап БД (cron на сервере, по желанию)
+## Бэкап БД (cron на сервере)
 
-После первого деплоя на сервере есть `/home/deploy/apps/cloudlyru/.env` — crontab root:
+Дампы кладутся в тот же бакет, префикс `db/` (`db/cloudly-<штамп>.sql.gz`), retention —
+lifecycle-правилом бакета на префикс `db/` (30 дней). Скрипты едут на сервер вместе с
+деплоем (каталог `deploy/` в бандле), поэтому обновляются автоматически.
+
+Cron от пользователя `deployer` (от него же работает приложение — root не нужен,
+секреты читаются из `.env` приложения):
 
 ```bash
-0 3 * * * CLOUDLY_ENV_FILE=/home/deploy/apps/cloudlyru/.env /home/deploy/apps/cloudlyru/deploy/scripts/backup-db.sh >> /var/log/cloudlyru-backup.log 2>&1
+crontab -e   # пользователь deployer
+0 3 * * * CLOUDLY_ENV_FILE=/home/deploy/apps/cloudlyru/.env /home/deploy/apps/cloudlyru/deploy/scripts/backup-db.sh >> /home/deploy/cloudlyru-backup.log 2>&1
 ```
 
-(скрипт backup-db.sh лежит в репо `deploy/scripts/` — при необходимости скопировать на сервер;
-S3-дампы: prefix `db/`, retention 30 дней — правилом lifecycle на бакете.)
+Проверка руками (создаёт дамп и заливает его в S3):
+
+```bash
+CLOUDLY_ENV_FILE=/home/deploy/apps/cloudlyru/.env /home/deploy/apps/cloudlyru/deploy/scripts/backup-db.sh
+```
+
+Восстановление:
+
+```bash
+createdb cloudly_restore
+# скачать дамп с ключами S3 (aws cli/mc/любой клиент), затем:
+gunzip -c cloudly-<штамп>.sql.gz | psql cloudly_restore
+```
+
+Требования: `pg_dump` и `node` — модуль `@aws-sdk/client-s3` берётся из `node_modules`
+приложения, отдельный rclone/aws-cli не нужен.

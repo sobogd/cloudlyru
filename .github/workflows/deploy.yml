@@ -45,7 +45,7 @@ jobs:
       - name: "Prepare bundle (tar: dist + web + node_modules)"
         run: |
           tar czf cloudlyru.tgz \
-            package.json pnpm-lock.yaml prisma dist web/dist node_modules
+            package.json pnpm-lock.yaml prisma dist web/dist node_modules deploy
       - name: Prisma migrate deploy (SSH tunnel to prod Postgres)
         if: ${{ github.event_name == 'push' || inputs.run_migrations }}
         env:
@@ -99,6 +99,9 @@ jobs:
             mkdir -p web
             rm -rf web/dist
             cp -r incoming/web/dist web/dist
+            # deploy/ нужен на сервере: оттуда cron запускает backup-db.sh
+            rm -rf deploy
+            cp -r incoming/deploy ./deploy
             rm -rf incoming
 
             cat > .env <<EOF

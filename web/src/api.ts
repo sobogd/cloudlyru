@@ -86,8 +86,13 @@ const FALLBACK_PART_BYTES = 16 * 1024 * 1024;
 /** Сколько частей льём в S3 одновременно (память: concurrency × partSize). */
 const DIRECT_CONCURRENCY = 3;
 const HASH_CHUNK_BYTES = 8 * 1024 * 1024;
+/** Сколько ждём байты одной части, прежде чем считать PUT в S3 зависшим. */
+const PART_STALL_MS = 45_000;
+/** Попыток на часть при «обычной» сетевой ошибке; зависшую часть пробуем ещё раз только один. */
+const PART_ATTEMPTS = 3;
+const PART_STALL_ATTEMPTS = 2;
 
-export type UploadPhase = 'hash' | 'upload';
+export type UploadPhase = 'hash' | 'upload' | 'relay' | 'verify';
 
 /** mime по расширению, если браузер не отдал type (HEIC/RAW и т.п.). */
 export function guessMime(file: { name: string; type: string }): string {
@@ -137,7 +142,7 @@ async function putChunk(uploadId: string, part: number, buf: ArrayBuffer, signal
 export async function uploadFile(
   file: File,
   folderId: string | undefined,
-  onProgress?: (pct: number, phase: UploadPhase) => void,
+  onProgress?: (pct: number, phase: UploadPhase, note?: string) => void,
   signal?: AbortSignal,
 ): Promise<{ entry: { id: string }; deduped: boolean }> {
   const mime = guessMime(file);
@@ -145,6 +150,9 @@ export async function uploadFile(
   // sha256 считаем ДО загрузки: сервер по нему либо вообще не начнёт передачу
   // (объект с таким содержимым уже есть), либо использует его как ключ объекта в S3.
   const sha256 = await hashFile(file, signal, (p) => onProgress?.(p, 'hash'));
+  // Хеш готов — фаза меняется сразу, иначе панель ещё десятки секунд показывает
+  // «считаю sha256 · 100%», хотя байты уже уходят (первая часть идёт до первого события).
+  onProgress?.(0, 'upload');
 
   let init = await initUpload(file, folderId, mime, sha256, 'direct');
   if (init.deduped && init.entry) return { entry: init.entry, deduped: true };
@@ -155,18 +163,22 @@ export async function uploadFile(
       try {
         await uploadDirect(file, uploadId, init.partSize ?? FALLBACK_PART_BYTES, signal, onProgress);
       } catch (e) {
-        // Браузер не смог ходить в S3 напрямую (нет CORS, сеть режет) — пересоздаём сессию
-        // и льём чанки через сервер: медленнее, но работает.
+        // Браузер не смог ходить в S3 напрямую (нет CORS, сеть режет, S3 не отвечает) —
+        // пересоздаём сессию и льём чанки через сервер: медленнее, но работает.
         if (!(e instanceof DirectUnavailable) || signal?.aborted) throw e;
         await abortUpload(uploadId);
         init = await initUpload(file, folderId, mime, sha256, 'relay');
         if (init.deduped && init.entry) return { entry: init.entry, deduped: true };
         uploadId = init.uploadId as string;
-        await uploadChunks(file, uploadId, signal, onProgress);
+        onProgress?.(0, 'relay', e.message);
+        await uploadChunks(file, uploadId, signal, onProgress, 'relay');
       }
     } else {
       await uploadChunks(file, uploadId, signal, onProgress);
     }
+    // complete — сервер собирает multipart и перечитывает объект из S3, чтобы посчитать
+    // sha256 по факту: на большом файле это заметная пауза, о ней надо сказать честно.
+    onProgress?.(100, 'verify');
     return await request<{ entry: { id: string }; deduped: boolean }>(`/uploads/${uploadId}/complete`, {
       method: 'POST',
       body: JSON.stringify({ sha256 }),
@@ -180,6 +192,9 @@ export async function uploadFile(
 
 /** Прямая загрузка в S3 не удалась так, что имеет смысл уйти на релей через сервер. */
 class DirectUnavailable extends Error {}
+
+/** Часть не отдала ни одного байта за отведённое время — запрос завис, а не «идёт медленно». */
+class PartStalled extends Error {}
 
 interface UploadInit {
   uploadId: string | null;
@@ -241,42 +256,105 @@ async function presignPart(uploadId: string, part: number): Promise<string> {
   }
 }
 
-/** PUT части прямо в S3 по presigned-ссылке. Возвращает ETag (нужен для complete). */
-async function putPartDirect(url: string, buf: ArrayBuffer, signal?: AbortSignal): Promise<string> {
-  let last: unknown;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    if (signal?.aborted) throw new Error('загрузка отменена');
-    try {
-      const res = await fetch(url, {
-        method: 'PUT',
-        body: buf,
-        signal,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
-      if (res.ok) {
-        const etag = res.headers.get('etag');
-        if (!etag) {
-          throw new DirectUnavailable('S3 не отдал ETag — в CORS-правиле бакета нет ExposeHeaders: ETag');
-        }
-        return etag;
-      }
-      if (res.status >= 500 && attempt < 3) {
+/**
+ * PUT части прямо в S3 по presigned-ссылке. Возвращает ETag (нужен для complete).
+ *
+ * Через XHR, а не fetch, по двум причинам: (1) нужен прогресс по байтам — иначе 16-МиБ
+ * часть сутками «висит» без движения индикатора; (2) fetch без таймаута не отличит
+ * мёртвый сокет от медленной сети, и загрузка замирает навсегда. Часть без байтов
+ * дольше PART_STALL_MS считаем зависшей: повторяем один раз и уходим на релей.
+ */
+function putPartDirect(
+  url: string,
+  buf: ArrayBuffer,
+  signal?: AbortSignal,
+  onBytes?: (loaded: number) => void,
+): Promise<string> {
+  let last: Error | null = null;
+  const send = () => putPartOnce(url, buf, signal, onBytes);
+  const loop = async (): Promise<string> => {
+    for (let attempt = 1; ; attempt++) {
+      if (signal?.aborted) throw new Error('загрузка отменена');
+      try {
+        return await send();
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        if (e instanceof DirectUnavailable) throw e;
+        last = e as Error;
+        const limit = e instanceof PartStalled ? PART_STALL_ATTEMPTS : PART_ATTEMPTS;
+        if (attempt >= limit) break;
+        onBytes?.(0); // прогресс обнуляем: часть переливаем с нуля
         await sleep(700 * attempt);
-        continue;
       }
-      last = new Error(`S3 ответил HTTP ${res.status}`);
-    } catch (e) {
-      if (e instanceof DirectUnavailable || signal?.aborted) throw e;
-      // сюда попадает и TypeError от fetch: CORS/сеть — прямая загрузка в S3 недоступна
-      last = e;
-      if (attempt >= 3) break;
-      await sleep(700 * attempt);
-      continue;
     }
-    if (attempt >= 3) break;
-    await sleep(700 * attempt);
-  }
-  throw new DirectUnavailable(`прямая загрузка в S3 не удалась: ${(last as Error)?.message ?? last}`);
+    throw new DirectUnavailable(`прямая загрузка в S3 не удалась: ${last?.message ?? 'неизвестная ошибка'}`);
+  };
+  return loop();
+}
+
+/** Одна попытка PUT части: прогресс по байтам + watchdog на «ни одного байта за 45 с». */
+function putPartOnce(
+  url: string,
+  buf: ArrayBuffer,
+  signal?: AbortSignal,
+  onBytes?: (loaded: number) => void,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let stalled = false;
+    let lastTick = Date.now();
+    let finished = false;
+
+    const stop = () => {
+      clearInterval(watchdog);
+      signal?.removeEventListener('abort', onCancel);
+    };
+    const onCancel = () => xhr.abort();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastTick > PART_STALL_MS) {
+        stalled = true;
+        xhr.abort();
+      }
+    }, 1000);
+
+    const finish = (fn: () => void) => {
+      if (finished) return;
+      finished = true;
+      stop();
+      fn();
+    };
+
+    signal?.addEventListener('abort', onCancel, { once: true });
+    xhr.open('PUT', url, true);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => {
+      lastTick = Date.now();
+      onBytes?.(e.loaded);
+    };
+    xhr.onload = () =>
+      finish(() => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const etag = xhr.getResponseHeader('etag');
+          if (!etag) {
+            reject(new DirectUnavailable('S3 не отдал ETag — в CORS-правиле бакета нет ExposeHeaders: ETag'));
+            return;
+          }
+          resolve(etag);
+          return;
+        }
+        reject(new Error(`S3 ответил HTTP ${xhr.status}`));
+      });
+    // сюда попадает и сетевая ошибка, и CORS-отказ: и то и другое — повод попробовать ещё раз
+    xhr.onerror = () => finish(() => reject(new Error('сеть до S3 недоступна (CORS или обрыв)')));
+    xhr.ontimeout = () => finish(() => reject(new Error('таймаут S3')));
+    xhr.onabort = () =>
+      finish(() => {
+        if (signal?.aborted) reject(new Error('загрузка отменена'));
+        else if (stalled) reject(new PartStalled(`S3 не принял ни байта за ${Math.round(PART_STALL_MS / 1000)} с`));
+        else reject(new Error('запрос к S3 прерван'));
+      });
+    xhr.send(buf);
+  });
 }
 
 /** Части льём в S3 параллельно; ETag каждой части сообщаем серверу. */
@@ -285,11 +363,18 @@ async function uploadDirect(
   uploadId: string,
   partSize: number,
   signal?: AbortSignal,
-  onProgress?: (pct: number, phase: UploadPhase) => void,
+  onProgress?: (pct: number, phase: UploadPhase, note?: string) => void,
 ): Promise<void> {
   const total = Math.max(1, Math.ceil(file.size / partSize));
-  let done = 0;
+  // Прогресс считаем по байтам, а не по «частям целиком»: внутри 16-МиБ части индикатор
+  // обязан двигаться, иначе панель выглядит зависшей.
+  const loaded = new Array<number>(total + 1).fill(0);
   let next = 1;
+
+  const report = () => {
+    const sum = loaded.reduce((a, b) => a + b, 0);
+    onProgress?.(Math.min(100, Math.floor((sum / file.size) * 100)), 'upload');
+  };
 
   const worker = async () => {
     for (;;) {
@@ -299,16 +384,22 @@ async function uploadDirect(
 
       const start = (part - 1) * partSize;
       const end = Math.min(file.size, start + partSize);
+      const already = loaded.slice(0, part).reduce((a, b) => a + b, 0);
+      onProgress?.(Math.min(100, Math.floor((already / file.size) * 100)), 'upload',
+        `часть ${part} из ${total}`);
       const url = await presignPart(uploadId, part);
       const buf = await file.slice(start, end).arrayBuffer();
-      const etag = await putPartDirect(url, buf, signal);
+      const etag = await putPartDirect(url, buf, signal, (n) => {
+        loaded[part] = n;
+        report();
+      });
       await request<unknown>(`/uploads/${uploadId}/parts/${part}`, {
         method: 'PUT',
         body: JSON.stringify({ etag, size: buf.byteLength }),
       });
 
-      done++;
-      onProgress?.(Math.round((done / total) * 100), 'upload');
+      loaded[part] = buf.byteLength;
+      report();
     }
   };
 
@@ -322,7 +413,8 @@ async function uploadChunks(
   file: File,
   uploadId: string,
   signal?: AbortSignal,
-  onProgress?: (pct: number, phase: UploadPhase) => void,
+  onProgress?: (pct: number, phase: UploadPhase, note?: string) => void,
+  phase: UploadPhase = 'upload',
 ): Promise<void> {
   const parts = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
   for (let part = 1; part <= parts; part++) {
@@ -330,7 +422,7 @@ async function uploadChunks(
     const end = Math.min(file.size, start + CHUNK_BYTES);
     const buf = await file.slice(start, end).arrayBuffer();
     await putChunk(uploadId, part, buf, signal);
-    onProgress?.(Math.round((part / parts) * 100), 'upload');
+    onProgress?.(Math.round((part / parts) * 100), phase, `часть ${part} из ${parts}`);
   }
 }
 
