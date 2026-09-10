@@ -111,16 +111,16 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   async enqueue(assetId: string, sha256: string, mime: string): Promise<void> {
     const kind = IMAGE_MIMES.includes(mime) ? 'photo' : VIDEO_MIMES.includes(mime) ? 'video' : null;
     if (!kind) return;
-    // Мастер уже есть, а сырьё удалено (KEEP_ORIGINALS=false) — задача обречена на три
-    // падения при скачивании files/<sha>. Ставим её только если мастера на самом деле нет.
+    // Превью уже есть, а оригинала нет (KEEP_ORIGINALS=false) — задача обречена на три
+    // падения при скачивании files/<sha>. Ставим её только если превью на самом деле нет.
     const asset = await this.prisma.asset
       .findUnique({ where: { id: assetId }, select: { masterReadyAt: true } })
       .catch(() => null);
     if (asset?.masterReadyAt) {
       const rawAlive = await this.s3.headObject(S3Service.assetKey(sha256)).catch(() => false);
       if (!rawAlive) {
-        const masterKey = kind === 'photo' ? MediaService.photoMasterKey(sha256) : MediaService.videoMasterKey(sha256);
-        if (await this.s3.headObject(masterKey).catch(() => false)) return;
+        const previewKey = kind === 'photo' ? MediaService.photoFullKey(sha256) : MediaService.video1080Key(sha256);
+        if (await this.s3.headObject(previewKey).catch(() => false)) return;
       }
     }
     if (kind === 'video') {
@@ -264,7 +264,10 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ============ Фото → AVIF мастер + WebP 512/2048 ============
+  // ============ Фото → превью 512 (список) + 2048 (полный экран) ============
+  // Мастер-версия не создаётся: оригинал и есть мастер и отдаётся как есть
+  // (при KEEP_ORIGINALS=true он не удаляется), поэтому метаданные исходника
+  // (EXIF, GPS, ICC, MakerNotes, MPF/depth, gain map) не теряются вообще.
 
   private async convertPhoto(job: JobRow, rawPath: string): Promise<ConvertResult> {
     const sha = job.sha256;
@@ -273,7 +276,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     if (/^image\/(heic|heif)/.test(job.mime)) {
       // HEIC/HEIF: декодируем libheif'ом напрямую (sharp prebuilt умеет только AVIF:
       // format.heif.input.fileSuffix = ['.avif']). heif-convert отдаёт 8-битный PNG,
-      // поэтому 10-битные HEIC и gain map (HDR) здесь теряются безвозвратно.
+      // поэтому превью из 10-битных HDR-HEIC получаются SDR — оригинал при этом цел.
       const png = join(tmpdir(), `clq-${job.id}.png`);
       try {
         await this.run(['heif-convert', rawPath, png], 120000);
@@ -293,64 +296,54 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const meta = await sharp(decodedPath, { animated: true }).metadata().catch(() => null);
     const animated = (meta?.pages ?? 1) > 1;
 
-    // Метаданные сохраняем НА ЭТАПЕ КОДИРОВАНИЯ, а не через exiftool после:
-    //  - sharp по умолчанию вырезает EXIF/ICC/XMP целиком;
-    //  - exiftool в AVIF умеет ICC только «block write» (заменить существующий блок),
-    //    но не создать его, поэтому после кодирования ICC вернуть уже нельзя.
-    //  - keepExif() заодно нормализует Orientation: libvips сбрасывает тег после
-    //    авто-поворота, иначе в мастере остаётся Orientation=6 при повёрнутых пикселях.
-    const keepAll = () => base.clone().keepExif().keepIccProfile();
-
+    // ICC кладём через keepIccProfile(): без профиля Display P3-фото выглядят блёкло
+    // в браузере, а ICC в AVIF нельзя добавить постфактум (exiftool умеет только
+    // заменять уже существующий блок). EXIF в превью не нужен — метаданные живут
+    // в оригинале; ориентация уже запечена в пиксели через rotate().
     await this.setProgress(job.id, 40, true);
-    // Превью всегда с ICC: без профиля Display P3-фото выглядят блёкло в браузере.
     const grid = await base
       .clone()
       .keepIccProfile()
       .resize({ width: 512, withoutEnlargement: true })
       .webp({ quality: 78 })
       .toBuffer();
-    const full = await base
-      .clone()
-      .keepIccProfile()
-      .resize({ width: 2048, withoutEnlargement: true })
-      .webp({ quality: 80 })
-      .toBuffer();
 
-    if (animated) {
-      // Анимированный источник (GIF/WebP): AVIF-мастер = только первый кадр, поэтому
-      // вместо мастера отдаём оригинал как есть, а «полный экран» — анимированным WebP.
-      await this.setProgress(job.id, 70, true);
-      await Promise.all([
-        this.s3.putObject(MediaService.gridKey(sha), grid, 'image/webp'),
-        this.s3.putObject(MediaService.fullKey(sha), full, 'image/webp'),
-      ]);
-      await this.prisma.asset.update({
-        where: { id: job.assetId },
-        data: { masterMime: null, masterReadyAt: new Date() },
-      });
-      return { keepRaw: true };
-    }
+    // Анимированный источник (GIF/WebP): полноэкранное превью оставляем анимированным
+    // WebP — AVIF-мастер в старом пайплайне отдавал только первый кадр.
+    const full = animated
+      ? await base
+          .clone()
+          .keepIccProfile()
+          .resize({ width: 2048, withoutEnlargement: true })
+          .webp({ quality: 80 })
+          .toBuffer()
+      : await base
+          .clone()
+          .keepIccProfile()
+          .resize({ width: 2048, withoutEnlargement: true })
+          .avif({ quality: 85 })
+          .toBuffer();
 
-    const avif = await keepAll().avif({ quality: 85 }).toBuffer();
     await this.setProgress(job.id, 85, true);
-
     await Promise.all([
-      this.s3.putObject(MediaService.photoMasterKey(sha), avif, 'image/avif'),
       this.s3.putObject(MediaService.gridKey(sha), grid, 'image/webp'),
-      this.s3.putObject(MediaService.fullKey(sha), full, 'image/webp'),
+      this.s3.putObject(MediaService.photoFullKey(sha), full, animated ? 'image/webp' : 'image/avif'),
     ]);
 
-    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'image/avif', masterReadyAt: new Date() } });
-    return {};
+    // masterMime не выставляем: оптимизированного мастера нет, исходник — он и есть.
+    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: null, masterReadyAt: new Date() } });
+    return animated ? { keepRaw: true } : {};
   }
 
-  // ============ Видео → AV1 mp4 мастер + постер + 720p ============
+  // ============ Видео → постер 512 (список) + 1080 AV1 (полный экран) ============
+  // Полноразмерный AV1-мастер не собирается: оригинал и есть мастер. Это заодно снимает
+  // проблему памяти — энкодер больше не держит 4K-кадры, из-за которых libaom падал
+  // под ulimit -v ("Failed to initialize encoder: Memory allocation error").
 
   private async convertVideo(job: JobRow, rawPath: string): Promise<ConvertResult> {
     const sha = job.sha256;
-    const masterPath = join(tmpdir(), `clq-${job.id}.mp4`);
     const posterRaw = join(tmpdir(), `clq-${job.id}-poster.png`);
-    const previewPath = join(tmpdir(), `clq-${job.id}-720.mp4`);
+    const previewPath = join(tmpdir(), `clq-${job.id}-1080.mp4`);
 
     const src = this.probeSource(rawPath);
     // Метаданные пишем здесь, из ЛОКАЛЬНОГО файла: extractDetail() ходит в ffprobe по
@@ -370,46 +363,33 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
-    // 2) 720p-превью (AV1 libaom, быстрее полного): 5 → 60%.
+    // 2) превью 1080 (AV1 libaom): 5 → 99%.
+    // Апскейл не делаем: ролики ниже 1080 остаются в своём разрешении (scale с ростом
+    // только раздул бы битрейт без пользы).
+    const vf = src.height && src.height <= 1080 ? [] : ['-vf', 'scale=-2:1080'];
     // -map_metadata 0 + use_metadata_tags: без них у превью creation_time = 0, а Apple
     // Keys (GPS, Make/Model, ContentIdentifier) не переносятся вообще — проверено на проде.
-    await this.runProgress(job.id, src.duration, 5, 55, [
-      'ffmpeg', '-y', '-i', rawPath,
-      '-map_metadata', '0',
-      '-map', '0:v:0', '-vf', 'scale=-2:720',
-      ...this.videoEncodeArgs(src, 36, false),
-      '-map', '0:a?', '-c:a', 'aac', '-b:a', this.audioBitrate(src, '96k'),
-      '-movflags', '+faststart+use_metadata_tags',
-      previewPath,
-    ], 6 * 60 * 60 * 1000);
-    await this.setProgress(job.id, 60, true);
-    await this.s3.putFile(MediaService.video720Key(sha), previewPath, 'video/mp4');
-    // «готово для просмотра»: постер+720 уже есть, полный мастер дожимается в фоне.
-    // ВАЖНО: masterReadyAt здесь = «есть чем показать», а НЕ «есть view/<sha>.mp4».
-    // Поэтому files.service.presignedUrl обязан проверять мастер через headObject,
-    // иначе отдаёт presigned-URL на несуществующий объект (404 от S3).
-    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: 'video/mp4', masterReadyAt: new Date() } });
-
-    // 3) мастер: AV1 полный. Падение этого прохода задачу НЕ валит: постер и 720p уже
-    // опубликованы и медиа смотрится. Так падает, например, 4K/10-бит — libaom упирается
-    // в RLIMIT_AS (ulimit -v из CONVERT_MEM_MB):
-    //   "Failed to initialize encoder: Memory allocation error"
     try {
-      await this.runProgress(job.id, src.duration, 60, 39, [
+      await this.runProgress(job.id, src.duration, 5, 94, [
         'ffmpeg', '-y', '-i', rawPath,
         '-map_metadata', '0',
-        '-map', '0:v:0',
-        ...this.videoEncodeArgs(src, 32, true),
+        '-map', '0:v:0', ...vf,
+        ...this.videoEncodeArgs(src, 36, true),
         '-map', '0:a?', '-c:a', 'aac', '-b:a', this.audioBitrate(src, '128k'),
         '-movflags', '+faststart+use_metadata_tags',
-        masterPath,
+        previewPath,
       ], 6 * 60 * 60 * 1000);
-      await this.s3.putFile(MediaService.videoMasterKey(sha), masterPath, 'video/mp4');
-      await this.setProgress(job.id, 100, true);
-      return {};
+      await this.s3.putFile(MediaService.video1080Key(sha), previewPath, 'video/mp4');
     } catch (e) {
-      return { warn: `мастер не собран (${(e as Error).message}); доступны постер и 720p` };
+      // Постер уже опубликован — ролик виден в ленте, это не повод валить задачу.
+      await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: null, masterReadyAt: new Date() } });
+      return { warn: `превью 1080 не собрано (${(e as Error).message}); есть только постер` };
     }
+
+    // masterReadyAt = «превью готовы, есть чем показать» (оптимизированного мастера нет).
+    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: null, masterReadyAt: new Date() } });
+    await this.setProgress(job.id, 100, true);
+    return {};
   }
 
   /**

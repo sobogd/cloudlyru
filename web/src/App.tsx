@@ -593,32 +593,6 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
-      {job && (
-        <div className="panel" style={{ margin: '10px 2px' }}>
-          <div className="row">
-            <span className="icon">📦</span>
-            <strong>Распаковка</strong>
-            <span style={{ flex: 1 }} />
-            <span className="meta">
-              {job.state === 'done' ? 'готово'
-                : job.state === 'failed' ? 'ошибка'
-                : job.state === 'cancelled' ? 'отменено'
-                : `${job.percent}%`}
-            </span>
-            {busy && <button className="btn ghost" onClick={cancelUnzip}>✕</button>}
-          </div>
-          <div className="ubar"><i style={{ width: `${job.percent}%`, background: job.state === 'done' ? '#2fae5f' : undefined }} /></div>
-          <div className="copy">
-            файлов: {job.doneEntries} из {job.totalEntries || '…'} · {fmt(job.doneBytes)} из {fmt(job.totalBytes)}
-            {job.skippedEntries ? ` · уже было: ${job.skippedEntries}` : ''}
-          </div>
-          {busy && job.currentName && <div className="copy" style={{ wordBreak: 'break-all' }}>сейчас: {job.currentName}</div>}
-          {job.error && <div className="err">{job.error}</div>}
-          {job.state === 'done' && (
-            <div className="copy">Папка создана рядом с архивом — вернись в «Файлы», она появится в списке</div>
-          )}
-        </div>
-      )}
       {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
       {meta && (
         <div className="detbody">
@@ -646,7 +620,8 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
   const [screen, setScreen] = useState<Screen>({ kind: 'grid' });
-  const [info, setInfo] = useState(false);
+  // полноценная деталка (как в «Файлах»): открывается кнопкой ℹ️ из просмотра
+  const [detailId, setDetailId] = useState<string | null>(null);
   const isImg = (m: string) => /^image\//.test(m || '');
   const isVid = (m: string) => /^video\//.test(m || '');
 
@@ -675,6 +650,8 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   // ===== Экран деталки (#1-4) =====
   if (screen.kind === 'view' && current) {
     const it = current;
+    // полноценная деталка: те же метаданные и кнопки, что в «Файлах»
+    if (detailId) return <FileDetail entryId={detailId} onBack={() => setDetailId(null)} />;
     return (
       <div className="full">
         {/* медиа занимает весь канвас (верх экрана → нав-бар); шапка/инфо — поверх */}
@@ -696,16 +673,16 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
               <div className="copy">Статус обновляется автоматически — можно не перезагружать страницу.</div>
             </div>
           ) : isVid(it.mime) ? (
-            <video src={api.video720Url(it.sha256!)} controls autoPlay style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />
+            <video src={api.videoPreviewUrl(it.sha256!)} controls autoPlay style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />
           ) : (
             <PhotoZoom src={api.previewUrl(it.sha256!, 2048)} />
           )}
         </div>
         <div className="tbar">
-          <button className="iconbtn" title="Назад" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
+          <button className="iconbtn" title="Назад в галерею" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
           <span style={{ flex: 1 }} />
-          <button className="iconbtn" title="Инфо" onClick={() => setInfo(!info)}>ℹ️</button>
-          <a className="iconbtn" title="Оригинал (AVIF/AV1)" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">🖼️</a>
+          <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(it.entryId)}>ℹ️</button>
+          <a className="iconbtn" title="Открыть оригинал" href={api.originalUrl(it.sha256!)} target="_blank" rel="noreferrer">🖼️</a>
           <button
             className="iconbtn"
             title="Удалить (в корзину)"
@@ -720,14 +697,9 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
               }
             }}
           >🗑</button>
-          <button className="iconbtn" disabled={screen.idx === 0} title="Назад" onClick={() => { setScreen({ kind: 'view', idx: screen.idx - 1 }); setInfo(false); }}>⬅️</button>
-          <button className="iconbtn" disabled={screen.idx >= media.length - 1} title="Вперёд" onClick={() => { setScreen({ kind: 'view', idx: screen.idx + 1 }); setInfo(false); }}>➡️</button>
+          <button className="iconbtn" disabled={screen.idx === 0} title="Назад" onClick={() => setScreen({ kind: 'view', idx: screen.idx - 1 })}>⬅️</button>
+          <button className="iconbtn" disabled={screen.idx >= media.length - 1} title="Вперёд" onClick={() => setScreen({ kind: 'view', idx: screen.idx + 1 })}>➡️</button>
         </div>
-        {info && (
-          <div className="det-info">
-            {it.name}{it.capturedAt ? ` · ${new Date(it.capturedAt).toLocaleString()}` : ''}
-          </div>
-        )}
       </div>
     );
   }

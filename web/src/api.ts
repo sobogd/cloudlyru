@@ -178,7 +178,7 @@ export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; n
 
 export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
 export const originalUrl = (sha: string) => `/api/v1/originals/${sha}`;
-export const video720Url = (sha: string) => `/api/v1/video-preview/${sha}`;
+export const videoPreviewUrl = (sha: string) => `/api/v1/video-preview/${sha}`;
 export interface QueueStatus {
   byState: Record<string, number>;
   processing: { id: string; kind: string; sha256: string; startedMinAgo: number; progress: number } | null;

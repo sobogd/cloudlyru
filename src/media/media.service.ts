@@ -129,39 +129,55 @@ export class MediaService {
   static viewKey(sha256: string, suffix: string): string {
     return `view/${sha256}${suffix}`;
   }
+  /** Превью для списка (сетка галереи): фото — кадр 512, видео — постер 512. */
   static gridKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-512.webp');
   }
-  static fullKey(sha256: string): string {
-    return MediaService.viewKey(sha256, '-2048.webp');
+  /** Полноэкранное превью фото (2048, AVIF). */
+  static photoFullKey(sha256: string): string {
+    return MediaService.viewKey(sha256, '-2048.avif');
   }
-  static photoMasterKey(sha256: string): string {
-    return MediaService.viewKey(sha256, '.avif');
-  }
-  static videoMasterKey(sha256: string): string {
-    return MediaService.viewKey(sha256, '.mp4');
-  }
+  /** Постер видео для списка. */
   static videoPosterKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-poster.webp');
   }
+  /** Полноэкранное превью видео (1080, AV1). */
+  static video1080Key(sha256: string): string {
+    return MediaService.viewKey(sha256, '-1080.mp4');
+  }
   private static readonly EXIF_HEAD_BYTES = EXIF_HEAD_BYTES;
 
-  static video720Key(sha256: string): string {
+  // ===== Устаревшие ключи: мастер-версии старого пайплайна =====
+  // Больше не создаются (оригинал и есть мастер), но остаются в derivativeKeys(),
+  // чтобы purge корзины вычистил производные, сделанные прежним кодом.
+  static legacyPhotoMasterKey(sha256: string): string {
+    return MediaService.viewKey(sha256, '.avif');
+  }
+  static legacyVideoMasterKey(sha256: string): string {
+    return MediaService.viewKey(sha256, '.mp4');
+  }
+  static legacyVideo720Key(sha256: string): string {
     return MediaService.viewKey(sha256, '-720.mp4');
+  }
+  static legacyPhotoFullWebpKey(sha256: string): string {
+    return MediaService.viewKey(sha256, '-2048.webp');
   }
 
   /**
-   * Все производные ассета (мастер + превью). Нужно для полного удаления: до этого
-   * осиротевшие view/* не удалял никто, и они оставались в S3 навсегда.
+   * Все производные ассета — актуальные и устаревшие. Нужно для полного удаления:
+   * до этого осиротевшие view/* не удалял никто, и они оставались в S3 навсегда.
+   * Лишние ключи безвредны: удаление несуществующего объекта S3 игнорирует.
    */
   static derivativeKeys(sha256: string): string[] {
     return [
-      MediaService.photoMasterKey(sha256),
       MediaService.gridKey(sha256),
-      MediaService.fullKey(sha256),
-      MediaService.videoMasterKey(sha256),
-      MediaService.video720Key(sha256),
+      MediaService.photoFullKey(sha256),
       MediaService.videoPosterKey(sha256),
+      MediaService.video1080Key(sha256),
+      MediaService.legacyPhotoMasterKey(sha256),
+      MediaService.legacyVideoMasterKey(sha256),
+      MediaService.legacyVideo720Key(sha256),
+      MediaService.legacyPhotoFullWebpKey(sha256),
     ];
   }
 

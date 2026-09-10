@@ -17,55 +17,66 @@ export class MediaController {
     private readonly s3: S3Service,
   ) {}
 
-  /** Превью WebP: ?w=512 (сетка; для видео — постер) | ?w=2048 (полный экран фото). */
+  /** Превью для списка: ?w=512 (фото — кадр 512, видео — постер). */
   @Public()
   @Get('previews/:sha')
   async preview(@Param('sha') sha: string, @Query('w') wRaw: string | undefined, @Res() res: Response) {
     const asset = await this.prisma.asset.findUnique({ where: { sha256: sha } });
     if (!asset) return res.status(404).end();
-    const isVideo = asset.masterMime === 'video/mp4' || String(asset.mime).startsWith('video/');
-    const w = Number(wRaw ?? 512);
-    let key: string | null = null;
-    if (w === 512) key = isVideo ? MediaService.videoPosterKey(sha) : MediaService.gridKey(sha);
-    else if (w === 2048 && !isVideo) key = MediaService.fullKey(sha);
-    if (!key || !(await this.s3.headObject(key))) return res.status(404).end();
-    return res.redirect(302, await this.s3.presignedInline(key, 'image/webp'));
+    const isVideo = String(asset.mime).startsWith('video/') || asset.masterMime === 'video/mp4';
+    if (isVideo) {
+      const poster = MediaService.videoPosterKey(sha);
+      if (!(await this.s3.headObject(poster).catch(() => false))) return res.status(404).end();
+      return res.redirect(302, await this.s3.presignedInline(poster, 'image/webp'));
+    }
+    // Фото: 512 — сетка, 2048 — полный экран (AVIF; у анимированных источников WebP).
+    const wantFull = Number(wRaw ?? 512) === 2048;
+    const candidates = wantFull
+      ? [MediaService.photoFullKey(sha), MediaService.legacyPhotoFullWebpKey(sha)]
+      : [MediaService.gridKey(sha)];
+    for (const key of candidates) {
+      if (await this.s3.headObject(key).catch(() => false)) {
+        const mime = key.endsWith('.avif') ? 'image/avif' : 'image/webp';
+        return res.redirect(302, await this.s3.presignedInline(key, mime));
+      }
+    }
+    return res.status(404).end();
   }
 
-  /** 720p-превью видео (просмотр); фолбэк — мастер AV1. */
+  /** Превью видео для полного экрана: 1080 (AV1), фолбэк — легаси 720 или сам оригинал. */
   @Public()
   @Get('video-preview/:sha')
   async videoPreview(@Param('sha') sha: string, @Res() res: Response) {
     const asset = await this.prisma.asset.findUnique({ where: { sha256: sha } });
     if (!asset) return res.status(404).end();
-    let url: string;
-    if (await this.s3.headObject(MediaService.video720Key(sha))) {
-      url = await this.s3.presignedInline(MediaService.video720Key(sha), 'video/mp4');
-    } else if (asset.masterMime === 'video/mp4' && (await this.s3.headObject(MediaService.videoMasterKey(sha)))) {
-      url = await this.s3.presignedInline(MediaService.videoMasterKey(sha), 'video/mp4');
-    } else {
-      return res.status(404).end();
+    for (const key of [MediaService.video1080Key(sha), MediaService.legacyVideo720Key(sha)]) {
+      if (await this.s3.headObject(key).catch(() => false)) {
+        return res.redirect(302, await this.s3.presignedInline(key, 'video/mp4'));
+      }
     }
-    return res.redirect(302, url);
+    // превью ещё не собрано — играем оригинал (он и есть мастер)
+    return res.redirect(302, await this.s3.presignedInline(S3Service.assetKey(sha), asset.mime));
   }
 
-  /** «Оригинал»: AVIF (фото) / AV1 mp4 (видео) мастер; фолбэк — сырьё. */
+  /** «Оригинал»: всегда исходный файл, как он был загружен. */
   @Public()
   @Get('originals/:sha')
   async original(@Param('sha') sha: string, @Res() res: Response) {
     const asset = await this.prisma.asset.findUnique({ where: { sha256: sha } });
     if (!asset) throw notFound('asset not found');
-    let key: string | null = null;
-    let mime = 'application/octet-stream';
-    if (asset.masterMime === 'image/avif' && (await this.s3.headObject(MediaService.photoMasterKey(sha)))) {
-      key = MediaService.photoMasterKey(sha);
-      mime = 'image/avif';
-    } else if (asset.masterMime === 'video/mp4' && (await this.s3.headObject(MediaService.videoMasterKey(sha)))) {
-      key = MediaService.videoMasterKey(sha);
-      mime = 'video/mp4';
+    if (await this.s3.headObject(S3Service.assetKey(sha)).catch(() => false)) {
+      return res.redirect(302, await this.s3.presignedInline(S3Service.assetKey(sha), asset.mime));
     }
-    const url = key ? await this.s3.presignedInline(key, mime) : await this.s3.presignedGet(S3Service.assetKey(sha), asset.mime);
-    return res.redirect(302, url);
+    // Легаси: у части старых ассетов оригинал был удалён после конвертации — отдаём мастер.
+    const legacy = String(asset.mime).startsWith('video/')
+      ? [MediaService.legacyVideoMasterKey(sha), MediaService.video1080Key(sha)]
+      : [MediaService.legacyPhotoMasterKey(sha), MediaService.photoFullKey(sha)];
+    for (const key of legacy) {
+      if (await this.s3.headObject(key).catch(() => false)) {
+        return res.redirect(302, await this.s3.presignedInline(key, key.endsWith('.avif') ? 'image/avif' : key.endsWith('.mp4') ? 'video/mp4' : 'image/webp'));
+      }
+    }
+    return res.status(404).end();
   }
 
   @Get('timeline')

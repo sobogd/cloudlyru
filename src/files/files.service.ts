@@ -129,10 +129,9 @@ export class FilesService {
   }
 
   /**
-   * Presigned-URL для скачивания. Фото-зона: оптимизированный мастер; файлы-зона: оригинал как есть.
-   * masterReadyAt у видео выставляется РАНЬШЕ, чем появляется полный AV1-мастер (постер и 720p
-   * уже готовы, а мастер дожимается часами и может не собраться вообще), поэтому мастер
-   * обязательно проверяем через headObject — иначе отдаём presigned-URL на несуществующий объект.
+   * Presigned-URL для скачивания. Отдаём ВСЕГДА оригинал: он и есть мастер, отдельной
+   * оптимизированной версии в пайплайне нет. Фолбэк — производные, если у легаси-ассета
+   * оригинал был удалён прежним кодом сразу после конвертации.
    */
   async presignedUrl(entryId: string): Promise<string> {
     const entry = await this.prisma.fileEntry.findUnique({
@@ -141,26 +140,36 @@ export class FilesService {
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
     const { asset } = entry;
-    const masterMime = entry.asset.masterMime === 'image/avif' || entry.asset.masterMime === 'video/mp4' ? entry.asset.masterMime : null;
+    const sha = asset.sha256;
+    const rawKey = S3Service.assetKey(sha);
 
-    if (masterMime && asset.masterReadyAt) {
-      const masterKey = masterMime === 'image/avif' ? MediaService.photoMasterKey(asset.sha256) : MediaService.videoMasterKey(asset.sha256);
-      const masterAlive = await this.s3.headObject(masterKey).catch(() => false);
-      if (masterAlive) {
-        // фото-зона: мастер; файлы-зона: оригинал, если жив в S3 (у легаси-медиа сырьё могло быть удалено)
-        if (entry.zone === ZONE_PHOTOS) return this.s3.presignedInline(masterKey, masterMime);
-        const rawAlive = await this.s3.headObject(S3Service.assetKey(asset.sha256)).catch(() => false);
-        if (!rawAlive) return this.s3.presignedInline(masterKey, masterMime);
-      } else if (masterMime === 'video/mp4') {
-        // мастер не собрался (например 4K упёрся в CONVERT_MEM_MB) — отдаём 720p-превью,
-        // оно публикуется одновременно с masterReadyAt
-        const previewKey = MediaService.video720Key(asset.sha256);
-        if (await this.s3.headObject(previewKey).catch(() => false)) {
-          return this.s3.presignedInline(previewKey, 'video/mp4');
-        }
+    if (await this.s3.headObject(rawKey).catch(() => false)) {
+      return this.s3.presignedGet(rawKey, asset.mime);
+    }
+
+    // оригинала нет (легаси) — берём самое полное из доступных производных
+    const isVideo = String(asset.mime).startsWith('video/');
+    const fallback = isVideo
+      ? [
+          MediaService.legacyVideoMasterKey(sha),
+          MediaService.video1080Key(sha),
+          MediaService.legacyVideo720Key(sha),
+          MediaService.videoPosterKey(sha),
+        ]
+      : [
+          MediaService.legacyPhotoMasterKey(sha),
+          MediaService.photoFullKey(sha),
+          MediaService.legacyPhotoFullWebpKey(sha),
+          MediaService.gridKey(sha),
+        ];
+    for (const key of fallback) {
+      if (await this.s3.headObject(key).catch(() => false)) {
+        const mime = key.endsWith('.avif') ? 'image/avif' : key.endsWith('.mp4') ? 'video/mp4' : 'image/webp';
+        return this.s3.presignedInline(key, mime);
       }
     }
-    return this.s3.presignedGet(S3Service.assetKey(asset.sha256), asset.mime);
+    // ничего нет — отдаём presigned на оригинал, чтобы S3 вернул свою ошибку
+    return this.s3.presignedGet(rawKey, asset.mime);
   }
 
   async softDelete(entryId: string) {
