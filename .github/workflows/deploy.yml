@@ -118,7 +118,7 @@ jobs:
             S3_FILES_BUCKET=cloudlyru
             S3_FILES_FORCE_PATH_STYLE=true
             UPLOAD_CHUNK_MAX_MB=20
-            MAX_FILE_SIZE_MB=51200
+            MAX_FILE_SIZE_MB=65536
             TRASH_RETENTION_DAYS=30
             CONVERT_ENABLED=true
             CONVERT_MEM_MB=1536
