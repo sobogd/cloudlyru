@@ -14,6 +14,28 @@ const NAV: Array<{ id: Tab; icon: string; label: string }> = [
   { id: 'settings', icon: '⚙️', label: 'Настройки' },
 ];
 
+// ===== Восстановление экрана после перезагрузки (F5) =====
+// Открытая вкладка, путь в «Файлах», открытый файл/папка и альбом живут в sessionStorage:
+// переживают F5, но не «протекают» в новую вкладку (там стартуем с «Файлов»).
+
+type UiState = {
+  tab?: Tab;
+  files?: { stack?: Array<{ id?: string; name: string }>; openFile?: string | null; folderMeta?: boolean };
+  photos?: { viewEntryId?: string | null; detailId?: string | null };
+  albums?: { openId?: string | null };
+};
+const UI_KEY = 'cloudlyru:ui';
+
+function readUi(): UiState {
+  try { return JSON.parse(sessionStorage.getItem(UI_KEY) || '{}') as UiState; } catch { return {}; }
+}
+function patchUi(patch: UiState) {
+  try { sessionStorage.setItem(UI_KEY, JSON.stringify({ ...readUi(), ...patch })); } catch { /* приватный режим */ }
+}
+function clearUi() {
+  try { sessionStorage.removeItem(UI_KEY); } catch { /* приватный режим */ }
+}
+
 export default function App() {
   const [user, setUser] = useState<api.UserInfo | null>(null);
   const [checking, setChecking] = useState(true);
@@ -22,7 +44,7 @@ export default function App() {
   }, []);
   if (checking) return <div className="app">…</div>;
   if (!user) return <Login onLogin={(u) => setUser(u)} />;
-  return <Shell user={user} onLogout={() => setUser(null)} />;
+  return <Shell user={user} onLogout={() => { clearUi(); setUser(null); }} />;
 }
 
 function Login({ onLogin }: { onLogin: (u: api.UserInfo) => void }) {
@@ -50,7 +72,11 @@ function Login({ onLogin }: { onLogin: (u: api.UserInfo) => void }) {
 }
 
 function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void }) {
-  const [tab, setTab] = useState<Tab>('files');
+  const [tab, setTab] = useState<Tab>(() => {
+    const saved = readUi().tab;
+    return NAV.some((n) => n.id === saved) ? (saved as Tab) : 'files';
+  });
+  useEffect(() => { patchUi({ tab }); }, [tab]);
 
   // Запрет «свайпа обновления страницы» (pull-to-refresh): на современных браузерах —
   // CSS overscroll-behavior:none; здесь фолбэк JS для старых Safari, где CSS не работает.
@@ -263,12 +289,18 @@ function UploadPanel({ rows, busy, onCancel, onRetryFailed, onDismissFailed }: {
 }
 
 function Files({ photoFolderId }: { photoFolderId: string | null }) {
-  const [stack, setStack] = useState<Array<{ id?: string; name: string }>>([{ name: 'Главная' }]);
+  const [saved] = useState(() => readUi().files);
+  const [stack, setStack] = useState<Array<{ id?: string; name: string }>>(
+    () => (saved?.stack?.length ? saved.stack : [{ name: 'Главная' }]),
+  );
   const [view, setView] = useState<api.FolderView | null>(null);
   const [err, setErr] = useState('');
-  const [openFile, setOpenFile] = useState<string | null>(null);
-  const [folderMeta, setFolderMeta] = useState(false);
+  const [openFile, setOpenFile] = useState<string | null>(saved?.openFile ?? null);
+  const [folderMeta, setFolderMeta] = useState(!!saved?.folderMeta);
   const currentId = stack[stack.length - 1]?.id;
+
+  // запоминаем экран, чтобы F5 возвращал в ту же папку/файл
+  useEffect(() => { patchUi({ files: { stack, openFile, folderMeta } }); }, [stack, openFile, folderMeta]);
 
   const load = async (parentId?: string) => {
     setErr('');
@@ -621,12 +653,15 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
 
 function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   type Screen = { kind: 'grid' } | { kind: 'view'; idx: number };
+  const [saved] = useState(() => readUi().photos);
   const [items, setItems] = useState<api.TimelineItem[]>([]);
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
   const [screen, setScreen] = useState<Screen>({ kind: 'grid' });
   // полноценная деталка (как в «Файлах»): открывается кнопкой ℹ️ из просмотра
-  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
+  // открытый файл после F5 восстанавливаем по entryId (индекс в таймлайне мог сдвинуться)
+  const restoreOpen = useRef<string | null>(saved?.viewEntryId ?? null);
   const isImg = (m: string) => /^image\//.test(m || '');
   const isVid = (m: string) => /^video\//.test(m || '');
 
@@ -651,6 +686,23 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
 
   const media = items.filter((it) => isImg(it.mime) || isVid(it.mime));
   const current = screen.kind === 'view' ? media[screen.idx] : null;
+
+  // восстановление открытого файла после F5: ждём таймлайн и находим его позицию
+  useEffect(() => {
+    const id = restoreOpen.current;
+    if (!id || !items.length) return;
+    const idx = media.findIndex((it) => it.entryId === id);
+    restoreOpen.current = null;
+    if (idx >= 0) setScreen({ kind: 'view', idx });
+    else setDetailId(null); // файла больше нет — и деталка не нужна
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items]);
+
+  // запоминаем открытый файл/деталку для F5
+  useEffect(() => {
+    if (restoreOpen.current) return; // пока не восстановили — не затираем сохранённое
+    patchUi({ photos: { viewEntryId: current?.entryId ?? null, detailId } });
+  }, [current?.entryId, detailId]);
 
   // ===== Экран деталки (#1-4) =====
   if (screen.kind === 'view' && current) {
@@ -1024,10 +1076,17 @@ function Shares() {
 
 function Albums() {
   const [albums, setAlbums] = useState<api.AlbumInfo[]>([]);
+  // открытый альбом переживает F5: храним id и перезапрашиваем содержимое
+  const [openId, setOpenId] = useState<string | null>(() => readUi().albums?.openId ?? null);
   const [open, setOpen] = useState<api.AlbumView | null>(null);
   const [err, setErr] = useState('');
   const load = () => api.listAlbums().then(setAlbums).catch((e) => setErr((e as Error).message));
   useEffect(() => { void load(); }, []);
+  useEffect(() => { patchUi({ albums: { openId } }); }, [openId]);
+  useEffect(() => {
+    if (!openId) { setOpen(null); return; }
+    api.getAlbum(openId).then(setOpen).catch(() => setOpenId(null)); // альбом удалили — назад к списку
+  }, [openId]);
   const create = async () => {
     const name = prompt('Имя альбома');
     if (!name) return;
@@ -1040,16 +1099,16 @@ function Albums() {
       {albums.map((a) => (
         <div className="item" key={a.id}>
           <span className="icon">🗂️</span>
-          <span className="fname" onClick={async () => { try { setOpen(await api.getAlbum(a.id)); } catch (e) { setErr((e as Error).message); } }}>{a.name}</span>
+          <span className="fname" onClick={() => setOpenId(a.id)}>{a.name}</span>
           <span className="meta">{a.count}</span>
-          <button className="btn ghost" onClick={async () => { if (confirm('Удалить альбом?')) { await api.deleteAlbum(a.id); setOpen(null); await load(); } }}>🗑</button>
+          <button className="btn ghost" onClick={async () => { if (confirm('Удалить альбом?')) { await api.deleteAlbum(a.id); if (openId === a.id) setOpenId(null); await load(); } }}>🗑</button>
         </div>
       ))}
       {!albums.length && <div className="copy">Альбомов нет</div>}
       {open && (
         <div className="panel">
           <div className="row"><strong>{open.name}</strong><span className="copy">{open.items.length}</span>
-            <button className="btn ghost" onClick={() => setOpen(null)}>закрыть</button></div>
+            <button className="btn ghost" onClick={() => setOpenId(null)}>закрыть</button></div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
             {open.items.map((it) => (
               <div key={it.entryId} style={{ width: '31.5%' }}>
