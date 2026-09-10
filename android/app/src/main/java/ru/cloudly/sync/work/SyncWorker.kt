@@ -1,0 +1,32 @@
+package ru.cloudly.sync.work
+
+import android.content.Context
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import ru.cloudly.sync.App
+
+/**
+ * Фоновый проход. Именно WorkManager, а не постоянный foreground-сервис: на Android 15
+ * сервис типа dataSync ограничен шестью часами за сутки, и вечное уведомление не нужно —
+ * периодическая задача и событийные запуски дают тот же эффект без борьбы с системой.
+ */
+class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        val app = App.of(applicationContext)
+        if (!app.prefs.configured) return Result.success()
+        val stats = app.engine().syncAll()
+        app.db.putKv("last_run_at", System.currentTimeMillis().toString())
+        app.db.putKv(
+            "last_run_stats",
+            "загружено ${stats.uploaded}, дедуп ${stats.deduped}, пропущено ${stats.skipped}, " +
+                "удалено ${stats.deleted}, конфликтов ${stats.conflicts}, ошибок ${stats.errors}",
+        )
+        stats.fatal?.let { app.db.putKv("last_run_error", it) }
+        return if (stats.fatal != null) Result.retry() else Result.success()
+    }
+
+    companion object {
+        const val PERIODIC = "cloudly-sync-periodic"
+        const val ONE_OFF = "cloudly-sync-now"
+    }
+}

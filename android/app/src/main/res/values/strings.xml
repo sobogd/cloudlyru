@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CloudlyRu Sync</string>
+    <string name="channel_sync">Синхронизация</string>
+    <string name="channel_sync_desc">Загрузка файлов в облако</string>
+</resources>

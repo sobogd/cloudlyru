@@ -1,0 +1,358 @@
+package ru.cloudly.sync.data
+
+import android.content.ContentValues
+import android.content.Context
+import android.database.Cursor
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
+
+/** Локальное состояние синхронизации: задачи, состояние файлов, очередь операций, курсор журнала. */
+class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
+
+    override fun onCreate(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE jobs(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              source_dir TEXT NOT NULL,
+              target_folder_id TEXT NOT NULL,
+              target_path TEXT NOT NULL,
+              zone TEXT NOT NULL,
+              include_subfolders INTEGER NOT NULL DEFAULT 1,
+              wifi_only INTEGER NOT NULL DEFAULT 0,
+              keep_days INTEGER NOT NULL DEFAULT -1,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TABLE items(
+              job_id INTEGER NOT NULL,
+              rel_path TEXT NOT NULL,
+              local_path TEXT NOT NULL,
+              local_size INTEGER NOT NULL,
+              local_mtime INTEGER NOT NULL,
+              sha256 TEXT,
+              remote_entry_id TEXT,
+              remote_sha256 TEXT,
+              remote_folder_id TEXT,
+              name TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'new',
+              keep_offline INTEGER NOT NULL DEFAULT 0,
+              uploaded_at INTEGER,
+              PRIMARY KEY(job_id, rel_path)
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TABLE ops(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id INTEGER NOT NULL,
+              rel_path TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              upload_id TEXT,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              next_attempt_at INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL("CREATE UNIQUE INDEX ops_unique ON ops(job_id, rel_path, kind)")
+        db.execSQL("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execSQL(
+            """
+            CREATE TABLE remote_deleted(
+              entry_id TEXT PRIMARY KEY,
+              job_id INTEGER NOT NULL,
+              name TEXT NOT NULL,
+              folder_id TEXT,
+              sha256 TEXT,
+              at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        // схема локальная и восстановимая: проще пересоздать, состояние догонится сканом
+        db.execSQL("DROP TABLE IF EXISTS jobs")
+        db.execSQL("DROP TABLE IF EXISTS items")
+        db.execSQL("DROP TABLE IF EXISTS ops")
+        db.execSQL("DROP TABLE IF EXISTS kv")
+        db.execSQL("DROP TABLE IF EXISTS remote_deleted")
+        onCreate(db)
+    }
+
+    // ===== задачи =====
+
+    fun addJob(sourceDir: String, targetFolderId: String, targetPath: String, zone: String): Long {
+        val now = System.currentTimeMillis()
+        return writableDatabase.insertOrThrow(
+            "jobs",
+            null,
+            ContentValues().apply {
+                put("source_dir", sourceDir)
+                put("target_folder_id", targetFolderId)
+                put("target_path", targetPath)
+                put("zone", zone)
+                put("created_at", now)
+            },
+        )
+    }
+
+    fun jobs(enabledOnly: Boolean = false): List<Job> {
+        val where = if (enabledOnly) " WHERE enabled = 1" else ""
+        return readableDatabase.rawQuery("SELECT * FROM jobs$where ORDER BY id", null).use { c ->
+            buildList { while (c.moveToNext()) add(readJob(c)) }
+        }
+    }
+
+    fun job(id: Long): Job? = readableDatabase.rawQuery("SELECT * FROM jobs WHERE id = ?", arrayOf(id.toString())).use { c ->
+        if (c.moveToFirst()) readJob(c) else null
+    }
+
+    fun updateJob(id: Long, values: Map<String, Any?>) {
+        val cv = ContentValues()
+        values.forEach { (k, v) -> cv.putAny(k, v) }
+        writableDatabase.update("jobs", cv, "id = ?", arrayOf(id.toString()))
+    }
+
+    fun deleteJob(id: Long) {
+        writableDatabase.delete("jobs", "id = ?", arrayOf(id.toString()))
+        writableDatabase.delete("items", "job_id = ?", arrayOf(id.toString()))
+        writableDatabase.delete("ops", "job_id = ?", arrayOf(id.toString()))
+        writableDatabase.delete("remote_deleted", "job_id = ?", arrayOf(id.toString()))
+    }
+
+    private fun readJob(c: Cursor) = Job(
+        id = c.getLong(c.getColumnIndexOrThrow("id")),
+        sourceDir = c.getString(c.getColumnIndexOrThrow("source_dir")),
+        targetFolderId = c.getString(c.getColumnIndexOrThrow("target_folder_id")),
+        targetPath = c.getString(c.getColumnIndexOrThrow("target_path")),
+        zone = c.getString(c.getColumnIndexOrThrow("zone")),
+        includeSubfolders = c.getInt(c.getColumnIndexOrThrow("include_subfolders")) == 1,
+        wifiOnly = c.getInt(c.getColumnIndexOrThrow("wifi_only")) == 1,
+        keepDays = c.getInt(c.getColumnIndexOrThrow("keep_days")),
+        enabled = c.getInt(c.getColumnIndexOrThrow("enabled")) == 1,
+    )
+
+    // ===== состояние файлов =====
+
+    fun itemsOf(jobId: Long): List<Item> =
+        readableDatabase.rawQuery("SELECT * FROM items WHERE job_id = ?", arrayOf(jobId.toString())).use { c ->
+            buildList { while (c.moveToNext()) add(readItem(c)) }
+        }
+
+    fun item(jobId: Long, relPath: String): Item? =
+        readableDatabase.rawQuery("SELECT * FROM items WHERE job_id = ? AND rel_path = ?", arrayOf(jobId.toString(), relPath)).use { c ->
+            if (c.moveToFirst()) readItem(c) else null
+        }
+
+    fun putItem(item: Item) {
+        writableDatabase.insertWithOnConflict("items", null, itemValues(item), SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun updateItem(jobId: Long, relPath: String, values: Map<String, Any?>) {
+        val cv = ContentValues()
+        values.forEach { (k, v) -> cv.putAny(k, v) }
+        writableDatabase.update("items", cv, "job_id = ? AND rel_path = ?", arrayOf(jobId.toString(), relPath))
+    }
+
+    fun deleteItem(jobId: Long, relPath: String) {
+        writableDatabase.delete("items", "job_id = ? AND rel_path = ?", arrayOf(jobId.toString(), relPath))
+    }
+
+    fun itemsWithSha(jobId: Long): Map<String, Item> = itemsOf(jobId)
+        .filter { it.sha256 != null }
+        .associateBy { it.sha256!! }
+
+    private fun itemValues(i: Item) = ContentValues().apply {
+        put("job_id", i.jobId)
+        put("rel_path", i.relPath)
+        put("local_path", i.localPath)
+        put("local_size", i.localSize)
+        put("local_mtime", i.localMtime)
+        put("sha256", i.sha256)
+        put("remote_entry_id", i.remoteEntryId)
+        put("remote_sha256", i.remoteSha256)
+        put("remote_folder_id", i.remoteFolderId)
+        put("name", i.name)
+        put("state", i.state)
+        put("keep_offline", if (i.keepOffline) 1 else 0)
+        put("uploaded_at", i.uploadedAt)
+    }
+
+    private fun readItem(c: Cursor) = Item(
+        jobId = c.getLong(c.getColumnIndexOrThrow("job_id")),
+        relPath = c.getString(c.getColumnIndexOrThrow("rel_path")),
+        localPath = c.getString(c.getColumnIndexOrThrow("local_path")),
+        localSize = c.getLong(c.getColumnIndexOrThrow("local_size")),
+        localMtime = c.getLong(c.getColumnIndexOrThrow("local_mtime")),
+        sha256 = c.getString(c.getColumnIndexOrThrow("sha256")),
+        remoteEntryId = c.getString(c.getColumnIndexOrThrow("remote_entry_id")),
+        remoteSha256 = c.getString(c.getColumnIndexOrThrow("remote_sha256")),
+        remoteFolderId = c.getString(c.getColumnIndexOrThrow("remote_folder_id")),
+        name = c.getString(c.getColumnIndexOrThrow("name")),
+        state = c.getString(c.getColumnIndexOrThrow("state")),
+        keepOffline = c.getInt(c.getColumnIndexOrThrow("keep_offline")) == 1,
+        uploadedAt = c.getLongOrNull("uploaded_at"),
+    )
+
+    // ===== очередь операций =====
+
+    fun enqueueOp(jobId: Long, relPath: String, kind: String) {
+        val cv = ContentValues().apply {
+            put("job_id", jobId)
+            put("rel_path", relPath)
+            put("kind", kind)
+            put("next_attempt_at", 0)
+            put("created_at", System.currentTimeMillis())
+        }
+        // повторная постановка той же операции не должна сбрасывать прогресс загрузки
+        writableDatabase.insertWithOnConflict("ops", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    fun nextOp(now: Long): Op? = readableDatabase.rawQuery(
+        "SELECT * FROM ops WHERE next_attempt_at <= ? ORDER BY id LIMIT 1",
+        arrayOf(now.toString()),
+    ).use { c -> if (c.moveToFirst()) readOp(c) else null }
+
+    /** Операции конкретной задачи: проход по одной папке не должен утаскивать чужие. */
+    fun nextOpForJob(jobId: Long, now: Long): Op? = readableDatabase.rawQuery(
+        "SELECT * FROM ops WHERE job_id = ? AND next_attempt_at <= ? ORDER BY id LIMIT 1",
+        arrayOf(jobId.toString(), now.toString()),
+    ).use { c -> if (c.moveToFirst()) readOp(c) else null }
+
+    fun ops(): List<Op> = readableDatabase.rawQuery("SELECT * FROM ops ORDER BY id", null).use { c ->
+        buildList { while (c.moveToNext()) add(readOp(c)) }
+    }
+
+    fun updateOp(id: Long, values: Map<String, Any?>) {
+        val cv = ContentValues()
+        values.forEach { (k, v) -> cv.putAny(k, v) }
+        writableDatabase.update("ops", cv, "id = ?", arrayOf(id.toString()))
+    }
+
+    fun deleteOp(id: Long) = writableDatabase.delete("ops", "id = ?", arrayOf(id.toString()))
+
+    private fun readOp(c: Cursor) = Op(
+        id = c.getLong(c.getColumnIndexOrThrow("id")),
+        jobId = c.getLong(c.getColumnIndexOrThrow("job_id")),
+        relPath = c.getString(c.getColumnIndexOrThrow("rel_path")),
+        kind = c.getString(c.getColumnIndexOrThrow("kind")),
+        uploadId = c.getString(c.getColumnIndexOrThrow("upload_id")),
+        attempts = c.getInt(c.getColumnIndexOrThrow("attempts")),
+        lastError = c.getString(c.getColumnIndexOrThrow("last_error")),
+    )
+
+    // ===== удаления, приехавшие с сервера (чтобы не заливать их обратно) =====
+
+    fun markRemoteDeleted(entryId: String, jobId: Long, name: String, folderId: String?, sha256: String?) {
+        writableDatabase.insertWithOnConflict(
+            "remote_deleted",
+            null,
+            ContentValues().apply {
+                put("entry_id", entryId)
+                put("job_id", jobId)
+                put("name", name)
+                put("folder_id", folderId)
+                put("sha256", sha256)
+                put("at", System.currentTimeMillis())
+            },
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    fun remoteDeletedIds(): Set<String> = readableDatabase.rawQuery("SELECT entry_id FROM remote_deleted", null).use { c ->
+        buildSet { while (c.moveToNext()) add(c.getString(0)) }
+    }
+
+    fun clearRemoteDeleted(entryId: String) = writableDatabase.delete("remote_deleted", "entry_id = ?", arrayOf(entryId))
+
+    // ===== курсор журнала =====
+
+    fun cursor(): String = kv(KV_CURSOR) ?: "0"
+
+    fun setCursor(seq: String) = putKv(KV_CURSOR, seq)
+
+    fun kv(key: String): String? = readableDatabase.rawQuery("SELECT value FROM kv WHERE key = ?", arrayOf(key)).use { c ->
+        if (c.moveToFirst()) c.getString(0) else null
+    }
+
+    fun putKv(key: String, value: String) {
+        writableDatabase.insertWithOnConflict(
+            "kv",
+            null,
+            ContentValues().apply { put("key", key); put("value", value) },
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    data class Job(
+        val id: Long,
+        val sourceDir: String,
+        val targetFolderId: String,
+        val targetPath: String,
+        val zone: String,
+        val includeSubfolders: Boolean,
+        val wifiOnly: Boolean,
+        val keepDays: Int,
+        val enabled: Boolean,
+    )
+
+    data class Item(
+        val jobId: Long,
+        val relPath: String,
+        val localPath: String,
+        val localSize: Long,
+        val localMtime: Long,
+        val sha256: String?,
+        val remoteEntryId: String?,
+        val remoteSha256: String?,
+        val remoteFolderId: String?,
+        val name: String,
+        val state: String,
+        val keepOffline: Boolean,
+        val uploadedAt: Long?,
+    )
+
+    data class Op(val id: Long, val jobId: Long, val relPath: String, val kind: String, val uploadId: String?, val attempts: Int, val lastError: String?)
+
+    companion object {
+        const val NAME = "cloudly-sync.db"
+        const val VERSION = 1
+        const val KV_CURSOR = "journal_cursor"
+
+        const val STATE_NEW = "new"
+        const val STATE_SYNCED = "synced"
+        const val STATE_EVICTED = "evicted"
+
+        const val OP_UPLOAD = "upload"
+        const val OP_DELETE = "delete"
+        const val OP_MOVE = "move"
+    }
+}
+
+/** ContentValues не умеет Any: раскладываем по типам, остальное пишем строкой. */
+private fun ContentValues.putAny(key: String, value: Any?) {
+    when (value) {
+        null -> putNull(key)
+        is String -> put(key, value)
+        is Int -> put(key, value)
+        is Long -> put(key, value)
+        is Boolean -> put(key, value)
+        is Double -> put(key, value)
+        is Float -> put(key, value)
+        is ByteArray -> put(key, value)
+        else -> put(key, value.toString())
+    }
+}
+
+private fun Cursor.getLongOrNull(name: String): Long? {
+    val idx = getColumnIndexOrThrow(name)
+    return if (isNull(idx)) null else getLong(idx)
+}
