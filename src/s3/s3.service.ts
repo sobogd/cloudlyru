@@ -36,6 +36,12 @@ export interface S3ObjectStream {
   lastModified?: Date;
 }
 
+/** Нормализация префикса ключей: ' dev/test/ ' → 'dev/test/'. */
+function normalizePrefix(raw: string): string {
+  const p = raw.trim().replace(/^\/+/, '').replace(/\/+$/, '');
+  return p ? `${p}/` : '';
+}
+
 /**
  * Обёртка над Hetzner Object Storage (S3-совместимый).
  * Ключи объектов: files/<sha256> (content-addressed, дедуп), db/* — дампы БД.
@@ -93,12 +99,29 @@ export class S3Service implements OnModuleDestroy {
 
   bucket = env.S3_FILES_BUCKET;
 
+  /**
+   * Префикс ключей в бакете: прод — пусто, dev/тесты — свой. Наружу (в БД, в API,
+   * в ответах) ключи всегда ходят без префикса, он добавляется только здесь,
+   * на границе с S3.
+   */
+  private readonly prefix = normalizePrefix(env.S3_FILES_PREFIX);
+
+  /** Ключ для S3 (с префиксом инстанса). */
+  private k(key: string): string {
+    return this.prefix + key;
+  }
+
+  /** Обратно к «чистому» ключу (префикс убираем — вызывающие про него не знают). */
+  private un(key: string): string {
+    return this.prefix && key.startsWith(this.prefix) ? key.slice(this.prefix.length) : key;
+  }
+
   static assetKey(sha256: string): string {
     return `files/${sha256}`;
   }
 
   async createMultipartUpload(key: string): Promise<string> {
-    const cmd = new CreateMultipartUploadCommand({ Bucket: this.bucket, Key: key });
+    const cmd = new CreateMultipartUploadCommand({ Bucket: this.bucket, Key: this.k(key) });
     const out = await this.s3().send(cmd);
     if (!out.UploadId) throw new Error('S3: no UploadId');
     return out.UploadId;
@@ -107,7 +130,7 @@ export class S3Service implements OnModuleDestroy {
   async uploadPart(key: string, uploadId: string, partNumber: number, body: Buffer): Promise<string> {
     const cmd = new UploadPartCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       UploadId: uploadId,
       PartNumber: partNumber,
       Body: body,
@@ -118,14 +141,14 @@ export class S3Service implements OnModuleDestroy {
   }
 
   async abortMultipartUpload(key: string, uploadId: string): Promise<void> {
-    const cmd = new AbortMultipartUploadCommand({ Bucket: this.bucket, Key: key, UploadId: uploadId });
+    const cmd = new AbortMultipartUploadCommand({ Bucket: this.bucket, Key: this.k(key), UploadId: uploadId });
     await this.s3().send(cmd);
   }
 
   async completeMultipartUpload(key: string, uploadId: string, parts: S3Part[]): Promise<void> {
     const cmd = new CompleteMultipartUploadCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       UploadId: uploadId,
       MultipartUpload: { Parts: parts },
     });
@@ -133,32 +156,38 @@ export class S3Service implements OnModuleDestroy {
   }
 
   async deleteObject(key: string): Promise<void> {
-    const cmd = new DeleteObjectCommand({ Bucket: this.bucket, Key: key });
+    const cmd = new DeleteObjectCommand({ Bucket: this.bucket, Key: this.k(key) });
     await this.s3().send(cmd);
   }
 
-  /** Пакетное удаление (для purge корзины); ошибки отдельных ключей не роняют остальные. */
-  async deleteObjects(keys: string[]): Promise<void> {
-    if (!keys.length) return;
+  /**
+   * Пакетное удаление (для purge корзины); ошибки отдельных ключей не роняют остальные.
+   * Возвращает ключи (без префикса), которые S3 НЕ удалил: вызывающий решает, что с ними
+   * делать. Раньше ошибки молча проглатывались, и БД расходилась с бакетом без следов в логе.
+   */
+  async deleteObjects(keys: string[]): Promise<string[]> {
+    if (!keys.length) return [];
     const chunks: string[][] = [];
     for (let i = 0; i < keys.length; i += 1000) chunks.push(keys.slice(i, i + 1000));
+    const failed: string[] = [];
     for (const chunk of chunks) {
       const cmd = new DeleteObjectsCommand({
         Bucket: this.bucket,
-        Delete: { Objects: chunk.map((Key) => ({ Key })) },
+        Delete: { Objects: chunk.map((Key) => ({ Key: this.k(Key) })) },
       });
       const out = await this.s3().send(cmd);
+      for (const err of out.Errors ?? []) if (err.Key) failed.push(this.un(err.Key));
       if (out.Errors?.length) {
-        // best-effort: пропускаем ошибки, логируем
-        // eslint-disable-next-line no-console
-        console.warn(`[s3] deleteObjects partial errors: ${out.Errors.length}`);
+        const sample = out.Errors.slice(0, 5).map((e) => `${e.Key} (${e.Code ?? '?'})`).join(', ');
+        this.logger.warn(`[s3] не удалено объектов: ${out.Errors.length} — ${sample}`);
       }
     }
+    return failed;
   }
 
   /** Скачать объект целиком в память (для EXIF-парсинга; maxBytes-страховка). */
   async getObjectBytes(key: string, maxBytes = 150 * 1024 * 1024): Promise<Buffer> {
-    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: key });
+    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: this.k(key) });
     const out = await this.s3().send(cmd);
     if (!out.Body) throw new Error('S3: empty body');
     const chunks: Buffer[] = [];
@@ -181,7 +210,11 @@ export class S3Service implements OnModuleDestroy {
   async copyObject(srcKey: string, dstKey: string): Promise<void> {
     const size = await this.objectSize(srcKey);
     if (size <= S3Service.COPY_SINGLE_MAX) {
-      const cmd = new CopyObjectCommand({ Bucket: this.bucket, Key: dstKey, CopySource: `${this.bucket}/${srcKey}` });
+      const cmd = new CopyObjectCommand({
+        Bucket: this.bucket,
+        Key: this.k(dstKey),
+        CopySource: `${this.bucket}/${this.k(srcKey)}`,
+      });
       await this.s3().send(cmd);
       return;
     }
@@ -200,10 +233,10 @@ export class S3Service implements OnModuleDestroy {
           const out = await this.s3().send(
             new UploadPartCopyCommand({
               Bucket: this.bucket,
-              Key: dstKey,
+              Key: this.k(dstKey),
               UploadId: uploadId,
               PartNumber: i + 1,
-              CopySource: `${this.bucket}/${srcKey}`,
+              CopySource: `${this.bucket}/${this.k(srcKey)}`,
               CopySourceRange: `bytes=${start}-${end}`,
             }),
           );
@@ -225,7 +258,7 @@ export class S3Service implements OnModuleDestroy {
 
   /** Размер объекта (HeadObject); 0 — если объекта нет. */
   async objectSize(key: string): Promise<number> {
-    const out = await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+    const out = await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: this.k(key) }));
     return Number(out.ContentLength ?? 0);
   }
 
@@ -233,7 +266,7 @@ export class S3Service implements OnModuleDestroy {
   async readRange(key: string, start: number, endInclusive: number): Promise<Buffer> {
     const cmd = new GetObjectCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       Range: `bytes=${start}-${endInclusive}`,
     });
     const out = await this.s3().send(cmd);
@@ -295,7 +328,7 @@ export class S3Service implements OnModuleDestroy {
   async putObject(key: string, body: Buffer, contentType: string): Promise<void> {
     const cmd = new PutObjectCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       Body: body,
       ContentType: contentType,
     });
@@ -305,7 +338,7 @@ export class S3Service implements OnModuleDestroy {
   /** Существует ли объект (HeadObject). */
   async headObject(key: string): Promise<boolean> {
     try {
-      await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: this.k(key) }));
       return true;
     } catch {
       return false;
@@ -314,7 +347,7 @@ export class S3Service implements OnModuleDestroy {
 
   /** Скачать объект в локальный файл (для воркера конвертации). */
   async downloadToFile(key: string, filePath: string): Promise<void> {
-    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: key });
+    const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: this.k(key) });
     const out = await this.s3().send(cmd);
     if (!out.Body) throw new Error('S3: empty body');
     await pipeline(out.Body as NodeJS.ReadableStream, createWriteStream(filePath));
@@ -325,7 +358,7 @@ export class S3Service implements OnModuleDestroy {
     const size = (await stat(filePath)).size;
     const cmd = new PutObjectCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       Body: createReadStream(filePath),
       ContentType: contentType,
       ContentLength: size,
@@ -342,7 +375,7 @@ export class S3Service implements OnModuleDestroy {
   ): Promise<void> {
     const cmd = new PutObjectCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       Body: body as never,
       ContentType: contentType,
       ...(contentLength ? { ContentLength: contentLength } : {}),
@@ -354,7 +387,7 @@ export class S3Service implements OnModuleDestroy {
   async presignedGet(key: string, mime: string): Promise<string> {
     const cmd = new GetObjectCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       ResponseContentType: mime,
       ResponseContentDisposition: 'attachment',
     });
@@ -374,7 +407,7 @@ export class S3Service implements OnModuleDestroy {
   ): Promise<string> {
     const cmd = new UploadPartCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       UploadId: uploadId,
       PartNumber: partNumber,
     });
@@ -424,7 +457,7 @@ export class S3Service implements OnModuleDestroy {
   async getObjectStream(key: string, range?: string): Promise<S3ObjectStream> {
     const cmd = new GetObjectCommand({
       Bucket: this.bucket,
-      Key: key,
+      Key: this.k(key),
       ...(range ? { Range: range } : {}),
     });
     const out = await this.s3().send(cmd);

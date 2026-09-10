@@ -24,6 +24,11 @@ const envSchema = z.object({
   S3_FILES_ENDPOINT: z.string().url().default('https://nbg1.your-objectstorage.com'),
   S3_FILES_REGION: z.string().default('nbg1'),
   S3_FILES_BUCKET: z.string().default('cloudlyru'),
+  // Префикс всех ключей приложения в бакете. Прод живёт без префикса (пусто),
+  // а локальный/тестовый инстанс задаёт свой — иначе он пишет в прод-бакет, а его
+  // строки живут в отдельной БД: при её пересоздании объекты остаются «зомби»,
+  // которые приложению уже не видны (чистятся deploy/scripts/sweep-orphans.mjs).
+  S3_FILES_PREFIX: z.string().default(''),
   S3_FILES_FORCE_PATH_STYLE: booleanish.default('true'),
 
   UPLOAD_CHUNK_MAX_MB: z.coerce.number().positive().default(20),

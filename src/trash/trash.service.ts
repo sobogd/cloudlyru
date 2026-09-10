@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { MediaService } from '../media/media.service';
@@ -9,6 +9,8 @@ import { conflict } from '../common/errors';
 
 @Injectable()
 export class TrashService {
+  private readonly logger = new Logger(TrashService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
@@ -111,16 +113,37 @@ export class TrashService {
         S3Service.assetKey(a.sha256),
         ...MediaService.derivativeKeys(a.sha256),
       ]);
-      await this.s3.deleteObjects(keys).catch(() => undefined);
-      await this.prisma.asset.deleteMany({
-        where: { id: { in: orphanAssets.map((a) => a.id) } },
+      // Ошибку S3 больше не глотаем: если объект не удалился, ассет остаётся в БД и его
+      // удаление повторится при следующей очистке. Иначе строка исчезает, а объект
+      // остаётся в бакете навсегда — его уже ничто не найдёт (ровно так появлялись «зомби»
+      // после того, как локальный инстанс с прод-бакетом терял свою БД).
+      const failed = await this.s3.deleteObjects(keys).catch((e: Error) => {
+        this.logger.error(`S3 не ответил на удаление объектов: ${e.message}`);
+        return keys;
       });
+      const failedSet = new Set(failed);
+      const removed = orphanAssets.filter((a) => !failedSet.has(S3Service.assetKey(a.sha256)));
+      const kept = orphanAssets.length - removed.length;
+      if (kept) {
+        this.logger.warn(
+          `${kept} ассетов остались в БД: S3 не подтвердил удаление — повтор при следующей очистке`,
+        );
+      }
+      if (removed.length) {
+        await this.prisma.asset.deleteMany({ where: { id: { in: removed.map((a) => a.id) } } });
+      }
+      return {
+        purgedEntries: entryIds.length,
+        purgedFolders: folderIds.length,
+        purgedAssets: removed.length,
+        ...(kept ? { retryAssets: kept } : {}),
+      };
     }
 
     return {
       purgedEntries: entryIds.length,
       purgedFolders: folderIds.length,
-      purgedAssets: orphanAssets.length,
+      purgedAssets: 0,
     };
   }
 }

@@ -79,3 +79,22 @@ gunzip -c cloudly-<штамп>.sql.gz | psql cloudly_restore
 
 Требования: `pg_dump` и `node` — модуль `@aws-sdk/client-s3` берётся из `node_modules`
 приложения, отдельный rclone/aws-cli не нужен.
+
+## Уборка «зомби»-объектов в бакете
+
+Объект без строки `Asset` в БД приложению уже не виден: удалить его может только
+уборщик. Такие объекты остаются, если строка исчезла в обход приложения (сброс БД
+локального инстанса, ручной SQL) или если S3 не ответил на удаление при очистке корзины.
+
+```bash
+cd /home/deploy/apps/cloudlyru
+set -a && . ./.env && set +a
+node deploy/scripts/sweep-orphans.mjs                       # dry-run: только показать
+node deploy/scripts/sweep-orphans.mjs --min-age-hours=1     # показать и свежие
+node deploy/scripts/sweep-orphans.mjs --apply               # удалить
+```
+
+Не трогает `db/` (дампы) и объекты моложе 24 часов: при загрузке файл сначала
+копируется в `files/<sha>`, и только потом создаётся строка `Asset` — свежий объект
+без строки это нормальная загрузка «в полёте».
+
