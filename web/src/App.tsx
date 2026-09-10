@@ -698,7 +698,6 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     return () => clearInterval(t);
   }, []);
 
-  const up = useBulkUpload(() => { void load(); });
   const busy = up.busy;
   // файл догрузился — сразу показываем его в таймлайне (опрос раз в 3 с для этого не нужен)
   useEffect(() => { if (uploadedAt) void load(); }, [uploadedAt]); // eslint-disable-line react-hooks/exhaustive-deps

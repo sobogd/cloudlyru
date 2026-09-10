@@ -107,20 +107,43 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     if (this.timer) clearInterval(this.timer);
   }
 
+  /**
+   * Ключи «полного» превью, которые реально умеет отдавать `/previews` и `/video-preview`
+   * (включая легаси-ключи старого пайплайна: у части ассетов оригинал был удалён).
+   */
+  private fullPreviewKeys(kind: string, sha256: string): string[] {
+    return kind === 'photo'
+      ? [MediaService.photoFullKey(sha256), MediaService.legacyPhotoFullWebpKey(sha256)]
+      : [MediaService.video1080Key(sha256), MediaService.legacyVideo720Key(sha256)];
+  }
+
+  /** Есть ли чем показать содержимое, кроме оригинала. */
+  async previewsAlive(mime: string, sha256: string): Promise<boolean> {
+    const kind = IMAGE_MIMES.includes(mime) ? 'photo' : VIDEO_MIMES.includes(mime) ? 'video' : null;
+    if (!kind) return false;
+    for (const key of this.fullPreviewKeys(kind, sha256)) {
+      if (await this.s3.headObject(key).catch(() => false)) return true;
+    }
+    return false;
+  }
+
   /** Ставит задачу, если для ассета ещё нет активной. */
   async enqueue(assetId: string, sha256: string, mime: string): Promise<void> {
     const kind = IMAGE_MIMES.includes(mime) ? 'photo' : VIDEO_MIMES.includes(mime) ? 'video' : null;
     if (!kind) return;
     // Превью уже есть, а оригинала нет (KEEP_ORIGINALS=false) — задача обречена на три
     // падения при скачивании files/<sha>. Ставим её только если превью на самом деле нет.
+    // Проверяем весь набор ключей, которые отдаёт UI, а не только текущий: у старых
+    // ассетов полное превью лежит под легаси-ключом `-2048.webp`/`-720.mp4`.
     const asset = await this.prisma.asset
       .findUnique({ where: { id: assetId }, select: { masterReadyAt: true } })
       .catch(() => null);
     if (asset?.masterReadyAt) {
       const rawAlive = await this.s3.headObject(S3Service.assetKey(sha256)).catch(() => false);
       if (!rawAlive) {
-        const previewKey = kind === 'photo' ? MediaService.photoFullKey(sha256) : MediaService.video1080Key(sha256);
-        if (await this.s3.headObject(previewKey).catch(() => false)) return;
+        for (const key of this.fullPreviewKeys(kind, sha256)) {
+          if (await this.s3.headObject(key).catch(() => false)) return;
+        }
       }
     }
     if (kind === 'video') {
@@ -310,6 +333,10 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
     // Анимированный источник (GIF/WebP): полноэкранное превью оставляем анимированным
     // WebP — AVIF-мастер в старом пайплайне отдавал только первый кадр.
+    // Качество полного превью — q60: у AVIF шкала не как у JPEG, q60 ≈ JPEG 85–90 на глаз,
+    // а вес на 4000×3000 выходит ~400 КБ против ~940 КБ при q85 (замеры на реальных файлах).
+    // Полный экран открывают по одному фото, поэтому каждый лишний мегабайт — это трафик
+    // мобильного клиента, а не «запас качества».
     const full = animated
       ? await base
           .clone()
@@ -321,7 +348,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
           .clone()
           .keepIccProfile()
           .resize({ width: 2048, withoutEnlargement: true })
-          .avif({ quality: 85 })
+          .avif({ quality: 60 })
           .toBuffer();
 
     await this.setProgress(job.id, 85, true);

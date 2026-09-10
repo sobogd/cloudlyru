@@ -269,9 +269,10 @@ function putPartDirect(
   buf: ArrayBuffer,
   signal?: AbortSignal,
   onBytes?: (loaded: number) => void,
+  onNote?: (note: string) => void,
 ): Promise<string> {
   let last: Error | null = null;
-  const send = () => putPartOnce(url, buf, signal, onBytes);
+  const send = () => putPartOnce(url, buf, signal, onBytes, onNote);
   const loop = async (): Promise<string> => {
     for (let attempt = 1; ; attempt++) {
       if (signal?.aborted) throw new Error('загрузка отменена');
@@ -284,6 +285,7 @@ function putPartDirect(
         const limit = e instanceof PartStalled ? PART_STALL_ATTEMPTS : PART_ATTEMPTS;
         if (attempt >= limit) break;
         onBytes?.(0); // прогресс обнуляем: часть переливаем с нуля
+        onNote?.(`${last.message} — повторяю (попытка ${attempt + 1})`);
         await sleep(700 * attempt);
       }
     }
@@ -298,6 +300,7 @@ function putPartOnce(
   buf: ArrayBuffer,
   signal?: AbortSignal,
   onBytes?: (loaded: number) => void,
+  onNote?: (note: string) => void,
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -313,6 +316,7 @@ function putPartOnce(
     const watchdog = setInterval(() => {
       if (Date.now() - lastTick > PART_STALL_MS) {
         stalled = true;
+        onNote?.(`S3 не отдал ни байта за ${Math.round(PART_STALL_MS / 1000)} с — прерываю`);
         xhr.abort();
       }
     }, 1000);
@@ -371,9 +375,9 @@ async function uploadDirect(
   const loaded = new Array<number>(total + 1).fill(0);
   let next = 1;
 
-  const report = () => {
+  const report = (note?: string) => {
     const sum = loaded.reduce((a, b) => a + b, 0);
-    onProgress?.(Math.min(100, Math.floor((sum / file.size) * 100)), 'upload');
+    onProgress?.(Math.min(100, Math.floor((sum / file.size) * 100)), 'upload', note);
   };
 
   const worker = async () => {
@@ -384,22 +388,23 @@ async function uploadDirect(
 
       const start = (part - 1) * partSize;
       const end = Math.min(file.size, start + partSize);
-      const already = loaded.slice(0, part).reduce((a, b) => a + b, 0);
-      onProgress?.(Math.min(100, Math.floor((already / file.size) * 100)), 'upload',
-        `часть ${part} из ${total}`);
+      report(`часть ${part} из ${total}`);
       const url = await presignPart(uploadId, part);
       const buf = await file.slice(start, end).arrayBuffer();
-      const etag = await putPartDirect(url, buf, signal, (n) => {
-        loaded[part] = n;
-        report();
-      });
+      const etag = await putPartDirect(
+        url,
+        buf,
+        signal,
+        (n) => { loaded[part] = n; report(`часть ${part} из ${total}`); },
+        (note) => report(note),
+      );
       await request<unknown>(`/uploads/${uploadId}/parts/${part}`, {
         method: 'PUT',
         body: JSON.stringify({ etag, size: buf.byteLength }),
       });
 
       loaded[part] = buf.byteLength;
-      report();
+      report(`часть ${part} из ${total}`);
     }
   };
 

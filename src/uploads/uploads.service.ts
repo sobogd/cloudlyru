@@ -1,5 +1,5 @@
 import { createHash, Hash } from 'crypto';
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
@@ -92,10 +92,14 @@ function storedParts(raw: unknown): StoredPart[] {
  * поэтому рестарт сервиса больше не убивает сессию загрузки.
  */
 @Injectable()
-export class UploadsService implements OnModuleInit {
+export class UploadsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(UploadsService.name);
   private readonly live = new Map<string, LiveSession>();
-  private readonly STALE_MS = 24 * 60 * 60 * 1000;
+  /** Сессия без единого запроса дольше этого — брошена (вкладку закрыли, сеть умерла). */
+  private readonly STALE_MS = 6 * 60 * 60 * 1000;
+  /** Как часто подчищаем брошенные сессии (раньше — только при старте сервиса). */
+  private readonly SWEEP_MS = 15 * 60 * 1000;
+  private timer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -107,14 +111,29 @@ export class UploadsService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    // чистка зависших сессий загрузки (после рестарта сервера)
+    await this.sweepStale();
+    this.timer = setInterval(() => void this.sweepStale(), this.SWEEP_MS);
+  }
+
+  onModuleDestroy() {
+    if (this.timer) clearInterval(this.timer);
+  }
+
+  /**
+   * Чистка брошенных сессий загрузки: без неё незавершённый multipart в S3 остаётся
+   * висеть (оплачиваемый мусор), а записи в БД копятся. Раньше это делалось только
+   * при старте сервиса, то есть после закрытой вкладки мусор мог жить сутками.
+   */
+  private async sweepStale(): Promise<void> {
     try {
       const stale = await this.prisma.uploadSession.findMany({
         where: { updatedAt: { lt: new Date(Date.now() - this.STALE_MS) } },
       });
       for (const s of stale) {
         await this.s3.abortMultipartUpload(s.uploadKey, s.s3UploadId).catch(() => undefined);
+        await this.s3.deleteObject(s.uploadKey).catch(() => undefined);
         await this.prisma.uploadSession.delete({ where: { id: s.id } }).catch(() => undefined);
+        this.live.delete(s.id);
       }
       if (stale.length) this.logger.log(`Очищено зависших upload-сессий: ${stale.length}`);
     } catch (e) {
@@ -205,17 +224,24 @@ export class UploadsService implements OnModuleInit {
     if (declared) {
       const asset = await this.prisma.asset.findUnique({ where: { sha256: declared } });
       if (asset && Number(asset.size) === size && (await this.auth.ownsAsset(userId, asset.id))) {
-        const done = await this.finish({
-          userId,
-          folderId,
-          name,
-          size,
-          mime,
-          sha256: declared,
-          assetId: asset.id,
-          deduped: true,
-        });
-        return { ...done, uploadId: null, direct: false, nextPart: 1 };
+        // Дедуп годится, только если содержимое реально можно отдать: либо оригинал на месте,
+        // либо это легаси-ассет, у которого старый пайплайн удалил оригинал, но превью собраны.
+        // Иначе получилась бы запись, которую нечем показать и нечем пересобрать — такой файл
+        // лучше залить байтами заново (дедуп никуда не девается, просто не в этом случае).
+        const rawAlive = await this.s3.headObject(S3Service.assetKey(declared)).catch(() => false);
+        if (rawAlive || (await this.queue.previewsAlive(mime, declared))) {
+          const done = await this.finish({
+            userId,
+            folderId,
+            name,
+            size,
+            mime,
+            sha256: declared,
+            assetId: asset.id,
+            deduped: true,
+          });
+          return { ...done, uploadId: null, direct: false, nextPart: 1 };
+        }
       }
     }
 
