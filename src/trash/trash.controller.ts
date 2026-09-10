@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Post } from '@nestjs/common';
 import { TrashService } from './trash.service';
-import { CurrentUser, RequestUser } from '../common/decorators';
+import { CurrentUser, RequestUser, SessionOnly } from '../common/decorators';
 import { isPlainObject } from '../common/utils';
 import { badRequest } from '../common/errors';
 
@@ -21,11 +21,17 @@ export class TrashController {
     return this.trash.restore(body.type, body.id, user.id);
   }
 
+  /**
+   * Безвозвратная очистка корзины — только из веб-сессии: устройство со своим токеном
+   * не должно уметь вычистить единственную точку восстановления одним запросом.
+   */
+  @SessionOnly()
   @Post('purge')
   purge(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
-    const days = body && typeof (body as { olderThanDays?: unknown }).olderThanDays === 'number'
-      ? (body as { olderThanDays: number }).olderThanDays
-      : undefined;
+    if (!isPlainObject(body)) throw badRequest('invalid body');
+    const raw = typeof body.olderThanDays === 'number' ? body.olderThanDays : undefined;
+    // NaN и отрицательное раньше означали «вычистить всё» (cutoff в будущем) — клампим
+    const days = raw === undefined || !Number.isFinite(raw) ? undefined : Math.max(0, raw);
     return this.trash.purge(user.id, days);
   }
 }

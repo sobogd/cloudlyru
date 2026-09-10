@@ -38,6 +38,9 @@ const envSchema = z.object({
   // Срок жизни presigned-ссылки на часть, минуты.
   UPLOAD_PART_URL_TTL_MIN: z.coerce.number().positive().default(15),
   MAX_FILE_SIZE_MB: z.coerce.number().positive().default(51200),
+  // Потолок одновременных незавершённых загрузок на пользователя (мобильный клиент с
+  // ретраями иначе наплодит висящих multipart'ов в S3).
+  MAX_UPLOAD_SESSIONS_PER_USER: z.coerce.number().int().positive().default(16),
   TRASH_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
 
   CONVERT_ENABLED: z.string().default('false'),
@@ -75,4 +78,5 @@ export const CHUNK_MAX_BYTES = Math.floor(env.UPLOAD_CHUNK_MAX_MB * 1024 * 1024)
 export const DIRECT_PART_BYTES = Math.floor(env.UPLOAD_DIRECT_PART_MB * 1024 * 1024);
 export const PART_URL_TTL_SEC = Math.floor(env.UPLOAD_PART_URL_TTL_MIN * 60);
 export const MAX_FILE_BYTES = Math.floor(env.MAX_FILE_SIZE_MB * 1024 * 1024);
+export const MAX_UPLOAD_SESSIONS_PER_USER = env.MAX_UPLOAD_SESSIONS_PER_USER;
 export const TRASH_RETENTION_MS = env.TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;

@@ -22,6 +22,16 @@ export class UploadsController {
         size: typeof body.size === 'number' ? body.size : NaN,
         mime: typeof body.mime === 'string' ? body.mime : 'application/octet-stream',
         sha256: typeof body.sha256 === 'string' ? body.sha256 : undefined,
+        // Перезапись существующего имени и mtime с устройства — часть контракта синхронизации
+        // (контроллер собирает тело руками, поэтому поля надо перечислить здесь явно).
+        replace: body.replace === true || body.replace === 'true',
+        clientMtime: typeof body.clientMtime === 'string' || body.clientMtime === null ? body.clientMtime : undefined,
+        // оптимистичная блокировка: какую версию файла клиент заменяет
+        expectedSha256: typeof body.expectedSha256 === 'string' || body.expectedSha256 === null ? body.expectedSha256 : undefined,
+        expectedUpdatedAt:
+          typeof body.expectedUpdatedAt === 'string' || body.expectedUpdatedAt === null
+            ? body.expectedUpdatedAt
+            : undefined,
         // Клиенты, не знающие про прямую загрузку (скрипты, старые версии), льют чанки
         // через сервер — это релей-режим, он и остаётся поведением по умолчанию.
         mode: body.mode === 'direct' ? 'direct' : 'relay',

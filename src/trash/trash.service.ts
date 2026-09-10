@@ -5,6 +5,8 @@ import { MediaService } from '../media/media.service';
 import { FoldersService } from '../folders/folders.service';
 import { FilesService } from '../files/files.service';
 import { AuthService } from '../auth/auth.service';
+import { AuditService } from '../audit/audit.service';
+import { ChangesService } from '../sync/changes.service';
 import { conflict } from '../common/errors';
 
 @Injectable()
@@ -17,6 +19,8 @@ export class TrashService {
     private readonly folders: FoldersService,
     private readonly files: FilesService,
     private readonly auth: AuthService,
+    private readonly changes: ChangesService,
+    private readonly audit: AuditService,
   ) {}
 
   /** Корзина ТОЛЬКО этого пользователя: папки и файлы внутри его дерева. */
@@ -70,9 +74,19 @@ export class TrashService {
     }
   }
 
-  /** Полная очистка СВОЕЙ корзины (hard delete) с удалением осиротевших объектов из S3. */
+  /**
+   * Полная очистка СВОЕЙ корзины (hard delete) с удалением осиротевших объектов из S3.
+   *
+   * Порядок важен и был перевёрнут раньше: СНАЧАЛА в одной транзакции пишутся tombstones
+   * и удаляются строки БД, и только ПОСЛЕ коммита трогаются объекты в S3 — и то лишь для тех
+   * ассетов, строки которых реально исчезли. Обратный порядок (сначала S3) ломался на гонке:
+   * параллельный дедуп-upload в этом окне привязывает запись к тому же sha, объект живого
+   * файла удалялся, а `asset.deleteMany` падал на FK `Restrict`.
+   */
   async purge(userId: string, olderThanDays?: number) {
-    const cutoff = olderThanDays ? new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000) : undefined;
+    // отрицательное/NaN значение раньше означало «вычистить всё» (cutoff в будущем/undefined)
+    const days = Number.isFinite(olderThanDays) ? Math.max(0, Number(olderThanDays)) : undefined;
+    const cutoff = days === undefined ? undefined : new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const tree = await this.auth.subtreeIds(userId, { includeDeleted: true });
 
     const deletedEntries = await this.prisma.fileEntry.findMany({
@@ -81,7 +95,15 @@ export class TrashService {
         folderId: { in: tree },
         ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
       },
-      select: { id: true },
+      select: {
+        id: true,
+        name: true,
+        folderId: true,
+        zone: true,
+        keepOffline: true,
+        clientMtime: true,
+        asset: { select: { sha256: true, size: true, mime: true } },
+      },
     });
     const deletedFolders = await this.prisma.folder.findMany({
       where: {
@@ -89,61 +111,101 @@ export class TrashService {
         id: { in: tree },
         ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
       },
-      select: { id: true },
+      select: { id: true, name: true, parentId: true, zone: true, keepOffline: true },
     });
     const entryIds = deletedEntries.map((e) => e.id);
     const folderIds = deletedFolders.map((f) => f.id);
 
-    if (entryIds.length) await this.prisma.fileEntry.deleteMany({ where: { id: { in: entryIds } } });
-    if (folderIds.length) {
+    // Tombstones и удаление строк — атомарно: журнал изменений не связан внешними ключами
+    // с деревом именно ради того, чтобы tombstone пережил физическое удаление (иначе клиент
+    // зальёт удалённое обратно). Ошибку записи не глотаем: без tombstone чистку делать нельзя.
+    await this.prisma.$transaction(async (tx) => {
+      for (const e of deletedEntries) {
+        await this.changes.record(
+          {
+            userId,
+            target: 'entry',
+            op: 'delete',
+            targetId: e.id,
+            folderId: e.folderId,
+            name: e.name,
+            zone: e.zone,
+            sha256: e.asset.sha256,
+            size: Number(e.asset.size),
+            mime: e.asset.mime,
+            clientMtime: e.clientMtime,
+            keepOffline: e.keepOffline,
+          },
+          tx,
+        );
+      }
+      for (const f of deletedFolders) {
+        // для папки одного события на поддерево достаточно: «папки нет» ⇒ её содержимого нет
+        await this.changes.record(
+          {
+            userId,
+            target: 'folder',
+            op: 'delete',
+            targetId: f.id,
+            folderId: f.parentId,
+            name: f.name,
+            zone: f.zone,
+            keepOffline: f.keepOffline,
+          },
+          tx,
+        );
+      }
+      if (entryIds.length) await tx.fileEntry.deleteMany({ where: { id: { in: entryIds } } });
       // onDelete: Cascade убирает и все FileEntry внутри удалённых папок
-      await this.prisma.folder.deleteMany({ where: { id: { in: folderIds } } });
-    }
+      if (folderIds.length) await tx.folder.deleteMany({ where: { id: { in: folderIds } } });
+    });
 
-    // осиротевшие Asset (больше ни один FileEntry не ссылается) — удаляем из S3 и БД
-    const orphanAssets = await this.prisma.asset.findMany({
+    // Осиротевшие ассеты: строку удаляем под условием «ссылок нет» (никакого FK-500 при гонке),
+    // а объекты в S3 трогаем только после коммита и только у реально удалённых строк.
+    const orphans = await this.prisma.asset.findMany({
       where: { entries: { none: {} } },
       select: { id: true, sha256: true },
     });
-    if (orphanAssets.length) {
-      // Удаляем и сырьё, и ВСЕ производные (view/*): мастер AVIF/AV1, превью и постер.
-      // Раньше удалялось только files/<sha>, поэтому деривативы оставались в S3 навсегда
-      // (а для зоны «Фото», где сырьё уже удалено после конвертации, не удалялось вообще ничего).
-      const keys = orphanAssets.flatMap((a) => [
+    let purgedAssets = 0;
+    let retryAssets = 0;
+    if (orphans.length) {
+      const removed: Array<{ id: string; sha256: string }> = [];
+      for (const a of orphans) {
+        const res = await this.prisma.asset.deleteMany({ where: { id: a.id, entries: { none: {} } } });
+        if (res.count > 0) removed.push(a);
+      }
+      // производные (view/*) и сырьё: у легаси-ассетов «Фото» сырья могло уже не быть
+      const keys = removed.flatMap((a) => [
         S3Service.assetKey(a.sha256),
         ...MediaService.derivativeKeys(a.sha256),
       ]);
-      // Ошибку S3 больше не глотаем: если объект не удалился, ассет остаётся в БД и его
-      // удаление повторится при следующей очистке. Иначе строка исчезает, а объект
-      // остаётся в бакете навсегда — его уже ничто не найдёт (ровно так появлялись «зомби»
-      // после того, как локальный инстанс с прод-бакетом терял свою БД).
-      const failed = await this.s3.deleteObjects(keys).catch((e: Error) => {
-        this.logger.error(`S3 не ответил на удаление объектов: ${e.message}`);
-        return keys;
-      });
+      const failed = keys.length
+        ? await this.s3.deleteObjects(keys).catch((e: Error) => {
+            this.logger.error(`S3 не ответил на удаление объектов: ${e.message}`);
+            return keys;
+          })
+        : [];
       const failedSet = new Set(failed);
-      const removed = orphanAssets.filter((a) => !failedSet.has(S3Service.assetKey(a.sha256)));
-      const kept = orphanAssets.length - removed.length;
-      if (kept) {
-        this.logger.warn(
-          `${kept} ассетов остались в БД: S3 не подтвердил удаление — повтор при следующей очистке`,
-        );
+      purgedAssets = removed.filter((a) => !failedSet.has(S3Service.assetKey(a.sha256))).length;
+      retryAssets = removed.length - purgedAssets;
+      if (retryAssets) {
+        // строки уже удалены, объекты остались — их подберёт deploy/scripts/sweep-orphans.mjs
+        this.logger.warn(`${retryAssets} объектов S3 не удалились (S3 не подтвердил) — подберёт sweep-orphans`);
       }
-      if (removed.length) {
-        await this.prisma.asset.deleteMany({ where: { id: { in: removed.map((a) => a.id) } } });
-      }
-      return {
-        purgedEntries: entryIds.length,
-        purgedFolders: folderIds.length,
-        purgedAssets: removed.length,
-        ...(kept ? { retryAssets: kept } : {}),
-      };
     }
+
+    await this.audit.log('trash.purge', {
+      entries: entryIds.length,
+      folders: folderIds.length,
+      assets: purgedAssets,
+      olderThanDays: days ?? null,
+    });
 
     return {
       purgedEntries: entryIds.length,
       purgedFolders: folderIds.length,
-      purgedAssets: 0,
+      purgedAssets,
+      ...(retryAssets ? { retryAssets } : {}),
     };
   }
 }

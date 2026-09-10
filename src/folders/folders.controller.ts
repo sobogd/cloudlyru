@@ -33,6 +33,18 @@ export class FoldersController {
     return this.folders.create(parentId, name, user.id);
   }
 
+  /**
+   * Идемпотентный mkdir по пути: `{ path: "Files/2025/07", parentId? }`.
+   * Нужен клиенту синхронизации, чтобы не строить дерево руками.
+   */
+  @Post('ensure-path')
+  ensurePath(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {
+    if (!isPlainObject(body)) throw badRequest('invalid body');
+    const path = asString(body.path, 'path');
+    const parentId = asOptionalString(body.parentId, 'parentId');
+    return this.folders.ensurePath(user.id, path, parentId);
+  }
+
   @Patch(':id')
   update(
     @Param('id') id: string,
@@ -40,9 +52,19 @@ export class FoldersController {
     @CurrentUser() user: RequestUser,
   ) {
     if (!isPlainObject(body)) throw badRequest('invalid body');
-    if (typeof body.name === 'string') return this.folders.rename(id, body.name, user.id);
-    if (typeof body.parentId === 'string') return this.folders.move(id, body.parentId, user.id);
-    throw badRequest('provide name or parentId');
+    const hasName = typeof body.name === 'string';
+    const hasParent = typeof body.parentId === 'string';
+    const hasPin = typeof body.keepOffline === 'boolean';
+    if (!hasName && !hasParent && !hasPin) throw badRequest('provide name, parentId or keepOffline');
+    return this.folders.patch(
+      id,
+      {
+        name: hasName ? (body.name as string) : undefined,
+        parentId: hasParent ? (body.parentId as string) : undefined,
+        keepOffline: hasPin ? (body.keepOffline as boolean) : undefined,
+      },
+      user.id,
+    );
   }
 
   @Delete(':id')

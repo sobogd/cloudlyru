@@ -31,3 +31,14 @@ export function assertSafeName(name: string): void {
   }
   if (name === '.' || name === '..') throw new Error('invalid name');
 }
+
+/**
+ * Дата из ISO-строки для клиентов синхронизации (mtime файла на устройстве).
+ * null и '' — «снять значение», undefined — поле не передано или мусор (менять не надо).
+ */
+export function parseOptionalDate(v: unknown): Date | null | undefined {
+  if (v === null || v === '') return null;
+  if (typeof v !== 'string') return undefined;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? undefined : d;
+}

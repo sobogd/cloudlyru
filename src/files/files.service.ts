@@ -1,21 +1,65 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import type { Request, Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { MediaService } from '../media/media.service';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
+import { ChangesService } from '../sync/changes.service';
+import { QueueService } from '../queue/queue.service';
 import { safeInlineImageMime, sendObjectOr404 } from '../common/http-object';
-import { assertSafeName } from '../common/utils';
+import { assertSafeName, parseOptionalDate } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
-import { conflict, notFound } from '../common/errors';
+import { badRequest, conflict, notFound } from '../common/errors';
+
+/** Снимок содержимого для журнала изменений: без него пришлось бы читать Asset лишний раз. */
+export interface AssetSnapshot {
+  sha256: string;
+  size: number;
+  mime: string;
+}
+
+/** Параметры создания/перезаписи записи в дереве. */
+export interface CreateEntryOptions {
+  /**
+   * Владелец дерева для журнала изменений. Не задан — запись в журнал не пишется
+   * (так бывает только у гостевой загрузки по старой share-ссылке без владельца),
+   * и это видно в логе: молча расходиться с клиентом синхронизации нельзя.
+   */
+  userId?: string;
+  /** Перезаписать существующий файл с тем же именем (а не отдавать 409). */
+  replace?: boolean;
+  /** mtime файла на устройстве-источнике. */
+  clientMtime?: Date | null;
+  /** Снимок содержимого — чтобы не читать Asset ради записи в журнал. */
+  asset?: AssetSnapshot;
+  /**
+   * Разрешить вернуть запись из корзины, если имя занято удалённым файлом.
+   * Только для WebDAV (Finder/rclone): они перезаписывают файл, не зная о нашей корзине.
+   * Клиент синхронизации такого разрешения не получает — он должен решить сам (409).
+   */
+  restoreDeleted?: boolean;
+  /**
+   * Оптимистичная блокировка: какую версию файла клиент считает текущей.
+   * `sha256` — содержимое (основной вариант, есть в снимках журнала), `updatedAt` — момент
+   * правки (для тех, кто его отслеживает). Любое расхождение → 409 `stale_version`
+   * со снимком фактической версии, чтобы клиент сразу сделал конфликтную копию.
+   * Не задано — проверки нет (веб-форма, WebDAV, скрипты).
+   */
+  expect?: { sha256?: string | null; updatedAt?: Date | null };
+}
 
 @Injectable()
 export class FilesService {
+  private readonly logger = new Logger(FilesService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
     private readonly media: MediaService,
     private readonly auth: AuthService,
+    private readonly changes: ChangesService,
+    private readonly queue: QueueService,
   ) {}
 
   /** Папка-приёмник: существует и не в корзине. */
@@ -35,35 +79,285 @@ export class FilesService {
     return asset.id;
   }
 
-  async assertNameFree(folderId: string, name: string, exceptId?: string): Promise<void> {
-    const existing = await this.prisma.fileEntry.findFirst({
-      where: { folderId, name, ...(exceptId ? { id: { not: exceptId } } : {}) },
-    });
-    if (existing) {
-      if (existing.deletedAt) {
-        throw conflict('file with this name is in trash — restore or purge it first');
-      }
-      throw conflict('file name already exists');
+  /**
+   * Событие в журнал изменений по уже существующей записи. Владельца знать обязательно:
+   * без него событие не попало бы ни одному клиенту, поэтому такой случай — это ошибка
+   * в коде вызова, и мы о ней громко пишем в лог, а не молчим.
+   */
+  private async recordEntryChange(input: {
+    userId?: string;
+    op: 'create' | 'update' | 'move' | 'restore' | 'pin';
+    targetId: string;
+    folderId: string;
+    name: string;
+    zone: string;
+    sha256: string;
+    size: number;
+    mime: string;
+    clientMtime?: Date | null;
+    keepOffline: boolean;
+    /** Транзакция мутации: журнал должен писаться вместе с ней, а не после. */
+    tx?: Prisma.TransactionClient;
+  }): Promise<void> {
+    if (!input.userId) {
+      this.logger.warn(
+        `журнал изменений: неизвестен владелец дерева для файла «${input.name}» (${input.folderId}) — событие не записано`,
+      );
+      return;
+    }
+    await this.changes.record(
+      {
+        userId: input.userId,
+        target: 'entry',
+        op: input.op,
+        targetId: input.targetId,
+        folderId: input.folderId,
+        name: input.name,
+        zone: input.zone,
+        sha256: input.sha256,
+        size: input.size,
+        mime: input.mime,
+        clientMtime: input.clientMtime ?? null,
+        keepOffline: input.keepOffline,
+      },
+      input.tx,
+    );
+  }
+
+  /** Единый ответ на расхождение версий: клиенту нужен снимок фактической версии. */
+  private staleVersionError(current: {
+    entryId: string | null;
+    name: string;
+    sha256: string | null;
+    size?: number;
+    mime?: string;
+    clientMtime?: Date | null;
+    updatedAt?: Date;
+  }): Error {
+    return conflict(
+      current.entryId
+        ? 'на сервере уже другая версия файла — сохраните свою как конфликтную копию'
+        : 'файла на сервере нет — версия разошлась, синхронизируйте состояние',
+      'stale_version',
+      current,
+    );
+  }
+
+  /**
+   * Проверка предусловия перезаписи ДО начала загрузки: клиент не должен потратить
+   * гигабайты на файл, который всё равно не примут из-за расхождения версий.
+   * Та же проверка повторяется в createEntry — между init и complete версия могла измениться.
+   */
+  async assertExpectedVersion(
+    folderId: string,
+    name: string,
+    expect?: { sha256?: string | null; updatedAt?: Date | null },
+  ): Promise<void> {
+    if (!expect) return;
+    const existing = await this.prisma.fileEntry.findFirst({ where: { folderId, name } });
+    if (!existing) throw this.staleVersionError({ entryId: null, name, sha256: null });
+    if (existing.deletedAt) {
+      throw conflict('file with this name is in trash — restore or purge it first', 'in_trash', {
+        entryId: existing.id,
+        name,
+      });
+    }
+    const snap = await this.assetSnapshot(existing.assetId);
+    const wantSha = expect.sha256 === undefined ? undefined : (expect.sha256 ?? '');
+    const shaMismatch = wantSha !== undefined && wantSha !== snap.sha256;
+    const mtimeMismatch =
+      expect.updatedAt != null && existing.updatedAt.getTime() !== expect.updatedAt.getTime();
+    if (shaMismatch || mtimeMismatch) {
+      throw this.staleVersionError({
+        entryId: existing.id,
+        name,
+        sha256: snap.sha256,
+        size: snap.size,
+        mime: snap.mime,
+        clientMtime: existing.clientMtime,
+        updatedAt: existing.updatedAt,
+      });
     }
   }
 
-  /** Создание FileEntry (после того, как объект в S3 готов или найден по хэшу). Возвращает зону записи. */
-  async createEntry(folderId: string, name: string, assetId: string): Promise<{ id: string; deduped: boolean; zone: string }> {
+  /** Снимок содержимого ассета (для журнала изменений). */
+  private async assetSnapshot(assetId: string, known?: AssetSnapshot): Promise<AssetSnapshot> {
+    if (known) return known;
+    const asset = await this.prisma.asset.findUnique({
+      where: { id: assetId },
+      select: { sha256: true, size: true, mime: true },
+    });
+    return asset
+      ? { sha256: asset.sha256, size: Number(asset.size), mime: asset.mime }
+      : { sha256: '', size: 0, mime: 'application/octet-stream' };
+  }
+
+  /**
+   * Создание FileEntry (после того, как объект в S3 готов или найден по хэшу).
+   * `replace` перезаписывает существующее имя, сохраняя id записи: иначе для всех устройств
+   * правка файла выглядела бы как «удали + создай» (новая запись, новый путь в истории).
+   */
+  async createEntry(
+    folderId: string,
+    name: string,
+    assetId: string,
+    opts: CreateEntryOptions,
+  ): Promise<{ id: string; deduped: boolean; zone: string; replaced: boolean }> {
     const folder = await this.ensureFolder(folderId);
     assertSafeName(name);
-    await this.assertNameFree(folderId, name);
-
-    // если на одно содержимое уже есть живой entry в этой папке с другим именем — дедуп по содержимому
-    const sameAssetLive = await this.prisma.fileEntry.findFirst({
-      where: { folderId, assetId, deletedAt: null, name: { not: name } },
-    });
-
     const zone = folder.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
-    const entry = await this.prisma.fileEntry.create({
-      data: { folderId, assetId, name, zone },
-      select: { id: true },
+    const existing = await this.prisma.fileEntry.findFirst({ where: { folderId, name } });
+    const snap = await this.assetSnapshot(assetId, opts.asset);
+    const previousAssetId = existing?.assetId ?? null;
+
+    // Мутация и запись в журнал — в одной транзакции: иначе падение между ними теряет
+    // событие навсегда, а для delete/move это расхождение клиента с сервером.
+    const result = await this.prisma
+      .$transaction(async (tx) => {
+        if (existing) {
+          // предусловие проверяем ДО любых изменений: расхождение — это конфликт версий,
+          // а не повод молча затереть чужую правку
+          if (!existing.deletedAt && opts.expect) {
+            const current = await this.assetSnapshot(existing.assetId);
+            const wantSha = opts.expect.sha256 === undefined ? undefined : (opts.expect.sha256 ?? '');
+            const shaMismatch = wantSha !== undefined && wantSha !== current.sha256;
+            const mtimeMismatch =
+              opts.expect.updatedAt !== undefined &&
+              opts.expect.updatedAt !== null &&
+              existing.updatedAt.getTime() !== opts.expect.updatedAt.getTime();
+            if (shaMismatch || mtimeMismatch) {
+              throw this.staleVersionError({
+                entryId: existing.id,
+                name: existing.name,
+                sha256: current.sha256,
+                size: current.size,
+                mime: current.mime,
+                clientMtime: existing.clientMtime,
+                updatedAt: existing.updatedAt,
+              });
+            }
+          }
+          if (existing.deletedAt && !opts.restoreDeleted) {
+            // молча воскрешать удалённое нельзя: корзина — единственная точка восстановления,
+            // решение «вернуть» принимает пользователь (или явный флаг от WebDAV-клиента)
+            throw conflict('file with this name is in trash — restore or purge it first', 'in_trash');
+          }
+          if (!existing.deletedAt && !opts.replace) {
+            throw conflict('file name already exists');
+          }
+          const wasDeleted = Boolean(existing.deletedAt);
+          const updated = await tx.fileEntry.update({
+            where: { id: existing.id },
+            data: {
+              assetId,
+              zone,
+              deletedAt: null,
+              ...(opts.clientMtime !== undefined ? { clientMtime: opts.clientMtime } : {}),
+            },
+            select: { id: true, zone: true, keepOffline: true, clientMtime: true },
+          });
+          await this.recordEntryChange({
+            userId: opts.userId,
+            op: wasDeleted ? 'restore' : 'update',
+            targetId: updated.id,
+            folderId,
+            name,
+            zone: updated.zone,
+            sha256: snap.sha256,
+            size: snap.size,
+            mime: snap.mime,
+            // фактическое значение из БД: в снимок нельзя класть аргумент (DAV PUT его не шлёт)
+            clientMtime: updated.clientMtime,
+            keepOffline: updated.keepOffline,
+            tx,
+          });
+          return {
+            id: updated.id,
+            deduped: existing.assetId === assetId,
+            zone: updated.zone,
+            replaced: true,
+          };
+        }
+
+        // предусловие задано, а записи нет: клиент считал, что файл на сервере есть
+        if (opts.expect?.sha256 !== undefined) {
+          throw this.staleVersionError({ entryId: null, name, sha256: null });
+        }
+
+        // если на одно содержимое уже есть живой entry в этой папке с другим именем — дедуп по содержимому
+        const sameAssetLive = await tx.fileEntry.findFirst({
+          where: { folderId, assetId, deletedAt: null, name: { not: name } },
+        });
+        const entry = await tx.fileEntry.create({
+          data: { folderId, assetId, name, zone, clientMtime: opts.clientMtime ?? null },
+          select: { id: true, keepOffline: true },
+        });
+        await this.recordEntryChange({
+          userId: opts.userId,
+          op: 'create',
+          targetId: entry.id,
+          folderId,
+          name,
+          zone,
+          sha256: snap.sha256,
+          size: snap.size,
+          mime: snap.mime,
+          clientMtime: opts.clientMtime ?? null,
+          keepOffline: entry.keepOffline,
+          tx,
+        });
+        return { id: entry.id, deduped: Boolean(sameAssetLive), zone, replaced: false };
+      })
+      .catch(async (e: unknown) => {
+        // гонка на @@unique([folderId, name]): два устройства грузят одно имя одновременно —
+        // наружу должен уйти 409 с внятным текстом, а не 500 от Prisma
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+          throw conflict('file name already exists (created concurrently)');
+        }
+        throw e;
+      });
+
+    // прежнее содержимое могло остаться без ссылок — тогда его надо убрать из S3
+    if (opts.userId && previousAssetId && previousAssetId !== assetId) {
+      await this.safeGcOrphanAsset(previousAssetId);
+    }
+    return result;
+  }
+
+  /** GC без риска уронить процесс: отклонённый промис здесь недопустим (unhandled rejection). */
+  async safeGcOrphanAsset(assetId: string): Promise<void> {
+    await this.gcOrphanAsset(assetId).catch((e: unknown) =>
+      this.logger.warn(`gc ассета ${assetId}: ${e instanceof Error ? e.message : String(e)}`),
+    );
+  }
+
+  /**
+   * Убрать ассет, на который больше никто не ссылается: и сырьё files/<sha>, и все производные
+   * view/*. Нужно после перезаписи файла — иначе старые объекты остаются в бакете навсегда
+   * (плановый GC есть только в очистке корзины, а перезапись при синхронизации — частый путь).
+   */
+  async gcOrphanAsset(assetId: string): Promise<boolean> {
+    const asset = await this.prisma.asset.findUnique({ where: { id: assetId }, select: { sha256: true } });
+    if (!asset) return false;
+    // строка удаляется только при отсутствии ссылок (двойная защита: условие в where + FK Restrict)
+    const res = await this.prisma.asset.deleteMany({ where: { id: assetId, entries: { none: {} } } });
+    if (res.count === 0) return false;
+    // Объекты трогаем только если строки с таким sha не появилось снова: параллельный
+    // дедуп-upload того же содержимого создаёт новый Asset с тем же ключом files/<sha>,
+    // и удаление ключей убило бы байты живого файла.
+    const alive = await this.prisma.asset.count({ where: { sha256: asset.sha256 } });
+    if (alive > 0) return false;
+    const keys = [S3Service.assetKey(asset.sha256), ...MediaService.derivativeKeys(asset.sha256)];
+    const failed = await this.s3.deleteObjects(keys).catch((e: Error) => {
+      this.logger.warn(`S3 не подтвердил удаление объектов ${asset.sha256}: ${e.message}`);
+      return keys;
     });
-    return { id: entry.id, deduped: Boolean(sameAssetLive), zone };
+    if (failed.length) {
+      // строки уже нет, объекты остались — их подберёт deploy/scripts/sweep-orphans.mjs
+      this.logger.warn(`${failed.length} объектов S3 осиротели (${asset.sha256}) — подберёт sweep-orphans`);
+      return false;
+    }
+    return true;
   }
 
   /** Полные метаданные файла для деталки: путь, размер/тип/хэш, EXIF/видео и метаданные Google. */
@@ -93,6 +387,9 @@ export class FilesService {
       id: entry.id,
       name: entry.name,
       createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      clientMtime: entry.clientMtime,
+      keepOffline: entry.keepOffline,
       folderId: entry.folderId,
       zone: entry.zone,
       path: await this.folderPath(entry.folder),
@@ -236,7 +533,10 @@ export class FilesService {
   async softDelete(entryId: string, userId: string) {
     const owned = await this.auth.ownEntry(userId, entryId);
     if (!owned) throw notFound('file not found');
-    await this.prisma.fileEntry.update({ where: { id: entryId }, data: { deletedAt: new Date() } });
+    await this.prisma.$transaction(async (tx) => {
+      await tx.fileEntry.update({ where: { id: entryId }, data: { deletedAt: new Date() } });
+      await this.changes.recordEntry(userId, entryId, 'delete', tx);
+    });
     return { ok: true };
   }
 
@@ -250,7 +550,105 @@ export class FilesService {
       const folder = await this.prisma.folder.findUnique({ where: { id: entry.folderId } });
       if (!folder || folder.deletedAt) throw conflict('parent folder is deleted — restore folder first');
     }
-    await this.prisma.fileEntry.update({ where: { id: entryId }, data: { deletedAt: null } });
+    await this.prisma.$transaction(async (tx) => {
+      await tx.fileEntry.update({ where: { id: entryId }, data: { deletedAt: null } });
+      await this.changes.recordEntry(userId, entryId, 'restore', tx);
+    });
     return { ok: true };
+  }
+
+  /**
+   * Правка записи клиентом синхронизации: переименование, перенос в другую папку,
+   * «держать офлайн» и запись mtime с устройства. Перенос — отдельная операция, а не
+   * «удали + создай»: id записи сохраняется, другие устройства видят move, а не новый файл.
+   */
+  async patch(
+    entryId: string,
+    userId: string,
+    body: { folderId?: unknown; name?: unknown; keepOffline?: unknown; clientMtime?: unknown } = {},
+  ) {
+    const entry = await this.prisma.fileEntry.findUnique({
+      where: { id: entryId },
+      include: { asset: true },
+    });
+    if (!entry || entry.deletedAt) throw notFound('file not found');
+    if (!(await this.auth.folderOwnedBy(userId, entry.folderId))) throw notFound('file not found');
+
+    const data: { folderId?: string; name?: string; zone?: string; keepOffline?: boolean; clientMtime?: Date | null } = {};
+    let op: 'update' | 'move' | 'pin' = 'update';
+
+    if (typeof body.name === 'string' && body.name !== entry.name) {
+      try {
+        assertSafeName(body.name);
+      } catch {
+        throw badRequest('invalid name');
+      }
+      const clash = await this.prisma.fileEntry.findFirst({
+        where: { folderId: entry.folderId, name: body.name, id: { not: entryId } },
+      });
+      if (clash) throw conflict('file name already exists');
+      data.name = body.name;
+    }
+
+    if (typeof body.folderId === 'string' && body.folderId !== entry.folderId) {
+      const target = await this.prisma.folder.findUnique({ where: { id: body.folderId } });
+      if (!target || target.deletedAt) throw notFound('folder not found');
+      if (!(await this.auth.folderOwnedBy(userId, target.id))) throw notFound('folder not found');
+      const clash = await this.prisma.fileEntry.findFirst({
+        where: { folderId: target.id, name: data.name ?? entry.name },
+      });
+      if (clash) throw conflict('file name already exists in the target folder');
+      data.folderId = target.id;
+      data.zone = target.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+      op = 'move';
+    }
+
+    if (typeof body.keepOffline === 'boolean' && body.keepOffline !== entry.keepOffline) {
+      data.keepOffline = body.keepOffline;
+      if (op === 'update') op = 'pin';
+    }
+
+    if (body.clientMtime !== undefined) {
+      const mtime = parseOptionalDate(body.clientMtime);
+      if (mtime !== undefined) data.clientMtime = mtime;
+    }
+
+    if (!Object.keys(data).length) return { ok: true, changed: false };
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.fileEntry.update({
+        where: { id: entryId },
+        data,
+        select: { id: true, name: true, folderId: true, zone: true, keepOffline: true, clientMtime: true },
+      });
+      await this.changes.record(
+        {
+          userId,
+          target: 'entry',
+          op,
+          targetId: row.id,
+          folderId: row.folderId,
+          name: row.name,
+          zone: row.zone,
+          sha256: entry.asset.sha256,
+          size: Number(entry.asset.size),
+          mime: entry.asset.mime,
+          clientMtime: row.clientMtime,
+          keepOffline: row.keepOffline,
+        },
+        tx,
+      );
+      return row;
+    });
+
+    // Файл переехал в медиа-зону: без EXIF и превью он не попадёт в таймлайн
+    if (updated.zone === ZONE_PHOTOS && entry.zone !== ZONE_PHOTOS) {
+      await this.media
+        .captureMeta(entry.assetId, entry.asset.sha256, Number(entry.asset.size), entry.asset.mime)
+        .catch(() => undefined);
+      await this.queue.enqueue(entry.assetId, entry.asset.sha256, entry.asset.mime).catch(() => undefined);
+    }
+
+    return { ok: true, changed: true, entry: updated };
   }
 }

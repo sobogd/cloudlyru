@@ -261,7 +261,13 @@ export class SharesService {
       await this.files.ensureAsset(sha256, body.length, mime, this.extOf(name));
     }
     const asset = await this.prisma.asset.findUniqueOrThrow({ where: { sha256 } });
-    const entry = await this.files.createEntry(folder.id, name, asset.id);
+    // журнал изменений требует владельца дерева: у старых ссылок userId мог не сохраниться,
+    // тогда вычисляем владельца по дереву — иначе гостевая загрузка прошла бы мимо синхронизации
+    const ownerId = share.userId ?? (await this.auth.ownerOfFolder(folder.id));
+    const entry = await this.files.createEntry(folder.id, name, asset.id, {
+      userId: ownerId ?? undefined,
+      asset: { sha256, size: body.length, mime },
+    });
     // конвертация/EXIF — только когда файл попал в медиа-зону («Фото»)
     if (entry.zone === ZONE_PHOTOS) {
       try {

@@ -11,11 +11,12 @@ import {
   CHUNK_MAX_BYTES,
   DIRECT_PART_BYTES,
   MAX_FILE_BYTES,
+  MAX_UPLOAD_SESSIONS_PER_USER,
   PART_URL_TTL_SEC,
 } from '../config/env';
-import { assertSafeName, randomToken } from '../common/utils';
+import { assertSafeName, parseOptionalDate, randomToken } from '../common/utils';
 import { ZONE_PHOTOS } from '../common/zones';
-import { badRequest, conflict, notFound, payloadTooLarge } from '../common/errors';
+import { badRequest, conflict, notFound, payloadTooLarge, tooMany } from '../common/errors';
 
 /** Принятая часть multipart: ETag отдаёт S3, клиент передаёт его серверу. */
 interface StoredPart {
@@ -45,6 +46,12 @@ type SessionRow = {
   parts: unknown;
   declaredSha256: string | null;
   direct: boolean;
+  replace: boolean;
+  clientMtime: Date | null;
+  expectedSha256: string | null;
+  expectedUpdatedAt: Date | null;
+  completedAt: Date | null;
+  result: unknown;
 };
 
 /** sha256 в нижнем регистре; всё, что не 64 hex-символа, — не хэш. */
@@ -99,6 +106,8 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
   private readonly STALE_MS = 6 * 60 * 60 * 1000;
   /** Как часто подчищаем брошенные сессии (раньше — только при старте сервиса). */
   private readonly SWEEP_MS = 15 * 60 * 1000;
+  /** Сколько держим завершённую сессию, чтобы отдать тот же ответ на ретрай complete. */
+  private readonly DONE_KEEP_MS = 60 * 60 * 1000;
   private timer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -124,10 +133,18 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
    * висеть (оплачиваемый мусор), а записи в БД копятся. Раньше это делалось только
    * при старте сервиса, то есть после закрытой вкладки мусор мог жить сутками.
    */
-  private async sweepStale(): Promise<void> {
+  private async sweepStale(userId?: string): Promise<void> {
     try {
       const stale = await this.prisma.uploadSession.findMany({
-        where: { updatedAt: { lt: new Date(Date.now() - this.STALE_MS) } },
+        where: {
+          ...(userId ? { userId } : {}),
+          // брошенные ИЛИ завершённые больше часа назад (завершённые храним, чтобы ретрай
+          // complete после потерянного ответа получил тот же ответ, а не 404)
+          OR: [
+            { updatedAt: { lt: new Date(Date.now() - this.STALE_MS) } },
+            { completedAt: { not: null, lt: new Date(Date.now() - this.DONE_KEEP_MS) } },
+          ],
+        },
       });
       for (const s of stale) {
         await this.s3.abortMultipartUpload(s.uploadKey, s.s3UploadId).catch(() => undefined);
@@ -137,7 +154,24 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       }
       if (stale.length) this.logger.log(`Очищено зависших upload-сессий: ${stale.length}`);
     } catch (e) {
-      this.logger.warn(`cleanup uploads: ${(e as Error).message}`);
+      this.logger.warn(`cleanup uploads: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Потолок одновременных сессий на пользователя: телефон с ретраями иначе наплодит
+   * незавершённых multipart'ов (каждый висит в S3 до очистки и держит запись в БД).
+   * Брошенные сессии сначала подчищаем — они не должны занимать лимит.
+   */
+  private async assertSessionQuota(userId: string): Promise<void> {
+    let active = await this.prisma.uploadSession.count({ where: { userId } });
+    if (active < MAX_UPLOAD_SESSIONS_PER_USER) return;
+    await this.sweepStale(userId);
+    active = await this.prisma.uploadSession.count({ where: { userId } });
+    if (active >= MAX_UPLOAD_SESSIONS_PER_USER) {
+      throw tooMany(
+        `слишком много незавершённых загрузок (${active}) — завершите или отмените их (лимит ${MAX_UPLOAD_SESSIONS_PER_USER})`,
+      );
     }
   }
 
@@ -156,6 +190,11 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     const row = await this.prisma.uploadSession.findUnique({ where: { id: uploadId } });
     if (!row || row.userId !== userId) throw notFound('upload not found');
     return row as SessionRow;
+  }
+
+  /** Загрузка уже завершена: части в неё доливать нельзя, но complete обязан быть повторяемым. */
+  private assertNotCompleted(row: SessionRow): void {
+    if (row.completedAt) throw conflict('upload already completed', 'upload_completed');
   }
 
   /** Сколько частей ожидается при прямой загрузке (последняя может быть короче). */
@@ -217,12 +256,41 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
   }
 
   async init(
-    body: { folderId?: string; name: string; size: number; mime: string; sha256?: string; mode?: string },
+    body: {
+      folderId?: string;
+      name: string;
+      size: number;
+      mime: string;
+      sha256?: string;
+      mode?: string;
+      replace?: unknown;
+      clientMtime?: unknown;
+      expectedSha256?: unknown;
+      expectedUpdatedAt?: unknown;
+    },
     userId: string,
   ) {
     const name = String(body.name ?? '');
     const size = Number(body.size);
     const mime = String(body.mime ?? 'application/octet-stream');
+    // перезапись существующего имени (зеркалирование): иначе каждый изменённый файл — 409
+    const replace = body.replace === true || body.replace === 'true';
+    const clientMtime = parseOptionalDate(body.clientMtime) ?? null;
+    // предполётное условие перезаписи: клиент называет версию, которую заменяет
+    const expect =
+      body.expectedSha256 === undefined && body.expectedUpdatedAt === undefined
+        ? undefined
+        : {
+            sha256: body.expectedSha256 === null ? null : normalizeSha(body.expectedSha256),
+            updatedAt: parseOptionalDate(body.expectedUpdatedAt) ?? null,
+          };
+    if (expect && expect.sha256 === undefined && expect.updatedAt == null) {
+      throw badRequest('invalid expectedSha256/expectedUpdatedAt');
+    }
+    if (expect && !replace) {
+      // без replace сервер создаёт новую запись, и условие «я заменяю версию X» теряет смысл
+      throw badRequest('expectedSha256/expectedUpdatedAt требуют replace: true');
+    }
     assertSafeName(name);
     if (!Number.isFinite(size) || size <= 0) throw badRequest('invalid size');
     if (size > MAX_FILE_BYTES) throw payloadTooLarge('file too large');
@@ -231,6 +299,8 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       throw badRequest('файл слишком велик для текущего размера части: увеличьте UPLOAD_DIRECT_PART_MB');
     }
     const folderId = await this.resolveFolder(body.folderId, userId);
+    // предусловие проверяем сразу: иначе клиент зальёт гигабайты, а на complete получит 409
+    if (expect) await this.files.assertExpectedVersion(folderId, name, expect);
     const declared = normalizeSha(body.sha256);
     const direct = body.mode !== 'relay' && this.s3.configured;
 
@@ -257,11 +327,16 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
             sha256: declared,
             assetId: asset.id,
             deduped: true,
+            replace,
+            clientMtime,
+            expect,
           });
           return { ...done, uploadId: null, direct: false, nextPart: 1 };
         }
       }
     }
+
+    await this.assertSessionQuota(userId);
 
     const tmpKey = `files/tmp/${randomToken(16)}`;
     const s3UploadId = await this.s3.createMultipartUpload(tmpKey);
@@ -277,6 +352,10 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
         parts: [] as unknown as Prisma.InputJsonValue,
         declaredSha256: declared ?? null,
         direct,
+        replace,
+        clientMtime,
+        expectedSha256: expect?.sha256 ?? null,
+        expectedUpdatedAt: expect?.updatedAt ?? null,
       },
     });
 
@@ -315,6 +394,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
   /** Presigned-ссылка на часть: клиент заливает по ней байты прямо в S3, минуя сервер. */
   async partUrl(uploadId: string, partNumber: number, userId: string) {
     const row = await this.requireSession(uploadId, userId);
+    this.assertNotCompleted(row);
     this.assertPartNumber(Number(row.size), partNumber);
     const url = await this.s3.presignedUploadPart(
       row.uploadKey,
@@ -338,6 +418,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     userId: string,
   ) {
     const row = await this.requireSession(uploadId, userId);
+    this.assertNotCompleted(row);
     this.assertPartNumber(Number(row.size), partNumber);
     const clean = normalizeEtag(etag);
     if (!clean) throw badRequest('etag required');
@@ -353,6 +434,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
   async putChunk(uploadId: string, partNumber: number, chunk: Buffer, userId: string) {
     if (chunk.length > CHUNK_MAX_BYTES) throw payloadTooLarge('chunk too large');
     const row = await this.requireSession(uploadId, userId);
+    this.assertNotCompleted(row);
 
     const live = this.live.get(uploadId);
     if (!live) {
@@ -375,6 +457,8 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
 
   async complete(uploadId: string, userId: string, body: { sha256?: unknown } = {}) {
     const row = await this.requireSession(uploadId, userId);
+    // повторный complete (ретрай после потерянного ответа) — отдаём тот же результат
+    if (row.completedAt && row.result) return row.result;
     const live = this.live.get(uploadId);
     const size = Number(row.size);
     const mime = row.mime;
@@ -452,9 +536,19 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       sha256,
       assetId,
       deduped,
+      replace: row.replace,
+      clientMtime: row.clientMtime,
+      expect:
+        row.expectedSha256 === null && row.expectedUpdatedAt === null
+          ? undefined
+          : { sha256: row.expectedSha256, updatedAt: row.expectedUpdatedAt },
     });
 
-    await this.prisma.uploadSession.delete({ where: { id: uploadId } });
+    // сессию не удаляем: сохраняем результат, чтобы ретрай complete был идемпотентным
+    await this.prisma.uploadSession.update({
+      where: { id: uploadId },
+      data: { completedAt: new Date(), result: done as unknown as Prisma.InputJsonValue },
+    });
     this.live.delete(uploadId);
     return done;
   }
@@ -478,23 +572,33 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     sha256: string;
     assetId: string;
     deduped: boolean;
+    replace?: boolean;
+    clientMtime?: Date | null;
+    expect?: { sha256?: string | null; updatedAt?: Date | null };
   }): Promise<{
     entry: { id: string };
     asset: { sha256: string; size: number; mime: string };
     deduped: boolean;
+    replaced: boolean;
     zone: string;
   }> {
     const folderId = params.folderId ?? (await this.auth.rootFolderId(params.userId));
-    let entry: { id: string; deduped: boolean; zone: string };
+    let entry: { id: string; deduped: boolean; zone: string; replaced: boolean };
     try {
-      entry = await this.files.createEntry(folderId, params.name, params.assetId);
+      entry = await this.files.createEntry(folderId, params.name, params.assetId, {
+        userId: params.userId,
+        replace: params.replace,
+        clientMtime: params.clientMtime ?? null,
+        expect: params.expect,
+        asset: { sha256: params.sha256, size: params.size, mime: params.mime },
+      });
     } catch (e) {
       // повторный complete (после сетевого ретрая) — запись уже создана, это успех
       const existing = await this.prisma.fileEntry.findFirst({
         where: { folderId, name: params.name, deletedAt: null },
       });
       if (existing && existing.assetId === params.assetId) {
-        entry = { id: existing.id, deduped: true, zone: existing.zone };
+        entry = { id: existing.id, deduped: true, zone: existing.zone, replaced: false };
       } else {
         throw e;
       }
@@ -522,6 +626,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       entry: { id: entry.id },
       asset: { sha256: params.sha256, size: params.size, mime: params.mime },
       deduped: params.deduped,
+      replaced: entry.replaced,
       zone: entry.zone,
     };
   }

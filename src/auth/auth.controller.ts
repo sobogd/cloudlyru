@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { AuthService } from './auth.service';
-import { CurrentUser, Public, RateLimit, RequestUser } from '../common/decorators';
+import { CurrentUser, Public, RateLimit, RequestUser, SessionOnly } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { env } from '../config/env';
 
@@ -44,7 +44,10 @@ export class AuthController {
   }
 
   // ===== App-password / device-токены =====
+  // Выпуск и отзыв токенов — только веб-сессия: устройство со своим токеном не должно
+  // выпускать себе новые (иначе отзыв украденного токена ничего не даёт).
 
+  @SessionOnly()
   @Post('tokens')
   createToken(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
     const label = typeof body.label === 'string' ? body.label : 'app';
@@ -56,6 +59,7 @@ export class AuthController {
     return this.auth.listTokens(user.id);
   }
 
+  @SessionOnly()
   @HttpCode(200)
   @Delete('tokens/:id')
   revokeToken(@Param('id') id: string, @CurrentUser() user: RequestUser) {

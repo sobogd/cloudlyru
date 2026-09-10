@@ -50,6 +50,11 @@ export const mkdir = (name: string, parentId?: string) =>
 export const renameFolder = (id: string, name: string) =>
   request<unknown>(`/folders/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
 export const deleteFolder = (id: string) => request<{ ok: boolean }>(`/folders/${id}`, { method: 'DELETE' });
+/** «Держать офлайн»: телефон обязан хранить содержимое и не вытеснять его ради места. */
+export const setFolderKeepOffline = (id: string, keepOffline: boolean) =>
+  request<unknown>(`/folders/${id}`, { method: 'PATCH', body: JSON.stringify({ keepOffline }) });
+export const setFileKeepOffline = (id: string, keepOffline: boolean) =>
+  request<unknown>(`/files/${id}`, { method: 'PATCH', body: JSON.stringify({ keepOffline }) });
 export const deleteFile = (id: string) => request<{ ok: boolean }>(`/files/${id}`, { method: 'DELETE' });
 /** Скачивание оригинала: сервис отдаёт его с Content-Disposition: attachment. */
 export const fileUrl = (id: string) => `${BASE}/files/${id}/content`;
@@ -71,12 +76,13 @@ export interface FileMedia {
 export interface FileMeta {
   id: string; name: string; createdAt: string; folderId: string; zone: string; path: string;
   size: number; mime: string; ext?: string; sha256: string; masterMime?: string | null;
+  keepOffline?: boolean;
   media?: FileMedia | null;
 }
 export const fileMeta = (id: string) => request<FileMeta>(`/files/${id}`);
 export interface FolderMeta {
   id: string; name: string; zone: string; path: string;
-  folders: number; entries: number; createdAt: string; updatedAt: string;
+  folders: number; entries: number; keepOffline?: boolean; createdAt: string; updatedAt: string;
 }
 export const folderMeta = (id: string) => request<FolderMeta>(`/folders/${id}/meta`);
 

@@ -3,16 +3,19 @@ import { Reflector } from '@nestjs/core';
 import { env } from '../../config/env';
 import { sha256Hex } from '../utils';
 import { PrismaService } from '../../prisma/prisma.service';
-import { IS_PUBLIC_KEY } from '../decorators';
-import { unauthorized } from '../errors';
+import { AuthService } from '../../auth/auth.service';
+import { IS_PUBLIC_KEY, READ_ONLY_ALLOWED_KEY, SESSION_ONLY_KEY } from '../decorators';
+import { forbidden, unauthorized } from '../errors';
 
 const COOKIE = env.COOKIE_NAME;
+const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
 
 @Injectable()
 export class AuthGuard implements CanActivate {
   constructor(
     private readonly reflector: Reflector,
     private readonly prisma: PrismaService,
+    private readonly auth: AuthService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -23,16 +26,47 @@ export class AuthGuard implements CanActivate {
     if (isPublic) return true;
 
     const req = context.switchToHttp().getRequest();
+    const sessionOnly = this.reflector.getAllAndOverride<boolean>(SESSION_ONLY_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
     const token: unknown = req.cookies?.[COOKIE];
-    if (typeof token !== 'string' || token.length === 0) throw unauthorized();
+    if (typeof token === 'string' && token.length > 0) {
+      const session = await this.prisma.session.findUnique({
+        where: { tokenHash: sha256Hex(token) },
+        include: { user: { select: { id: true, login: true } } },
+      });
+      if (!session || session.expiresAt.getTime() <= Date.now()) throw unauthorized();
 
-    const session = await this.prisma.session.findUnique({
-      where: { tokenHash: sha256Hex(token) },
-      include: { user: { select: { id: true, login: true } } },
-    });
-    if (!session || session.expiresAt.getTime() <= Date.now()) throw unauthorized();
+      req.user = { id: session.user.id, login: session.user.login };
+      return true;
+    }
 
-    req.user = { id: session.user.id, login: session.user.login };
-    return true;
+    // ApiToken в Bearer — тот же app-password, что и Basic в WebDAV: мобильному клиенту
+    // не нужны ни cookie-сессия, ни логин с паролем на телефоне. Токен со scope files:ro
+    // пускается только на чтение.
+    const header: unknown = req.headers['authorization'];
+    if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
+      if (sessionOnly) throw forbidden('this endpoint requires a web session, not an API token');
+      const resolved = await this.auth.resolveApiToken(header.slice(7).trim());
+      if (!resolved) throw unauthorized('invalid token');
+      const readOnlyAllowed = this.reflector.getAllAndOverride<boolean>(READ_ONLY_ALLOWED_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]);
+      const writes = !SAFE_METHODS.includes(String(req.method)) && !readOnlyAllowed;
+      if (writes && !resolved.scope.endsWith(':rw')) {
+        throw forbidden('token is read-only');
+      }
+      const user = await this.prisma.user.findUnique({
+        where: { id: resolved.userId },
+        select: { id: true, login: true },
+      });
+      if (!user) throw unauthorized('invalid token');
+      req.user = { id: user.id, login: user.login, scope: resolved.scope };
+      return true;
+    }
+
+    throw unauthorized();
   }
 }

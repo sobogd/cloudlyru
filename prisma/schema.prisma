@@ -62,6 +62,8 @@ model Folder {
   name      String
   // зона: FILES (обычный диск, медиа хранится как есть) | PHOTOS (поддерево системной папки «Фото», медиа конвертируется)
   zone      String      @default("FILES")
+  // «держать офлайн»: клиент обязан держать содержимое целиком и не вытеснять его ради места
+  keepOffline Boolean   @default(false)
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   deletedAt DateTime?
@@ -81,7 +83,13 @@ model FileEntry {
   name       String
   // зона папки на момент создания (FILES|PHOTOS) — для фильтра таймлайна и политики конвертации
   zone       String      @default("FILES")
+  // mtime файла на устройстве-источнике: без него синхронизация сравнивала бы даты,
+  // которые сервер не знает, и каждый скан считал бы скачанный файл «изменённым»
+  clientMtime DateTime?
+  // «держать офлайн» на отдельный файл: перекрывает вытеснение на клиенте
+  keepOffline Boolean     @default(false)
   createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
   deletedAt  DateTime?
   folder     Folder      @relation(fields: [folderId], references: [id], onDelete: Cascade)
   asset      Asset       @relation(fields: [assetId], references: [id], onDelete: Restrict)
@@ -125,6 +133,20 @@ model UploadSession {
   // нужен для дедупа до передачи байтов и как ожидаемое значение при верификации.
   declaredSha256 String?
   direct     Boolean  @default(false) // части льются клиентом прямо в S3 (без релея через сервер)
+  // Перезапись существующего файла с тем же именем: без неё зеркалирование на каждом
+  // изменённом файле получало бы 409, а «удали + создай» меняло бы id записи у всех устройств
+  replace    Boolean  @default(false)
+  // mtime файла на устройстве-источнике, чтобы он попал в FileEntry при создании записи
+  clientMtime DateTime?
+  // Предполётное условие перезаписи (оптимистичная блокировка): клиент говорит, какую
+  // версию файла он заменяет. Если на сервере уже другая — 409 со снимком текущей версии,
+  // и клиент сохраняет свою копию как конфликтную, а не затирает чужую правку.
+  expectedSha256    String?
+  expectedUpdatedAt DateTime?
+  // Сессия не удаляется сразу после complete: ретрай после потерянного ответа должен
+  // получить тот же результат, а не 404 (клиент на плохой сети иначе считает загрузку провалом)
+  completedAt DateTime?
+  result      Json?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -214,6 +236,33 @@ model AlbumItem {
   entry     FileEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
 
   @@unique([albumId, entryId])
+}
+
+// ===== Журнал изменений дерева для клиентов синхронизации (M3) =====
+// Append-only лента: клиент держит курсор по seq и применяет изменения по порядку.
+// Записи НЕ связаны внешними ключами с FileEntry/Folder — смысл журнала в том, что
+// tombstone переживает физическое удаление строки (trash purge), иначе клиент зальёт
+// удалённый файл заново. Поля — снимок состояния цели на момент события, поэтому клиенту
+// достаточно применить строку, а не восстанавливать состояние запросами.
+
+model ChangeLog {
+  seq         BigInt   @id @default(autoincrement())
+  userId      String
+  target      String // entry | folder
+  op          String // create | update | move | delete | restore | pin
+  targetId    String // id FileEntry или Folder (у tombstone — уже не существующий)
+  folderId    String? // родительская папка цели на момент события
+  name        String
+  zone        String?
+  sha256      String?
+  size        BigInt?
+  mime        String?
+  clientMtime DateTime?
+  keepOffline Boolean  @default(false)
+  at          DateTime @default(now())
+
+  @@index([userId, seq])
+  @@index([at])
 }
 
 // ===== M2.5: очередь конвертации (оригинал -> AVIF/AV1 + производные) =====

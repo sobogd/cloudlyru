@@ -1,7 +1,9 @@
-import { Controller, Delete, Get, Param, Req, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { FilesService } from './files.service';
 import { CurrentUser, RequestUser } from '../common/decorators';
+import { isPlainObject } from '../common/utils';
+import { badRequest } from '../common/errors';
 
 @Controller('files')
 export class FilesController {
@@ -10,6 +12,20 @@ export class FilesController {
   @Get(':id')
   meta(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     return this.files.getEntryMeta(id, user.id);
+  }
+
+  /**
+   * Правка записи клиентом синхронизации: переименование, перенос, «держать офлайн»,
+   * mtime с устройства. Перенос — отдельная операция, а не «удали + создай».
+   */
+  @Patch(':id')
+  patch(
+    @Param('id') id: string,
+    @Body() body: Record<string, unknown> = {},
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (!isPlainObject(body)) throw badRequest('invalid body');
+    return this.files.patch(id, user.id, body);
   }
 
   /**

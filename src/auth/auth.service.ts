@@ -9,6 +9,9 @@ import { badRequest, notFound, unauthorized } from '../common/errors';
 
 export const ROOT_FOLDER_NAME = '__root__';
 
+/** Потолок живых device-токенов на пользователя. */
+export const MAX_API_TOKENS_PER_USER = 32;
+
 @Injectable()
 export class AuthService implements OnModuleInit {
   private readonly logger = new Logger(AuthService.name);
@@ -95,6 +98,23 @@ export class AuthService implements OnModuleInit {
   async photoRootIdOrNull(userId: string): Promise<string | null> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { photoFolderId: true } });
     return user?.photoFolderId ?? null;
+  }
+
+  /**
+   * Владелец дерева, в котором лежит папка. Нужен там, где известна только папка, а журнал
+   * изменений требует userId (гостевая загрузка по share-ссылке, распаковка архивов).
+   * Один рекурсивный запрос вверх: раньше это был цикл с лимитом 64 уровня, из-за чего на
+   * глубоком дереве владелец не находился и событие журнала молча терялось.
+   */
+  async ownerOfFolder(folderId: string): Promise<string | null> {
+    const rows = await this.prisma.$queryRaw<Array<{ userId: string }>>`
+      WITH RECURSIVE up AS (
+        SELECT f.id, f."parentId" FROM "Folder" f WHERE f.id = ${folderId}
+        UNION ALL
+        SELECT f.id, f."parentId" FROM "Folder" f JOIN up ON f.id = up."parentId"
+      )
+      SELECT u.id AS "userId" FROM "User" u JOIN up ON u."rootFolderId" = up.id LIMIT 1`;
+    return rows[0]?.userId ?? null;
   }
 
   // ===== Принадлежность файлов пользователю =====
@@ -244,6 +264,12 @@ export class AuthService implements OnModuleInit {
 
   async createToken(userId: string, label: string): Promise<{ id: string; token: string; label: string }> {
     const clean = String(label ?? 'app').slice(0, 64) || 'app';
+    // кап на число живых токенов: без него выпуск токенов бесконечен, а отзыв одного
+    // ничего не значит (владелец не видит, сколько их всего)
+    const alive = await this.prisma.apiToken.count({ where: { userId, revokedAt: null } });
+    if (alive >= MAX_API_TOKENS_PER_USER) {
+      throw badRequest(`слишком много активных токенов (${alive}) — отзовите ненужные (лимит ${MAX_API_TOKENS_PER_USER})`);
+    }
     const token = randomToken(32);
     const t = await this.prisma.apiToken.create({
       data: {
@@ -254,6 +280,7 @@ export class AuthService implements OnModuleInit {
         expiresAt: new Date(Date.now() + env.API_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000),
       },
     });
+    await this.audit.log('auth.token.create', { label: clean, tokenId: t.id });
     // plain-токен показывается один раз
     return { id: t.id, token, label: t.label };
   }
@@ -273,6 +300,7 @@ export class AuthService implements OnModuleInit {
       data: { revokedAt: new Date() },
     });
     if (res.count === 0) throw badRequest('token not found');
+    await this.audit.log('auth.token.revoke', { tokenId });
     return { ok: true };
   }
 

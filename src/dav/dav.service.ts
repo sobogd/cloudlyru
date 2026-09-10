@@ -4,12 +4,13 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { createHash } from 'crypto';
-import { AuthService } from '../auth/auth.service';
+import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
 import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
+import { ChangesService } from '../sync/changes.service';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { notFound } from '../common/errors';
@@ -25,6 +26,7 @@ export class DavService {
     private readonly auth: AuthService,
     private readonly media: MediaService,
     private readonly queue: QueueService,
+    private readonly changes: ChangesService,
   ) {}
 
   /** Проверка Authorization: Basic login:apptoken → владелец и scope токена. */
@@ -152,9 +154,28 @@ export class DavService {
     }
     const dup = await this.prisma.folder.findFirst({ where: { parentId, name } });
     if (dup) throw new BadRequestException('already exists');
+    // имя системного корня зарезервировано: папка с ним считается корнем и становится
+    // неуправляемой (её нельзя переименовать, переместить или удалить)
+    if (name === ROOT_FOLDER_NAME) throw new BadRequestException('reserved name');
     const parent = await this.prisma.folder.findUnique({ where: { id: parentId }, select: { zone: true } });
-    await this.prisma.folder.create({
-      data: { parentId, name, zone: parent?.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES },
+    const zone = parent?.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    await this.prisma.$transaction(async (tx) => {
+      const created = await tx.folder.create({
+        data: { parentId, name, zone },
+        select: { id: true },
+      });
+      await this.changes.record(
+        {
+          userId,
+          target: 'folder',
+          op: 'create',
+          targetId: created.id,
+          folderId: parentId,
+          name,
+          zone,
+        },
+        tx,
+      );
     });
     return 201;
   }
@@ -201,7 +222,9 @@ export class DavService {
 
     const sha256 = hash.digest('hex');
     const finalKey = S3Service.assetKey(sha256);
-    const size = contentLength ?? 0;
+    // Content-Length есть не всегда (Transfer-Encoding: chunked у rclone и части клиентов):
+    // раньше писался размер 0, и это утекало в журнал синхронизации — клиент вечно перезаливал файл
+    const size = contentLength ?? (await this.s3.objectSize(tmpKey).catch(() => 0));
 
     const existing = await this.prisma.asset.findUnique({ where: { sha256 } });
     let assetId: string;
@@ -218,23 +241,24 @@ export class DavService {
     // EXIF + очередь конвертации — только для медиа-зоны («Фото»); в «Файлы» — как есть
     if (zone === ZONE_PHOTOS) {
       try {
-        await this.media.captureMeta(assetId, sha256, Number(contentLength ?? 0), mime);
+        await this.media.captureMeta(assetId, sha256, size, mime);
       } catch { /* ignore */ }
       await this.queue.enqueue(assetId, sha256, mime);
     }
 
-    // перезапись существующего файла с тем же именем — обновляем entry на новый asset
-    const dup = await this.prisma.fileEntry.findFirst({ where: { folderId: parentId, name } });
-    if (dup) {
-      if (dup.deletedAt) {
-        await this.prisma.fileEntry.update({ where: { id: dup.id }, data: { deletedAt: null, assetId, zone } });
-      } else {
-        await this.prisma.fileEntry.update({ where: { id: dup.id }, data: { assetId, zone } });
-      }
-      return 204;
-    }
-    await this.prisma.fileEntry.create({ data: { folderId: parentId, name, assetId, zone } });
-    return 201;
+    // перезапись существующего файла с тем же именем — обновляем entry на новый asset.
+    // Через FilesService.createEntry(replace): id записи сохраняется, а в журнал изменений
+    // уходит update (а не «удали + создай»), иначе клиенты синхронизации перекачивали бы файл.
+    const existed = await this.prisma.fileEntry.findFirst({ where: { folderId: parentId, name } });
+    await this.files.createEntry(parentId, name, assetId, {
+      userId,
+      replace: true,
+      // Finder/rclone перезаписывают файл, не зная про корзину: возврат из неё для них —
+      // ожидаемое поведение (раньше так и было). Клиент синхронизации такого флага не шлёт.
+      restoreDeleted: true,
+      asset: { sha256, size, mime },
+    });
+    return existed ? 204 : 201;
   }
 
   /**
@@ -272,7 +296,10 @@ export class DavService {
     if (parts.length === 0) throw new BadRequestException('cannot delete root');
     const entry = await this.entryByPath(userId, parts);
     if (entry) {
-      await this.prisma.fileEntry.update({ where: { id: entry.id }, data: { deletedAt: new Date() } });
+      await this.prisma.$transaction(async (tx) => {
+        await tx.fileEntry.update({ where: { id: entry.id }, data: { deletedAt: new Date() } });
+        await this.changes.recordEntry(userId, entry.id, 'delete', tx);
+      });
       return 204;
     }
     const parentId = await this.folderByPath(userId, parts.slice(0, -1));
@@ -286,15 +313,22 @@ export class DavService {
     if (photoId && folder.id === photoId) throw new BadRequestException('cannot delete photo library root');
     // мягкое удаление поддерева
     const ids: string[] = [folder.id];
+    const seen = new Set<string>([folder.id]);
     let frontier = [folder.id];
     while (frontier.length) {
       const children = await this.prisma.folder.findMany({ where: { parentId: { in: frontier } }, select: { id: true } });
-      const next = children.map((c) => c.id);
+      // seen — защита от вечного цикла, если дерево уже успели испортить конкурентные перемещения
+      const next = children.map((c) => c.id).filter((cid) => !seen.has(cid));
       if (!next.length) break;
+      for (const cid of next) seen.add(cid);
       ids.push(...next);
       frontier = next;
     }
-    await this.prisma.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
+    await this.prisma.$transaction(async (tx) => {
+      await tx.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
+      // одно событие на корень поддерева: «папка удалена» ⇒ всего её содержимого нет
+      await this.changes.recordFolderTreeDeleted(userId, folder.id, tx);
+    });
     return 204;
   }
 
@@ -313,7 +347,10 @@ export class DavService {
     if (entry) {
       const dup = await this.prisma.fileEntry.findFirst({ where: { folderId: entry.folderId, name: newName, id: { not: entry.id } } });
       if (dup) throw new BadRequestException('already exists');
-      await this.prisma.fileEntry.update({ where: { id: entry.id }, data: { name: newName } });
+      await this.prisma.$transaction(async (tx) => {
+        await tx.fileEntry.update({ where: { id: entry.id }, data: { name: newName } });
+        await this.changes.recordEntry(userId, entry.id, 'update', tx);
+      });
       return 204;
     }
     const parentId = await this.folderByPath(userId, srcParts.slice(0, -1));
@@ -326,7 +363,11 @@ export class DavService {
     if (photoId && folder.id === photoId) throw new BadRequestException('cannot rename photo library root');
     const dup = await this.prisma.folder.findFirst({ where: { parentId: folder.parentId ?? undefined, name: newName, id: { not: folder.id } } });
     if (dup) throw new BadRequestException('already exists');
-    await this.prisma.folder.update({ where: { id: folder.id }, data: { name: newName } });
+    if (newName === ROOT_FOLDER_NAME) throw new BadRequestException('reserved name');
+    await this.prisma.$transaction(async (tx) => {
+      await tx.folder.update({ where: { id: folder.id }, data: { name: newName } });
+      await this.changes.recordFolder(userId, folder.id, 'update', tx);
+    });
     return 204;
   }
 

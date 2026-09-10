@@ -5,6 +5,7 @@ import { S3Service } from '../s3/s3.service';
 import { FilesService } from '../files/files.service';
 import { QueueService } from '../queue/queue.service';
 import { AuthService } from '../auth/auth.service';
+import { ChangesService } from '../sync/changes.service';
 import { RemoteZip, ZipEntryInfo, hashStream } from './s3-zip';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
@@ -61,6 +62,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     private readonly files: FilesService,
     private readonly queue: QueueService,
     private readonly auth: AuthService,
+    private readonly changes: ChangesService,
   ) {}
 
   async onModuleInit() {
@@ -253,12 +255,30 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Папка-приёмник: рядом с архивом, имя = имя архива без .zip. */
-  private async ensureTargetFolder(parentId: string, baseName: string): Promise<string> {
+  private async ensureTargetFolder(parentId: string, baseName: string, ownerId: string | null): Promise<string> {
     const existing = await this.prisma.folder.findFirst({ where: { parentId, name: baseName, deletedAt: null } });
     if (existing) return existing.id;
     const parent = await this.prisma.folder.findUniqueOrThrow({ where: { id: parentId }, select: { zone: true } });
     const zone = parent.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
-    const created = await this.prisma.folder.create({ data: { parentId, name: baseName, zone } });
+    const created = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.folder.create({ data: { parentId, name: baseName, zone } });
+      if (ownerId) {
+        await this.changes.record(
+          {
+            userId: ownerId,
+            target: 'folder',
+            op: 'create',
+            targetId: row.id,
+            folderId: parentId,
+            name: baseName,
+            zone,
+            keepOffline: false,
+          },
+          tx,
+        );
+      }
+      return row;
+    });
     return created.id;
   }
 
@@ -279,13 +299,17 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     files.sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
 
     const baseName = entry.name.replace(/\.zip$/i, '') || 'archive';
-    const targetId = await this.ensureTargetFolder(entry.folderId, baseName);
+    // владелец дерева нужен для журнала изменений (клиенты синхронизации должны увидеть распаковку)
+    const ownerId = await this.auth.ownerOfFolder(job.folderId);
+    const targetId = await this.ensureTargetFolder(entry.folderId, baseName, ownerId);
     await this.progress(jobId, { totalEntries: files.length, totalBytes: BigInt(totalBytes), currentName: null }, true);
     await this.prisma.unzipJob.update({ where: { id: jobId }, data: { targetFolderId: targetId } });
     this.logger.log(`распаковка «${entry.name}»: ${files.length} файлов, ${(totalBytes / 1e9).toFixed(2)} ГБ → папка «${baseName}»`);
 
     const folderCache = new Map<string, string>(); // "a/b/c" → folderId
     folderCache.set('', targetId);
+    /** Папки, по которым событие уже записано: за один проход в одну папку заходим многократно. */
+    const journaledFolders = new Set<string>();
 
     const folderIdFor = async (segments: string[]): Promise<string> => {
       const key = segments.join('/');
@@ -295,11 +319,31 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       const name = segments[segments.length - 1];
       const parentZone = await this.prisma.folder.findUniqueOrThrow({ where: { id: parentId }, select: { zone: true } });
       const zone = parentZone.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
-      let folder = await this.prisma.folder.findFirst({ where: { parentId, name } });
-      if (folder?.deletedAt) {
-        folder = await this.prisma.folder.update({ where: { id: folder.id }, data: { deletedAt: null, zone } });
-      } else if (!folder) {
+      const found = await this.prisma.folder.findFirst({ where: { parentId, name } });
+      let folder = found;
+      let op: 'create' | 'restore' | null = null;
+      if (found?.deletedAt) {
+        folder = await this.prisma.folder.update({ where: { id: found.id }, data: { deletedAt: null, zone } });
+        op = 'restore';
+      } else if (!found) {
         folder = await this.prisma.folder.create({ data: { parentId, name, zone } });
+        op = 'create';
+      }
+      if (!folder) throw notFound(`folder ${name} not found after create`);
+      // одно событие на папку за проход; ошибку журнала не глотаем — распаковка идемпотентна
+      // (чекпойнт + проверка уже распакованных записей), повторный заход безопасен
+      if (op && ownerId && !journaledFolders.has(folder.id)) {
+        journaledFolders.add(folder.id);
+        await this.changes.record({
+          userId: ownerId,
+          target: 'folder',
+          op,
+          targetId: folder.id,
+          folderId: parentId,
+          name,
+          zone: folder.zone,
+          keepOffline: folder.keepOffline,
+        });
       }
       folderCache.set(key, folder.id);
       return folder.id;
@@ -389,13 +433,14 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
 
       const assetId = (await this.prisma.asset.findUniqueOrThrow({ where: { sha256 } })).id;
 
-      if (existing) {
-        // имя занято другим содержимым — не затираем, добавляем суффикс
-        const unique = await this.uniqueName(folderId, fileName);
-        await this.prisma.fileEntry.create({ data: { folderId, name: unique, assetId, zone: entry.zone } });
-      } else {
-        await this.prisma.fileEntry.create({ data: { folderId, name: fileName, assetId, zone: entry.zone } });
-      }
+      // имя занято другим содержимым — не затираем, добавляем суффикс
+      const createdName = existing ? await this.uniqueName(folderId, fileName) : fileName;
+      // через FilesService.createEntry: зона берётся у папки-приёмника, запись в дереве и
+      // событие журнала идут одной транзакцией (раньше здесь была своя копия этой логики)
+      await this.files.createEntry(folderId, createdName, assetId, {
+        userId: ownerId ?? undefined,
+        asset: { sha256, size: realSize, mime },
+      });
 
       // Медиа-зона: запоминаем для очереди конвертации. Ставим её ПОСЛЕ распаковки —
       // вызов здесь блокировал бы разбор архива, а EXIF воркер возьмёт из локального файла.

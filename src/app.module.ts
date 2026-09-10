@@ -15,6 +15,7 @@ import { MediaModule } from './media/media.module';
 import { QueueModule } from './queue/queue.module';
 import { HealthModule } from './health/health.module';
 import { UnzipModule } from './unzip/unzip.module';
+import { SyncModule } from './sync/sync.module';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { UnzipModule } from './unzip/unzip.module';
     QueueModule,
     HealthModule,
     UnzipModule,
+    SyncModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },

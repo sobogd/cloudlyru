@@ -1,9 +1,11 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { MediaService } from '../media/media.service';
 import { assertSafeName } from '../common/utils';
 import { QueueService } from '../queue/queue.service';
+import { ChangesService } from '../sync/changes.service';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
 
@@ -16,6 +18,7 @@ export class FoldersService {
     private readonly auth: AuthService,
     private readonly media: MediaService,
     private readonly queue: QueueService,
+    private readonly changes: ChangesService,
   ) {}
 
   /** Системную папку «Фото» нельзя переименовать/переместить/удалить. */
@@ -89,6 +92,7 @@ export class FoldersService {
       path: await this.folderPath(folder),
       folders: folderCount,
       entries: entryCount,
+      keepOffline: folder.keepOffline,
       createdAt: folder.createdAt,
       updatedAt: folder.updatedAt,
     };
@@ -113,27 +117,207 @@ export class FoldersService {
 
   async create(parentId: string | undefined, name: string, userId: string) {
     assertSafeName(name);
+    this.assertNotReservedName(name);
     const parent = await this.resolveAccessible(parentId, userId);
     await this.assertNameFree(parent.id, name);
     // новые папки наследуют зону родителя: внутри «Фото» — медиа-зона, в остальном дереве — файлы
     const zone = parent.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
-    return this.prisma.folder.create({
-      data: { parentId: parent.id, name, zone },
-      select: { id: true, name: true, parentId: true, createdAt: true },
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const created = await tx.folder.create({
+          data: { parentId: parent.id, name, zone },
+          select: { id: true, name: true, parentId: true, createdAt: true },
+        });
+        await this.changes.record(
+          {
+            userId,
+            target: 'folder',
+            op: 'create',
+            targetId: created.id,
+            folderId: parent.id,
+            name,
+            zone,
+          },
+          tx,
+        );
+        return created;
+      });
+    } catch (e) {
+      throw this.asNameConflict(e, 'folder');
+    }
+  }
+
+  /**
+   * Имя системного корня зарезервировано: папка с таким именем считается корнем
+   * (`isRoot`), её нельзя ни переименовать, ни переместить, ни удалить через API.
+   */
+  private assertNotReservedName(name: string): void {
+    if (name === ROOT_FOLDER_NAME) throw badRequest(`${ROOT_FOLDER_NAME} is a reserved name`);
+  }
+
+  /** Гонка на @@unique([parentId, name]) должна давать 409, а не 500 от Prisma. */
+  private asNameConflict(e: unknown, kind: 'folder' | 'file'): Error {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      return conflict(`${kind} name already exists (created concurrently)`);
+    }
+    return e as Error;
+  }
+
+  /**
+   * Идемпотентный mkdir по пути: `Files/2025/07` от указанного родителя (по умолчанию — корень).
+   * Нужен клиенту синхронизации, чтобы не строить дерево руками и не ловить 409 на каждом уровне.
+   */
+  async ensurePath(userId: string, path: string, parentId?: string) {
+    const raw = String(path);
+    if (raw.length > 1024) throw badRequest('path too long (max 1024)');
+    const segments = raw
+      .split('/')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (!segments.length) throw badRequest('empty path');
+    // без потолка глубины один запрос создаёт тысячи папок (и столько же строк журнала),
+    // а папки глубже 128 уровней всё равно недоступны: обход владельца упирается в лимит
+    const MAX_PATH_SEGMENTS = 32;
+    if (segments.length > MAX_PATH_SEGMENTS) {
+      throw badRequest(`too many path segments (max ${MAX_PATH_SEGMENTS})`);
+    }
+    for (const s of segments) {
+      try {
+        assertSafeName(s);
+      } catch {
+        throw badRequest(`invalid path segment: ${s}`);
+      }
+    }
+    // запросы с других клиентов могут прислать системный корень первым сегментом — он не создаётся
+    const wanted = segments.filter((s) => s !== ROOT_FOLDER_NAME);
+
+    let current = await this.resolveAccessible(parentId, userId);
+    let createdCount = 0;
+    for (const name of wanted) {
+      const existing = await this.prisma.folder.findFirst({ where: { parentId: current.id, name } });
+      if (existing) {
+        if (existing.deletedAt) {
+          throw conflict(`folder ${name} is in trash — restore or purge it first`);
+        }
+        current = existing;
+        continue;
+      }
+      const zone = current.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+      try {
+        const created = await this.prisma.$transaction(async (tx) => {
+          const row = await tx.folder.create({ data: { parentId: current.id, name, zone } });
+          await this.changes.record(
+            {
+              userId,
+              target: 'folder',
+              op: 'create',
+              targetId: row.id,
+              folderId: current.id,
+              name,
+              zone,
+            },
+            tx,
+          );
+          return row;
+        });
+        current = created;
+        createdCount += 1;
+      } catch (e) {
+        // параллельный ensure-path того же пути: папку создал кто-то другой — просто идём в неё
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+          const raced = await this.prisma.folder.findFirst({ where: { parentId: current.id, name } });
+          if (raced && !raced.deletedAt) {
+            current = raced;
+            continue;
+          }
+        }
+        throw this.asNameConflict(e, 'folder');
+      }
+    }
+    return { id: current.id, name: current.name, parentId: current.parentId, zone: current.zone, created: createdCount };
+  }
+
+  /** Флаг «держать офлайн»: клиент обязан держать содержимое папки целиком и не вытеснять его. */
+  async setKeepOffline(id: string, keepOffline: boolean, userId: string) {
+    const folder = await this.resolveAccessible(id, userId);
+    if (folder.keepOffline !== keepOffline) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.folder.update({ where: { id: folder.id }, data: { keepOffline } });
+        await this.changes.record(
+          {
+            userId,
+            target: 'folder',
+            op: 'pin',
+            targetId: folder.id,
+            folderId: folder.parentId,
+            name: folder.name,
+            zone: folder.zone,
+            keepOffline,
+          },
+          tx,
+        );
+      });
+    }
+    return { ok: true, id: folder.id, keepOffline };
+  }
+
+  /**
+   * Правка папки одним запросом (клиент синхронизации): имя, переезд, «держать офлайн».
+   * Порядок важен: сначала переименование и переезд, потом флаг — каждое действие
+   * пишет своё событие, клиент применяет их по порядку seq.
+   */
+  async patch(
+    id: string,
+    body: { name?: string; parentId?: string; keepOffline?: boolean },
+    userId: string,
+  ) {
+    let renamed: { id: string; name: string } | null = null;
+    let moved: { id: string; parentId: string | null; zone: string } | null = null;
+    if (body.name !== undefined) renamed = await this.rename(id, body.name, userId);
+    if (body.parentId !== undefined) {
+      const res = await this.move(id, body.parentId, userId);
+      moved = { id: res.id, parentId: res.parentId, zone: res.zone };
+    }
+    if (body.keepOffline !== undefined) await this.setKeepOffline(id, body.keepOffline, userId);
+    const folder = await this.prisma.folder.findUnique({
+      where: { id },
+      select: { id: true, name: true, parentId: true, zone: true, keepOffline: true },
     });
+    return { ok: true, renamed, moved, folder };
   }
 
   async rename(id: string, name: string, userId: string) {
     assertSafeName(name);
+    this.assertNotReservedName(name);
     const folder = await this.resolveAccessible(id, userId);
     await this.assertNotPhotoRoot(folder, userId, 'rename');
     if (isRoot(folder)) throw badRequest('cannot rename root');
     await this.assertNameFree(folder.parentId!, name, id);
-    return this.prisma.folder.update({
-      where: { id },
-      data: { name },
-      select: { id: true, name: true },
-    });
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const renamed = await tx.folder.update({
+          where: { id },
+          data: { name },
+          select: { id: true, name: true },
+        });
+        await this.changes.record(
+          {
+            userId,
+            target: 'folder',
+            op: 'update',
+            targetId: id,
+            folderId: folder.parentId,
+            name,
+            zone: folder.zone,
+            keepOffline: folder.keepOffline,
+          },
+          tx,
+        );
+        return renamed;
+      });
+    } catch (e) {
+      throw this.asNameConflict(e, 'folder');
+    }
   }
 
   async move(id: string, newParentId: string, userId: string) {
@@ -146,17 +330,33 @@ export class FoldersService {
     await this.assertNameFree(target.id, folder.name, id);
 
     const newZone = target.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
-    const moved = await this.prisma.folder.update({
-      where: { id },
-      data: { parentId: target.id },
-      select: { id: true, parentId: true, zone: true },
+    const moved = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.folder.update({
+        where: { id },
+        data: { parentId: target.id },
+        select: { id: true, parentId: true, zone: true },
+      });
+      // папка переехала между зонами — пересчитываем зону всего поддерева (папки + файлы)
+      if (folder.zone !== newZone) {
+        await tx.folder.updateMany({ where: { id: { in: subtree } }, data: { zone: newZone } });
+        await tx.fileEntry.updateMany({ where: { folderId: { in: subtree } }, data: { zone: newZone } });
+      }
+      await this.changes.record(
+        {
+          userId,
+          target: 'folder',
+          op: 'move',
+          targetId: id,
+          folderId: target.id,
+          name: folder.name,
+          zone: newZone,
+          keepOffline: folder.keepOffline,
+        },
+        tx,
+      );
+      return row;
     });
-    // папка переехала между зонами — пересчитываем зону всего поддерева (папки + файлы)
-    if (folder.zone !== newZone) {
-      await this.prisma.folder.updateMany({ where: { id: { in: subtree } }, data: { zone: newZone } });
-      await this.prisma.fileEntry.updateMany({ where: { folderId: { in: subtree } }, data: { zone: newZone } });
-      if (newZone === ZONE_PHOTOS) void this.reprocessAsMedia(subtree);
-    }
+    if (folder.zone !== newZone && newZone === ZONE_PHOTOS) void this.reprocessAsMedia(subtree);
     return { id: moved.id, parentId: moved.parentId, zone: newZone };
   }
 
@@ -166,16 +366,79 @@ export class FoldersService {
     await this.assertNotPhotoRoot(folder, userId, 'delete');
     if (isRoot(folder)) throw badRequest('cannot delete root');
     const ids = await this.collectSubtreeIds(id);
-    await this.prisma.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
+    await this.prisma.$transaction(async (tx) => {
+      await tx.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
+      // одно событие на корень поддерева: «папка удалена» означает «всего её содержимого нет»
+      await this.changes.recordFolderTreeDeleted(userId, id, tx);
+    });
     await this.cancelAssetsIn(ids);
     return { ok: true, affected: ids.length };
   }
 
-  /** Восстановление папки: само поддерево, но не выше (родитель уже мог быть удалён). */
+  /**
+   * Восстановление папки: само поддерево, но не выше (родитель уже мог быть удалён).
+   * Удаление журналируется одним событием на поддерево («папки нет» ⇒ содержимого нет),
+   * поэтому на восстановлении наоборот нужны события по детям: иначе клиент знает только
+   * про саму папку и не может восстановить её содержимое.
+   */
   async restore(id: string, userId: string) {
     await this.resolveAccessibleOrDeleted(id, userId);
     const ids = await this.collectSubtreeIds(id);
-    await this.prisma.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: null } });
+    const folders = await this.prisma.folder.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, parentId: true, name: true, zone: true, keepOffline: true },
+    });
+    const entries = await this.prisma.fileEntry.findMany({
+      where: { folderId: { in: ids }, deletedAt: null },
+      select: {
+        id: true,
+        folderId: true,
+        name: true,
+        zone: true,
+        clientMtime: true,
+        keepOffline: true,
+        asset: { select: { sha256: true, size: true, mime: true } },
+      },
+    });
+    await this.prisma.$transaction(async (tx) => {
+      await tx.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: null } });
+      for (const f of folders) {
+        await this.changes.record(
+          {
+            userId,
+            target: 'folder',
+            // и корень, и дети — именно restore: клиент отличает «вернулось из корзины»
+            // от «создано заново», хотя применяет снимок одинаково
+            op: 'restore',
+            targetId: f.id,
+            folderId: f.parentId,
+            name: f.name,
+            zone: f.zone,
+            keepOffline: f.keepOffline,
+          },
+          tx,
+        );
+      }
+      if (entries.length) {
+        // пачкой: восстановление папки с тысячами файлов не должно превращаться в тысячи INSERT'ов
+        await tx.changeLog.createMany({
+          data: entries.map((e) => ({
+            userId,
+            target: 'entry',
+            op: 'restore',
+            targetId: e.id,
+            folderId: e.folderId,
+            name: e.name,
+            zone: e.zone,
+            sha256: e.asset.sha256,
+            size: e.asset.size,
+            mime: e.asset.mime,
+            clientMtime: e.clientMtime,
+            keepOffline: e.keepOffline,
+          })),
+        });
+      }
+    });
     await this.requeueAssetsIn(ids);
     return { ok: true, affected: ids.length };
   }
@@ -240,14 +503,18 @@ export class FoldersService {
   /** BFS всех id поддерева, включая саму папку. */
   async collectSubtreeIds(rootId: string): Promise<string[]> {
     const all: string[] = [rootId];
+    // seen защищает от вечного цикла: два конкурентных перемещения могли сделать папку
+    // своим же предком, и тогда BFS без отметок рос бы бесконечно (OOM процесса)
+    const seen = new Set<string>([rootId]);
     let frontier = [rootId];
     while (frontier.length) {
       const children = await this.prisma.folder.findMany({
         where: { parentId: { in: frontier } },
         select: { id: true },
       });
-      const ids = children.map((c) => c.id);
+      const ids = children.map((c) => c.id).filter((cid) => !seen.has(cid));
       if (!ids.length) break;
+      for (const cid of ids) seen.add(cid);
       all.push(...ids);
       frontier = ids;
     }

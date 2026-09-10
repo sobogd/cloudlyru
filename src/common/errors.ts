@@ -1,8 +1,8 @@
 import { HttpException, HttpStatus } from '@nestjs/common';
 
 export class ApiError extends HttpException {
-  constructor(status: HttpStatus, message: string, code?: string) {
-    super({ statusCode: status, message, code: code ?? 'error' }, status);
+  constructor(status: HttpStatus, message: string, code?: string, extra?: Record<string, unknown>) {
+    super({ statusCode: status, message, code: code ?? 'error', ...(extra ?? {}) }, status);
   }
 }
 
@@ -10,7 +10,8 @@ export const badRequest = (msg: string, code = 'bad_request') => new ApiError(Ht
 export const unauthorized = (msg = 'unauthorized', code = 'unauthorized') => new ApiError(HttpStatus.UNAUTHORIZED, msg, code);
 export const forbidden = (msg = 'forbidden', code = 'forbidden') => new ApiError(HttpStatus.FORBIDDEN, msg, code);
 export const notFound = (msg = 'not found', code = 'not_found') => new ApiError(HttpStatus.NOT_FOUND, msg, code);
-export const conflict = (msg: string, code = 'conflict') => new ApiError(HttpStatus.CONFLICT, msg, code);
+export const conflict = (msg: string, code = 'conflict', extra?: Record<string, unknown>) =>
+  new ApiError(HttpStatus.CONFLICT, msg, code, extra);
 export const tooMany = (msg = 'too many requests', code = 'rate_limited') =>
   new ApiError(HttpStatus.TOO_MANY_REQUESTS, msg, code);
 export const payloadTooLarge = (msg = 'payload too large', code = 'payload_too_large') =>
