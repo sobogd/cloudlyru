@@ -67,11 +67,28 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
             Text("  ${job.targetPath}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         }
         Spacer(Modifier.height(8.dp))
+        val summary = remember(job.id, version) { runBlocking(Dispatchers.IO) { app.db.opSummary(job.id) } }
+        val progress = remember(job.id, version) { app.db.kv("job_progress:${job.id}").orEmpty() }
+        if (progress.isNotEmpty()) Text(progress, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         Text(
-            "всего ${all.size} · вытеснено $evicted · закреплено $pinned · не выгружено $pending",
+            "всего ${all.size} · не выгружено $pending · в очереди ${summary.ready}" +
+                if (summary.waiting > 0) " · ждут повтора ${summary.waiting}" else "",
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (summary.waiting > 0) {
+            val wait = (summary.soonestAt - System.currentTimeMillis()).coerceAtLeast(0)
+            Text(
+                "ближайшая попытка через ${minutes(wait)} — или нажмите «Повторить сейчас»",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        OutlinedButton(onClick = {
+            app.db.resetOps(job.id)
+            SyncService.start(app)
+            version += 1
+        }) { Text("Повторить всё сейчас", fontSize = 12.sp) }
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf(
@@ -109,6 +126,24 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
                             fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        // состояние операции: без него «ждёт выгрузки» выглядит как «ничего не происходит»
+                        val op = remember(item.relPath, version) {
+                            runBlocking(Dispatchers.IO) { app.db.opFor(job.id, item.relPath) }
+                        }
+                        if (op != null) {
+                            val waitingMs = (op.nextAttemptAt - System.currentTimeMillis()).coerceAtLeast(0)
+                            Text(
+                                buildString {
+                                    append(opKindLabel(op.kind))
+                                    if (op.attempts > 0) append(" · попыток ${op.attempts}")
+                                    if (op.lastError != null) append(" · ${op.lastError}")
+                                    if (waitingMs > 0) append(" · следующая через ${minutes(waitingMs)}")
+                                },
+                                fontSize = 11.sp,
+                                color = if (op.lastError != null) MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                         Spacer(Modifier.height(6.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (item.state == Db.STATE_EVICTED) {
@@ -117,6 +152,14 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
                                     SyncService.start(app)
                                     version += 1
                                 }) { Text("Вернуть на телефон", fontSize = 12.sp) }
+                            }
+                            if (op != null) {
+                                OutlinedButton(onClick = {
+                                    // снять паузу и попробовать прямо сейчас
+                                    app.db.resetOp(job.id, item.relPath)
+                                    SyncService.start(app)
+                                    version += 1
+                                }) { Text("Повторить сейчас", fontSize = 12.sp) }
                             }
                             if (!item.remoteEntryId.isNullOrBlank()) {
                                 OutlinedButton(onClick = {
@@ -144,6 +187,22 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+private fun opKindLabel(kind: String): String = when (kind) {
+    Db.OP_UPLOAD -> "выгрузка"
+    Db.OP_DOWNLOAD -> "скачивание"
+    Db.OP_DELETE -> "удаление"
+    else -> kind
+}
+
+private fun minutes(ms: Long): String {
+    val totalMinutes = ms / 60_000
+    return when {
+        totalMinutes < 1 -> "минуту"
+        totalMinutes < 60 -> "$totalMinutes мин"
+        else -> "${totalMinutes / 60} ч ${totalMinutes % 60} мин"
     }
 }
 

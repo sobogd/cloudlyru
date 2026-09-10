@@ -379,7 +379,10 @@ private fun JobCard(
                 runBlocking(Dispatchers.IO) { app.db.stateCounts(job.id) }
             }
             val note = remember(job.id, tick) { app.db.kv("job_note:${job.id}").orEmpty() }
+            val progress = remember(job.id, tick) { app.db.kv("job_progress:${job.id}").orEmpty() }
+            val lastAt = remember(job.id, tick) { (app.db.kv("job_at:${job.id}") ?: "0").toLongOrNull() ?: 0L }
             val stat = remember(job.id, tick) { app.db.kv("job_stat:${job.id}").orEmpty() }
+            val queue = remember(job.id, tick) { runBlocking(Dispatchers.IO) { app.db.opSummary(job.id) } }
             Text(
                 "файлов: ${counts.values.sum()}  ·  выгружено ${counts["synced"] ?: 0}  ·  " +
                     "вытеснено ${counts["evicted"] ?: 0}  ·  новых ${counts["new"] ?: 0}",
@@ -391,8 +394,27 @@ private fun JobCard(
                 else "хранение: ${job.keepDays} дн.",
                 fontSize = 12.sp,
             )
+            if (progress.isNotEmpty()) {
+                Text(progress, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+            if (lastAt > 0) {
+                val mins = (System.currentTimeMillis() - lastAt) / 60_000
+                Text(
+                    if (mins < 1) "проход был только что" else "проход был $mins мин назад",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (stat.isNotEmpty()) {
                 Text("проход: $stat", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (queue.ready + queue.waiting > 0) {
+                Text(
+                    "в очереди ${queue.ready}" + if (queue.waiting > 0) ", ждут повтора ${queue.waiting}" else "",
+                    fontSize = 11.sp,
+                    color = if (queue.waiting > 0) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (note.isNotEmpty()) {
                 Text(note, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
@@ -418,6 +440,13 @@ private fun JobCard(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = onOpenFiles) { Text("Файлы") }
+                if (queue.waiting > 0) {
+                    OutlinedButton(onClick = {
+                        app.db.resetOps(job.id)
+                        SyncService.start(app)
+                        onChange()
+                    }) { Text("Повторить", fontSize = 12.sp) }
+                }
                 OutlinedButton(onClick = {
                     val next = !pinned
                     scope.launch {

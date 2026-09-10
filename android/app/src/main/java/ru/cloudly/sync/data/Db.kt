@@ -123,6 +123,61 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
         if (c.moveToFirst()) c.getInt(0) else 0
     }
 
+    /** Сводка очереди: сколько готово к работе, сколько ждёт повтора и когда ближайший. */
+    fun opSummary(jobId: Long? = null): OpSummary {
+        val where = if (jobId != null) "WHERE job_id = ?" else ""
+        val args = if (jobId != null) arrayOf(jobId.toString()) else null
+        val now = System.currentTimeMillis()
+        var ready = 0
+        var waiting = 0
+        var soonest = 0L
+        readableDatabase.rawQuery(
+            "SELECT next_attempt_at, COUNT(*) FROM ops $where GROUP BY next_attempt_at",
+            args,
+        ).use { c ->
+            while (c.moveToNext()) {
+                val at = c.getLong(0)
+                val count = c.getInt(1)
+                if (at <= now) ready += count else {
+                    waiting += count
+                    if (soonest == 0L || at < soonest) soonest = at
+                }
+            }
+        }
+        return OpSummary(ready, waiting, soonest)
+    }
+
+    /** Сбросить паузы: операции с ошибкой пробуем снова прямо сейчас. */
+    fun resetOps(jobId: Long? = null) {
+        val cv = ContentValues().apply {
+            put("attempts", 0)
+            put("next_attempt_at", 0)
+            putNull("last_error")
+        }
+        if (jobId == null) {
+            writableDatabase.update("ops", cv, null, null)
+        } else {
+            writableDatabase.update("ops", cv, "job_id = ?", arrayOf(jobId.toString()))
+        }
+    }
+
+    fun resetOp(jobId: Long, relPath: String) {
+        val cv = ContentValues().apply {
+            put("attempts", 0)
+            put("next_attempt_at", 0)
+            putNull("last_error")
+        }
+        writableDatabase.update("ops", cv, "job_id = ? AND rel_path = ?", arrayOf(jobId.toString(), relPath))
+    }
+
+    /** Операция по конкретному файлу — чтобы показать её состояние рядом с ним. */
+    fun opFor(jobId: Long, relPath: String): Op? = readableDatabase.rawQuery(
+        "SELECT * FROM ops WHERE job_id = ? AND rel_path = ? ORDER BY id LIMIT 1",
+        arrayOf(jobId.toString(), relPath),
+    ).use { c -> if (c.moveToFirst()) readOp(c) else null }
+
+    data class OpSummary(val ready: Int, val waiting: Int, val soonestAt: Long)
+
     /** Операции, которые не прошли: показываем текст последней ошибки. */
     fun failedOps(limit: Int = 5): List<Op> = readableDatabase.rawQuery(
         "SELECT * FROM ops WHERE last_error IS NOT NULL AND last_error <> '' ORDER BY id LIMIT ?",
@@ -271,6 +326,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
         uploadId = c.getString(c.getColumnIndexOrThrow("upload_id")),
         attempts = c.getInt(c.getColumnIndexOrThrow("attempts")),
         lastError = c.getString(c.getColumnIndexOrThrow("last_error")),
+        nextAttemptAt = c.getLong(c.getColumnIndexOrThrow("next_attempt_at")),
     )
 
     // ===== курсор журнала =====
@@ -316,7 +372,16 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
         val uploadedAt: Long?,
     )
 
-    data class Op(val id: Long, val jobId: Long, val relPath: String, val kind: String, val uploadId: String?, val attempts: Int, val lastError: String?)
+    data class Op(
+        val id: Long,
+        val jobId: Long,
+        val relPath: String,
+        val kind: String,
+        val uploadId: String?,
+        val attempts: Int,
+        val lastError: String?,
+        val nextAttemptAt: Long,
+    )
 
     companion object {
         const val NAME = "cloudly-sync.db"

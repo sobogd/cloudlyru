@@ -25,6 +25,9 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     /** relDir → id папки на сервере: создаём подпапки один раз за проход. */
     private val folderCache = HashMap<String, String>()
 
+    /** Какая задача сейчас обрабатывается: к ней привязываем строку прогресса. */
+    private var currentJobId: Long? = null
+
     data class Stats(
         var scanned: Int = 0,
         var uploaded: Int = 0,
@@ -59,11 +62,20 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     fun syncAll(onProgress: (String) -> Unit = {}): Stats {
         val stats = Stats()
         folderCache.clear()
+        // Прогресс пишем и в kv: уведомление видно не всегда, а «ничего не происходит» —
+        // самый частый вопрос. Интерфейс показывает эту строку в карточке задачи.
+        val report: (String) -> Unit = { line ->
+            onProgress(line)
+            val jobId = currentJobId
+            if (jobId != null) db.putKv("job_progress:$jobId", line)
+        }
         for (job in db.jobs(enabledOnly = true)) {
-            if (job.wifiOnly && !Network.isUnmetered(context)) {
+            if (Decisions.shouldWaitForWifi(job, Network.isUnmetered(context))) {
                 onProgress("${File(job.sourceDir).name}: ждём Wi-Fi")
+                db.putKv("job_note:${job.id}", "ждём Wi-Fi: у задачи включено «только по Wi-Fi»")
                 continue
             }
+            db.putKv("job_note:${job.id}", "")
             var journal = JournalResult(0, false)
             try {
                 journal = applyJournal(job, onProgress)
@@ -71,7 +83,11 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                     // курсор устарел (журнал подрезали или БД восстановили): состояние пересоберём сканом
                     for (item in db.itemsOf(job.id)) db.deleteItem(job.id, item.relPath)
                 }
-                syncJob(job, stats, onProgress, journal.applied)
+                currentJobId = job.id
+                db.putKv("job_progress:${job.id}", "начал проход")
+                syncJob(job, stats, report, journal.applied)
+                db.putKv("job_at:${job.id}", System.currentTimeMillis().toString())
+        db.putKv("job_progress:${job.id}", "проход завершён")
             } catch (e: Exception) {
                 stats.errors += 1
                 stats.fatal = "${File(job.sourceDir).name}: ${e.message}"
@@ -82,6 +98,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         }
         stats.pending = db.ops().size
         db.putKv("last_run_at", System.currentTimeMillis().toString())
+        currentJobId = null
         return stats
     }
 
@@ -176,6 +193,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     // ===== проход по папке задачи =====
 
     private fun syncJob(job: Db.Job, stats: Stats, onProgress: (String) -> Unit, journalApplied: Int = 0) {
+        currentJobId = job.id
         val root = File(job.sourceDir)
         val known = db.itemsOf(job.id)
         if (!root.isDirectory) {
@@ -351,6 +369,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                 "ошибок ${stats.errors}",
         )
         db.putKv("job_at:${job.id}", System.currentTimeMillis().toString())
+        db.putKv("job_progress:${job.id}", "проход завершён")
 
         // Скачивание вниз: зеркало (папка без вытеснения) либо закрепление. Закрепление перекрывает
         // срок хранения — «держать офлайн» должно дотягивать отсутствующее, иначе оно врёт.
