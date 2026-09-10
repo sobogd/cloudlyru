@@ -339,6 +339,39 @@ class Api(private val prefs: Prefs) {
     }
 
     fun ping(): Boolean = runCatching { me(); true }.getOrDefault(false)
+
+    /**
+     * Диагностика связи: что именно не работает — сеть, DNS, TLS или сервер.
+     * Нужна потому, что «Unable to resolve host» ничего не объясняет пользователю.
+     */
+    fun diagnose(): String {
+        val host = runCatching { java.net.URL(prefs.serverUrl).host }.getOrNull() ?: prefs.serverUrl
+        val sb = StringBuilder()
+        sb.append("адрес: ${prefs.serverUrl}\n")
+        sb.append("хост: $host\n")
+        sb.append("токен: ${if (prefs.token.isBlank()) "не задан" else "задан (" + prefs.token.length + " симв.)"}\n")
+        val dns = runCatching { java.net.InetAddress.getAllByName(host).joinToString(", ") { it.hostAddress ?: "?" } }
+        sb.append(
+            if (dns.isSuccess) "DNS: ${dns.getOrNull()}\n"
+            else "DNS: не разрешается — ${dns.exceptionOrNull()?.message}\n",
+        )
+        if (dns.isSuccess) {
+            val health = runCatching {
+                val req = Request.Builder()
+                    .url(prefs.serverUrl.trimEnd('/') + "/api/v1/healthz")
+                    .header("Authorization", "Bearer ${prefs.token}")
+                    .build()
+                downloadClient.newBuilder().readTimeout(15, TimeUnit.SECONDS).build().newCall(req).execute().use { res ->
+                    "HTTP ${res.code} ${res.body?.string()?.take(80).orEmpty()}"
+                }
+            }
+            sb.append(
+                if (health.isSuccess) "сервер: ${health.getOrNull()}\n"
+                else "сервер: не ответил — ${health.exceptionOrNull()?.message}\n",
+            )
+        }
+        return sb.toString().trim()
+    }
 }
 
 private val downloadClient = OkHttpClient.Builder()

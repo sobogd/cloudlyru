@@ -277,6 +277,14 @@ private fun Screen() {
                         }
                     }
                 }) { Text("Проверить токен") }
+                OutlinedButton(onClick = {
+                    app.prefs.serverUrl = serverUrl
+                    app.prefs.token = token
+                    checkResult = "диагностика…"
+                    scope.launch {
+                        checkResult = withContext(Dispatchers.IO) { app.api.diagnose() }
+                    }
+                }) { Text("Диагностика сети") }
             }
             if (checkResult.isNotEmpty()) Text(checkResult, fontSize = 12.sp)
 
@@ -353,7 +361,11 @@ private fun hint(e: Throwable): String {
     return when {
         text.contains("cleartext", ignoreCase = true) || text.contains("CLEARTEXT") ->
             "ошибка: сервер по http — нужен https-адрес"
-        text.contains("Unable to resolve host", ignoreCase = true) -> "ошибка: адрес сервера не найден"
+        text.contains("Unable to resolve host", ignoreCase = true) ->
+            "сеть недоступна: имя хоста не разрешается. Проверьте мобильные данные для приложения " +
+                "и «Экономию трафика», либо включите Wi-Fi"
+        text.contains("Failed to connect", ignoreCase = true) || text.contains("timeout", ignoreCase = true) ->
+            "сервер не ответил: проверьте адрес и сеть"
         else -> "ошибка: $text"
     }
 }
