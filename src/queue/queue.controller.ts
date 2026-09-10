@@ -1,13 +1,17 @@
-import { Controller, Get } from '@nestjs/common';
+import { Body, Controller, Get, Post } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from '../auth/auth.service';
+import { QueueService } from './queue.service';
 import { CurrentUser, RequestUser } from '../common/decorators';
+import { asString, isPlainObject } from '../common/utils';
+import { badRequest, notFound } from '../common/errors';
 
 @Controller('queue')
 export class QueueController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auth: AuthService,
+    private readonly queue: QueueService,
   ) {}
 
   /** Статус очереди конвертации (для UI-монитора) — только по своим файлам. */
@@ -56,5 +60,24 @@ export class QueueController {
         masterReady: Boolean(j.asset.masterReadyAt),
       })),
     };
+  }
+
+  /**
+   * Пересобрать превью: файл остался без превью после падения задачи (или задача
+   * была отменена при удалении в корзину). Файл свой и не в корзине — иначе 404.
+   */
+  @Post('retry')
+  async retry(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
+    if (!isPlainObject(body)) throw badRequest('body must be an object');
+    const entryId = asString(body.entryId, 'entryId');
+    const tree = await this.auth.subtreeIds(user.id);
+    const entry = await this.prisma.fileEntry.findFirst({
+      where: { id: entryId, deletedAt: null, folderId: { in: tree } },
+      select: { assetId: true },
+    });
+    if (!entry?.assetId) throw notFound('file not found');
+    const res = await this.queue.retryPreview(entry.assetId);
+    if (!res.ok) throw badRequest(res.reason, 'cannot_retry');
+    return { ok: true };
   }
 }

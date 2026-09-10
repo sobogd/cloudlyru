@@ -430,6 +430,14 @@ function fmtDuration(sec?: number): string | undefined {
   const s2 = total % 60;
   return h ? `${h} ч ${m} мин ${s2} с` : `${m}:${String(s2).padStart(2, '0')}`;
 }
+/** Причина падения сборки превью в одну строку: ffmpeg сыпет баннер и настройки,
+ *  поэтому причина — в самом конце stderr, а не в начале. */
+function shortErr(e?: string | null, max = 110): string {
+  const s = String(e ?? '').replace(/\s+/g, ' ').trim();
+  if (!s) return 'не удалось собрать превью';
+  return s.length > max ? `…${s.slice(-max)}` : s;
+}
+
 /** EXIF-даты без часового пояса показываем «как в файле», без пересчёта. */
 function fmtExifDate(iso?: unknown): string | undefined {
   if (typeof iso !== 'string' || !iso) return undefined;
@@ -691,6 +699,10 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const load = async () => {
     try { setItems(await api.timeline()); } catch { /* keep old */ }
   };
+  /** Пересобрать превью упавшего файла: сервер сбрасывает задачу в очередь. */
+  const retryPreview = async (entryId: string) => {
+    try { await api.retryPreview(entryId); await load(); } catch (e) { alert((e as Error).message); }
+  };
   useEffect(() => { void load(); api.trips().then(setTrips).catch(() => undefined); }, []);
   // автообновление статусов сборки превью
   useEffect(() => {
@@ -733,19 +745,24 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
         <div className="mediaarea">
           {!it.masterReady ? (
             <div className="panel">
-              {/* #2: статус/лог, пока грузится или ошибка */}
-              <div className="copy">
-                {it.jobState === 'failed'
-                  ? '❌ Не удалось собрать превью'
-                  : it.jobState === 'processing'
-                    ? `⏳ Готовлю превью: ${it.jobProgress ?? 0}%`
-                    : it.jobState === 'pending'
-                      ? '⏳ В очереди на превью'
-                      : '⏳ Загрузка/подготовка…'}
-              </div>
-              {it.jobState === 'processing' && <progress value={it.jobProgress ?? 0} max={100} />}
-              {it.jobState === 'failed' && it.jobError && <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c' }}>{it.jobError}</pre>}
-              <div className="copy">Статус обновляется автоматически — можно не перезагружать страницу.</div>
+              {/* #2: плейсхолдер, пока превью не собрано; процент не показываем — он врёт */}
+              {it.jobState === 'failed' ? (
+                <>
+                  <div className="copy">❌ Не удалось собрать превью</div>
+                  {it.jobError && (
+                    <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c', maxHeight: 180, overflow: 'auto' }}>{it.jobError}</pre>
+                  )}
+                  <div className="row" style={{ justifyContent: 'center' }}>
+                    <button className="btn ghost" onClick={() => void retryPreview(it.entryId)}>⟳ Пересобрать</button>
+                    <a className="btn ghost" href={api.fileUrl(it.entryId)} download>⬇️ Скачать оригинал</a>
+                  </div>
+                </>
+              ) : (
+                <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
+                  <span className="spin" />
+                  <div className="copy">⏳ Готовлю превью…</div>
+                </div>
+              )}
             </div>
           ) : isVid(it.mime) ? (
             <video src={api.videoPreviewUrl(it.sha256!)} controls autoPlay style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />
@@ -837,9 +854,29 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
             {!it.masterReady ? (
               <div
                 title={it.jobError || 'превью'}
-                style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'grid', placeItems: 'center', color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 11, textAlign: 'center', padding: 4, cursor: 'pointer' }}
+                style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6, color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 11, textAlign: 'center', padding: 4, cursor: 'pointer' }}
               >
-                {it.jobState === 'failed' ? '❌ ошибка' : it.jobState === 'processing' ? <>⏳ {it.jobProgress ?? 0}%</> : it.jobState === 'pending' ? '⏳ в очереди' : '⏳'}
+                {it.jobState === 'failed' ? (
+                  <>
+                    <span style={{ overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflowWrap: 'anywhere' }}>❌ {shortErr(it.jobError, 70)}</span>
+                    <span style={{ display: 'flex', gap: 2 }}>
+                      <button
+                        className="iconbtn"
+                        title="Пересобрать превью"
+                        style={{ fontSize: 16, padding: '2px 6px' }}
+                        onClick={(e) => { e.stopPropagation(); void retryPreview(it.entryId); }}
+                      >⟳</button>
+                      <a
+                        className="iconbtn"
+                        title="Скачать оригинал"
+                        href={api.fileUrl(it.entryId)}
+                        download
+                        style={{ fontSize: 16, padding: '2px 6px' }}
+                        onClick={(e) => e.stopPropagation()}
+                      >⬇️</a>
+                    </span>
+                  </>
+                ) : <span className="spin" />}
               </div>
             ) : it.sha256 ? (
               <div style={{ position: 'relative', cursor: 'pointer' }}>

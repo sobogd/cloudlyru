@@ -12,6 +12,15 @@ import { env } from '../config/env';
 
 const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 1 ГБ)
 const MAX_ATTEMPTS = 3;
+/** Задержка перед повтором временно упавшей задачи (умножается на номер попытки). */
+const RETRY_BASE_DELAY_MS = 30_000;
+/**
+ * Временная ошибка: сеть/S3 могут отпустить сами — повтор осмыслен.
+ * Всё остальное (таймаут энкода, память libaom, битый контейнер) повторится тем же
+ * результатом, только займёт очередь: задача одна за раз, а энкод идёт часами.
+ */
+const TRANSIENT_ERR =
+  /(NetworkingError|TimeoutError|RequestTimeout|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network|throttl|SlowDown|ServiceUnavailable|InternalError|reduce your request rate|(?:HTTP|Status Code): 5\d\d)/i;
 /** Сколько символов stderr кладём в Job.error (раньше в БД уезжал дамп настроек libaom на 1.5 КБ). */
 const MAX_ERROR_CHARS = 600;
 /** Префикс временных каталогов задач — для чистки осиротевших после SIGKILL/pm2 reload. */
@@ -193,7 +202,45 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       .catch(() => undefined);
   }
 
+  /** Временная ли ошибка: сеть/S3 могут отпустить сами, остальное повторится тем же. */
+  private isTransient(msg: string): boolean {
+    return TRANSIENT_ERR.test(msg);
+  }
+
+  /**
+   * Пересобрать превью вручную: упавшую задачу сбрасываем в очередь с нуля.
+   * Оригинала нет — собирать нечего, говорим об этом честно (обычно он удалён
+   * после успешной конвертации, а падение было уже на превью).
+   */
+  async retryPreview(assetId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const asset = await this.prisma.asset
+      .findUnique({ where: { id: assetId }, select: { sha256: true, mime: true } })
+      .catch(() => null);
+    if (!asset) return { ok: false, reason: 'файл не найден' };
+    const kind = IMAGE_MIMES.includes(asset.mime) ? 'photo' : VIDEO_MIMES.includes(asset.mime) ? 'video' : null;
+    if (!kind) return { ok: false, reason: 'превью для такого типа файла не собираются' };
+    const rawAlive = await this.s3.headObject(S3Service.assetKey(asset.sha256)).catch(() => false);
+    if (!rawAlive) return { ok: false, reason: 'оригинала больше нет в хранилище — залейте файл заново' };
+
+    const last = await this.prisma.job.findFirst({ where: { assetId }, orderBy: { createdAt: 'desc' } });
+    if (last && (last.state === 'pending' || last.state === 'processing')) return { ok: true }; // уже собирается
+    if (last) {
+      this.retryAfter.delete(last.id);
+      await this.prisma.job.update({
+        where: { id: last.id },
+        data: { state: 'pending', error: null, attempts: 0, progress: 0, startedAt: null, finishedAt: null },
+      });
+    } else {
+      await this.prisma.job.create({ data: { assetId, kind, state: 'pending' } });
+    }
+    this.logger.log(`пересборка превью запущена вручную (${kind} ${asset.sha256.slice(0, 8)})`);
+    return { ok: true };
+  }
+
   private lastProgressUpdate = 0;
+  /** Отложенные повторы временно упавших задач: id → время, раньше которого не брать. */
+  private readonly retryAfter = new Map<string, number>();
+
   private async setProgress(jobId: string, value: number, force = false): Promise<void> {
     const now = Date.now();
     if (!force && now - this.lastProgressUpdate < 2000) return;
@@ -216,7 +263,18 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   private async next(): Promise<JobRow | null> {
     return this.prisma.$transaction(async (tx) => {
-      const row = await tx.job.findFirst({ where: { state: 'pending' }, orderBy: { createdAt: 'asc' }, include: { asset: true } });
+      const now = Date.now();
+      // отложенные повторы пропускаем: пока их пауза не вышла, берём следующую задачу
+      const delayed: string[] = [];
+      for (const [id, at] of this.retryAfter) {
+        if (at <= now) this.retryAfter.delete(id);
+        else delayed.push(id);
+      }
+      const row = await tx.job.findFirst({
+        where: { state: 'pending', ...(delayed.length ? { id: { notIn: delayed } } : {}) },
+        orderBy: { createdAt: 'asc' },
+        include: { asset: true },
+      });
       if (!row) return null;
       await tx.job.update({ where: { id: row.id }, data: { state: 'processing', startedAt: new Date(), attempts: { increment: 1 }, error: null } });
       return { id: row.id, assetId: row.assetId, kind: row.kind, sha256: row.asset.sha256, mime: row.asset.mime };
@@ -261,6 +319,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       }
       // res.warn = мастер-версия не собрана, но производные готовы: задача не «failed»,
       // иначе UI показывал бы ошибку конвертации, хотя медиа доступно для просмотра.
+      this.retryAfter.delete(job.id);
       await this.prisma.job.update({
         where: { id: job.id },
         data: { state: 'done', error: res.warn ? truncErr(res.warn) : null, progress: 100, finishedAt: new Date() },
@@ -269,16 +328,27 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       else this.logger.log(`✓ ${tag}`);
     } catch (e) {
       const msg = (e as Error).message || 'error';
-      this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)}`);
       const row = await this.prisma.job.findUnique({ where: { id: job.id } });
       const cancelled = row?.state === 'failed' && row?.error?.startsWith('cancelled');
-      if (!cancelled) {
-        const attempts = row?.attempts ?? 1;
-        if (attempts < MAX_ATTEMPTS) {
-          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: truncErr(msg) } });
-        } else {
-          await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } });
-        }
+      const attempts = row?.attempts ?? 1;
+      const transient = this.isTransient(msg);
+      if (cancelled) {
+        // задачу сняли снаружи (файл удалён) — это не падение конвертации
+        this.retryAfter.delete(job.id);
+        this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)}`);
+      } else if (transient && attempts < MAX_ATTEMPTS) {
+        const delay = RETRY_BASE_DELAY_MS * attempts;
+        this.retryAfter.set(job.id, Date.now() + delay);
+        this.logger.warn(
+          `✗ ${tag}: ${msg.slice(0, 200)} — повтор через ${Math.round(delay / 1000)} с (попытка ${attempts} из ${MAX_ATTEMPTS})`,
+        );
+        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: truncErr(msg) } });
+      } else {
+        // постоянная ошибка: три попытки подряд дают тот же результат, а очередь занята
+        const why = transient ? `попытки исчерпаны (${attempts})` : 'ошибка не временная — повтор не поможет';
+        this.retryAfter.delete(job.id);
+        this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)} — ${why}`);
+        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } });
       }
     } finally {
       this.activeJob = null;

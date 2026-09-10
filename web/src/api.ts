@@ -464,6 +464,9 @@ export interface QueueStatus {
   recent: Array<{ id: string; kind: string; state: string; error: string | null; updatedAt: string; sha256: string; progress: number; masterReady: boolean }>;
 }
 export const queueStatus = () => request<QueueStatus>('/queue/status');
+/** Пересобрать превью упавшего файла: задача конвертации ставится в очередь заново. */
+export const retryPreview = (entryId: string) =>
+  request<{ ok: boolean }>('/queue/retry', { method: 'POST', body: JSON.stringify({ entryId }) });
 export const timeline = () => request<TimelineItem[]>('/timeline');
 export const trips = () => request<Trip[]>('/trips');
 export const listAlbums = () => request<AlbumInfo[]>('/albums');
