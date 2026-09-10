@@ -290,7 +290,6 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
     if (!name) return;
     try { await api.mkdir(name, currentId); await load(currentId); } catch (e) { setErr((e as Error).message); }
   };
-  const goHome = () => setStack((s) => s.slice(0, 1));
   const goUp = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
   const closeFile = () => { setOpenFile(null); void load(currentId); };
 
@@ -314,10 +313,9 @@ function Files({ photoFolderId }: { photoFolderId: string | null }) {
   return (
     <div>
       <div className="filehead">
-        <button className="iconbtn" title="Главная" onClick={goHome} disabled={stack.length === 1}>🏠</button>
         <button className="iconbtn" title="На уровень выше" onClick={goUp} disabled={stack.length === 1}>⬆️</button>
         {stack.length > 1 && (
-          <button className="iconbtn" title="Свойства папки" onClick={() => setFolderMeta(true)} disabled={busy}>⚙️</button>
+          <button className="iconbtn" title="Инфо о папке" onClick={() => setFolderMeta(true)} disabled={busy}>ℹ️</button>
         )}
         <span style={{ flex: 1 }} />
         <button className="iconbtn" title="Новая папка" onClick={mkdir} disabled={busy}>📂</button>
@@ -510,7 +508,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
     <div>
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
-        <strong className="detname">{meta?.name ?? 'Файл'}</strong>
+        <span style={{ flex: 1 }} />
         {isZip && (
           <button
             className="iconbtn"
@@ -596,7 +594,7 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
     <div>
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
-        <strong className="detname">{meta?.name ?? 'Папка'}</strong>
+        <span style={{ flex: 1 }} />
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
@@ -715,7 +713,6 @@ function Photos({ photoFolderId }: { photoFolderId: string | null }) {
   return (
     <div>
       <div className="filehead">
-        <strong>Фото</strong>
         <span style={{ flex: 1 }} />
         {photoFolderId && (
           <>
@@ -1007,7 +1004,7 @@ function Shares() {
   };
   return (
     <div>
-      <div className="row"><button className="btn" onClick={create}>🔗 Создать ссылку</button></div>
+      <div className="row"><span style={{ flex: 1 }} /><button className="btn" title="Создать ссылку" onClick={create}>🔗</button></div>
       {notice && <div className="notice">{notice}</div>}
       {err && <div className="err">{err}</div>}
       {items.map((s) => (
@@ -1038,7 +1035,7 @@ function Albums() {
   };
   return (
     <div>
-      <div className="row"><button className="btn" onClick={create}>🗂️ Альбом</button></div>
+      <div className="row"><span style={{ flex: 1 }} /><button className="btn" title="Новый альбом" onClick={create}>🗂️</button></div>
       {err && <div className="err">{err}</div>}
       {albums.map((a) => (
         <div className="item" key={a.id}>
@@ -1139,9 +1136,8 @@ function TrashPage() {
   return (
     <div>
       <div className="row">
-        <strong>Корзина</strong>
         <span style={{ flex: 1 }} />
-        <button className="btn danger" onClick={purge}>🧹 Очистить</button>
+        <button className="btn danger" title="Очистить корзину" onClick={purge}>🧹</button>
       </div>
       {err && <div className="err">{err}</div>}
       <div className="panel">
