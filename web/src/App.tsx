@@ -375,6 +375,31 @@ function fmtDuration(sec?: number): string | undefined {
   const s2 = total % 60;
   return h ? `${h} ч ${m} мин ${s2} с` : `${m}:${String(s2).padStart(2, '0')}`;
 }
+/** EXIF-даты без часового пояса показываем «как в файле», без пересчёта. */
+function fmtExifDate(iso?: unknown): string | undefined {
+  if (typeof iso !== 'string' || !iso) return undefined;
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return undefined;
+  const [, y, mo, d, h, mi, sec] = m;
+  return `${d}.${mo}.${y} ${h}:${mi}:${sec}`;
+}
+/** ffprobe отдаёт время с таймзоной — его показываем в местном времени. */
+function fmtLocal(iso?: unknown): string | undefined {
+  if (typeof iso !== 'string' || !iso) return undefined;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? undefined : d.toLocaleString();
+}
+const ORIENTATION: Record<number, string> = {
+  1: 'нормальная', 2: 'зеркально по горизонтали', 3: 'повёрнуто на 180°',
+  4: 'зеркально по вертикали', 5: 'зеркально + 90°', 6: 'повёрнуто на 90°',
+  7: 'зеркально + 270°', 8: 'повёрнуто на 270°',
+};
+const COLOR_SPACE: Record<number, string> = { 1: 'sRGB', 2: 'Adobe RGB', 65535: 'некалиброванное' };
+const EXPOSURE_PROGRAM: Record<number, string> = {
+  0: 'не задано', 1: 'ручной', 2: 'авто', 3: 'приоритет диафрагмы',
+  4: 'приоритет выдержки', 5: 'творческий', 6: 'спорт', 7: 'портрет', 8: 'пейзаж',
+};
+
 function fmtBitrate(bps?: number): string | undefined {
   if (!bps || !Number.isFinite(bps)) return undefined;
   return bps >= 1e6 ? `${(bps / 1e6).toFixed(1)} Мбит/с` : `${Math.round(bps / 1e3)} кбит/с`;
@@ -480,7 +505,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
           <MetaRow k="Расположение" v={meta.path} />
           <MetaRow k="Создан" v={new Date(meta.createdAt).toLocaleString()} />
           {meta.masterMime && <MetaRow k="Оптимизирован" v={meta.masterMime} />}
-          {meta.media && (
+          {meta.media && !meta.media.raw && (
             <>
               {meta.media.capturedAt && <MetaRow k="Дата съёмки" v={new Date(meta.media.capturedAt).toLocaleString()} />}
               {meta.media.make || meta.media.model ? <MetaRow k="Камера" v={[meta.media.make, meta.media.model].filter(Boolean).join(' ')} /> : null}
@@ -500,23 +525,23 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
               const val = f ? f(v as never) : String(v);
               if (val) rows.push([k, val]);
             };
-            const dt = (v: unknown) => (typeof v === 'string' ? new Date(v).toLocaleString() : undefined);
+            const dt = fmtExifDate; // EXIF без таймзоны — показываем как в файле
 
             if (raw?.kind === 'image') {
               push('Дата съёмки', raw.dateTimeOriginal, dt);
               push('Создан (EXIF)', raw.createDate, dt);
-              push('Изменён', raw.modifyDate, dt);
+              push('Изменён (EXIF)', raw.modifyDate, dt);
               push('Часовой пояс', raw.offsetTime);
               push('Камера', [raw.make, raw.model].filter(Boolean).join(' '));
               push('Объектив', raw.lens);
               push('Выдержка', raw.exposureTime);
-              push('Диафрагма', raw.fNumber, (v: number) => `f/${v}`);
+              push('Диафрагма', raw.fNumber, (v: number) => `f/${Number(v).toFixed(1).replace(/\.0$/, '')}`);
               push('ISO', raw.iso);
-              push('Фокусное', raw.focalLength, (v: number) => `${v} мм`);
+              push('Фокусное', raw.focalLength, (v: number) => `${Number(v).toFixed(1).replace(/\.0$/, '')} мм`);
               push('Фокусное (35 мм)', raw.focalLength35, (v: number) => `${v} мм`);
-              push('Программа', raw.exposureProgram);
-              push('Ориентация', raw.orientation);
-              push('Цвет. пространство', raw.colorSpace);
+              push('Программа съёмки', raw.exposureProgram, (v: number) => EXPOSURE_PROGRAM[v] ?? String(v));
+              push('Ориентация', raw.orientation, (v: number) => ORIENTATION[v] ?? String(v));
+              push('Цвет. пространство', raw.colorSpace, (v: number) => COLOR_SPACE[v] ?? String(v));
               if (rawNum(raw.width) && rawNum(raw.height)) push('Кадр', `${raw.width} × ${raw.height}`);
               if (rawNum(raw.latitude) != null && rawNum(raw.longitude) != null) {
                 push('Координаты', `${Number(raw.latitude).toFixed(6)}, ${Number(raw.longitude).toFixed(6)}`);
@@ -536,14 +561,14 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
               push('Битрейт', raw.bitrate, fmtBitrate);
               push('Дорожки', raw.audioChannels, (v: number) => `${v} канал(а)`);
               push('Частота дискретизации', raw.audioSampleRate, (v: number) => `${v} Гц`);
-              push('Создан', raw.createdAt, dt);
+              push('Создан', raw.createdAt, fmtLocal);
             }
 
             return (
               <>
                 {rows.length > 0 && (
                   <>
-                    <DetSection title={raw?.kind === 'video' ? 'Видео (из файла)' : 'Медиа (из файла)'} />
+                    <DetSection title={raw?.kind === 'video' ? 'Метаданные файла (видео)' : 'Метаданные файла (EXIF)'} />
                     {rows.map(([k, v]) => <MetaRow key={k} k={k} v={v} />)}
                   </>
                 )}
