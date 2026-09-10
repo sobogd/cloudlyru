@@ -300,7 +300,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         val pinnedFolders = pinned()
         val jobPinned = job.targetFolderId in pinnedFolders
         val mirror = job.zone == "FILES" && job.keepDays < 0
-        if (mirror || jobPinned) mirrorDown(job, stats, onProgress, onlyPinned = !mirror)
+        if (mirror || jobPinned) mirrorDown(job, stats, onProgress)
         else downloadPinnedFiles(job, stats, onProgress)
         if (job.keepDays >= 0 && !jobPinned) evict(job, onProgress)
     }
@@ -490,7 +490,8 @@ class Engine(private val context: Context, private val db: Db, private val api: 
      */
     private fun handleNameTaken(job: Db.Job, op: Db.Op, stats: Stats) {
         val item = db.item(job.id, op.relPath) ?: run { db.deleteOp(op.id); return }
-        val remote = runCatching { api.children(job.targetFolderId).entries.firstOrNull { it.name == item.name } }.getOrNull()
+        val remoteFolderId = remoteFolderFor(job, item.relPath.substringBeforeLast('/', ""))
+        val remote = runCatching { api.children(remoteFolderId).entries.firstOrNull { it.name == item.name } }.getOrNull()
         if (remote == null) {
             retry(op, "имя занято, но запись не найдена", stats)
             return
@@ -519,20 +520,15 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
     // ===== зеркало вниз и вытеснение =====
 
-    private fun mirrorDown(
-        job: Db.Job,
-        stats: Stats,
-        onProgress: (String) -> Unit,
-        onlyPinned: Boolean = false,
-    ) {
+    private fun mirrorDown(job: Db.Job, stats: Stats, onProgress: (String) -> Unit) {
         val remote = ArrayList<Pair<String, ru.cloudly.sync.net.RemoteEntry>>()
         collectRemote(job.targetFolderId, "", remote, 0)
         val known = db.itemsOf(job.id).associateBy { it.relPath }
         for ((relPath, entry) in remote) {
-            if (onlyPinned && !entry.keepOffline) continue
             val item = known[relPath]
             if (item != null) {
-                if (item.state == Db.STATE_EVICTED && !(entry.keepOffline || onlyPinned)) continue
+                // вытесненное обратно не тянем — иначе смысл вытеснения теряется; исключение — закреплённое
+                if (item.state == Db.STATE_EVICTED && !entry.keepOffline && !item.keepOffline) continue
                 if (item.remoteSha256 == entry.sha256 && File(item.localPath).isFile) continue
             }
             val target = File(job.sourceDir, relPath)

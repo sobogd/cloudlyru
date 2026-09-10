@@ -210,20 +210,41 @@ private fun uploadShared(
                 tmp.outputStream().use { output -> input.copyTo(output, bufferSize = 1 shl 20) }
             } ?: throw IllegalStateException("не прочитал файл")
             val sha = Hasher.sha256(tmp)
-            val file = LocalFile(name, tmp.absolutePath, name, tmp.length(), tmp.lastModified())
-            Uploader(app.api).upload(
-                folderId = folderId,
-                file = file,
-                sha256 = sha,
-                replace = false,
-                expectedSha256 = null,
-                uploadIdFromQueue = null,
-                onSession = {},
-                onProgress = { sent, total ->
-                    val part = if (total > 0) sent.toFloat() / total else 1f
-                    onProgress((index + part) / uris.size)
-                },
-            )
+            // имя могло быть занято (например, делишься тем же снимком второй раз) — тогда
+            // добавляем суффикс: молча перезаписывать чужое нельзя, а падать с ошибкой глупо
+            var attemptName = name
+            var uploaded = false
+            var lastError: Exception? = null
+            for (attempt in 0 until 3) {
+                val file = LocalFile(attemptName, tmp.absolutePath, attemptName, tmp.length(), tmp.lastModified())
+                try {
+                    Uploader(app.api).upload(
+                        folderId = folderId,
+                        file = file,
+                        sha256 = sha,
+                        replace = false,
+                        expectedSha256 = null,
+                        uploadIdFromQueue = null,
+                        onSession = {},
+                        onProgress = { sent, total ->
+                            val part = if (total > 0) sent.toFloat() / total else 1f
+                            onProgress((index + part) / uris.size)
+                        },
+                    )
+                    uploaded = true
+                    break
+                } catch (e: ru.cloudly.sync.net.ApiException) {
+                    lastError = e
+                    if (!(e.message ?: "").contains("already exists") && e.code != "conflict") throw e
+                    val dot = name.lastIndexOf('.')
+                    attemptName = if (dot > 0) {
+                        "${name.substring(0, dot)} (${attempt + 2})${name.substring(dot)}"
+                    } else {
+                        "$name (${attempt + 2})"
+                    }
+                }
+            }
+            if (!uploaded) throw lastError ?: IllegalStateException("не загрузилось")
             done += 1
         } catch (e: Exception) {
             errors.add("$name: ${e.message}")
