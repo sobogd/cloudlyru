@@ -40,7 +40,7 @@ import ru.cloudly.sync.work.SyncService
  */
 @Composable
 fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
-    var filter by remember { mutableStateOf("evicted") }
+    var filter by remember { mutableStateOf("all") }
     var version by remember { mutableStateOf(0) }
     var error by remember { mutableStateOf("") }
     // чтение из SQLite — только вне главного потока: на большой библиотеке это подвисания UI
@@ -74,17 +74,29 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
         )
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("evicted" to "вытесненные", "pinned" to "закреплённые", "new" to "не выгружены", "all" to "все")
-                .forEach { (key, label) ->
-                    OutlinedButton(onClick = { filter = key }) {
-                        Text(if (filter == key) "• $label" else label, fontSize = 12.sp)
-                    }
+            listOf(
+                "all" to "все ${all.size}",
+                "new" to "не выгружены $pending",
+                "evicted" to "вытеснены $evicted",
+                "pinned" to "закреплены $pinned",
+            ).forEach { (key, label) ->
+                OutlinedButton(onClick = { filter = key }) {
+                    Text(if (filter == key) "• $label" else label, fontSize = 12.sp)
                 }
+            }
         }
         Spacer(Modifier.height(8.dp))
         if (error.isNotEmpty()) Text(error, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
         if (items.isEmpty()) {
-            Text("Пусто", fontSize = 13.sp)
+            Text(
+                when (filter) {
+                    "all" -> "Файлов пока нет: нажмите «Синхронизировать сейчас» или подождите фонового прохода"
+                    "new" -> "Всё выгружено"
+                    "evicted" -> "Ничего не вытеснено"
+                    else -> "Ничего не закреплено"
+                },
+                fontSize = 13.sp,
+            )
         }
         LazyColumn(modifier = Modifier.fillMaxWidth()) {
             items(items.take(500), key = { it.relPath }) { item ->

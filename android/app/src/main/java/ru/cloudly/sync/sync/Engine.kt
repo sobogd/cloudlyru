@@ -75,6 +75,8 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             } catch (e: Exception) {
                 stats.errors += 1
                 stats.fatal = "${File(job.sourceDir).name}: ${e.message}"
+                // причина видна прямо в карточке задачи, а не только в общем логе
+                db.putKv("job_note:${job.id}", "ошибка прохода: ${e.message}")
                 Log.w(TAG, "проход задачи ${job.sourceDir}: ${e.message}")
             }
         }
@@ -189,6 +191,17 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             stats.fatal = "скан вернул 0 файлов при ${known.size} известных — проход прерван"
             return
         }
+        // Диагностика: молчаливый «0 файлов» — худший вариант, пользователь не понимает, что не так
+        val dirEntries = root.listFiles()?.size ?: -1
+        val scanNote = when {
+            dirEntries < 0 -> "папка не читается (нет доступа ко всем файлам?)"
+            files.isEmpty() && dirEntries == 0 -> "папка пуста"
+            files.isEmpty() && scan.skipped.isNotEmpty() ->
+                "все файлы пропущены (свежие или скрытые): ${scan.skipped.size}"
+            files.isEmpty() -> "файлов не найдено, хотя в папке $dirEntries объектов"
+            else -> null
+        }
+        if (scanNote != null) db.putKv("job_note:${job.id}", scanNote) else db.putKv("job_note:${job.id}", "")
         stats.scanned += files.size
         onProgress("${File(job.sourceDir).name}: ${files.size} файлов")
 
@@ -329,6 +342,15 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         }
 
         runOps(job, stats, onProgress)
+
+        // Итог прохода по задаче — в kv, чтобы интерфейс показывал его без разбора логов
+        db.putKv(
+            "job_stat:${job.id}",
+            "проверено ${files.size}, выгружено ${stats.uploaded}, дедуп ${stats.deduped}, " +
+                "скачано ${stats.downloaded}, удалено ${stats.deleted}, вытеснено ${stats.evicted}, " +
+                "ошибок ${stats.errors}",
+        )
+        db.putKv("job_at:${job.id}", System.currentTimeMillis().toString())
 
         // Скачивание вниз: зеркало (папка без вытеснения) либо закрепление. Закрепление перекрывает
         // срок хранения — «держать офлайн» должно дотягивать отсутствующее, иначе оно врёт.

@@ -96,6 +96,8 @@ private fun Screen() {
     var lastError by remember { mutableStateOf(app.db.kv("last_run_error").orEmpty()) }
     var lastVerify by remember { mutableStateOf(app.db.kv("last_verify_stats").orEmpty()) }
     var pending by remember { mutableStateOf(0) }
+    // тик обновления: карточки пересчитывают состояния по нему, иначе счётчики «залипают» на нуле
+    var tick by remember { mutableStateOf(0) }
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     var showAdd by remember { mutableStateOf(false) }
     var openJob by remember { mutableStateOf<Long?>(null) }
@@ -130,6 +132,7 @@ private fun Screen() {
             lastError = err
             lastVerify = verify
             pending = count
+            tick += 1
         }
     }
 
@@ -281,7 +284,13 @@ private fun Screen() {
             Text("Папки", fontWeight = FontWeight.SemiBold)
             LazyColumn(modifier = Modifier.height(if (jobs.isEmpty()) 1.dp else 240.dp)) {
                 items(jobs, key = { it.id }) { job ->
-                    JobCard(job, app, onChange = { reload() }, onOpenFiles = { openJob = job.id })
+                    JobCard(
+                        job = job,
+                        app = app,
+                        tick = tick,
+                        onChange = { reload() },
+                        onOpenFiles = { openJob = job.id },
+                    )
                 }
             }
 
@@ -330,6 +339,9 @@ private fun Screen() {
                 status = message
                 showAdd = false
                 reload()
+                // задача добавлена — сразу запускаем проход, иначе пользователь видит пустой список
+                // и думает, что приложение ничего не нашло
+                SyncService.start(context)
             },
         )
     }
@@ -347,7 +359,13 @@ private fun hint(e: Throwable): String {
 }
 
 @Composable
-private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit, onOpenFiles: () -> Unit) {
+private fun JobCard(
+    job: Db.Job,
+    app: App,
+    tick: Int,
+    onChange: () -> Unit,
+    onOpenFiles: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
     var pinned by remember(job.id) { mutableStateOf(false) }
     LaunchedEffect(job.id) {
@@ -357,7 +375,11 @@ private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit, onOpenFiles: ()
         Column(Modifier.padding(12.dp)) {
             Text(job.sourceDir, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             Text("→ ${job.targetPath}  ·  ${if (job.zone == "PHOTOS") "Фото" else "Файлы"}", fontSize = 12.sp)
-            val counts = remember(job.id) { runBlocking(Dispatchers.IO) { app.db.stateCounts(job.id) } }
+            val counts = remember(job.id, tick) {
+                runBlocking(Dispatchers.IO) { app.db.stateCounts(job.id) }
+            }
+            val note = remember(job.id, tick) { app.db.kv("job_note:${job.id}").orEmpty() }
+            val stat = remember(job.id, tick) { app.db.kv("job_stat:${job.id}").orEmpty() }
             Text(
                 "файлов: ${counts.values.sum()}  ·  выгружено ${counts["synced"] ?: 0}  ·  " +
                     "вытеснено ${counts["evicted"] ?: 0}  ·  новых ${counts["new"] ?: 0}",
@@ -369,6 +391,12 @@ private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit, onOpenFiles: ()
                 else "хранение: ${job.keepDays} дн.",
                 fontSize = 12.sp,
             )
+            if (stat.isNotEmpty()) {
+                Text("проход: $stat", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (note.isNotEmpty()) {
+                Text(note, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
                     checked = job.enabled,
