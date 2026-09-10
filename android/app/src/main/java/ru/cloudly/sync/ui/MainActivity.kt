@@ -282,11 +282,32 @@ private fun Screen() {
                     app.prefs.token = token
                     checkResult = "диагностика…"
                     scope.launch {
-                        checkResult = withContext(Dispatchers.IO) { app.api.diagnose() }
+                        checkResult = withContext(Dispatchers.IO) {
+                            app.api.diagnose() + "\n" + app.api.storageHostReachable()
+                        }
                     }
                 }) { Text("Диагностика сети") }
             }
             if (checkResult.isNotEmpty()) Text(checkResult, fontSize = 12.sp)
+
+            if (app.engine().relayMode()) {
+                Spacer(Modifier.height(6.dp))
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Загрузка идёт через сервер", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Хранилище напрямую с телефона недоступно (DNS, блокировщик или VPN), " +
+                                "поэтому файлы идут через сервер. Это медленнее, но работает.",
+                            fontSize = 12.sp,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedButton(onClick = {
+                            app.engine().resetRelayMode()
+                            checkResult = "попробую прямое подключение к хранилищу"
+                        }) { Text("Вернуть прямую загрузку", fontSize = 12.sp) }
+                    }
+                }
+            }
 
             Spacer(Modifier.height(16.dp))
             Text("Папки", fontWeight = FontWeight.SemiBold)

@@ -46,6 +46,8 @@ class Uploader(private val api: Api) {
         uploadIdFromQueue: String?,
         onSession: (String) -> Unit,
         onProgress: (sent: Long, total: Long) -> Unit,
+        /** true — лить через сервер: нужно, когда хранилище с телефона недоступно. */
+        forceRelay: Boolean = false,
     ): Result {
         val mime = Scanner.mimeOf(file.name)
         if (uploadIdFromQueue == null) {
@@ -58,6 +60,7 @@ class Uploader(private val api: Api) {
                 replace = replace,
                 clientMtime = file.mtime,
                 expectedSha256 = expectedSha256,
+                mode = if (forceRelay) "relay" else "direct",
             )
             if (init.stale) return Result("", file.name, sha256, false, stale = true, currentSha256 = init.currentSha256)
             if (init.inTrash) return Result("", file.name, sha256, false, stale = false, currentSha256 = null, inTrash = true)

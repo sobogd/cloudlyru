@@ -48,9 +48,15 @@ class Prefs(context: Context) {
     /** Токен для этого прогона, чтобы не читать шифрованное хранилище на каждый запрос. */
     val configured: Boolean get() = serverUrl.isNotBlank() && token.isNotBlank()
 
+    /** Хост хранилища из последней presigned-ссылки: показываем его в диагностике. */
+    var lastS3Host: String?
+        get() = prefs.getString(KEY_S3_HOST, null)
+        set(value) = prefs.edit().putString(KEY_S3_HOST, value).apply()
+
     companion object {
         const val DEFAULT_URL = "https://files.iq-factura.com"
         private const val KEY_URL = "server_url"
         private const val KEY_TOKEN = "api_token"
+        private const val KEY_S3_HOST = "last_s3_host"
     }
 }

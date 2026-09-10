@@ -475,19 +475,46 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         // перезаписываем только ту версию, которую видели: иначе сервер не сможет защитить чужой файл
         val replace = item.remoteEntryId != null && item.remoteSha256 != null
         onProgress("загрузка: ${item.name}")
-        val result = Uploader(api).upload(
-            folderId = remoteFolderFor(job, item.relPath.substringBeforeLast('/', "")),
-            file = LocalFile(item.relPath, item.localPath, item.name, item.localSize, item.localMtime),
-            sha256 = sha,
-            replace = replace,
-            expectedSha256 = if (replace) item.remoteSha256 else null,
-            uploadIdFromQueue = sessionId,
-            onSession = { id -> db.updateOp(op.id, mapOf("upload_id" to id)) },
-            onProgress = { sent, total ->
-                val pct = if (total > 0) (sent * 100 / total).toInt() else 0
-                onProgress("загрузка ${item.name}: $pct%")
-            },
-        )
+        val result = runCatching {
+            Uploader(api).upload(
+                folderId = remoteFolderFor(job, item.relPath.substringBeforeLast('/', "")),
+                file = LocalFile(item.relPath, item.localPath, item.name, item.localSize, item.localMtime),
+                sha256 = sha,
+                replace = replace,
+                expectedSha256 = if (replace) item.remoteSha256 else null,
+                uploadIdFromQueue = sessionId,
+                onSession = { id -> db.updateOp(op.id, mapOf("upload_id" to id)) },
+                onProgress = { sent, total ->
+                    val pct = if (total > 0) (sent * 100 / total).toInt() else 0
+                    onProgress("загрузка ${item.name}: $pct%")
+                },
+                forceRelay = relayMode(),
+            )
+        }.getOrElse { e ->
+            // Хранилище с телефона недоступно (DNS, блокировщик, VPN) — это не повод не выгрузить
+            // файл: переключаемся на заливку через сервер и запоминаем режим для следующих файлов.
+            val dnsLike = (e.message ?: "").let {
+                it.contains("Unable to resolve host", true) || it.contains("No address associated", true)
+            }
+            if (!dnsLike || relayMode()) throw e
+            Log.w(TAG, "хранилище недоступно с телефона (${e.message}) — переключаюсь на заливку через сервер")
+            db.putKv(KV_RELAY_MODE, System.currentTimeMillis().toString())
+            db.putKv("job_note:${job.id}", "хранилище недоступно напрямую — выгрузка идёт через сервер")
+            Uploader(api).upload(
+                folderId = remoteFolderFor(job, item.relPath.substringBeforeLast('/', "")),
+                file = LocalFile(item.relPath, item.localPath, item.name, item.localSize, item.localMtime),
+                sha256 = sha,
+                replace = replace,
+                expectedSha256 = if (replace) item.remoteSha256 else null,
+                uploadIdFromQueue = null,
+                onSession = { id -> db.updateOp(op.id, mapOf("upload_id" to id)) },
+                onProgress = { sent, total ->
+                    val pct = if (total > 0) (sent * 100 / total).toInt() else 0
+                    onProgress("загрузка через сервер ${item.name}: $pct%")
+                },
+                forceRelay = true,
+            )
+        }
         if (result.stale) {
             handleStale(job, op)
             return
@@ -869,6 +896,11 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         Log.w(TAG, "операция ${op.kind} ${op.relPath}: $message (попытка $attempts)")
     }
 
+    /** Режим «через сервер»: включён, если прямое подключение к хранилищу не сработало. */
+    fun relayMode(): Boolean = db.kv(KV_RELAY_MODE) != null
+
+    fun resetRelayMode() = db.putKv(KV_RELAY_MODE, "")
+
     /** Служебное: пометить папку на сервере как «держать офлайн». */
     fun setFolderKeepOffline(folderId: String, keepOffline: Boolean) {
         api.patchFolder(folderId, JSONObject().put("keepOffline", keepOffline))
@@ -901,5 +933,6 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         /** После стольких попыток операция помечается как «требует внимания» и больше не долбится. */
         private const val MAX_ATTEMPTS = 20
         private const val KV_PINNED_FOLDERS = "pinned_folders"
+        private const val KV_RELAY_MODE = "relay_mode"
     }
 }

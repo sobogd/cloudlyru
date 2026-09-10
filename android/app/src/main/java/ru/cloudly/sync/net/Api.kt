@@ -216,13 +216,15 @@ class Api(private val prefs: Prefs) {
         replace: Boolean,
         clientMtime: Long,
         expectedSha256: String?,
+        /** relay — байты идут через сервер: нужно, если S3 с телефона недоступен. */
+        mode: String = "direct",
     ): UploadInit {
         val body = JSONObject().apply {
             put("folderId", folderId)
             put("name", name)
             put("size", size)
             put("mime", mime)
-            put("mode", "direct")
+            put("mode", mode)
             put("replace", replace)
             put("clientMtime", isoOf(clientMtime))
             if (sha256 != null) put("sha256", sha256)
@@ -298,14 +300,33 @@ class Api(private val prefs: Prefs) {
 
     /** Заливка одной части напрямую в S3 по presigned-ссылке (мимо VPS). */
     fun putPartToS3(presignedUrl: String, bytes: ByteArray, offset: Int, length: Int): String {
+        val host = runCatching { java.net.URL(presignedUrl).host }.getOrNull() ?: "S3"
+        prefs.lastS3Host = host
         val req = Request.Builder()
             .url(presignedUrl)
             .put(bytes.toRequestBody("application/octet-stream".toMediaType(), offset, length))
             .build()
         // свой клиент без Authorization: ссылка уже подписана, лишние заголовки ломают подпись
-        Oks3.client.newCall(req).execute().use { res ->
-            if (!res.isSuccessful) throw IOException("S3 ответил ${res.code}")
-            return res.header("ETag")?.trim('"') ?: throw IOException("S3 не отдал ETag")
+        try {
+            Oks3.client.newCall(req).execute().use { res ->
+                if (!res.isSuccessful) throw IOException("S3 ответил ${res.code}")
+                return res.header("ETag")?.trim('"') ?: throw IOException("S3 не отдал ETag")
+            }
+        } catch (e: IOException) {
+            // в сообщении должно быть видно, какой именно хост не отвечает
+            throw IOException("$host: ${e.message}", e)
+        }
+    }
+
+    /** Доступен ли хост хранилища с этого телефона (частая причина — блокировка в DNS/VPN). */
+    fun storageHostReachable(): String {
+        val host = prefs.lastS3Host
+        if (host.isNullOrBlank()) return "хост хранилища ещё не известен (он придёт с первой загрузкой)"
+        val dns = runCatching { java.net.InetAddress.getAllByName(host).joinToString(", ") { it.hostAddress ?: "?" } }
+        return if (dns.isSuccess) {
+            "хранилище: $host → ${dns.getOrNull()}"
+        } else {
+            "хранилище: $host не разрешается — ${dns.exceptionOrNull()?.message}"
         }
     }
 
