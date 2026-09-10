@@ -235,6 +235,7 @@ model UnzipJob {
   totalBytes     BigInt    @default(0)
   doneBytes      BigInt    @default(0)
   skippedEntries Int       @default(0) // уже существовали (идемпотентный перезапуск)
+  cursorIndex    Int       @default(0) // чекпойнт: сколько файлов архива уже обработано
   currentName    String?
   error          String?
   createdAt      DateTime  @default(now())

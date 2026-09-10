@@ -207,6 +207,40 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     await this.prisma.unzipJob.update({ where: { id: jobId }, data: patch }).catch(() => undefined);
   }
 
+  /**
+   * Чекпойнт: фиксирует индекс следующего файла и счётчики. Вызывается после
+   * каждого обработанного файла, но пишет в БД: прогресс — раз в 2 с, курсор —
+   * раз в 500 файлов (курсор всегда указывает на границу уже сделанного).
+   */
+  private async checkpoint(
+    jobId: string,
+    cursorIndex: number,
+    doneEntries: number,
+    doneBytes: number,
+    skipped: number,
+    currentName: string | null,
+    force = false,
+  ) {
+    const now = Date.now();
+    const last = Number(this.recent.get(jobId) ?? 0);
+    const wantProgress = force || now - last >= 2000;
+    const wantCursor = force || cursorIndex % 500 === 0;
+    if (!wantProgress && !wantCursor) return;
+    if (wantProgress) this.recent.set(jobId, String(now));
+    await this.prisma.unzipJob
+      .update({
+        where: { id: jobId },
+        data: {
+          doneEntries,
+          doneBytes: BigInt(doneBytes),
+          skippedEntries: skipped,
+          currentName,
+          ...(wantCursor ? { cursorIndex } : {}),
+        },
+      })
+      .catch(() => undefined);
+  }
+
   /** Папка-приёмник: рядом с архивом, имя = имя архива без .zip. */
   private async ensureTargetFolder(parentId: string, baseName: string): Promise<string> {
     const existing = await this.prisma.folder.findFirst({ where: { parentId, name: baseName, deletedAt: null } });
@@ -260,11 +294,18 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       return folder.id;
     };
 
-    let doneEntries = 0;
-    let doneBytes = 0;
-    let skipped = 0;
+    // Чекпойнт: сколько файлов уже обработано в прошлых заходах (рестарт сервиса
+    // не должен начинать архив заново — деплой иначе откатывает прогресс).
+    const startIndex = Math.min(job.cursorIndex ?? 0, files.length);
+    let doneEntries = job.doneEntries;
+    let doneBytes = Number(job.doneBytes);
+    let skipped = job.skippedEntries;
+    if (startIndex > 0) {
+      this.logger.log(`распаковка ${jobId}: продолжаем с файла ${startIndex + 1} из ${files.length}`);
+    }
 
-    for (const e of files) {
+    for (let idx = startIndex; idx < files.length; idx++) {
+      const e = files[idx];
       if (this.cancelled.has(jobId)) {
         await this.progress(jobId, { doneEntries, doneBytes: BigInt(doneBytes), currentName: null }, true);
         await this.prisma.unzipJob.update({
@@ -287,17 +328,12 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       const existing = await this.prisma.fileEntry.findFirst({ where: { folderId, name: fileName } });
       if (existing && !existing.deletedAt) {
         const asset = await this.prisma.asset.findUnique({ where: { id: existing.assetId } });
-        if (asset) {
-          const expected = e.uncompressedSize;
-          if (Number(asset.size) === expected) {
-            skipped += 1;
-            doneEntries += 1;
-            doneBytes += expected;
-            await this.progress(jobId, {
-              doneEntries, doneBytes: BigInt(doneBytes), skippedEntries: skipped, currentName: fileName,
-            });
-            continue;
-          }
+        if (asset && Number(asset.size) === e.uncompressedSize) {
+          skipped += 1;
+          doneEntries += 1;
+          doneBytes += e.uncompressedSize;
+          await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, fileName);
+          continue;
         }
       }
 
@@ -341,17 +377,11 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       }
 
       doneEntries += 1;
-      doneBytes += realSize;
-      await this.progress(jobId, {
-        doneEntries, doneBytes: BigInt(doneBytes), skippedEntries: skipped, currentName: fileName,
-      });
+      doneBytes += e.uncompressedSize;
+      await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, fileName);
     }
 
-    await this.progress(
-      jobId,
-      { doneEntries, doneBytes: BigInt(doneBytes), skippedEntries: skipped, currentName: null },
-      true,
-    );
+    await this.checkpoint(jobId, files.length, doneEntries, doneBytes, skipped, null, true);
     await this.prisma.unzipJob.update({
       where: { id: jobId },
       data: { state: 'done', finishedAt: new Date() },
