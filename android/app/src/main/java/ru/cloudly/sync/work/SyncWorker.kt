@@ -16,8 +16,16 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     override suspend fun doWork(): Result {
         val app = App.of(applicationContext)
         if (!app.prefs.configured) return Result.success()
+        if (!app.tryEnterSync()) return Result.success() // проход уже идёт
         // сеть и диск — на IO: воркер по умолчанию крутится на Dispatchers.Default
-        val stats = withContext(Dispatchers.IO) { app.engine().syncAll() }
+        val stats = withContext(Dispatchers.IO) {
+            try {
+                app.engine().syncAll()
+            } finally {
+                app.leaveSync()
+            }
+        }
+        app.db.kv("auth_error")?.let { Notifications.notifyProblems(applicationContext, "нет доступа: $it") }
         app.db.putKv("last_run_at", System.currentTimeMillis().toString())
         app.db.putKv(
             "last_run_stats",

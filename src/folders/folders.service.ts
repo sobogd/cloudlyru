@@ -426,25 +426,28 @@ export class FoldersService {
         );
       }
       if (entries.length) {
-        // пачкой: восстановление папки с тысячами файлов не должно превращаться в тысячи INSERT'ов
-        await tx.changeLog.createMany({
-          data: entries.map((e) => ({
-            userId,
-            target: 'entry',
-            op: 'restore',
-            targetId: e.id,
-            folderId: e.folderId,
-            name: e.name,
-            zone: e.zone,
-            sha256: e.asset.sha256,
-            size: e.asset.size,
-            mime: e.asset.mime,
-            clientMtime: e.clientMtime,
-            keepOffline: e.keepOffline,
-          })),
-        });
+        // Порциями: одна вставка с тысячами строк упирается в лимит параметров Postgres
+        // (65 535), а по одному INSERT'у — в таймаут транзакции.
+        for (let i = 0; i < entries.length; i += 500) {
+          await tx.changeLog.createMany({
+            data: entries.slice(i, i + 500).map((e) => ({
+              userId,
+              target: 'entry',
+              op: 'restore',
+              targetId: e.id,
+              folderId: e.folderId,
+              name: e.name,
+              zone: e.zone,
+              sha256: e.asset.sha256,
+              size: e.asset.size,
+              mime: e.asset.mime,
+              clientMtime: e.clientMtime,
+              keepOffline: e.keepOffline,
+            })),
+          });
+        }
       }
-    });
+    }, { timeout: 120_000, maxWait: 15_000 });
     await this.requeueAssetsIn(ids);
     return { ok: true, affected: ids.length };
   }

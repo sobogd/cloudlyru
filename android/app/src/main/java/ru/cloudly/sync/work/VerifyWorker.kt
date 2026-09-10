@@ -81,23 +81,40 @@ class VerifyWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 }
             }
             app.db.putKv(KV_VERIFY_CURSOR, "0")
-            // отдельно спрашиваем сервер, что из выгруженного он всё ещё считает своим
-            val shas = app.db.jobs(enabledOnly = true)
-                .flatMap { job -> app.db.itemsOf(job.id) }
-                .filter { it.state == Db.STATE_SYNCED && it.sha256 != null }
-                .mapNotNull { it.sha256 }
-                .distinct()
-                .take(500)
-            if (shas.isNotEmpty()) {
+            // Спрашиваем сервер, что из выгруженного он всё ещё считает своим. Идём по кругу
+            // порциями: иначе проверялись бы всегда одни и те же первые 500 хэшей.
+            val tracked = app.db.jobs(enabledOnly = true).flatMap { job ->
+                app.db.itemsOf(job.id)
+                    .filter { it.state == Db.STATE_SYNCED && it.sha256 != null }
+                    .map { job.id to it }
+            }
+            if (tracked.isNotEmpty()) {
+                val from = (app.db.kv(KV_REMOTE_CURSOR) ?: "0").toIntOrNull() ?: 0
+                val slice = ArrayList<Pair<Long, Db.Item>>(500)
+                var i = from
+                while (slice.size < 500 && i < tracked.size) {
+                    slice.add(tracked[i])
+                    i += 1
+                }
+                app.db.putKv(KV_REMOTE_CURSOR, (if (i >= tracked.size) 0 else i).toString())
+                val shas = slice.mapNotNull { it.second.sha256 }.distinct()
                 val present = runCatching { app.api.have(shas) }.getOrElse {
                     stats.errors += 1
                     emptySet()
                 }
-                stats.missing = shas.count { it !in present }
+                for ((jobId, item) in slice) {
+                    val sha = item.sha256 ?: continue
+                    if (sha in present) continue
+                    stats.missing += 1
+                    // содержимого на сервере больше нет — вернём файл в очередь на выгрузку
+                    app.db.updateItem(jobId, item.relPath, mapOf("state" to Db.STATE_NEW, "remote_sha256" to null))
+                    app.db.enqueueOp(jobId, item.relPath, Db.OP_UPLOAD)
+                }
             }
             return stats
         }
 
         private const val KV_VERIFY_CURSOR = "verify_cursor"
+        private const val KV_REMOTE_CURSOR = "verify_remote_cursor"
     }
 }

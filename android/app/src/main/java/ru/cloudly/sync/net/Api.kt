@@ -60,7 +60,7 @@ class Api(private val prefs: Prefs) {
     }
 
     /** Проверка токена и адреса сервера. */
-    fun me(): String = parse(request("/auth/me")).optJSONObject("user")?.optString("login").orEmpty()
+    fun me(): String = parse(request("/auth/me")).optString("login").orEmpty()
 
     /**
      * Первичная настройка: вход логином и паролем, затем выпуск device-токена.
@@ -228,6 +228,7 @@ class Api(private val prefs: Prefs) {
         }
         val o = parse(response)
         return UploadInit(
+            entryId = o.optJSONObject("entry")?.optString("id").orEmpty(),
             uploadId = if (o.isNull("uploadId")) null else o.optString("uploadId"),
             deduped = o.optBoolean("deduped", false),
             replaced = o.optBoolean("replaced", false),
@@ -238,10 +239,14 @@ class Api(private val prefs: Prefs) {
         )
     }
 
-    /** Состояние сессии: с какой части продолжать после обрыва. */
-    fun uploadStatus(uploadId: String): Pair<Int, Int> {
+    /** Состояние сессии: с какой части продолжать после обрыва и каким способом лить. */
+    fun uploadStatus(uploadId: String): UploadStatus {
         val o = parse(request("/uploads/$uploadId"))
-        return o.optInt("nextPart", 1) to o.optInt("partSize", 16 * 1024 * 1024)
+        return UploadStatus(
+            nextPart = o.optInt("nextPart", 1),
+            partSize = o.optInt("partSize", 16 * 1024 * 1024),
+            direct = o.optBoolean("direct", true),
+        )
     }
 
     fun partUrl(uploadId: String, part: Int): String =

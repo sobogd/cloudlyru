@@ -45,6 +45,8 @@ data class ChangesPage(
 
 /** Что вернул сервер на попытку начать загрузку. */
 data class UploadInit(
+    /** id записи в дереве: сервер отдаёт его и при дедупе (байты не передавались) */
+    val entryId: String = "",
     val uploadId: String?,
     val deduped: Boolean,
     val replaced: Boolean,
@@ -62,6 +64,9 @@ data class UploadInit(
 )
 
 data class EntryRef(val id: String, val name: String)
+
+/** Ответ GET /uploads/:id — с какой части продолжать и каким способом лить дальше. */
+data class UploadStatus(val nextPart: Int, val partSize: Int, val direct: Boolean)
 
 data class RemoteEntry(
     val id: String,

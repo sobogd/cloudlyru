@@ -62,29 +62,20 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
             """.trimIndent(),
         )
         db.execSQL("CREATE UNIQUE INDEX ops_unique ON ops(job_id, rel_path, kind)")
+        db.execSQL("CREATE INDEX ops_ready ON ops(job_id, next_attempt_at)")
         db.execSQL("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        db.execSQL(
-            """
-            CREATE TABLE remote_deleted(
-              entry_id TEXT PRIMARY KEY,
-              job_id INTEGER NOT NULL,
-              name TEXT NOT NULL,
-              folder_id TEXT,
-              sha256 TEXT,
-              at INTEGER NOT NULL
-            )
-            """.trimIndent(),
-        )
     }
 
+    /**
+     * Обновление схемы БЕЗ потери состояния: раньше здесь дропались все таблицы, то есть при
+     * первом же повышении версии терялись курсор журнала, состояние вытеснения и очередь —
+     * приложение заново заливало всю библиотеку.
+     */
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // схема локальная и восстановимая: проще пересоздать, состояние догонится сканом
-        db.execSQL("DROP TABLE IF EXISTS jobs")
-        db.execSQL("DROP TABLE IF EXISTS items")
-        db.execSQL("DROP TABLE IF EXISTS ops")
-        db.execSQL("DROP TABLE IF EXISTS kv")
-        db.execSQL("DROP TABLE IF EXISTS remote_deleted")
-        onCreate(db)
+        if (oldVersion < 2) {
+            db.execSQL("CREATE INDEX IF NOT EXISTS ops_ready ON ops(job_id, next_attempt_at)")
+            db.execSQL("DROP TABLE IF EXISTS remote_deleted")
+        }
     }
 
     // ===== задачи =====
@@ -113,15 +104,30 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
         )
     }
 
-    /** Сколько файлов в каком состоянии: нужно для понятного экрана статуса. */
+    /** Сколько файлов в каком состоянии: считает SQL, а не обход всех строк в Kotlin. */
     fun stateCounts(jobId: Long): Map<String, Int> {
         val out = HashMap<String, Int>()
-        for (item in itemsOf(jobId)) out[item.state] = (out[item.state] ?: 0) + 1
+        readableDatabase.rawQuery(
+            "SELECT state, COUNT(*) FROM items WHERE job_id = ? GROUP BY state",
+            arrayOf(jobId.toString()),
+        ).use { c -> while (c.moveToNext()) out[c.getString(0)] = c.getInt(1) }
         return out
     }
 
+    fun itemCount(jobId: Long): Int = readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM items WHERE job_id = ?",
+        arrayOf(jobId.toString()),
+    ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+
+    fun opCount(): Int = readableDatabase.rawQuery("SELECT COUNT(*) FROM ops", null).use { c ->
+        if (c.moveToFirst()) c.getInt(0) else 0
+    }
+
     /** Операции, которые не прошли: показываем текст последней ошибки. */
-    fun failedOps(): List<Op> = ops().filter { !it.lastError.isNullOrBlank() }
+    fun failedOps(limit: Int = 5): List<Op> = readableDatabase.rawQuery(
+        "SELECT * FROM ops WHERE last_error IS NOT NULL AND last_error <> '' ORDER BY id LIMIT ?",
+        arrayOf(limit.toString()),
+    ).use { c -> buildList { while (c.moveToNext()) add(readOp(c)) } }
 
     fun jobs(enabledOnly: Boolean = false): List<Job> {
         val where = if (enabledOnly) " WHERE enabled = 1" else ""
@@ -144,7 +150,6 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
         writableDatabase.delete("jobs", "id = ?", arrayOf(id.toString()))
         writableDatabase.delete("items", "job_id = ?", arrayOf(id.toString()))
         writableDatabase.delete("ops", "job_id = ?", arrayOf(id.toString()))
-        writableDatabase.delete("remote_deleted", "job_id = ?", arrayOf(id.toString()))
     }
 
     private fun readJob(c: Cursor) = Job(
@@ -224,15 +229,15 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
     // ===== очередь операций =====
 
     fun enqueueOp(jobId: Long, relPath: String, kind: String) {
-        val cv = ContentValues().apply {
-            put("job_id", jobId)
-            put("rel_path", relPath)
-            put("kind", kind)
-            put("next_attempt_at", 0)
-            put("created_at", System.currentTimeMillis())
-        }
-        // повторная постановка той же операции не должна сбрасывать прогресс загрузки
-        writableDatabase.insertWithOnConflict("ops", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
+        val now = System.currentTimeMillis()
+        // Повторная постановка обновляет срок и снимает прошлую ошибку, но НЕ трогает upload_id:
+        // прогресс частично залитого файла сохраняется. Раньше был CONFLICT_IGNORE, из-за чего
+        // операция с истёкшим «не повторять» оставалась мёртвой навсегда.
+        writableDatabase.execSQL(
+            "INSERT INTO ops(job_id, rel_path, kind, attempts, next_attempt_at, created_at) VALUES(?,?,?,0,?,?) " +
+                "ON CONFLICT(job_id, rel_path, kind) DO UPDATE SET next_attempt_at = 0, last_error = NULL",
+            arrayOf(jobId, relPath, kind, now, now),
+        )
     }
 
     fun nextOp(now: Long): Op? = readableDatabase.rawQuery(
@@ -268,35 +273,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
         lastError = c.getString(c.getColumnIndexOrThrow("last_error")),
     )
 
-    // ===== удаления, приехавшие с сервера (чтобы не заливать их обратно) =====
-
-    fun markRemoteDeleted(entryId: String, jobId: Long, name: String, folderId: String?, sha256: String?) {
-        writableDatabase.insertWithOnConflict(
-            "remote_deleted",
-            null,
-            ContentValues().apply {
-                put("entry_id", entryId)
-                put("job_id", jobId)
-                put("name", name)
-                put("folder_id", folderId)
-                put("sha256", sha256)
-                put("at", System.currentTimeMillis())
-            },
-            SQLiteDatabase.CONFLICT_REPLACE,
-        )
-    }
-
-    fun remoteDeletedIds(): Set<String> = readableDatabase.rawQuery("SELECT entry_id FROM remote_deleted", null).use { c ->
-        buildSet { while (c.moveToNext()) add(c.getString(0)) }
-    }
-
-    fun clearRemoteDeleted(entryId: String) = writableDatabase.delete("remote_deleted", "entry_id = ?", arrayOf(entryId))
-
     // ===== курсор журнала =====
-
-    fun cursor(): String = kv(KV_CURSOR) ?: "0"
-
-    fun setCursor(seq: String) = putKv(KV_CURSOR, seq)
 
     fun kv(key: String): String? = readableDatabase.rawQuery("SELECT value FROM kv WHERE key = ?", arrayOf(key)).use { c ->
         if (c.moveToFirst()) c.getString(0) else null
@@ -343,8 +320,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
 
     companion object {
         const val NAME = "cloudly-sync.db"
-        const val VERSION = 1
-        const val KV_CURSOR = "journal_cursor"
+        const val VERSION = 2
 
         const val STATE_NEW = "new"
         const val STATE_SYNCED = "synced"

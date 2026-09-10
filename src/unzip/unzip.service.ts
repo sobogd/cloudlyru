@@ -9,7 +9,7 @@ import { ChangesService } from '../sync/changes.service';
 import { RemoteZip, ZipEntryInfo, hashStream } from './s3-zip';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
-import { badRequest, notFound } from '../common/errors';
+import { badRequest, conflict, notFound } from '../common/errors';
 
 /** Файлы до этого размера распаковываются в память (один проход по S3). */
 const BUFFER_LIMIT = 128 * 1024 * 1024;
@@ -320,12 +320,14 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       const parentZone = await this.prisma.folder.findUniqueOrThrow({ where: { id: parentId }, select: { zone: true } });
       const zone = parentZone.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
       const found = await this.prisma.folder.findFirst({ where: { parentId, name } });
+      if (found?.deletedAt) {
+        // уникальный индекс (parentId, name) включает и мягко удалённые: без явной проверки
+        // create падал бы P2002 и задача распаковки уходила в failed с текстом Prisma
+        throw conflict(`папка «${name}» лежит в корзине — восстановите или очистите её`, 'in_trash');
+      }
       let folder = found;
       let op: 'create' | 'restore' | null = null;
-      if (found?.deletedAt) {
-        folder = await this.prisma.folder.update({ where: { id: found.id }, data: { deletedAt: null, zone } });
-        op = 'restore';
-      } else if (!found) {
+      if (!found) {
         folder = await this.prisma.folder.create({ data: { parentId, name, zone } });
         op = 'create';
       }

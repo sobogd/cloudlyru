@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import kotlinx.coroutines.CoroutineScope
@@ -41,6 +42,11 @@ class SyncService : Service() {
         startForegroundCompat(getString(R.string.app_name))
         if (job?.isActive == true) return START_NOT_STICKY
         val app = App.of(this)
+        if (!app.tryEnterSync()) {
+            stopForegroundCompat()
+            stopSelf()
+            return START_NOT_STICKY
+        }
         job = scope.launch {
             try {
                 val stats = app.engine().syncAll { line -> notifyProgress(line) }
@@ -52,11 +58,24 @@ class SyncService : Service() {
                 )
                 stats.fatal?.let { app.db.putKv("last_run_error", it) }
             } finally {
+                app.leaveSync()
                 stopForegroundCompat()
                 stopSelf()
             }
         }
         return START_NOT_STICKY
+    }
+
+    /**
+     * Android 15 ограничивает такие сервисы шестью часами за сутки и вызывает onTimeout:
+     * не остановиться самим — значит получить ANR. Продолжим следующим проходом WorkManager.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w("cloudly-sync", "лимит foreground-сервиса исчерпан — останавливаюсь")
+        job?.cancel()
+        App.of(this).leaveSync()
+        stopForegroundCompat()
+        stopSelf()
     }
 
     override fun onDestroy() {

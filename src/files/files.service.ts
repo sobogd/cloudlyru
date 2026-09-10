@@ -73,10 +73,19 @@ export class FilesService {
   async ensureAsset(sha256: string, size: number, mime: string, ext?: string): Promise<string> {
     const existing = await this.prisma.asset.findUnique({ where: { sha256 } });
     if (existing) return existing.id;
-    const asset = await this.prisma.asset.create({
-      data: { sha256, size: BigInt(size), mime, ext },
-    });
-    return asset.id;
+    try {
+      const asset = await this.prisma.asset.create({
+        data: { sha256, size: BigInt(size), mime, ext },
+      });
+      return asset.id;
+    } catch (e) {
+      // два устройства залили одно содержимое одновременно: строку создал кто-то другой
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        const raced = await this.prisma.asset.findUnique({ where: { sha256 } });
+        if (raced) return raced.id;
+      }
+      throw e;
+    }
   }
 
   /**
@@ -141,6 +150,20 @@ export class FilesService {
       'stale_version',
       current,
     );
+  }
+
+  /** Имя занято записью из корзины: отказ до передачи байтов, со ссылкой на запись. */
+  async assertNameNotInTrash(folderId: string, name: string): Promise<void> {
+    const trashed = await this.prisma.fileEntry.findFirst({
+      where: { folderId, name, deletedAt: { not: null } },
+      select: { id: true },
+    });
+    if (trashed) {
+      throw conflict('file with this name is in trash — restore or purge it first', 'in_trash', {
+        entryId: trashed.id,
+        name,
+      });
+    }
   }
 
   /**
@@ -537,6 +560,12 @@ export class FilesService {
       await tx.fileEntry.update({ where: { id: entryId }, data: { deletedAt: new Date() } });
       await this.changes.recordEntry(userId, entryId, 'delete', tx);
     });
+    // удалённый файл не должен доехать до конца конвертации: ffmpeg по 4K-видео держит оба ядра
+    const asset = await this.prisma.fileEntry.findUnique({
+      where: { id: entryId },
+      select: { assetId: true },
+    });
+    if (asset) await this.queue.cancelForAssets([asset.assetId]).catch(() => undefined);
     return { ok: true };
   }
 

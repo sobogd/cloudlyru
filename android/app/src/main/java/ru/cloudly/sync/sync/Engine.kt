@@ -35,6 +35,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         var evicted: Int = 0,
         var conflicts: Int = 0,
         var errors: Int = 0,
+        var empty: Int = 0,
         var pending: Int = 0,
         var fatal: String? = null,
     )
@@ -82,7 +83,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
 
     /** @return true, если нужен полный рескан (курсор старше журнала). */
     private fun applyJournal(job: Db.Job, onProgress: (String) -> Unit): Boolean {
-        var cursor = db.cursor().toLongOrNull() ?: 0L
+        var cursor = (db.kv(cursorKey(job.id)) ?: "0").toLongOrNull() ?: 0L
         var reset = false
         // Состояние читаем один раз и держим в памяти: применять событие запросом к базе на каждый
         // файл — это O(n²) на первой синхронизации большой библиотеки.
@@ -100,7 +101,6 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                 }
                 val item = byEntry[change.targetId] ?: byPathName[change.folderId to change.name]
                 if (change.op == "delete") {
-                    db.markRemoteDeleted(change.targetId, job.id, change.name, change.folderId, change.sha256)
                     if (item != null) {
                         deleteLocal(job, item, "удалено на сервере")
                         byEntry.remove(item.remoteEntryId)
@@ -127,15 +127,17 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                     )
                     byEntry[change.targetId] = updated
                     byPathName[change.folderId to change.name] = updated
-                    db.clearRemoteDeleted(change.targetId)
                 }
             }
-            db.setCursor(cursor.toString())
+            db.putKv(cursorKey(job.id), cursor.toString())
             if (!page.hasMore) break
             onProgress("журнал: ${page.changes.size} событий")
         }
         return reset
     }
+
+    /** Курсор у каждой задачи свой: журнал общий для пользователя, а состояние — по папкам. */
+    private fun cursorKey(jobId: Long) = "journal_cursor:$jobId"
 
     private fun applyFolderChange(change: ru.cloudly.sync.net.Change) {
         if (change.op == "pin") {
@@ -168,7 +170,9 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             stats.fatal = "папка недоступна: ${job.sourceDir}"
             return
         }
-        val files = Scanner.scan(job.sourceDir, job.includeSubfolders)
+        val scan = Scanner.scan(job.sourceDir, job.includeSubfolders)
+        val files = scan.files
+        val byPath = known.associateBy { it.relPath }
         // Аварийный стоп: пустой скан при известных файлах — это сбой чтения, а не удаление всего.
         // Без этой проверки один сбойный проход снёс бы и облако, и телефон.
         if (files.isEmpty() && known.isNotEmpty()) {
@@ -178,15 +182,21 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         stats.scanned += files.size
         onProgress("${File(job.sourceDir).name}: ${files.size} файлов")
 
-        val seen = HashSet<String>()
+        // Пропущенное сканером (файл ещё пишется, каталог не прочитался) — не «удалено»:
+        // иначе серверная копия такого файла уехала бы в корзину, а через проход файл залился
+        // бы заново как новая запись.
+        val seen = HashSet<String>(scan.skipped)
         val candidates = ArrayList<Pair<LocalFile, Db.Item?>>()
         for (file in files) {
             seen.add(file.relPath)
-            val item = known.firstOrNull { it.relPath == file.relPath }
-            if (item != null && item.state == Db.STATE_SYNCED && item.sha256 != null &&
-                item.localSize == file.size && item.localMtime == file.mtime
-            ) {
-                stats.skipped += 1
+            val item = byPath[file.relPath]
+            if (item != null && item.sha256 != null && item.localSize == file.size && item.localMtime == file.mtime) {
+                if (item.state == Db.STATE_SYNCED) {
+                    stats.skipped += 1
+                    continue
+                }
+                // файл не менялся, но операция ещё в очереди (ждёт бэкоффа): хэш не пересчитываем
+                candidates.add(file to item)
                 continue
             }
             candidates.add(file to item)
@@ -195,8 +205,13 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         // Хэшируем всех кандидатов одним проходом: эти же хэши нужны и для переносов, и для дедупа.
         val hashed = ArrayList<Triple<LocalFile, Db.Item?, String>>(candidates.size)
         for ((file, item) in candidates) {
-            if (file.size == 0L) continue
-            hashed.add(Triple(file, item, Hasher.sha256(File(file.path))))
+            if (file.size == 0L) {
+                // сервер принимает только непустые файлы: считаем и показываем, а не молчим
+                stats.empty += 1
+                continue
+            }
+            val knownSha = item?.sha256?.takeIf { item.localSize == file.size && item.localMtime == file.mtime }
+            hashed.add(Triple(file, item, knownSha ?: Hasher.sha256(File(file.path))))
         }
 
         // Переименование или перенос на телефоне — это НЕ «удалили и залили заново»: сопоставляем
@@ -235,10 +250,11 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         }
 
         // Локальные удаления: было в base, локально исчезло и ни с чем не совпало по содержимому.
+        val toDelete = ArrayList<Db.Item>()
         for (item in known) {
             if (item.relPath in seen || item.relPath in movedOld) continue
             if (item.state == Db.STATE_EVICTED) continue
-            if (item.remoteEntryId == null) {
+            if (item.remoteEntryId.isNullOrBlank()) {
                 db.deleteItem(job.id, item.relPath)
                 continue
             }
@@ -246,8 +262,17 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                 Log.i(TAG, "не удаляю закреплённое локально: ${item.relPath}")
                 continue
             }
-            db.enqueueOp(job.id, item.relPath, Db.OP_DELETE)
+            toDelete.add(item)
         }
+        // Предохранитель из плана: массовое удаление — почти всегда сбой чтения, а не воля
+        // пользователя. Останавливаемся, ничего не удаляя, и говорим об этом.
+        val base = known.count { it.remoteEntryId != null }
+        if (toDelete.size > 20 || (base > 0 && toDelete.size * 100 / base > 10)) {
+            stats.fatal = "похоже на массовое удаление (${toDelete.size} из $base) — проход прерван, ничего не удалено"
+            Log.w(TAG, stats.fatal!!)
+            return
+        }
+        for (item in toDelete) db.enqueueOp(job.id, item.relPath, Db.OP_DELETE)
 
         val shas = hashed.filter { entry -> entry.second?.sha256 != entry.third }.map { it.third }
         val present = if (shas.isEmpty()) emptySet() else runCatching { api.have(shas.distinct().take(500)) }.getOrDefault(emptySet())
@@ -349,11 +374,18 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             } catch (e: ApiException) {
                 when {
                     e.code == "stale_version" -> handleStale(job, op)
-                    e.code == "in_trash" -> handleInTrash(job, op)
+                    e.code == "in_trash" -> handleInTrash(job, op, stats)
                     e.code == "conflict" || (e.message ?: "").contains("already exists") -> handleNameTaken(job, op, stats)
-                    e.code == "upload_session_lost" -> {
-                        // сервер потерял состояние релей-сессии — начинаем загрузку заново
-                        db.updateOp(op.id, mapOf("upload_id" to null, "next_attempt_at" to System.currentTimeMillis() + 5_000))
+                    // сервер потерял сессию (рестарт, чистка брошенных, повторный complete):
+                    // сбрасываем upload_id и начинаем загрузку заново, иначе 404 будет вечно
+                    e.status == 404 || e.code == "upload_session_lost" || e.code == "upload_completed" -> {
+                        db.updateOp(op.id, mapOf("upload_id" to null, "next_attempt_at" to System.currentTimeMillis() + 3_000))
+                        Log.i(TAG, "сессия загрузки ${op.relPath} потеряна — начну заново")
+                    }
+                    e.status == 401 || e.status == 403 -> {
+                        // токен отозван или прав не хватает: повторять бессмысленно, говорим пользователю
+                        db.putKv("auth_error", e.message ?: "нет доступа")
+                        db.updateOp(op.id, mapOf("last_error" to "нет доступа (проверь токен)", "next_attempt_at" to System.currentTimeMillis() + 3_600_000))
                     }
                     else -> retry(op, e.message ?: "ошибка API", stats)
                 }
@@ -372,7 +404,14 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             return
         }
         val sha = item.sha256 ?: Hasher.sha256(file).also { db.updateItem(job.id, op.relPath, mapOf("sha256" to it)) }
-        val replace = item.remoteEntryId != null
+        // если файл изменился после начала заливки, продолжать чужую сессию нельзя
+        var sessionId = op.uploadId
+        if (sessionId != null && item.state == Db.STATE_SYNCED) {
+            runCatching { api.abort(sessionId) }
+            sessionId = null
+        }
+        // перезаписываем только ту версию, которую видели: иначе сервер не сможет защитить чужой файл
+        val replace = item.remoteEntryId != null && item.remoteSha256 != null
         onProgress("загрузка: ${item.name}")
         val result = Uploader(api).upload(
             folderId = remoteFolderFor(job, item.relPath.substringBeforeLast('/', "")),
@@ -380,7 +419,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             sha256 = sha,
             replace = replace,
             expectedSha256 = if (replace) item.remoteSha256 else null,
-            uploadIdFromQueue = op.uploadId,
+            uploadIdFromQueue = sessionId,
             onSession = { id -> db.updateOp(op.id, mapOf("upload_id" to id)) },
             onProgress = { sent, total ->
                 val pct = if (total > 0) (sent * 100 / total).toInt() else 0
@@ -392,15 +431,19 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             return
         }
         if (result.inTrash) {
-            handleInTrash(job, op)
+            handleInTrash(job, op, stats)
             return
         }
+        // id записи обязателен: с пустым id не поедет ни удаление, ни перенос, а зеркало
+        // притащит удалённый файл обратно. Сервер отдаёт его и в дедуп-ответе.
+        val entryId = result.entryId.ifBlank { item.remoteEntryId ?: "" }
+        if (entryId.isBlank()) throw IllegalStateException("сервер не вернул id записи для ${item.name}")
         db.updateItem(
             job.id,
             op.relPath,
             mapOf(
                 "state" to Db.STATE_SYNCED,
-                "remote_entry_id" to result.entryId.ifBlank { item.remoteEntryId ?: "" },
+                "remote_entry_id" to entryId,
                 "remote_sha256" to sha,
                 "uploaded_at" to System.currentTimeMillis(),
             ),
@@ -419,7 +462,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         }
         val target = File(item.localPath.ifBlank { File(job.sourceDir, item.relPath).absolutePath })
         onProgress("возврат: ${item.name}")
-        Downloader.download(api, entryId, target, null)
+        Downloader.download(api, entryId, target, null, item.sha256, item.localSize)
         db.updateItem(
             job.id,
             op.relPath,
@@ -451,7 +494,8 @@ class Engine(private val context: Context, private val db: Db, private val api: 
         val item = db.item(job.id, op.relPath) ?: run { db.deleteOp(op.id); return }
         val src = File(item.localPath)
         val stamp = java.text.SimpleDateFormat("yyyy-MM-dd HH-mm", java.util.Locale.US).format(java.util.Date())
-        val conflictName = buildConflictName(item.name, stamp)
+        val device = android.os.Build.MODEL.replace(Regex("[^A-Za-z0-9]+"), "-").take(12).ifBlank { "android" }
+        val conflictName = freeName(buildConflictName(item.name, "$stamp $device"), emptySet())
         val target = File(src.parentFile, conflictName)
         if (src.exists() && !target.exists() && src.renameTo(target)) {
             db.deleteItem(job.id, op.relPath)
@@ -474,29 +518,48 @@ class Engine(private val context: Context, private val db: Db, private val api: 
     }
 
     /**
-     * Файл с таким именем лежит в корзине сервера. Возвращать его сами не имеем права (корзина —
-     * решение пользователя), поэтому помечаем состояние и больше не повторяем бесконечно.
+     * Имя занято записью из корзины сервера. Воскрешать удалённое сами не имеем права,
+     * но и терять файл нельзя: заливаем его под свободным именем, а пользователь потом
+     * сам решит, что делать с корзиной.
      */
-    private fun handleInTrash(job: Db.Job, op: Db.Op) {
-        db.updateItem(job.id, op.relPath, mapOf("state" to Db.STATE_SYNCED, "remote_sha256" to null))
-        db.updateOp(op.id, mapOf("last_error" to "имя занято корзиной сервера", "next_attempt_at" to Long.MAX_VALUE / 2))
-        Log.w(TAG, "файл в корзине сервера: ${op.relPath}")
+    private fun handleInTrash(job: Db.Job, op: Db.Op, stats: Stats) {
+        val item = db.item(job.id, op.relPath) ?: run { db.deleteOp(op.id); return }
+        db.updateItem(job.id, op.relPath, mapOf("remote_sha256" to null, "remote_entry_id" to null))
+        val taken = runCatching {
+            api.children(remoteFolderFor(job, item.relPath.substringBeforeLast('/', ""))).entries.map { it.name }.toHashSet()
+        }.getOrDefault(emptySet())
+        val newName = freeName(item.name, taken)
+        val src = File(item.localPath)
+        val target = File(src.parentFile, newName)
+        if (!src.exists() || target.exists() || !src.renameTo(target)) {
+            retry(op, "имя занято корзиной, переименовать не удалось", stats)
+            return
+        }
+        val newRel = if (item.relPath.contains('/')) item.relPath.substringBeforeLast('/') + "/" + newName else newName
+        db.deleteItem(job.id, item.relPath)
+        db.putItem(item.copy(relPath = newRel, localPath = target.absolutePath, name = newName, state = Db.STATE_NEW))
+        db.deleteOp(op.id)
+        db.enqueueOp(job.id, newRel, Db.OP_UPLOAD)
+        Log.w(TAG, "имя занято корзиной сервера: ${item.name} → $newName")
     }
 
     /**
-     * Имя занято записью на сервере (загружено из веба, с другого устройства или после полного
-     * рескана). Совпал хэш — просто фиксируем состояние; не совпал — заливаем как замену строго,
-     * с ожидаемой версией, чтобы сервер подтвердил, что мы правим актуальное содержимое.
+     * Имя на сервере занято ДРУГОЙ записью. Совпал хэш — это то же содержимое, просто фиксируем.
+     * Не совпал — перезаписывать нельзя: за этим именем может стоять чужой файл (вторая папка
+     * с тем же именем файла, загрузка из веба), и сервер честно удалит его из S3, оставшись
+     * без ссылок. Поэтому локальный файл получает свободное имя с суффиксом и уезжает отдельно —
+     * ровно как решено в плане для плоско раскладываемой зоны «Фото».
      */
     private fun handleNameTaken(job: Db.Job, op: Db.Op, stats: Stats) {
         val item = db.item(job.id, op.relPath) ?: run { db.deleteOp(op.id); return }
         val remoteFolderId = remoteFolderFor(job, item.relPath.substringBeforeLast('/', ""))
-        val remote = runCatching { api.children(remoteFolderId).entries.firstOrNull { it.name == item.name } }.getOrNull()
-        if (remote == null) {
-            retry(op, "имя занято, но запись не найдена", stats)
+        val children = runCatching { api.children(remoteFolderId).entries }.getOrNull()
+        if (children == null) {
+            retry(op, "имя занято, но список папки не прочитался", stats)
             return
         }
-        if (remote.sha256 == item.sha256) {
+        val remote = children.firstOrNull { it.name == item.name }
+        if (remote != null && remote.sha256 == item.sha256) {
             db.updateItem(
                 job.id,
                 op.relPath,
@@ -510,17 +573,66 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             db.deleteOp(op.id)
             stats.deduped += 1
             Log.i(TAG, "уже на сервере (совпало по хэшу): ${item.name}")
-        } else {
-            db.updateItem(job.id, op.relPath, mapOf("remote_entry_id" to remote.id, "remote_sha256" to remote.sha256))
-            db.updateOp(op.id, mapOf("next_attempt_at" to 0, "upload_id" to null))
-            stats.conflicts += 1
-            Log.i(TAG, "на сервере другая версия ${item.name} — заливаем как замену")
+            return
         }
+        val taken = children.map { it.name }.toHashSet()
+        val newName = freeName(item.name, taken)
+        val src = File(item.localPath)
+        val target = File(src.parentFile, newName)
+        if (!src.exists() || target.exists() || !src.renameTo(target)) {
+            retry(op, "имя занято, переименовать локально не удалось", stats)
+            return
+        }
+        val newRel = if (item.relPath.contains('/')) {
+            item.relPath.substringBeforeLast('/') + "/" + newName
+        } else {
+            newName
+        }
+        db.deleteOp(op.id)
+        db.deleteItem(job.id, item.relPath)
+        db.putItem(
+            item.copy(
+                relPath = newRel,
+                localPath = target.absolutePath,
+                name = newName,
+                remoteEntryId = null,
+                remoteSha256 = null,
+                state = Db.STATE_NEW,
+            ),
+        )
+        db.enqueueOp(job.id, newRel, Db.OP_UPLOAD)
+        stats.conflicts += 1
+        Log.i(TAG, "имя занято другой версией: ${item.name} → $newName")
+    }
+
+    /** Свободное имя с суффиксом: `IMG_0001 (2).jpg`, `(3)`… — как принято в плане. */
+    private fun freeName(name: String, taken: Set<String>): String {
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        for (i in 2 until 1000) {
+            val candidate = "$base ($i)$ext"
+            if (candidate !in taken && !File(candidate).exists()) return candidate
+        }
+        return "$base (${System.currentTimeMillis()})$ext"
     }
 
     // ===== зеркало вниз и вытеснение =====
 
+    /** Свободное место на диске: не тянем вниз больше, чем помещается (иначе телефон встанет). */
+    private fun freeBytes(path: String): Long = runCatching {
+        val stat = android.os.StatFs(path)
+        stat.availableBlocksLong * stat.blockSizeLong
+    }.getOrDefault(Long.MAX_VALUE)
+
+    private val minFreeBytes = 500L * 1024 * 1024
+
     private fun mirrorDown(job: Db.Job, stats: Stats, onProgress: (String) -> Unit) {
+        if (freeBytes(job.sourceDir) < minFreeBytes) {
+            stats.fatal = "мало свободного места (${freeBytes(job.sourceDir) / 1024 / 1024} МБ) — скачивание остановлено"
+            Log.w(TAG, stats.fatal!!)
+            return
+        }
         val remote = ArrayList<Pair<String, ru.cloudly.sync.net.RemoteEntry>>()
         collectRemote(job.targetFolderId, "", remote, 0)
         val known = db.itemsOf(job.id).associateBy { it.relPath }
@@ -531,10 +643,15 @@ class Engine(private val context: Context, private val db: Db, private val api: 
                 if (item.state == Db.STATE_EVICTED && !entry.keepOffline && !item.keepOffline) continue
                 if (item.remoteSha256 == entry.sha256 && File(item.localPath).isFile) continue
             }
+            if (freeBytes(job.sourceDir) - entry.size < minFreeBytes) {
+                stats.fatal = "мало свободного места — скачивание остановлено на ${entry.name}"
+                Log.w(TAG, stats.fatal!!)
+                return
+            }
             val target = File(job.sourceDir, relPath)
             onProgress("скачивание: ${entry.name}")
             try {
-                Downloader.download(api, entry.id, target, entry.clientMtime)
+                Downloader.download(api, entry.id, target, entry.clientMtime, entry.sha256, entry.size)
             } catch (e: Exception) {
                 stats.errors += 1
                 Log.w(TAG, "не скачался ${entry.name}: ${e.message}")
@@ -573,7 +690,7 @@ class Engine(private val context: Context, private val db: Db, private val api: 
             if (target.isFile && item.state == Db.STATE_SYNCED) continue
             onProgress("возврат закреплённого: ${item.name}")
             try {
-                Downloader.download(api, item.remoteEntryId!!, target, null)
+                Downloader.download(api, item.remoteEntryId!!, target, null, item.sha256, item.localSize)
             } catch (e: Exception) {
                 stats.errors += 1
                 Log.w(TAG, "не вернулся ${item.name}: ${e.message}")

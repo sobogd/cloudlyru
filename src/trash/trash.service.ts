@@ -9,6 +9,13 @@ import { AuditService } from '../audit/audit.service';
 import { ChangesService } from '../sync/changes.service';
 import { conflict } from '../common/errors';
 
+/** Разбиение на порции: бережём лимит параметров запроса (у Postgres это 65 535). */
+function chunksOf<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 @Injectable()
 export class TrashService {
   private readonly logger = new Logger(TrashService.name);
@@ -119,46 +126,46 @@ export class TrashService {
     // Tombstones и удаление строк — атомарно: журнал изменений не связан внешними ключами
     // с деревом именно ради того, чтобы tombstone пережил физическое удаление (иначе клиент
     // зальёт удалённое обратно). Ошибку записи не глотаем: без tombstone чистку делать нельзя.
-    await this.prisma.$transaction(async (tx) => {
-      for (const e of deletedEntries) {
-        await this.changes.record(
-          {
-            userId,
-            target: 'entry',
-            op: 'delete',
-            targetId: e.id,
-            folderId: e.folderId,
-            name: e.name,
-            zone: e.zone,
-            sha256: e.asset.sha256,
-            size: Number(e.asset.size),
-            mime: e.asset.mime,
-            clientMtime: e.clientMtime,
-            keepOffline: e.keepOffline,
-          },
-          tx,
-        );
-      }
-      for (const f of deletedFolders) {
-        // для папки одного события на поддерево достаточно: «папки нет» ⇒ её содержимого нет
-        await this.changes.record(
-          {
-            userId,
-            target: 'folder',
-            op: 'delete',
-            targetId: f.id,
-            folderId: f.parentId,
-            name: f.name,
-            zone: f.zone,
-            keepOffline: f.keepOffline,
-          },
-          tx,
-        );
-      }
-      if (entryIds.length) await tx.fileEntry.deleteMany({ where: { id: { in: entryIds } } });
-      // onDelete: Cascade убирает и все FileEntry внутри удалённых папок
-      if (folderIds.length) await tx.folder.deleteMany({ where: { id: { in: folderIds } } });
-    });
+    await this.prisma.$transaction(
+      async (tx) => {
+        // Tombstone'ы пишем пачками: по одному INSERT на строку корзина на тысячи файлов
+        // не укладывалась в дефолтный 5-секундный таймаут транзакции Prisma.
+        const entryRows = deletedEntries.map((e) => ({
+          userId,
+          target: 'entry',
+          op: 'delete',
+          targetId: e.id,
+          folderId: e.folderId,
+          name: e.name,
+          zone: e.zone,
+          sha256: e.asset.sha256,
+          size: e.asset.size,
+          mime: e.asset.mime,
+          clientMtime: e.clientMtime,
+          keepOffline: e.keepOffline,
+        }));
+        const folderRows = deletedFolders.map((f) => ({
+          userId,
+          target: 'folder',
+          op: 'delete',
+          targetId: f.id,
+          folderId: f.parentId,
+          name: f.name,
+          zone: f.zone,
+          keepOffline: f.keepOffline,
+        }));
+        for (const chunk of chunksOf(entryRows, 500)) await tx.changeLog.createMany({ data: chunk });
+        for (const chunk of chunksOf(folderRows, 500)) await tx.changeLog.createMany({ data: chunk });
+        if (entryIds.length) {
+          for (const chunk of chunksOf(entryIds, 1000)) {
+            await tx.fileEntry.deleteMany({ where: { id: { in: chunk } } });
+          }
+        }
+        // onDelete: Cascade убирает и все FileEntry внутри удалённых папок
+        if (folderIds.length) await tx.folder.deleteMany({ where: { id: { in: folderIds } } });
+      },
+      { timeout: 120_000, maxWait: 15_000 },
+    );
 
     // Осиротевшие ассеты: строку удаляем под условием «ссылок нет» (никакого FK-500 при гонке),
     // а объекты в S3 трогаем только после коммита и только у реально удалённых строк.
@@ -174,11 +181,24 @@ export class TrashService {
         const res = await this.prisma.asset.deleteMany({ where: { id: a.id, entries: { none: {} } } });
         if (res.count > 0) removed.push(a);
       }
+      // Перед удалением объектов перепроверяем, что строки с этим содержимым не появились снова:
+      // параллельная загрузка того же sha создаёт новый Asset, и удаление ключей убило бы
+      // байты живого файла. Между deleteMany и deleteObjects это окно реально (дедуп по sha).
+      const stillAbsent = await this.prisma.asset.findMany({
+        where: { sha256: { in: removed.map((a) => a.sha256) } },
+        select: { sha256: true },
+      });
+      const backAgain = new Set(stillAbsent.map((a) => a.sha256));
+      if (backAgain.size) {
+        this.logger.warn(`${backAgain.size} ассетов вернулись во время очистки — объекты не трогаем`);
+      }
       // производные (view/*) и сырьё: у легаси-ассетов «Фото» сырья могло уже не быть
-      const keys = removed.flatMap((a) => [
-        S3Service.assetKey(a.sha256),
-        ...MediaService.derivativeKeys(a.sha256),
-      ]);
+      const keys = removed
+        .filter((a) => !backAgain.has(a.sha256))
+        .flatMap((a) => [
+          S3Service.assetKey(a.sha256),
+          ...MediaService.derivativeKeys(a.sha256),
+        ]);
       const failed = keys.length
         ? await this.s3.deleteObjects(keys).catch((e: Error) => {
             this.logger.error(`S3 не ответил на удаление объектов: ${e.message}`);

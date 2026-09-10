@@ -16,6 +16,7 @@ import ru.cloudly.sync.sync.Engine
 import ru.cloudly.sync.work.SyncWorker
 import ru.cloudly.sync.work.VerifyWorker
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Ручная сборка зависимостей без DI-фреймворка: приложение маленькое, а лишний кодогенератор
@@ -31,6 +32,19 @@ class App : Application() {
 
     /** Движок создаётся по требованию: он лёгкий, но держать его в Application незачем. */
     fun engine(): Engine = Engine(this, db, api)
+
+    /**
+     * Один проход синхронизации за раз. Периодическая задача WorkManager и «Синхронизировать
+     * сейчас» — разные исполнители: без этого лока два движка одновременно заливали бы одни
+     * и те же файлы и качали в один временный файл, портя содержимое.
+     */
+    fun tryEnterSync(): Boolean = syncRunning.compareAndSet(false, true)
+
+    fun leaveSync() {
+        syncRunning.set(false)
+    }
+
+    private val syncRunning = AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()

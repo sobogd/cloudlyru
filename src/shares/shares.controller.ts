@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
 import { SharesService } from './shares.service';
-import { CurrentUser, RequestUser } from '../common/decorators';
+import { CurrentUser, RequestUser, SessionOnly } from '../common/decorators';
 import { asOptionalString, asString, isPlainObject } from '../common/utils';
 import { badRequest } from '../common/errors';
 
@@ -8,6 +8,8 @@ import { badRequest } from '../common/errors';
 export class SharesController {
   constructor(private readonly shares: SharesService) {}
 
+  /** Публичные ссылки выпускает только веб-сессия: device-токен не должен выставлять дерево наружу. */
+  @SessionOnly()
   @Post()
   create(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
     if (!isPlainObject(body)) throw badRequest('invalid body');
@@ -35,6 +37,7 @@ export class SharesController {
     return this.shares.list(user.id);
   }
 
+  @SessionOnly()
   @Patch(':token')
   update(
     @Param('token') token: string,
@@ -66,6 +69,7 @@ export class SharesController {
     return this.shares.update(token, { password, expiresAt, capability }, user.id);
   }
 
+  @SessionOnly()
   @Delete(':token')
   revoke(@Param('token') token: string, @CurrentUser() user: RequestUser) {
     return this.shares.revoke(token, user.id);

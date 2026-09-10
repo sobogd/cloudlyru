@@ -20,6 +20,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -37,8 +42,12 @@ import ru.cloudly.sync.work.SyncService
 fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
     var filter by remember { mutableStateOf("evicted") }
     var version by remember { mutableStateOf(0) }
+    var error by remember { mutableStateOf("") }
+    // чтение из SQLite — только вне главного потока: на большой библиотеке это подвисания UI
+    val all = remember(job.id, version) {
+        runBlocking(Dispatchers.IO) { app.db.itemsOf(job.id) }
+    }
     val items = remember(job.id, version, filter) {
-        val all = app.db.itemsOf(job.id)
         when (filter) {
             "evicted" -> all.filter { it.state == Db.STATE_EVICTED }
             "pinned" -> all.filter { it.keepOffline }
@@ -46,11 +55,11 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
             else -> all
         }
     }
-    val all = remember(job.id, version) { app.db.itemsOf(job.id) }
     val evicted = all.count { it.state == Db.STATE_EVICTED }
     val pinned = all.count { it.keepOffline }
     val pending = all.count { it.state == Db.STATE_NEW }
 
+    val scope = rememberCoroutineScope()
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(onClick = onBack) { Text("⬅️ Назад") }
@@ -73,6 +82,7 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
                 }
         }
         Spacer(Modifier.height(8.dp))
+        if (error.isNotEmpty()) Text(error, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
         if (items.isEmpty()) {
             Text("Пусто", fontSize = 13.sp)
         }
@@ -96,17 +106,23 @@ fun JobFilesScreen(job: Db.Job, app: App, onBack: () -> Unit) {
                                     version += 1
                                 }) { Text("Вернуть на телефон", fontSize = 12.sp) }
                             }
-                            if (item.remoteEntryId != null) {
+                            if (!item.remoteEntryId.isNullOrBlank()) {
                                 OutlinedButton(onClick = {
-                                    runCatching {
-                                        app.engine().setFileKeepOffline(
-                                            job.id,
-                                            item.relPath,
-                                            item.remoteEntryId!!,
-                                            !item.keepOffline,
-                                        )
+                                    scope.launch {
+                                        // сеть и диск — не в главном потоке: иначе запрос молча падает
+                                        val failure = withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                app.engine().setFileKeepOffline(
+                                                    job.id,
+                                                    item.relPath,
+                                                    item.remoteEntryId!!,
+                                                    !item.keepOffline,
+                                                )
+                                            }.exceptionOrNull()
+                                        }
+                                        error = failure?.let { "не получилось: ${it.message}" } ?: ""
+                                        version += 1
                                     }
-                                    version += 1
                                 }) {
                                     Text(if (item.keepOffline) "Снять закрепление" else "Держать офлайн", fontSize = 12.sp)
                                 }

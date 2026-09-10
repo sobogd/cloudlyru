@@ -19,6 +19,9 @@ import { ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound, payloadTooLarge, tooMany } from '../common/errors';
 
 /** Принятая часть multipart: ETag отдаёт S3, клиент передаёт его серверу. */
+/** Минимальный размер части multipart в S3 (кроме последней). */
+const MIN_RELAY_PART_BYTES = 5 * 1024 * 1024;
+
 interface StoredPart {
   partNumber: number;
   etag: string;
@@ -301,6 +304,9 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     const folderId = await this.resolveFolder(body.folderId, userId);
     // предусловие проверяем сразу: иначе клиент зальёт гигабайты, а на complete получит 409
     if (expect) await this.files.assertExpectedVersion(folderId, name, expect);
+    // и отдельно имя из корзины: воскрешать удалённое сами не будем, но клиент должен узнать
+    // об этом ДО передачи байтов (раньше 409 приходил только на complete)
+    await this.files.assertNameNotInTrash(folderId, name);
     const declared = normalizeSha(body.sha256);
     const direct = body.mode !== 'relay' && this.s3.configured;
 
@@ -435,6 +441,10 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     if (chunk.length > CHUNK_MAX_BYTES) throw payloadTooLarge('chunk too large');
     const row = await this.requireSession(uploadId, userId);
     this.assertNotCompleted(row);
+    // S3 требует не меньше 5 МБ на часть, кроме последней: иначе complete падал бы 500'кой
+    if (partNumber < this.partCount(Number(row.size)) && chunk.length < MIN_RELAY_PART_BYTES) {
+      throw badRequest(`часть ${partNumber} меньше 5 МБ — S3 такую не примет`);
+    }
 
     const live = this.live.get(uploadId);
     if (!live) {
@@ -498,8 +508,11 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     //    не видел — считаем хэш по объекту в S3. Ключ content-addressed, поэтому заявленный
     //    клиентом хэш только проверяется, но никогда не используется «на веру».
     const claimed = normalizeSha(body.sha256) ?? normalizeSha(row.declaredSha256);
-    let sha256 = live?.sha256 ?? live?.hash.digest('hex');
-    if (live) live.sha256 = sha256;
+    // Инкрементальный хэш верен только для релея: при прямой загрузке сервер байтов не видел,
+    // и digest() отдал бы sha256 пустого буфера — тогда файл получил бы чужое содержимое
+    // (или отравил бы дедуп), если клиент не объявил sha256.
+    let sha256 = live?.sha256 ?? (row.direct ? undefined : live?.hash.digest('hex'));
+    if (live && sha256) live.sha256 = sha256;
     if (!sha256 || (claimed && claimed !== sha256)) {
       const computed = await this.s3.hashObject(row.uploadKey);
       if (claimed && claimed !== computed) {

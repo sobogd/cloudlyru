@@ -32,33 +32,60 @@ data class LocalFile(val relPath: String, val path: String, val name: String, va
 object Scanner {
     /** Служебные каталоги и мусор: в облако не отправляем. */
     val SKIP_DIRS = setOf("Android/data", "Android/obb", ".thumbnails", ".trashed", "LOST.DIR", ".cloudly-trash")
-    private val SKIP_SUFFIX = listOf(".tmp", ".part", ".crdownload")
+    private val SKIP_SUFFIX = listOf(".tmp", ".part", ".crdownload", ".cloudly-tmp")
     /** Файл, изменённый только что, может ещё дописываться — берём его следующим проходом. */
     private const val TOO_FRESH_MS = 30_000L
 
-    fun scan(rootDir: String, includeSubfolders: Boolean, now: Long = System.currentTimeMillis()): List<LocalFile> {
+    /**
+     * Результат обхода. `skipped` — пути, которые сканер видел, но сознательно пропустил
+     * (файл ещё пишется, нет доступа). Без этого набора пропущенный файл выглядел бы как
+     * удалённый пользователем, и его серверная копия уезжала бы в корзину.
+     */
+    data class Result(val files: List<LocalFile>, val skipped: Set<String>)
+
+    fun scan(rootDir: String, includeSubfolders: Boolean, now: Long = System.currentTimeMillis()): Result {
         val root = File(rootDir)
-        if (!root.isDirectory) return emptyList()
+        if (!root.isDirectory) return Result(emptyList(), emptySet())
         val out = ArrayList<LocalFile>()
-        walk(root, root, includeSubfolders, now, out)
-        return out
+        val skipped = HashSet<String>()
+        walk(root, root, includeSubfolders, now, out, skipped)
+        return Result(out, skipped)
     }
 
-    private fun walk(root: File, dir: File, recurse: Boolean, now: Long, out: MutableList<LocalFile>) {
-        val children = dir.listFiles() ?: return
+    private fun walk(
+        root: File,
+        dir: File,
+        recurse: Boolean,
+        now: Long,
+        out: MutableList<LocalFile>,
+        skipped: MutableSet<String>,
+    ) {
+        // listFiles() == null означает ошибку чтения каталога, а не его пустоту:
+        // помечаем содержимое как пропущенное, чтобы ничего не удалить по ошибке
+        val children = dir.listFiles()
+        if (children == null) {
+            skipped.add(dir.absolutePath.removePrefix(root.absolutePath).trimStart('/'))
+            return
+        }
         for (child in children) {
             val rel = child.absolutePath.removePrefix(root.absolutePath).trimStart('/')
             if (child.isDirectory) {
                 if (!recurse) continue
                 if (SKIP_DIRS.any { rel == it || rel.startsWith("$it/") }) continue
                 if (child.name.startsWith(".")) continue
-                walk(root, child, recurse = true, now = now, out = out)
+                walk(root, child, recurse = true, now = now, out = out, skipped = skipped)
                 continue
             }
             if (!child.isFile) continue
             if (child.name.startsWith(".")) continue
             if (SKIP_SUFFIX.any { child.name.endsWith(it, ignoreCase = true) }) continue
-            if (now - child.lastModified() < TOO_FRESH_MS) continue
+            val age = now - child.lastModified()
+            // «свежий» — только недавнее прошлое; mtime из будущего (чужие часы, архив)
+            // не повод пропускать файл навсегда
+            if (age in 0 until TOO_FRESH_MS) {
+                skipped.add(rel)
+                continue
+            }
             out.add(LocalFile(rel, child.absolutePath, child.name, child.length(), child.lastModified()))
         }
     }

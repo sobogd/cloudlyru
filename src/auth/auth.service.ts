@@ -314,9 +314,13 @@ export class AuthService implements OnModuleInit {
     if (!t || t.revokedAt) return null;
     if (t.expiresAt && t.expiresAt.getTime() <= Date.now()) return null;
     if (!String(t.scope).startsWith('files:')) return null;
-    await this.prisma.apiToken
-      .update({ where: { id: t.id }, data: { lastUsedAt: new Date() } })
-      .catch(() => undefined);
+    // Телефон синхронизации делает сотни запросов за проход — писать в БД на каждый незачем
+    const stale = !t.lastUsedAt || Date.now() - t.lastUsedAt.getTime() > 5 * 60 * 1000;
+    if (stale) {
+      await this.prisma.apiToken
+        .update({ where: { id: t.id }, data: { lastUsedAt: new Date() } })
+        .catch(() => undefined);
+    }
     return { userId: t.userId, scope: t.scope };
   }
 }

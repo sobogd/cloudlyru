@@ -59,8 +59,11 @@ import ru.cloudly.sync.work.VerifyWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
+
+private data class Quadruple<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -92,7 +95,7 @@ private fun Screen() {
     var lastRun by remember { mutableStateOf(app.db.kv("last_run_stats").orEmpty()) }
     var lastError by remember { mutableStateOf(app.db.kv("last_run_error").orEmpty()) }
     var lastVerify by remember { mutableStateOf(app.db.kv("last_verify_stats").orEmpty()) }
-    var pending by remember { mutableStateOf(app.db.ops().size) }
+    var pending by remember { mutableStateOf(0) }
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     var showAdd by remember { mutableStateOf(false) }
     var openJob by remember { mutableStateOf<Long?>(null) }
@@ -104,22 +107,40 @@ private fun Screen() {
         lastRun = app.db.kv("last_run_stats").orEmpty()
         lastError = app.db.kv("last_run_error").orEmpty()
         lastVerify = app.db.kv("last_verify_stats").orEmpty()
-        pending = app.db.ops().size
+        pending = app.db.opCount()
         allFiles = hasAllFilesAccess()
     }
 
-    LaunchedEffect(Unit) { reload() }
+    LaunchedEffect(Unit) {
+        // база читается вне главного потока: на большой библиотеке иначе подвисает интерфейс
+        withContext(Dispatchers.IO) { reload() }
+    }
     LaunchedEffect(Unit) {
         while (true) {
-            delay(2000)
-            lastRun = app.db.kv("last_run_stats").orEmpty()
-            lastError = app.db.kv("last_run_error").orEmpty()
-            lastVerify = app.db.kv("last_verify_stats").orEmpty()
-            pending = app.db.ops().size
+            delay(3000)
+            val (run, err, verify, count) = withContext(Dispatchers.IO) {
+                Quadruple(
+                    app.db.kv("last_run_stats").orEmpty(),
+                    app.db.kv("last_run_error").orEmpty() + app.db.kv("auth_error").orEmpty(),
+                    app.db.kv("last_verify_stats").orEmpty(),
+                    app.db.opCount(),
+                )
+            }
+            lastRun = run
+            lastError = err
+            lastVerify = verify
+            pending = count
         }
     }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    LaunchedEffect(Unit) {
+        // без этого разрешения единственный канал сообщить о проблемах молчит
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     val open = openJob?.let { id -> jobs.firstOrNull { it.id == id } }
     if (open != null) {
@@ -236,7 +257,7 @@ private fun Screen() {
                     checkResult = "проверяю…"
                     scope.launch {
                         checkResult = withContext(Dispatchers.IO) {
-                            runCatching { "подключено: ${app.api.me()}" }.getOrElse { "ошибка: ${it.message}" }
+                            runCatching { "подключено: ${app.api.me()}" }.getOrElse { hint(it) }
                         }
                     }
                 }) { Text("Проверить токен") }
@@ -273,7 +294,7 @@ private fun Screen() {
             }
             Spacer(Modifier.height(12.dp))
             Text("В очереди: $pending", fontSize = 13.sp)
-            val failed = remember(pending) { app.db.failedOps().take(5) }
+            val failed = remember(pending) { runBlocking(Dispatchers.IO) { app.db.failedOps(5) } }
             if (failed.isNotEmpty()) {
                 Text("Не прошло:", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 failed.forEach { op ->
@@ -301,6 +322,17 @@ private fun Screen() {
     }
 }
 
+/** Понятная подсказка вместо «cleartext not permitted» и прочих технических текстов. */
+private fun hint(e: Throwable): String {
+    val text = e.message.orEmpty()
+    return when {
+        text.contains("cleartext", ignoreCase = true) || text.contains("CLEARTEXT") ->
+            "ошибка: сервер по http — нужен https-адрес"
+        text.contains("Unable to resolve host", ignoreCase = true) -> "ошибка: адрес сервера не найден"
+        else -> "ошибка: $text"
+    }
+}
+
 @Composable
 private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit, onOpenFiles: () -> Unit) {
     val scope = rememberCoroutineScope()
@@ -312,7 +344,7 @@ private fun JobCard(job: Db.Job, app: App, onChange: () -> Unit, onOpenFiles: ()
         Column(Modifier.padding(12.dp)) {
             Text(job.sourceDir, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
             Text("→ ${job.targetPath}  ·  ${if (job.zone == "PHOTOS") "Фото" else "Файлы"}", fontSize = 12.sp)
-            val counts = app.db.stateCounts(job.id)
+            val counts = remember(job.id) { runBlocking(Dispatchers.IO) { app.db.stateCounts(job.id) } }
             Text(
                 "файлов: ${counts.values.sum()}  ·  выгружено ${counts["synced"] ?: 0}  ·  " +
                     "вытеснено ${counts["evicted"] ?: 0}  ·  новых ${counts["new"] ?: 0}",
