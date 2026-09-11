@@ -43,6 +43,16 @@ data class RemoteEntry(
 
 data class FolderChildren(val folderIds: Map<String, String>, val entries: List<RemoteEntry>)
 
+/** Последняя опубликованная сборка приложения (GET /app/android). */
+data class AppRelease(
+    val versionCode: Long,
+    val versionName: String,
+    val size: Long,
+    val sha256: String,
+    /** Постоянная ссылка на APK: https://<сервер>/apk */
+    val url: String,
+)
+
 /** ISO-8601 из сервера → миллисекунды (для сравнения с локальным mtime). */
 fun parseIsoMillis(iso: String): Long = runCatching {
     java.time.Instant.parse(iso).toEpochMilli()

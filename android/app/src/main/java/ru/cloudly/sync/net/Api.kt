@@ -68,6 +68,21 @@ class Api(private val prefs: Prefs) {
     fun me(): String = parse(request("/auth/me")).optString("login").orEmpty()
 
     /**
+     * Последняя опубликованная сборка приложения. Ручка без авторизации: обновиться нужно
+     * и тогда, когда токен отозван, — иначе приложение осталось бы сломанным навсегда.
+     */
+    fun latestApp(): AppRelease {
+        val o = parse(request("/app/android"))
+        return AppRelease(
+            versionCode = o.optLong("versionCode"),
+            versionName = o.optString("versionName"),
+            size = o.optLong("size"),
+            sha256 = o.optString("sha256"),
+            url = o.optString("url").ifBlank { prefs.serverUrl.trimEnd('/') + "/apk" },
+        )
+    }
+
+    /**
      * Первичная настройка: вход логином и паролем, затем выпуск device-токена.
      * Пароль на телефоне не сохраняется — сохраняется только выпущенный токен, который
      * можно отозвать в вебе, не меняя пароль владельца.

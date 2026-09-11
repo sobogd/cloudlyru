@@ -58,6 +58,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Db
+import ru.cloudly.sync.net.AppRelease
+import ru.cloudly.sync.update.Updater
 import ru.cloudly.sync.work.SyncService
 import java.io.File
 
@@ -101,6 +103,12 @@ private fun Screen() {
     var showFree by remember { mutableStateOf(false) }
     var relay by remember { mutableStateOf(app.engine().relayMode()) }
     var showToken by remember { mutableStateOf(false) }
+    // обновление приложения: что нашлось на сервере и что с этим происходит прямо сейчас
+    var update by remember { mutableStateOf<AppRelease?>(null) }
+    var updateNote by remember { mutableStateOf("") }
+    var updating by remember { mutableStateOf(false) }
+    val myVersion = remember { Updater.currentVersionCode(context) }
+    val myVersionName = remember { Updater.currentVersionName(context) }
     // тик обновления: карточки пересчитывают счётчики по нему, иначе цифры «залипают»
     var tick by remember { mutableStateOf(0) }
     var snap by remember { mutableStateOf(Snapshot()) }
@@ -138,6 +146,35 @@ private fun Screen() {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+
+    /**
+     * Проверка версии на сервере. Экран ничего не качает сам: адрес сборки приходит
+     * с сервера (постоянная ссылка /apk), поэтому отдельный «файл для скачивания»
+     * искать и обновлять не нужно.
+     */
+    fun checkForUpdate(explicit: Boolean) {
+        if (explicit) updateNote = "проверяю версию…"
+        scope.launch {
+            val found = withContext(Dispatchers.IO) { runCatching { app.api.latestApp() } }
+            found.fold(
+                onSuccess = { release ->
+                    update = release.takeIf { it.versionCode > myVersion }
+                    if (explicit) {
+                        updateNote = if (update == null) {
+                            "установлена последняя версия: $myVersionName ($myVersion)"
+                        } else {
+                            ""
+                        }
+                    }
+                },
+                onFailure = { if (explicit) updateNote = "не удалось проверить обновление: ${hint(it)}" },
+            )
+        }
+    }
+
+    // На старте проверяем молча: вышла новая сборка — о ней видно на экране, обновиться
+    // можно одной кнопкой вместо похода в браузер и ручной установки файла.
+    LaunchedEffect(Unit) { checkForUpdate(explicit = false) }
 
     if (showFree) {
         FreeSpaceScreen(app = app, onBack = { showFree = false })
@@ -293,6 +330,56 @@ private fun Screen() {
                 }) { Text("Диагностика сети") }
             }
             if (checkResult.isNotEmpty()) Text(checkResult, fontSize = 12.sp)
+
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(enabled = !updating, onClick = { checkForUpdate(explicit = true) }) {
+                    Text(if (updating) "…" else "Проверить обновление")
+                }
+                Text("версия $myVersionName", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (updateNote.isNotEmpty()) Text(updateNote, fontSize = 12.sp)
+            update?.let { release ->
+                Spacer(Modifier.height(8.dp))
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Доступна версия ${release.versionName}", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Установлена $myVersionName. Сборка скачается сама, дальше система спросит " +
+                                "подтверждение установки — это единственное нажатие, которое остаётся.",
+                            fontSize = 12.sp,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            enabled = !updating,
+                            onClick = {
+                                if (!Updater.canInstall(context)) {
+                                    updateNote = "разрешите установку приложений из этого источника " +
+                                        "и нажмите «Обновить» ещё раз"
+                                    Updater.openInstallSettings(context)
+                                    return@Button
+                                }
+                                updating = true
+                                updateNote = "скачиваю ${release.versionName}…"
+                                scope.launch {
+                                    val result = withContext(Dispatchers.IO) {
+                                        runCatching { Updater.download(context, release) }
+                                    }
+                                    updating = false
+                                    result.fold(
+                                        onSuccess = { apk ->
+                                            updateNote = "скачано — подтвердите установку"
+                                            runCatching { Updater.install(context, apk) }
+                                                .onFailure { updateNote = "установщик не открылся: ${hint(it)}" }
+                                        },
+                                        onFailure = { updateNote = "не удалось скачать сборку: ${hint(it)}" },
+                                    )
+                                }
+                            },
+                        ) { Text(if (updating) "обновляю…" else "Обновить") }
+                    }
+                }
+            }
 
             if (relay) {
                 Spacer(Modifier.height(6.dp))
