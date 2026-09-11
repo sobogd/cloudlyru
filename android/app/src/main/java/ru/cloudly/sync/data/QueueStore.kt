@@ -288,6 +288,22 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
         ),
     )
 
+    /**
+     * Снять зависшие «грузится». После перезапуска приложения или сервиса ничего не может
+     * быть в работе, а строка осталась бы в этом состоянии навсегда — и веб показывал бы
+     * «грузится» у давно выгруженного файла.
+     */
+    fun resetRunning(): Int =
+        writableDatabase.update(
+            "queue",
+            ContentValues().apply {
+                put("state", QueueState.PENDING.name)
+                putNull("last_error")
+            },
+            "state = ?",
+            arrayOf(QueueState.RUNNING.name),
+        )
+
     /** Вернуть в ожидание: кнопка повтора на строке с ошибкой. */
     /** Запомнить посчитанный хэш: повторная попытка не должна перечитывать весь файл. */
     fun setSha(id: Long, sha256: String) = update(id, mapOf("sha256" to sha256))

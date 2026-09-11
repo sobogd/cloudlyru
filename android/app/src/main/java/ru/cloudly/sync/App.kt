@@ -32,6 +32,22 @@ class App : Application() {
      * файл всё равно доедет. Запуск при этом ручной, по кнопке на строке.
      */
     val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Что нашёл последний проход по папкам. Снимок для сервера собирается из этого, а не из
+     * нового обхода диска: иначе каждое обновление состояния стоило бы полного сканирования,
+     * и статусы в вебе отставали бы на минуты.
+     */
+    @Volatile
+    var lastCandidates: List<ru.cloudly.sync.queue.Candidate> = emptyList()
+
+    /** Скелет папок последнего прохода: раздел, относительный путь, имя. */
+    @Volatile
+    var lastDirs: List<Triple<String, String, String>> = emptyList()
+
+    /** Когда проход был: по этому снимок понимает, можно ли ему доверять. */
+    @Volatile
+    var lastScanAt: Long = 0L
     lateinit var uploads: UploadRunner
         private set
 

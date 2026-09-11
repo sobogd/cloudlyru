@@ -15,6 +15,7 @@ import ru.cloudly.sync.device.Hasher
 import ru.cloudly.sync.device.MediaRules
 import ru.cloudly.sync.net.Api
 import ru.cloudly.sync.net.ApiException
+import ru.cloudly.sync.work.SyncSignals
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -85,6 +86,7 @@ class UploadRunner(
             } finally {
                 _progress.value = null
                 busy.set(false)
+                SyncSignals.requestReport()
             }
         }
     }
@@ -102,6 +104,7 @@ class UploadRunner(
         val size = file.length()
         val mtime = file.lastModified()
         withContext(Dispatchers.IO) { store.markRunning(itemId) }
+        SyncSignals.requestReport()
         _progress.value = Progress(itemId, item.name, 0, size)
 
         val sha = shaOf(item, file, size, mtime)
@@ -120,6 +123,7 @@ class UploadRunner(
                     store.markSkipped(itemId, entryId)
                     store.markUploaded(item.path, item.target, entryId, size, mtime, sha)
                 }
+                SyncSignals.requestReport()
                 Log.i(TAG, "уже в облаке: ${item.name}")
                 return
             }
@@ -132,6 +136,7 @@ class UploadRunner(
                     if (result.deduped) store.markSkipped(itemId, result.entryId) else store.markDone(itemId, result.entryId)
                     store.markUploaded(item.path, item.target, result.entryId, size, mtime, sha)
                 }
+                SyncSignals.requestReport()
                 Log.i(TAG, "выгружено ${item.name}${if (result.deduped) " (содержимое уже было)" else ""}")
             }
         }

@@ -49,6 +49,7 @@ class QueueBuilder(
         val targets = mapOf(Section.FILES to phoneFolderId, Section.PHOTOS to photoFolderId)
         val problems = ArrayList<String>()
         val candidates = ArrayList<Candidate>()
+        val dirs = ArrayList<Triple<String, String, String>>()
         val scannedSections = HashSet<Section>()
         var scanned = 0
         var unreadable = 0
@@ -76,6 +77,11 @@ class QueueBuilder(
             val paths = selection.paths(section)
             if (paths.isEmpty()) continue
             val label = if (section == Section.FILES) "Файлы" else "Фото"
+            files.walkRelDirs(
+                roots = paths.sorted(),
+                emit = { rel, name -> dirs.add(Triple(section.name, rel, name)) },
+                isCancelled = isCancelled,
+            )
             val result = files.scan(
                 paths = paths,
                 limit = 0,
@@ -100,6 +106,12 @@ class QueueBuilder(
                 )
             }
         }
+
+        // сохраняем результат прохода: снимок для сервера строится из него, без второго обхода
+        val app = ru.cloudly.sync.App.of(files.context())
+        app.lastCandidates = candidates
+        app.lastDirs = dirs
+        app.lastScanAt = System.currentTimeMillis()
 
         val planned = QueuePlanner.plan(candidates, store.uploaded())
         val added = store.enqueue(planned)

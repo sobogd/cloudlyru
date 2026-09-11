@@ -1,11 +1,11 @@
 name: Android APK (build + publish)
 
-# Любое изменение клиентского приложения уезжает на телефон само: push в main по android/**
-# собирает подписанный релиз, прогоняет юнит-тесты и публикует сборку в релизный артефакт S3,
-# откуда её всегда отдаёт https://files.iq-factura.com/apk.
+# Ручной прогон: собирает юнит-тесты, подписанный релиз и публикует его в релизный артефакт S3,
+# откуда сборку всегда отдаёт https://files.iq-factura.com/apk.
 #
-# Требуется поднять versionCode в android/app/build.gradle.kts: по нему приложение понимает,
-# что вышла новая версия (шаг публикации иначе падает с понятной ошибкой).
+# Автоматического запуска по push нет: пока APK публикуется напрямую
+# (`node --env-file=$HOME/work/.env scripts/publish-apk.mjs <apk>`), чтобы прогон не спотыкался
+# о запрет повторной публикации того же versionCode.
 # Ручной запуск: gh workflow run android.yml
 #
 # Секреты: ANDROID_KEYSTORE_BASE64 (файл ~/.cloudly-android-release.jks в base64),
@@ -13,12 +13,6 @@ name: Android APK (build + publish)
 # S3_FILES_ACCESS_KEY / S3_FILES_SECRET_KEY (уже есть — их использует автодеплой).
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'android/**'
-      - 'scripts/publish-apk.mjs'
-      - '.github/workflows/android.yml'
   workflow_dispatch:
 
 concurrency:

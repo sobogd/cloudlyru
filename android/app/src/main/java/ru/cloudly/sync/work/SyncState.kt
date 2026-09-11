@@ -6,15 +6,18 @@ import org.json.JSONObject
 import ru.cloudly.sync.App
 import ru.cloudly.sync.data.QueueState
 import ru.cloudly.sync.data.Section
-import ru.cloudly.sync.device.DeviceFiles
+import ru.cloudly.sync.queue.Candidate
 import ru.cloudly.sync.queue.UploadedKey
 
 /**
  * Снимок телефона для сервера: что у него есть и что с этим происходит.
  *
- * Отправляется только то, чего нет в облаке: структура папок (скелет) и файлы, которые ещё
- * не выгружены или стоят в очереди. Выгруженное веб видит в облачном дереве и без снимка —
- * поэтому десятки тысяч уже залитых файлов по сети не гоняются.
+ * Строится из результата последнего прохода по папкам (`App.lastCandidates`, `App.lastDirs`),
+ * а не из нового сканирования диска: иначе каждое обновление состояния стоило бы полного
+ * обхода, и статусы в вебе отставали бы на минуты.
+ *
+ * Отправляется только то, чего нет в облаке: скелет папок и файлы, которые ещё не выгружены
+ * или стоят в очереди. Выгруженное веб видит в облачном дереве и без снимка.
  */
 object SyncState {
 
@@ -23,7 +26,6 @@ object SyncState {
 
     fun build(context: Context): JSONArray {
         val app = App.of(context)
-        val deviceFiles = DeviceFiles(context)
         val queue = app.queueStore.items(MAX_ENTRIES)
         val uploaded = app.queueStore.uploaded()
         val byTargetPath = queue.associateBy { UploadedKey(it.path, it.target) }
@@ -32,28 +34,23 @@ object SyncState {
         var truncated = false
 
         for (section in Section.entries) {
-            val roots = app.selection.paths(section).sorted()
-            if (roots.isEmpty()) continue
             val target = when (section) {
                 Section.FILES -> app.prefs.phoneFolderId
                 Section.PHOTOS -> app.prefs.photoFolderId
             }.takeIf { it.isNotBlank() } ?: continue
 
             // скелет папок: без него в вебе не видно структуры, пока ничего не выгружено
-            deviceFiles.walkRelDirs(
-                roots = roots,
-                emit = { rel, name ->
-                    if (entries.length() < MAX_ENTRIES) {
-                        entries.put(entry(section.name, rel, name, isDir = true, size = 0, mtime = null, state = "LOCAL"))
-                    } else {
-                        truncated = true
-                    }
-                },
-                isCancelled = { entries.length() >= MAX_ENTRIES },
-            )
+            for ((dirSection, rel, name) in app.lastDirs) {
+                if (dirSection != section.name) continue
+                if (entries.length() >= MAX_ENTRIES) {
+                    truncated = true
+                    break
+                }
+                entries.put(entry(section.name, rel, name, isDir = true, size = 0, mtime = null, state = "LOCAL"))
+            }
 
-            val scan = deviceFiles.scan(paths = roots, limit = 0, onProgress = {}, isCancelled = { entries.length() >= MAX_ENTRIES })
-            for (file in scan.files) {
+            for (file in app.lastCandidates) {
+                if (file.sectionFor(app) != section) continue
                 if (entries.length() >= MAX_ENTRIES) {
                     truncated = true
                     break
@@ -62,7 +59,8 @@ object SyncState {
                 val queued = byTargetPath[key]
                 val already = uploaded[key]
                 val uploadedHere = already != null && already.size == file.size && already.mtime == file.mtime
-                if (uploadedHere && queued == null) continue // уже в облаке: веб видит его там
+                // уже в облаке и не в очереди — веб видит файл в облачном дереве
+                if (uploadedHere && queued == null) continue
                 entries.put(
                     entry(
                         section = section.name,
@@ -97,6 +95,10 @@ object SyncState {
             append(" · выгружено: $done")
         }
     }
+
+    /** Раздел файла берётся из его цели: у «Файлов» и «Фото» разные облачные папки. */
+    private fun Candidate.sectionFor(app: App): Section =
+        if (app.prefs.photoFolderId.isNotBlank() && target == app.prefs.photoFolderId) Section.PHOTOS else Section.FILES
 
     private fun entry(
         section: String,

@@ -57,6 +57,9 @@ data class ScanResult(
  */
 class DeviceFiles(private val context: Context) {
 
+    /** Контекст наружу: вызывающему он нужен, чтобы сохранить результат прохода. */
+    fun context(): Context = context
+
     fun roots(): List<RootFolder> {
         val out = LinkedHashMap<String, RootFolder>()
         val primary = Environment.getExternalStorageDirectory()

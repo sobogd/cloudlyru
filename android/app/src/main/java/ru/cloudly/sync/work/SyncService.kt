@@ -65,7 +65,11 @@ class SyncService : Service() {
         startForeground(NOTIFICATION_ID, notification("запускаюсь…"))
         if (!started) {
             started = true
-            scope.launch { loop() }
+            // после перезапуска в очереди не может быть «в работе»: снимаем зависшие строки
+            scope.launch {
+                runCatching { App.of(this@SyncService).queueStore.resetRunning() }
+                loop()
+            }
         }
         return START_STICKY
     }
@@ -103,6 +107,17 @@ class SyncService : Service() {
                     val error = execute(app, command.kind, command.payload)
                     runCatching { app.api.deviceAck(app.prefs.deviceId, command.id, error) }
                     if (error == null) needReport = true
+                }
+
+                // сигналы изнутри процесса: файл изменился или выгрузка закончилась —
+                // отчитываемся сразу, не дожидаясь расписания
+                if (SyncSignals.scanNow) {
+                    SyncSignals.scanNow = false
+                    dirty = true
+                }
+                if (SyncSignals.reportNow) {
+                    SyncSignals.reportNow = false
+                    needReport = true
                 }
 
                 // 2. проход по папкам: по сигналу «что-то появилось» или по расписанию
@@ -256,7 +271,7 @@ class SyncService : Service() {
     private fun registerMediaObserver() {
         val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean) {
-                dirty = true
+                SyncSignals.requestScan()
             }
         }
         runCatching {
@@ -272,7 +287,7 @@ class SyncService : Service() {
         private const val TICK_MS = 5_000L
         private const val IDLE_TICK = 30_000L
         private const val SCAN_PERIOD_MS = 3 * 60_000L
-        private const val REPORT_PERIOD_MS = 60_000L
+        private const val REPORT_PERIOD_MS = 15_000L
 
         /** Как часто телефон приглядывается к журналу изменений облака. */
         private const val APPLY_PERIOD_MS = 60_000L

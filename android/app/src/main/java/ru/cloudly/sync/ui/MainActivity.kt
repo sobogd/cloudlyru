@@ -34,6 +34,7 @@ import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.queue.QueueRefresher
 import ru.cloudly.sync.work.SyncService
+import ru.cloudly.sync.work.SyncSignals
 
 /**
  * Что показывает приложение: очередь загрузки и настройки. Управления файлами здесь нет —
@@ -74,6 +75,7 @@ private fun Root() {
     LaunchedEffect(folderSection) {
         if (folderSection != null) return@LaunchedEffect
         withContext(Dispatchers.IO) { runCatching { QueueRefresher.refresh(context) } }
+        SyncSignals.requestReport()
         waiting = withContext(Dispatchers.IO) { app.queueStore.waitingCount() }
     }
     LaunchedEffect(Unit) {

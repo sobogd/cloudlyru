@@ -1413,7 +1413,7 @@ function PhoneSync() {
         })
         .catch((e) => setErr((e as Error).message));
     void load();
-    const timer = setInterval(load, 10_000);
+    const timer = setInterval(load, 5_000);
     return () => clearInterval(timer);
   }, [reload]);
 
@@ -1430,7 +1430,7 @@ function PhoneSync() {
           if (alive) setErr((e as Error).message);
         });
     void load();
-    const timer = setInterval(load, 10_000);
+    const timer = setInterval(load, 4_000);
     return () => {
       alive = false;
       clearInterval(timer);
