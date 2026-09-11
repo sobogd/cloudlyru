@@ -605,10 +605,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
           style={meta?.keepOffline ? { opacity: 1 } : { opacity: 0.45 }}
           onClick={toggleOffline}
         >📌</button>
-        {/* системную папку телефона удалить нельзя — кнопку не показываем вовсе */}
-        {folderId !== protectedId && (
-          <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
-        )}
+        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       {job && (
@@ -698,7 +695,10 @@ function FolderDetail({ folderId, protectedId, onBack, onDeleted }: { folderId: 
           style={meta?.keepOffline ? { opacity: 1 } : { opacity: 0.45 }}
           onClick={toggleOffline}
         >📌</button>
-        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+        {/* системную папку телефона удалить нельзя — кнопку не показываем вовсе */}
+        {folderId !== protectedId && (
+          <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+        )}
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
