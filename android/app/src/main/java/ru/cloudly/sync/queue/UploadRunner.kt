@@ -118,7 +118,7 @@ class UploadRunner(
                 val entryId = alreadyUploaded?.entryId ?: return
                 withContext(Dispatchers.IO) {
                     store.markSkipped(itemId, entryId)
-                    store.markUploaded(item.path, item.target, entryId, size, mtime)
+                    store.markUploaded(item.path, item.target, entryId, size, mtime, sha)
                 }
                 Log.i(TAG, "уже в облаке: ${item.name}")
                 return
@@ -130,7 +130,7 @@ class UploadRunner(
                 val result = send(item, folderId, file, sha, replace, serverSha?.takeIf { replace })
                 withContext(Dispatchers.IO) {
                     if (result.deduped) store.markSkipped(itemId, result.entryId) else store.markDone(itemId, result.entryId)
-                    store.markUploaded(item.path, item.target, result.entryId, size, mtime)
+                    store.markUploaded(item.path, item.target, result.entryId, size, mtime, sha)
                 }
                 Log.i(TAG, "выгружено ${item.name}${if (result.deduped) " (содержимое уже было)" else ""}")
             }

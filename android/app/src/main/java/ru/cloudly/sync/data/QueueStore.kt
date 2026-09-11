@@ -54,6 +54,7 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
               entry_id TEXT NOT NULL,
               size INTEGER NOT NULL,
               mtime INTEGER NOT NULL,
+              sha256 TEXT,
               at INTEGER NOT NULL,
               PRIMARY KEY(path, target)
             )
@@ -87,6 +88,10 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         // Очередь пересобирается проходом, а вот uploaded (что уже выгружено) терять нельзя.
+        if (oldVersion < 3) {
+            // хэш выгруженного: по нему телефон понимает, что изменение облака — его собственное
+            db.execSQL("ALTER TABLE uploaded ADD COLUMN sha256 TEXT")
+        }
         if (oldVersion < 2) {
             // кэш хэша: считать SHA-256 заново на каждую попытку большого видео — минуты работы
             db.execSQL("ALTER TABLE queue ADD COLUMN sha256 TEXT")
@@ -108,7 +113,48 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
             }
         }
 
-    fun markUploaded(path: String, target: String, entryId: String, size: Long, mtime: Long) {
+    /** Что на телефоне соответствует этой записи облака: по ней применяются правки из веба. */
+    fun uploadedByEntry(entryId: String): List<Pair<UploadedKey, Uploaded>> =
+        readableDatabase.rawQuery(
+            "SELECT path, target, entry_id, size, mtime FROM uploaded WHERE entry_id = ?",
+            arrayOf(entryId),
+        ).use { c ->
+            buildList {
+                while (c.moveToNext()) {
+                    add(
+                        UploadedKey(c.getString(0), c.getString(1)) to
+                            Uploaded(c.getString(2), c.getLong(3), c.getLong(4)),
+                    )
+                }
+            }
+        }
+
+    /** Путь файла на телефоне изменился (переименование в вебе): переносим запись. */
+    fun moveUploaded(oldPath: String, target: String, newPath: String) {
+        writableDatabase.execSQL(
+            "UPDATE uploaded SET path = ? WHERE path = ? AND target = ?",
+            arrayOf(newPath, oldPath, target),
+        )
+    }
+
+    /** Запомнить новую версию содержимого: размер, дата и хэш после скачивания из облака. */
+    fun refreshUploaded(path: String, target: String, size: Long, mtime: Long, sha256: String?) {
+        val cv = ContentValues().apply {
+            put("size", size)
+            put("mtime", mtime)
+            if (sha256 != null) put("sha256", sha256)
+            put("at", System.currentTimeMillis())
+        }
+        writableDatabase.update("uploaded", cv, "path = ? AND target = ?", arrayOf(path, target))
+    }
+
+    fun shaOfUploaded(path: String, target: String): String? =
+        readableDatabase.rawQuery(
+            "SELECT sha256 FROM uploaded WHERE path = ? AND target = ?",
+            arrayOf(path, target),
+        ).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+
+    fun markUploaded(path: String, target: String, entryId: String, size: Long, mtime: Long, sha256: String? = null) {
         writableDatabase.insertWithOnConflict(
             "uploaded",
             null,
@@ -118,6 +164,7 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
                 put("entry_id", entryId)
                 put("size", size)
                 put("mtime", mtime)
+                if (sha256 != null) put("sha256", sha256)
                 put("at", System.currentTimeMillis())
             },
             SQLiteDatabase.CONFLICT_REPLACE,
@@ -302,7 +349,7 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
 
     private companion object {
         const val NAME = "cloudly-queue.db"
-        const val VERSION = 2
+        const val VERSION = 3
     }
 }
 

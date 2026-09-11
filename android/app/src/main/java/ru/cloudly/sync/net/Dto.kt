@@ -43,6 +43,25 @@ data class RemoteEntry(
 
 data class FolderChildren(val folderIds: Map<String, String>, val entries: List<RemoteEntry>)
 
+/** Одно изменение облака из журнала сервера. */
+data class SyncChange(
+    val targetId: String,
+    val target: String,
+    val op: String,
+    val name: String,
+    val sha256: String?,
+    val size: Long?,
+    val mime: String?,
+)
+
+/** Страница журнала изменений: курсор, признак «есть ещё» и требование полного рескана. */
+data class ChangesPage(
+    val nextSeq: String,
+    val hasMore: Boolean,
+    val resetRequired: Boolean,
+    val changes: List<SyncChange>,
+)
+
 /** Команда сервера телефону (GET /devices/:id/commands). */
 data class DeviceCommand(val id: String, val kind: String, val payload: JSONObject?)
 

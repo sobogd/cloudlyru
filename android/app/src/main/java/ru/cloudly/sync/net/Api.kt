@@ -196,6 +196,36 @@ class Api(private val prefs: Prefs) {
         return out
     }
 
+    /**
+     * Изменения облака после курсора. Телефон по ним приводит локальные файлы в порядок:
+     * переименование в вебе меняет имя файла на телефоне, новая версия — скачивается.
+     */
+    fun changes(since: String, limit: Int = 200): ChangesPage {
+        val o = parse(request("/sync/changes?since=$since&limit=$limit"))
+        val arr = o.optJSONArray("changes") ?: org.json.JSONArray()
+        val out = ArrayList<SyncChange>(arr.length())
+        for (i in 0 until arr.length()) {
+            val c = arr.optJSONObject(i) ?: continue
+            out.add(
+                SyncChange(
+                    targetId = c.optString("targetId"),
+                    target = c.optString("target"),
+                    op = c.optString("op"),
+                    name = c.optString("name"),
+                    sha256 = if (c.isNull("sha256")) null else c.optString("sha256").takeIf { it.isNotBlank() },
+                    size = if (c.isNull("size")) null else c.optLong("size"),
+                    mime = if (c.isNull("mime")) null else c.optString("mime"),
+                ),
+            )
+        }
+        return ChangesPage(
+            nextSeq = o.optString("nextSeq").ifBlank { since },
+            hasMore = o.optBoolean("hasMore", false),
+            resetRequired = o.optBoolean("resetRequired", false),
+            changes = out,
+        )
+    }
+
     /** Идемпотентный mkdir: возвращает id папки по пути от корня. */
     fun ensurePath(path: String, parentId: String? = null): String {
         val body = JSONObject().put("path", path)

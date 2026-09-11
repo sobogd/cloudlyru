@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 import ru.cloudly.sync.R
+import ru.cloudly.sync.queue.ChangeApplier
 import ru.cloudly.sync.queue.QueueRefresher
 import ru.cloudly.sync.ui.MainActivity
 
@@ -80,6 +81,7 @@ class SyncService : Service() {
         val app = App.of(this)
         var lastScan = 0L
         var lastReport = 0L
+        var lastApply = 0L
         var needReport = true
 
         while (scope.isActive) {
@@ -112,7 +114,17 @@ class SyncService : Service() {
                     needReport = true
                 }
 
-                // 3. снимок состояния для веба
+                // 3. изменения облака: переименования и новые версии доезжают до телефона
+                if (now - lastApply > APPLY_PERIOD_MS) {
+                    lastApply = now
+                    val applied = ChangeApplier(this, app.api, app.queueStore).apply()
+                    if (applied.applied > 0) {
+                        needReport = true
+                        Log.i(TAG, applied.text())
+                    }
+                }
+
+                // 4. снимок состояния для веба
                 if (needReport || now - lastReport > REPORT_PERIOD_MS) {
                     val entries = SyncState.build(this)
                     val after = app.api.deviceState(app.prefs.deviceId, entries)
@@ -181,7 +193,11 @@ class SyncService : Service() {
                     }
                 }
             }
-            "APPLY_CHANGES" -> "применение изменений облака на телефоне ещё не сделано"
+            "APPLY_CHANGES" -> {
+                val result = ChangeApplier(this, app.api, app.queueStore).apply()
+                updateNotification(result.text())
+                if (result.problem == null) null else result.problem
+            }
             else -> "неизвестная команда: $kind"
         }
     } catch (e: Exception) {
@@ -257,6 +273,9 @@ class SyncService : Service() {
         private const val IDLE_TICK = 30_000L
         private const val SCAN_PERIOD_MS = 3 * 60_000L
         private const val REPORT_PERIOD_MS = 60_000L
+
+        /** Как часто телефон приглядывается к журналу изменений облака. */
+        private const val APPLY_PERIOD_MS = 60_000L
 
         @Volatile
         var running = false
