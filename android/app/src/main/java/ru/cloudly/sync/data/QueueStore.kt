@@ -6,6 +6,8 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import ru.cloudly.sync.queue.Candidate
+import ru.cloudly.sync.queue.QueuePlanner
+import ru.cloudly.sync.queue.QueueRow
 import ru.cloudly.sync.queue.Uploaded
 import ru.cloudly.sync.queue.UploadedKey
 
@@ -243,6 +245,30 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
         val cv = ContentValues()
         values.forEach { (k, v) -> cv.putAny(k, v) }
         writableDatabase.update("queue", cv, "id = ?", arrayOf(id.toString()))
+    }
+
+    /**
+     * Убрать из очереди то, чего больше не должно быть: папку отключили от раздела или файл
+     * с телефона исчез. Ключи, которые остались кандидатами, и незатронутые разделы
+     * остаются на месте.
+     */
+    fun prune(keep: Set<UploadedKey>, scannedSections: Set<Section>): Int {
+        if (scannedSections.isEmpty()) return 0
+        val rows = readableDatabase.rawQuery("SELECT id, path, target, section, state FROM queue", null).use { c ->
+            buildList {
+                while (c.moveToNext()) add(QueueRow(c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4)))
+            }
+        }
+        val doomed = QueuePlanner.obsolete(rows, keep, scannedSections)
+        if (doomed.isEmpty()) return 0
+        writableDatabase.beginTransaction()
+        try {
+            for (id in doomed) writableDatabase.delete("queue", "id = ?", arrayOf(id.toString()))
+            writableDatabase.setTransactionSuccessful()
+        } finally {
+            writableDatabase.endTransaction()
+        }
+        return doomed.size
     }
 
     /** Убрать выполненные строки: очередь не должна превращаться в летопись. */

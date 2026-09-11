@@ -16,6 +16,7 @@ import { QueueModule } from './queue/queue.module';
 import { HealthModule } from './health/health.module';
 import { UnzipModule } from './unzip/unzip.module';
 import { SyncModule } from './sync/sync.module';
+import { DevicesModule } from './devices/devices.module';
 import { ReleaseModule } from './release/release.module';
 
 @Module({
@@ -34,6 +35,7 @@ import { ReleaseModule } from './release/release.module';
     HealthModule,
     UnzipModule,
     SyncModule,
+    DevicesModule,
     ReleaseModule,
   ],
   providers: [

@@ -19,6 +19,7 @@ class QueueBuilder(
     data class Result(
         val scanned: Int,
         val queued: Int,
+        val removed: Int,
         val skipped: Int,
         val capped: Boolean,
         val unreadable: Int,
@@ -27,6 +28,7 @@ class QueueBuilder(
     ) {
         fun text(): String = buildString {
             append("проверено файлов: $scanned, новых в очереди: $queued")
+            if (removed > 0) append(", убрано из очереди: $removed")
             if (unreadable > 0) append(", папок без доступа: $unreadable")
             if (capped) append(", обход упёрся в предел")
             problem?.let { append(" · $it") }
@@ -47,16 +49,17 @@ class QueueBuilder(
         val targets = mapOf(Section.FILES to phoneFolderId, Section.PHOTOS to photoFolderId)
         val problems = ArrayList<String>()
         val candidates = ArrayList<Candidate>()
+        val scannedSections = HashSet<Section>()
         var scanned = 0
         var unreadable = 0
         var capped = false
 
         for (section in Section.entries) {
             if (isCancelled()) break
-            val paths = selection.paths(section)
-            if (paths.isEmpty()) continue
             val target = targets[section]
             if (target.isNullOrBlank()) {
+                // Цель раздела неизвестна (не выполнен вход) — раздел не сканируем и НЕ считаем
+                // пройденным: иначе уборка выкосила бы его строки из-за одной неполадки.
                 problems.add(
                     if (section == Section.FILES) {
                         "«Файлы»: папка «Телефон» неизвестна — войдите в аккаунт"
@@ -66,6 +69,12 @@ class QueueBuilder(
                 )
                 continue
             }
+            // Цель есть — раздел пройден целиком, даже если папок в нём не выбрано:
+            // тогда его строки из очереди убираются. Без этого отключённая последняя папка
+            // оставалась в очереди навсегда.
+            scannedSections.add(section)
+            val paths = selection.paths(section)
+            if (paths.isEmpty()) continue
             val label = if (section == Section.FILES) "Файлы" else "Фото"
             val result = files.scan(
                 paths = paths,
@@ -94,10 +103,15 @@ class QueueBuilder(
 
         val planned = QueuePlanner.plan(candidates, store.uploaded())
         val added = store.enqueue(planned)
+        // и убираем то, чего в выбранных папках больше нет: иначе отключённая папка
+        // оставалась бы в очереди навсегда
+        val keep = candidates.map { UploadedKey(it.path, it.target) }.toSet()
+        val removed = store.prune(keep, scannedSections)
 
         return Result(
             scanned = scanned,
             queued = added,
+            removed = removed,
             skipped = candidates.size - planned.size,
             capped = capped,
             unreadable = unreadable,

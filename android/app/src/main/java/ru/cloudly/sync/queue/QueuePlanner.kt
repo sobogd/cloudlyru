@@ -18,6 +18,16 @@ data class Candidate(
     val target: String,
 )
 
+
+/** Строка очереди в том виде, в каком она нужна правилу уборки (значения — как в базе). */
+data class QueueRow(
+    val id: Long,
+    val path: String,
+    val target: String,
+    val section: String,
+    val state: String,
+)
+
 /** Что уже лежит в облаке: запись и слепок содержимого, по которому её выгружали. */
 data class Uploaded(val entryId: String, val size: Long, val mtime: Long)
 
@@ -58,4 +68,22 @@ object QueuePlanner {
         }
         return out
     }
+
+    /**
+     * Что из очереди больше не подлежит выгрузке и должно быть убрано: папку отключили
+     * от раздела, файла на телефоне уже нет, или он больше не подходит. Без этой уборки
+     * очередь копила бы мусор от каждого изменения выбора папок.
+     *
+     * Разделы, которые в этом проходе не сканировались (например, цель ещё неизвестна —
+     * не выполнен вход), не трогаются вовсе: иначе одна неполадка выкосила бы всю очередь.
+     * Запущенная выгрузка тоже не трогается — файл в этот момент льётся.
+     */
+    fun obsolete(rows: List<QueueRow>, keep: Set<UploadedKey>, scannedSections: Set<Section>): List<Long> =
+        rows.filter { row ->
+            val section = runCatching { Section.valueOf(row.section) }.getOrNull()
+            section != null &&
+                section in scannedSections &&
+                row.state != "RUNNING" &&
+                UploadedKey(row.path, row.target) !in keep
+        }.map { it.id }
 }
