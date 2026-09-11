@@ -301,16 +301,29 @@ class Api(private val prefs: Prefs) {
         }
     }
 
-    /** Доступен ли хост хранилища с этого телефона (частая причина — блокировка в DNS/VPN). */
+    /**
+     * Доступно ли хранилище с этого телефона. «Прямая загрузка не работает» почти всегда означает
+     * обрыв на стороне телефона (DNS, VPN, блокировщик), поэтому проверяем по шагам: имя →
+     * соединение → ответ по HTTPS. Так видно, где именно обрыв, а не «не удалось».
+     */
     fun storageHostReachable(): String {
         val host = prefs.lastS3Host
-        if (host.isNullOrBlank()) return "хост хранилища ещё не известен (он придёт с первой загрузкой)"
+        if (host.isNullOrBlank()) return "хост хранилища ещё не известен (он придёт с началом загрузки)"
         val dns = runCatching { java.net.InetAddress.getAllByName(host).joinToString(", ") { it.hostAddress ?: "?" } }
-        return if (dns.isSuccess) {
-            "хранилище: $host → ${dns.getOrNull()}"
-        } else {
-            "хранилище: $host не разрешается — ${dns.exceptionOrNull()?.message}"
+        if (dns.isFailure) return "хранилище: $host не разрешается в имя — ${dns.exceptionOrNull()?.message}"
+        val text = StringBuilder("хранилище: $host → ${dns.getOrNull()}\n")
+        val tcp = runCatching {
+            java.net.Socket().use { it.connect(java.net.InetSocketAddress(host, 443), 5_000) }
         }
+        if (tcp.isFailure) return text.append("соединение :443 не устанавливается — ${tcp.exceptionOrNull()?.message}").toString()
+        text.append("соединение :443 есть\n")
+        val https = runCatching {
+            val req = Request.Builder().url("https://$host/").get().build()
+            Oks3.client.newBuilder().readTimeout(10, TimeUnit.SECONDS).build().newCall(req).execute()
+                .use { "HTTPS ${it.code}" }
+        }
+        text.append(if (https.isSuccess) "ответ: ${https.getOrNull()}" else "HTTPS не ответил — ${https.exceptionOrNull()?.message}")
+        return text.toString()
     }
 
     /** Метаданные файла: имя, размер, тип, хэш — нужны файловому браузеру системы. */

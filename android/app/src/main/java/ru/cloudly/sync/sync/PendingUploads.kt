@@ -79,13 +79,17 @@ object PendingUploads {
                 forceRelay = viaRelay,
             )
         }
-        return runCatching { attempt(false) }.getOrElse { first ->
-            // прямое подключение к хранилищу могло не сработать (DNS, VPN, блокировщик);
-            // на внятную ошибку сервера повтор через него ничего не изменит
-            if (!Decisions.shouldRetryViaRelay(first)) throw first
-            Log.w(TAG, "прямая выгрузка не удалась (${first.message}) — пробую через сервер")
-            attempt(true)
-        }
+        val first = runCatching { attempt(false) }
+        if (first.isSuccess) return first.getOrThrow()
+        val error = first.exceptionOrNull()!!
+        // прямое подключение к хранилищу могло не сработать (DNS, VPN, блокировщик);
+        // на внятную ошибку сервера повтор через него ничего не изменит
+        if (!Decisions.shouldRetryViaRelay(error)) throw error
+        Log.w(TAG, "прямая выгрузка не удалась (${error.message}) — повторяю напрямую")
+        val second = runCatching { attempt(false) }
+        if (second.isSuccess) return second.getOrThrow()
+        Log.w(TAG, "прямая выгрузка не удалась дважды — пробую через сервер")
+        return attempt(true)
     }
 
     /**

@@ -184,11 +184,14 @@ private fun shareUpload(
             forceRelay = viaRelay,
         )
     }
-    runCatching { send(false) }.getOrElse { first ->
-        if (!Decisions.shouldRetryViaRelay(first)) throw first
-        uploadId?.let { runCatching { api.abort(it) } }
-        send(true)
-    }
+    val first = runCatching { send(false) }
+    if (first.isSuccess) return
+    val error = first.exceptionOrNull()!!
+    if (!Decisions.shouldRetryViaRelay(error)) throw error
+    // разовый обрыв — повторяем напрямую, прежде чем переключаться на медленный путь
+    uploadId?.let { runCatching { api.abort(it) } }
+    if (runCatching { send(false) }.isSuccess) return
+    send(true)
 }
 
 /** Копирование content:// в кэш, хэш, заливка, удаление временного файла. */

@@ -327,7 +327,7 @@ class UploadEngine(private val context: Context, private val db: Db, private val
                 onProgress("$prefix $cloudName: $pct%")
             }
         }
-        return runCatching {
+        val direct: () -> Uploader.Result = {
             Uploader(api).upload(
                 folderId = folderId,
                 file = local,
@@ -338,24 +338,53 @@ class UploadEngine(private val context: Context, private val db: Db, private val
                 onSession = { id -> db.updateOp(op.id, mapOf("upload_id" to id)) },
                 onProgress = progress("выгрузка"),
             )
-        }.getOrElse { e ->
-            if (relayMode() || !Decisions.shouldRetryViaRelay(e)) throw e
-            Log.w(TAG, "прямая загрузка не удалась (${e.message}) — пробую через сервер")
-            op.uploadId?.let { runCatching { api.abort(it) } }
-            db.putKv(KV_RELAY_MODE, System.currentTimeMillis().toString())
-            db.putKv("job_note:${job.id}", "хранилище недоступно напрямую — выгрузка идёт через сервер")
-            Uploader(api).upload(
-                folderId = folderId,
-                file = local,
-                sha256 = sha,
-                replace = false,
-                expectedSha256 = null,
-                uploadIdFromQueue = null,
-                onSession = { id -> db.updateOp(op.id, mapOf("upload_id" to id)) },
-                onProgress = progress("выгрузка через сервер"),
-                forceRelay = true,
-            )
         }
+
+        val first = runCatching { direct() }
+        if (first.isSuccess) {
+            noteDirectWorks(job)
+            return first.getOrThrow()
+        }
+        val error = first.exceptionOrNull()!!
+        if (!Decisions.shouldRetryViaRelay(error)) throw error
+        Log.w(TAG, "прямая загрузка не удалась (${error.message}) — повторяю напрямую")
+        op.uploadId?.let { runCatching { api.abort(it) } }
+        db.updateOp(op.id, mapOf("upload_id" to null))
+
+        // Разовый обрыв (смена сети, икота Wi-Fi, DNS) — не повод считать хранилище мёртвым:
+        // вторая попытка напрямую стоит секунд, а через сервер файл поедет в разы медленнее
+        val second = runCatching { direct() }
+        if (second.isSuccess) {
+            noteDirectWorks(job)
+            return second.getOrThrow()
+        }
+        val reason = (second.exceptionOrNull() ?: error).message.orEmpty().take(160)
+        Log.w(TAG, "прямая загрузка не удалась дважды ($reason) — пробую через сервер")
+        db.putKv(KV_RELAY_MODE, System.currentTimeMillis().toString())
+        db.putKv("job_note:${job.id}", "хранилище недоступно напрямую ($reason) — выгрузка идёт через сервер")
+        return Uploader(api).upload(
+            folderId = folderId,
+            file = local,
+            sha256 = sha,
+            replace = false,
+            expectedSha256 = null,
+            uploadIdFromQueue = null,
+            onSession = { id -> db.updateOp(op.id, mapOf("upload_id" to id)) },
+            onProgress = progress("выгрузка через сервер"),
+            forceRelay = true,
+        )
+    }
+
+    /**
+     * Прямая загрузка прошла: снимаем предупреждение «через сервер». Без этого сообщение
+     * о недоступном хранилище висело бы в интерфейсе вечно после одного сбоя, и выглядело бы
+     * так, будто прямая загрузка не работает вовсе.
+     */
+    private fun noteDirectWorks(job: Db.Job) {
+        if (!relayMode()) return
+        resetRelayMode()
+        db.putKv("job_note:${job.id}", "")
+        Log.i(TAG, "прямая загрузка работает — снимаю режим «через сервер»")
     }
 
     /** 30 с, 2 мин, 10 мин, 1 ч, дальше — раз в 6 часов. */
