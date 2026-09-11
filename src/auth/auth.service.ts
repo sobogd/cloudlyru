@@ -3,7 +3,7 @@ import * as argon2 from 'argon2';
 import { env } from '../config/env';
 import { PrismaService } from '../prisma/prisma.service';
 import { randomToken, sha256Hex } from '../common/utils';
-import { PHONE_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_PHOTOS } from '../common/zones';
+import { PHONE_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_PHOTOS, mirrorFolderName } from '../common/zones';
 import { AuditService } from '../audit/audit.service';
 import { badRequest, notFound, unauthorized } from '../common/errors';
 
@@ -79,12 +79,26 @@ export class AuthService implements OnModuleInit {
     return { ok: res.count > 0 };
   }
 
-  async me(userId: string) {
+  /**
+   * Свои данные и id системных папок. `deviceId` — id ApiToken'а, которым пришёл запрос
+   * (Bearer): клиенту синхронизации нужен свой корень зеркала, поэтому для устройства он
+   * создаётся лениво. Веб-сессия папку не заводит — там зеркало ни к чему.
+   */
+  async me(userId: string, deviceId?: string | null) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw unauthorized();
     const photoFolderId = await this.photoFolderId(userId).catch(() => null);
     const phoneFolderId = await this.phoneFolderId(userId).catch(() => null);
-    return { id: user.id, login: user.login, rootFolderId: user.rootFolderId, photoFolderId, phoneFolderId };
+    const mirrorFolderId = deviceId ? await this.deviceMirrorFolderId(deviceId).catch(() => null) : null;
+    return {
+      id: user.id,
+      login: user.login,
+      rootFolderId: user.rootFolderId,
+      photoFolderId,
+      phoneFolderId,
+      mirrorFolderId,
+      deviceId: deviceId ?? null,
+    };
   }
 
   /** Корневая папка пользователя (создаётся лениво, если отсутствует). */
@@ -135,6 +149,75 @@ export class AuthService implements OnModuleInit {
       : await this.prisma.folder.create({ data: { parentId: rootId, name: PHONE_FOLDER_NAME } });
     await this.prisma.user.update({ where: { id: userId }, data: { phoneFolderId: phone.id } });
     return phone.id;
+  }
+
+  /**
+   * Корень зеркала устройства «<Имя> - Файлы» в корне пользователя. Создаётся лениво, как и
+   * «Телефон», а существующую папку с таким именем «усыновляем» (снимаем deletedAt): она могла
+   * быть заведена руками или лежать в корзине, и плодить вторую рядом нельзя — клиент адресует
+   * файлы по имени корня. Удалить её нельзя (гарды в Folders/Dav через protectedFolderIds):
+   * потеря корня ломает адресацию всего зеркала.
+   */
+  async deviceMirrorFolderId(tokenId: string): Promise<string> {
+    const token = await this.prisma.apiToken.findUnique({ where: { id: tokenId } });
+    if (!token) throw unauthorized();
+    if (token.mirrorFolderId) {
+      const current = await this.prisma.folder.findUnique({ where: { id: token.mirrorFolderId } });
+      if (current && !current.deletedAt) return current.id;
+    }
+    const rootId = await this.rootFolderId(token.userId);
+    const name = mirrorFolderName(token.label);
+    const existing = await this.prisma.folder.findFirst({ where: { parentId: rootId, name } });
+    const mirror = existing
+      ? await this.prisma.folder.update({ where: { id: existing.id }, data: { deletedAt: null } })
+      : await this.prisma.folder.create({ data: { parentId: rootId, name } });
+    await this.prisma.apiToken.update({ where: { id: tokenId }, data: { mirrorFolderId: mirror.id } });
+    return mirror.id;
+  }
+
+  /**
+   * Живые корни зеркал устройств пользователя (без побочных эффектов; для гардов).
+   * Только не отозванные токены: отозванный токен клиенту уже не выдан, папку с его именем
+   * пользователь иначе не смог бы ни удалить, ни переименовать — и не увидел бы почему.
+   */
+  async deviceRootIdsOrNull(userId: string): Promise<string[]> {
+    const tokens = await this.prisma.apiToken.findMany({
+      where: { userId, revokedAt: null, mirrorFolderId: { not: null } },
+      select: { mirrorFolderId: true },
+    });
+    const ids = tokens.map((t) => t.mirrorFolderId).filter((id): id is string => Boolean(id));
+    if (!ids.length) return [];
+    const alive = await this.prisma.folder.findMany({
+      where: { id: { in: ids }, deletedAt: null },
+      select: { id: true },
+    });
+    return alive.map((f) => f.id);
+  }
+
+  /**
+   * Папки, которые нельзя удалять, переименовывать и переносить: корень пользователя, живые
+   * «Фото» и «Телефон» и корни зеркал устройств. Собрано одним методом намеренно: пока гарды
+   * в Folders и Dav проверяли папки по отдельности, новую системную папку забывали защитить
+   * в одном из мест — и клиент терял адресацию.
+   */
+  async protectedFolderIds(userId: string): Promise<Set<string>> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { rootFolderId: true, photoFolderId: true, phoneFolderId: true },
+    });
+    const ids = new Set<string>();
+    if (user?.rootFolderId) ids.add(user.rootFolderId);
+    // фото/телефон — только живые: удалённую системную папку незачем защищать от восстановления
+    const systemIds = [user?.photoFolderId, user?.phoneFolderId].filter((id): id is string => Boolean(id));
+    if (systemIds.length) {
+      const alive = await this.prisma.folder.findMany({
+        where: { id: { in: systemIds }, deletedAt: null },
+        select: { id: true },
+      });
+      for (const f of alive) ids.add(f.id);
+    }
+    for (const id of await this.deviceRootIdsOrNull(userId)) ids.add(id);
+    return ids;
   }
 
   /**
@@ -342,10 +425,12 @@ export class AuthService implements OnModuleInit {
   }
 
   /**
-   * Проверка Basic-токена (WebDAV). Возвращает владельца и scope или null.
+   * Проверка Basic-токена (WebDAV). Возвращает владельца, scope и id строки токена или null.
    * Раньше поле scope было декоративным и не читалось, а срок жизни отсутствовал.
+   * tokenId нужен как identity устройства: по нему берётся корень зеркала и пишется deviceId
+   * в журнал изменений.
    */
-  async resolveApiToken(token: string): Promise<{ userId: string; scope: string } | null> {
+  async resolveApiToken(token: string): Promise<{ userId: string; scope: string; tokenId: string } | null> {
     if (!token) return null;
     const t = await this.prisma.apiToken.findUnique({ where: { tokenHash: sha256Hex(token) } });
     if (!t || t.revokedAt) return null;
@@ -358,6 +443,6 @@ export class AuthService implements OnModuleInit {
         .update({ where: { id: t.id }, data: { lastUsedAt: new Date() } })
         .catch(() => undefined);
     }
-    return { userId: t.userId, scope: t.scope };
+    return { userId: t.userId, scope: t.scope, tokenId: t.id };
   }
 }

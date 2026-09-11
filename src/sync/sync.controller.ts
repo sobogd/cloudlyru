@@ -22,6 +22,18 @@ export class SyncController {
     return this.sync.changes(user.id, since, limit);
   }
 
+  /**
+   * Голова журнала на текущий момент: клиент включает зеркало так — узнаёт голову, делает
+   * полный проход по содержимому папки, потом догоняет журнал с этой головы. Без ручки
+   * изменения, случившиеся во время полного прохода, терялись бы.
+   */
+  @UseGuards(RateLimitGuard)
+  @RateLimit(240, 60_000)
+  @Get('head')
+  head(@CurrentUser() user: RequestUser) {
+    return this.sync.head(user.id);
+  }
+
   /** Что из перечисленного содержимого уже есть: `{ sha256: [...] }`. Только чтение. */
   @UseGuards(RateLimitGuard)
   @RateLimit(120, 60_000)

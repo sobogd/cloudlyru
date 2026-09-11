@@ -48,6 +48,8 @@ model ApiToken {
   lastUsedAt DateTime?
   revokedAt  DateTime?
   createdAt  DateTime  @default(now())
+  // корень зеркала этого устройства («<Имя> - Файлы»); создаётся лениво
+  mirrorFolderId String?
   user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
@@ -260,6 +262,8 @@ model ChangeLog {
   mime        String?
   clientMtime DateTime?
   keepOffline Boolean  @default(false)
+  // id ApiToken устройства, если изменение пришло от клиента синхронизации (иначе null)
+  deviceId    String?
   at          DateTime @default(now())
 
   @@index([userId, seq])

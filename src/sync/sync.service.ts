@@ -22,6 +22,8 @@ export interface SyncChangeDto {
   mime: string | null;
   clientMtime: string | null;
   keepOffline: boolean;
+  /** id ApiToken'а устройства-источника правки; null — правку сделал веб или фон. */
+  deviceId: string | null;
   at: string;
 }
 
@@ -113,9 +115,25 @@ export class SyncService {
         mime: c.mime,
         clientMtime: c.clientMtime ? c.clientMtime.toISOString() : null,
         keepOffline: c.keepOffline,
+        // клиент сравнивает с собственным deviceId из /auth/me и не применяет свои же правки
+        deviceId: c.deviceId,
         at: c.at.toISOString(),
       })),
     };
+  }
+
+  /**
+   * Текущая голова журнала: с неё клиент начинает догон после полного прохода по папке.
+   * Отдельная ручка, а не `changes` без `since`: курсор и голова — разные вещи, и клиенту
+   * нужна именно голова, снятая ДО полного прохода (иначе правки во время прохода потеряются).
+   */
+  async head(userId: string): Promise<{ seq: string }> {
+    const newest = await this.prisma.changeLog.findFirst({
+      where: { userId },
+      orderBy: { seq: 'desc' },
+      select: { seq: true },
+    });
+    return { seq: newest ? newest.seq.toString() : '0' };
   }
 
   /**

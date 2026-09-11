@@ -8,6 +8,11 @@ import kotlinx.coroutines.SupervisorJob
 import ru.cloudly.sync.data.Prefs
 import ru.cloudly.sync.data.QueueStore
 import ru.cloudly.sync.data.Selection
+import ru.cloudly.sync.data.Section
+import ru.cloudly.sync.mirror.MirrorEngine
+import ru.cloudly.sync.mirror.MirrorScheduler
+import ru.cloudly.sync.mirror.MirrorStore
+import ru.cloudly.sync.mirror.MirrorWatcher
 import ru.cloudly.sync.net.Api
 import ru.cloudly.sync.queue.UploadRunner
 
@@ -28,6 +33,19 @@ class App : Application() {
         private set
 
     /**
+     * Двустороннее зеркало выбранных папок раздела «Файлы»: состояние живёт в области
+     * приложения, потому что проходы запускает и система (периодическое задание), и интерфейс.
+     */
+    lateinit var mirrorStore: MirrorStore
+        private set
+    lateinit var mirror: MirrorEngine
+        private set
+
+    /** Быстрый путь: изменение файла — повод не ждать пятнадцати минут. */
+    lateinit var mirrorWatcher: MirrorWatcher
+        private set
+
+    /**
      * Выгрузка живёт в области приложения, а не экрана: ушёл с раздела «Очередь» —
      * файл всё равно доедет. Запуск при этом ручной, по кнопке на строке.
      */
@@ -45,6 +63,18 @@ class App : Application() {
         // иначе строка навсегда осталась бы в состоянии «грузится»
         runCatching { queueStore.resetRunning() }
         uploads = UploadRunner(api, queueStore, appScope)
+
+        mirrorStore = MirrorStore(this)
+        mirror = MirrorEngine(api, mirrorStore, selection)
+        mirrorWatcher = MirrorWatcher { MirrorScheduler.scheduleSoon(this) }
+        // периодический проход: наблюдатель за файлами только ускоряет, но не заменяет его
+        MirrorScheduler.schedulePeriodic(this)
+        runCatching { mirrorWatcher.watch(selection.paths(Section.FILES)) }
+    }
+
+    /** После изменения выбора папок наблюдение пересобирается: набор папок изменился. */
+    fun refreshMirrorWatch() {
+        runCatching { mirrorWatcher.watch(selection.paths(Section.FILES)) }
     }
 
     companion object {

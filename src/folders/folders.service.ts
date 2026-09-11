@@ -26,15 +26,16 @@ export class FoldersService {
   ) {}
 
   /**
-   * Системные папки («Фото» и «Телефон») нельзя переименовать, переместить или удалить.
-   * Клиент льёт в них по адресации, заведённой сервером: смена имени или места ломает
-   * и медиатеку, и зеркало телефона, а удаление уносит содержимое в корзину.
+   * Системные папки (корень, «Фото», «Телефон», корни зеркал устройств) нельзя переименовать,
+   * переместить или удалить. Клиент льёт в них по адресации, заведённой сервером: смена имени
+   * или места ломает и медиатеку, и зеркало, а удаление уносит содержимое в корзину.
+   * Список берём одним методом — иначе новую системную папку легко защитить в одном месте
+   * и забыть в другом.
    */
-  private async assertNotSystemRoot(folder: { id: string }, userId: string, action: string) {
-    const photoId = await this.auth.photoRootIdOrNull(userId);
-    if (photoId && folder.id === photoId) throw badRequest(`cannot ${action} photo library root`);
-    const phoneId = await this.auth.phoneRootIdOrNull(userId);
-    if (phoneId && folder.id === phoneId) throw badRequest(`cannot ${action} phone mirror root`);
+  private async assertNotSystemRoot(folder: { id: string; name?: string }, userId: string, action: string) {
+    const protectedIds = await this.auth.protectedFolderIds(userId);
+    if (!protectedIds.has(folder.id)) return;
+    throw badRequest(`cannot ${action} system folder${folder.name ? ` "${folder.name}"` : ''}`);
   }
 
   private async rootId(userId: string): Promise<string> {

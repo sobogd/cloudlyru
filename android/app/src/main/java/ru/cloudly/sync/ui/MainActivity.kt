@@ -69,6 +69,8 @@ private fun Root() {
     // ручным. Наполняем при старте и после каждого изменения выбора папок.
     LaunchedEffect(folderSection) {
         if (folderSection != null) return@LaunchedEffect
+        // выбор папок мог измениться: пересобираем наблюдение за папками зеркала
+        app.refreshMirrorWatch()
         withContext(Dispatchers.IO) { runCatching { QueueRefresher.refresh(context) } }
         waiting = withContext(Dispatchers.IO) { app.queueStore.waitingCount() }
     }

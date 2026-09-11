@@ -12,6 +12,9 @@
     <!-- Обновление по кнопке: приложение скачивает свою новую сборку и отдаёт её системному
          установщику. Сама установка всё равно подтверждается диалогом системы. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Периодическое задание зеркала переживает перезагрузку (JobScheduler setPersisted):
+         без этого разрешения задание пришлось бы заводить заново после каждого включения. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".App"
@@ -31,6 +34,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Зеркало выбранных папок «Файлы»: проход запускает система по расписанию и по
+             событию файловой системы. Отдельного foreground-сервиса нет — запуск уведомления
+             из фона на Android 12+ ограничен, а проход укладывается в лимит задания. -->
+        <service
+            android:name=".mirror.MirrorJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
 
         <!-- «Выбрать файл» из чужого приложения: отвечаем на системный запрос своим экраном,
              без прослойки системного выборщика. Отдаём ссылку на провайдера документов. -->

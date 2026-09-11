@@ -19,19 +19,19 @@ object QueueRefresher {
 
         // системные папки сервера спрашиваем один раз: без них очередь некуда направить,
         // но и наполнять её при отсутствии сети смысла нет
-        if ((prefs.phoneFolderId.isBlank() || prefs.photoFolderId.isBlank()) && prefs.token.isNotBlank()) {
+        if (prefs.photoFolderId.isBlank() && prefs.token.isNotBlank()) {
             onProgress("спрашиваю системные папки…")
             val folders = runCatching { app.api.systemFolders() }.getOrNull()
             if (folders != null) {
-                folders.phoneFolderId?.let { prefs.phoneFolderId = it }
                 folders.photoFolderId?.let { prefs.photoFolderId = it }
+                // «Телефон» больше не используется: раздел «Файлы» ведёт зеркало
+                folders.phoneFolderId?.let { prefs.phoneFolderId = it }
             }
         }
 
         val builder = QueueBuilder(DeviceFiles(context), app.queueStore)
         return builder.build(
             selection = app.selection,
-            phoneFolderId = prefs.phoneFolderId.takeIf { it.isNotBlank() },
             photoFolderId = prefs.photoFolderId.takeIf { it.isNotBlank() },
             onProgress = onProgress,
         )

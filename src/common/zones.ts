@@ -16,3 +16,19 @@ export const PHOTO_FOLDER_NAME = 'Фото';
  * клиент льёт в неё структуру выбранных папок, и потеря корня означала бы потерю адресации.
  */
 export const PHONE_FOLDER_NAME = 'Телефон';
+
+/**
+ * Корень зеркала устройства — папка «<Имя устройства> - Файлы» прямо в корне пользователя
+ * (ребёнок users.rootFolderId), а не внутри «Телефон»: корень у каждого устройства свой, а
+ * общий на всех означал бы, что удаление файла на одном телефоне уносит файлы другого.
+ */
+export const MIRROR_FOLDER_SUFFIX = ' - Файлы';
+
+/** Запасное имя для токена с пустым label, иначе папка называлась бы « - Файлы». */
+const MIRROR_FOLDER_FALLBACK = 'Устройство';
+
+/** Имя корня зеркала устройства по его label (устройства с одинаковым label делят корень). */
+export function mirrorFolderName(label: string): string {
+  const clean = String(label ?? '').trim();
+  return `${clean || MIRROR_FOLDER_FALLBACK}${MIRROR_FOLDER_SUFFIX}`;
+}
