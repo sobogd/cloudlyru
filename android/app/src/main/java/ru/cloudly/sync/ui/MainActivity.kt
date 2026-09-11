@@ -33,6 +33,7 @@ import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.queue.QueueRefresher
+import ru.cloudly.sync.work.SyncService
 
 /**
  * Что показывает приложение: очередь загрузки и настройки. Управления файлами здесь нет —
@@ -63,6 +64,10 @@ private fun Root() {
     // выбор папок — отдельный экран, а не диалог: дерево телефона в окне поверх не показать
     var folderSection by remember { mutableStateOf<Section?>(null) }
     var waiting by remember { mutableIntStateOf(0) }
+
+    // сервис синхронизации поднимаем при открытии приложения: он держит связь с сервером,
+    // наполняет очередь и выполняет команды веба
+    LaunchedEffect(Unit) { runCatching { SyncService.start(context) } }
 
     // Счётчик очереди и фоновое наполнение: очередь должна собираться сама, а запуск остаётся
     // ручным. Наполняем при старте и после каждого изменения выбора папок.

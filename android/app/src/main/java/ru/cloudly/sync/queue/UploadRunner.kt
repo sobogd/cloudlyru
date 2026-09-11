@@ -45,6 +45,10 @@ class UploadRunner(
     }
 
     private val busy = AtomicBoolean(false)
+
+    /** Пауза: текущая выгрузка прерывается, новые не начинаются, пока не снимут. */
+    @Volatile
+    private var paused = false
     private val folders = ConcurrentHashMap<String, String>()
 
     private val _progress = MutableStateFlow<Progress?>(null)
@@ -52,12 +56,26 @@ class UploadRunner(
 
     fun isBusy(): Boolean = busy.get()
 
+    fun isPaused(): Boolean = paused
+
+    fun pause() {
+        paused = true
+    }
+
+    fun resume() {
+        paused = false
+    }
+
     /** Кнопка «play» на строке: одна выгрузка за раз, интерфейс при этом не блокируется. */
     fun start(itemId: Long) {
+        if (paused) return
         if (!busy.compareAndSet(false, true)) return
         scope.launch {
             try {
                 upload(itemId)
+            } catch (e: UploadPaused) {
+                // пауза — не ошибка: строка возвращается в ожидание и продолжит по команде
+                withContext(Dispatchers.IO) { store.markPending(itemId) }
             } catch (e: Exception) {
                 Log.w(TAG, "выгрузка $itemId: ${e.message}")
                 withContext(Dispatchers.IO) {
@@ -156,6 +174,7 @@ class UploadRunner(
                 onSession = {},
                 onProgress = progress,
                 forceRelay = viaRelay,
+                shouldStop = { paused },
             )
         }
 

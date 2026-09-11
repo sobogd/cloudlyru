@@ -61,6 +61,11 @@ class Prefs(context: Context) {
         get() = prefs.getString(KEY_PHONE_FOLDER, "").orEmpty()
         set(value) = prefs.edit().putString(KEY_PHONE_FOLDER, value).apply()
 
+    /** id этого телефона на сервере: по нему веб ставит команды. */
+    var deviceId: String
+        get() = prefs.getString(KEY_DEVICE_ID, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_DEVICE_ID, value).apply()
+
     var photoFolderId: String
         get() = prefs.getString(KEY_PHOTO_FOLDER, "").orEmpty()
         set(value) = prefs.edit().putString(KEY_PHOTO_FOLDER, value).apply()
@@ -71,6 +76,7 @@ class Prefs(context: Context) {
         private const val KEY_TOKEN = "api_token"
         private const val KEY_S3_HOST = "last_s3_host"
         private const val KEY_PHONE_FOLDER = "phone_folder_id"
+        private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_PHOTO_FOLDER = "photo_folder_id"
     }
 }

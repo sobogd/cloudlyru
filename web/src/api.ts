@@ -509,3 +509,41 @@ export const unzipStatus = (id: string) => request<UnzipJob>(`/unzip/${id}`);
 export const latestUnzip = (entryId: string) =>
   request<UnzipJob | null>(`/unzip?entryId=${encodeURIComponent(entryId)}`);
 export const cancelUnzip = (id: string) => request<UnzipJob>(`/unzip/${id}/cancel`, { method: 'POST' });
+
+// ===== телефоны-исполнители (синхронизация) =====
+// Веб здесь пульт: телефон отдаёт состояние (структура выбранных папок и что с файлами),
+// а получает команды. У телефона нет своего адреса, поэтому он сам спрашивает команды —
+// поставленная сейчас команда дождётся, когда телефон выйдет на связь.
+export interface DeviceInfo {
+  id: string;
+  label: string;
+  lastSeenAt: string | null;
+  connectedAt: string | null;
+  /** Сколько записей в каждом состоянии: LOCAL, PENDING, RUNNING, DONE, SKIPPED, FAILED */
+  states: Record<string, number>;
+}
+export interface DeviceEntry {
+  section: 'FILES' | 'PHOTOS' | string;
+  path: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  mtime: string | null;
+  /** Абсолютный путь на телефоне: по нему просим выгрузить файл */
+  localPath: string | null;
+  state: string;
+  error: string | null;
+}
+export interface DeviceTree {
+  deviceId: string;
+  label: string;
+  lastSeenAt: string | null;
+  entries: DeviceEntry[];
+}
+export const listDevices = () => request<DeviceInfo[]>('/devices');
+export const deviceTree = (id: string) => request<DeviceTree>(`/devices/${id}/tree`);
+export const deviceCommand = (id: string, kind: string, payload?: Record<string, unknown>) =>
+  request<{ id: string }>(`/devices/${id}/commands`, {
+    method: 'POST',
+    body: JSON.stringify({ kind, ...(payload ? { payload } : {}) }),
+  });

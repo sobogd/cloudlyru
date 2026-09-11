@@ -4,10 +4,11 @@ import 'leaflet/dist/leaflet.css';
 import * as api from './api';
 import './styles.css';
 
-type Tab = 'files' | 'photos' | 'shares' | 'albums' | 'trash' | 'settings';
+type Tab = 'files' | 'photos' | 'phone' | 'shares' | 'albums' | 'trash' | 'settings';
 const NAV: Array<{ id: Tab; icon: string; label: string }> = [
   { id: 'files', icon: '📁', label: 'Файлы' },
   { id: 'photos', icon: '🖼️', label: 'Фото' },
+  { id: 'phone', icon: '📱', label: 'Телефон' },
   { id: 'shares', icon: '🔗', label: 'Шаринг' },
   { id: 'albums', icon: '🗂️', label: 'Альбомы' },
   { id: 'trash', icon: '🗑️', label: 'Корзина' },
@@ -126,6 +127,7 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
           />
         )}
         {tab === 'photos' && <Photos photoFolderId={user.photoFolderId} up={up} uploadedAt={uploadedAt} />}
+        {tab === 'phone' && <PhoneSync />}
         {tab === 'shares' && <Shares />}
         {tab === 'albums' && <Albums />}
         {tab === 'trash' && <TrashPage />}
@@ -1311,4 +1313,256 @@ function fmt(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} ГБ`;
+}
+
+// ================= Телефон (пульт синхронизации) =================
+// Веб — пульт, телефон — исполнитель: здесь видно, что лежит на телефоне (даже то, что
+// не выгружено), что стоит в очереди, и отсюда ставятся команды. Файлы, которых нет в облаке,
+// показываются только для просмотра: правка и удаление — в обычном дереве «Файлов», где они
+// уже облачные и уедут на телефон через очередь.
+
+const STATE_LABEL: Record<string, string> = {
+  LOCAL: 'только на телефоне',
+  PENDING: 'в очереди',
+  RUNNING: 'грузится',
+  DONE: 'выгружен',
+  SKIPPED: 'уже в облаке',
+  FAILED: 'ошибка',
+};
+
+function stateColor(state: string): string {
+  if (state === 'FAILED') return '#ff7b72';
+  if (state === 'RUNNING') return '#7ee787';
+  if (state === 'PENDING') return '#e3b341';
+  if (state === 'DONE' || state === 'SKIPPED') return '#8b949e';
+  return '#58a6ff';
+}
+
+type PhoneNode = {
+  name: string;
+  path: string;
+  children: PhoneNode[];
+  entry?: api.DeviceEntry;
+};
+
+/** Плоский список путей превращаем в дерево: так же, как структура ложится в облако. */
+function buildPhoneTree(entries: api.DeviceEntry[]): PhoneNode[] {
+  const root: PhoneNode = { name: '', path: '', children: [] };
+  const dirs = new Map<string, PhoneNode>([['', root]]);
+
+  const dirNode = (path: string, name: string): PhoneNode => {
+    const known = dirs.get(path);
+    if (known) return known;
+    const parentPath = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+    const parent = dirNode(parentPath, parentPath ? parentPath.split('/').pop() ?? '' : '');
+    const node: PhoneNode = { name, path, children: [] };
+    dirs.set(path, node);
+    parent.children.push(node);
+    return node;
+  };
+
+  for (const entry of entries) {
+    if (entry.isDir) {
+      dirNode(entry.path, entry.name);
+      continue;
+    }
+    const dirPath = entry.path.includes('/') ? entry.path.slice(0, entry.path.lastIndexOf('/')) : '';
+    const parent = dirPath ? dirNode(dirPath, dirPath.split('/').pop() ?? '') : root;
+    parent.children.push({ name: entry.name, path: entry.path, children: [], entry });
+  }
+
+  const sort = (nodes: PhoneNode[]) => {
+    nodes.sort((a, b) => {
+      const aDir = !a.entry;
+      const bDir = !b.entry;
+      if (aDir !== bDir) return aDir ? -1 : 1;
+      return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    });
+    nodes.forEach((n) => sort(n.children));
+  };
+  sort(root.children);
+  return root.children;
+}
+
+function fmtAgo(iso: string | null): string {
+  if (!iso) return 'ни разу';
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60_000) return 'только что';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} мин назад`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} ч назад`;
+  return `${Math.floor(diff / 86_400_000)} дн назад`;
+}
+
+function PhoneSync() {
+  const [devices, setDevices] = useState<api.DeviceInfo[] | null>(null);
+  const [deviceId, setDeviceId] = useState('');
+  const [tree, setTree] = useState<api.DeviceTree | null>(null);
+  const [err, setErr] = useState('');
+  const [note, setNote] = useState('');
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    const load = () =>
+      api
+        .listDevices()
+        .then((list) => {
+          setDevices(list);
+          setErr('');
+          setDeviceId((current) => current || list[0]?.id || '');
+        })
+        .catch((e) => setErr((e as Error).message));
+    void load();
+    const timer = setInterval(load, 10_000);
+    return () => clearInterval(timer);
+  }, [reload]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    let alive = true;
+    const load = () =>
+      api
+        .deviceTree(deviceId)
+        .then((t) => {
+          if (alive) setTree(t);
+        })
+        .catch((e) => {
+          if (alive) setErr((e as Error).message);
+        });
+    void load();
+    const timer = setInterval(load, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [deviceId, reload]);
+
+  const send = async (kind: string, payload?: Record<string, unknown>) => {
+    if (!deviceId) return;
+    setNote('команда отправлена');
+    try {
+      await api.deviceCommand(deviceId, kind, payload);
+      setTimeout(() => setReload((x) => x + 1), 1000);
+    } catch (e) {
+      setNote(`не удалось: ${(e as Error).message}`);
+    }
+  };
+
+  if (devices === null && !err) return <div className="copy" style={{ padding: 20 }}>Загрузка…</div>;
+
+  if (devices && devices.length === 0) {
+    return (
+      <div style={{ padding: 20 }}>
+        <h2 style={{ marginTop: 0 }}>Телефон</h2>
+        <div className="copy">
+          Телефон ещё не выходил на связь. Открой приложение Cloudly на телефоне или запусти сервис
+          в «Настройках» — после этого здесь появится его состояние.
+        </div>
+      </div>
+    );
+  }
+
+  const device = devices?.find((d) => d.id === deviceId) ?? devices?.[0];
+  const states = device?.states ?? {};
+  const files = (tree?.entries ?? []).filter((e) => e.section === 'FILES');
+  const photos = (tree?.entries ?? []).filter((e) => e.section === 'PHOTOS');
+
+  const renderNodes = (nodes: PhoneNode[], depth: number): JSX.Element[] =>
+    nodes.flatMap((node) => {
+      const isDir = !node.entry;
+      const isOpen = !collapsed.has(node.path);
+      const row = (
+        <div
+          key={node.path}
+          className="item"
+          style={{ paddingLeft: 8 + depth * 16, cursor: isDir ? 'pointer' : 'default' }}
+          onClick={() => {
+            if (!isDir) return;
+            setCollapsed((prev) => {
+              const next = new Set(prev);
+              if (next.has(node.path)) next.delete(node.path);
+              else next.add(node.path);
+              return next;
+            });
+          }}
+        >
+          <span className="icon">{isDir ? (isOpen ? '📂' : '📁') : '📄'}</span>
+          <span className="fname" style={{ flex: 1 }}>{node.name}</span>
+          {!isDir && node.entry && (
+            <>
+              <span className="copy" style={{ color: stateColor(node.entry.state), marginRight: 8, fontSize: 12 }}>
+                {STATE_LABEL[node.entry.state] ?? node.entry.state}
+              </span>
+              {(node.entry.state === 'LOCAL' || node.entry.state === 'PENDING' || node.entry.state === 'FAILED') && (
+                <button
+                  className="btn ghost"
+                  title="Выгрузить сейчас"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void send('UPLOAD_PATH', { path: node.entry?.localPath ?? '' });
+                  }}
+                >
+                  ⬆️
+                </button>
+              )}
+            </>
+          )}
+          {!isDir && node.entry?.error && (
+            <span className="copy" style={{ color: '#ff7b72', fontSize: 11 }}>{node.entry.error}</span>
+          )}
+          {isDir && (
+            <span className="copy" style={{ fontSize: 11 }}>
+              {node.children.filter((c) => c.entry).length} файлов
+            </span>
+          )}
+        </div>
+      );
+      return isOpen ? [row, ...renderNodes(node.children, depth + 1)] : [row];
+    });
+
+  return (
+    <div style={{ padding: '10px 2px' }}>
+      <h2 style={{ margin: '0 0 6px' }}>Телефон</h2>
+      <div className="copy" style={{ marginBottom: 8 }}>
+        {device?.label} · на связи: {fmtAgo(device?.lastSeenAt ?? null)}
+      </div>
+
+      {devices && devices.length > 1 && (
+        <div className="row" style={{ marginBottom: 8 }}>
+          {devices.map((d) => (
+            <button key={d.id} className="btn ghost" onClick={() => setDeviceId(d.id)}>
+              {d.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="panel" style={{ marginBottom: 10 }}>
+        <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn" onClick={() => void send('SYNC_NOW')}>Проверить папки сейчас</button>
+          <button className="btn ghost" onClick={() => void send('RESUME')}>Продолжить</button>
+          <button className="btn ghost" onClick={() => void send('PAUSE')}>Пауза</button>
+        </div>
+        <div className="copy" style={{ marginTop: 8 }}>
+          ждут: {(states.PENDING ?? 0) + (states.FAILED ?? 0)} · идёт: {states.RUNNING ?? 0} · выгружено:{' '}
+          {(states.DONE ?? 0) + (states.SKIPPED ?? 0)} · только на телефоне: {states.LOCAL ?? 0}
+          {states.FAILED ? ` · ошибок: ${states.FAILED}` : ''}
+        </div>
+        {note && <div className="copy" style={{ marginTop: 4 }}>{note}</div>}
+      </div>
+
+      {err && <div className="err" style={{ margin: '6px 2px' }}>{err}</div>}
+
+      {tree && tree.entries.length === 0 && (
+        <div className="copy">
+          Телефон ещё не присылал состояние. Проверь, что сервис запущен и указаны папки в «Настройках».
+        </div>
+      )}
+
+      {files.length > 0 && <h3>Файлы</h3>}
+      {renderNodes(buildPhoneTree(files), 0)}
+      {photos.length > 0 && <h3 style={{ marginTop: 14 }}>Фото и видео</h3>}
+      {renderNodes(buildPhoneTree(photos), 0)}
+    </div>
+  );
 }

@@ -205,6 +205,12 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
             if (c.moveToFirst()) c.getInt(0) else 0
         }
 
+    /** Строка очереди по пути файла: по ней веб просит выгрузить конкретный файл. */
+    fun itemByPath(path: String): QueueItem? =
+        readableDatabase.rawQuery("SELECT * FROM queue WHERE path = ? ORDER BY id LIMIT 1", arrayOf(path)).use { c ->
+            if (c.moveToFirst()) readItem(c) else null
+        }
+
     fun item(id: Long): QueueItem? = readableDatabase.rawQuery("SELECT * FROM queue WHERE id = ?", arrayOf(id.toString())).use { c ->
         if (c.moveToFirst()) readItem(c) else null
     }

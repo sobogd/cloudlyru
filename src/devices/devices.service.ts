@@ -10,6 +10,8 @@ export interface DeviceEntryInput {
   isDir?: boolean;
   size?: number;
   mtime?: string | null;
+  /** Абсолютный путь на телефоне: веб по нему просит выгрузить файл. */
+  localPath?: string | null;
   state?: string;
   error?: string | null;
 }
@@ -177,6 +179,7 @@ export class DevicesService {
         isDir: e.isDir,
         size: Number(e.size),
         mtime: e.mtime?.toISOString() ?? null,
+        localPath: e.localPath,
         state: e.state,
         error: e.error,
       })),
@@ -231,6 +234,8 @@ export class DevicesService {
       isDir: entry.isDir === true,
       size: BigInt(Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0),
       mtime: mtime && !Number.isNaN(mtime.getTime()) ? mtime : null,
+      localPath:
+        typeof entry.localPath === 'string' && entry.localPath ? entry.localPath.slice(0, MAX_PATH) : null,
       state,
       error: entry.error == null ? null : String(entry.error).slice(0, 500),
     };

@@ -43,6 +43,9 @@ data class RemoteEntry(
 
 data class FolderChildren(val folderIds: Map<String, String>, val entries: List<RemoteEntry>)
 
+/** Команда сервера телефону (GET /devices/:id/commands). */
+data class DeviceCommand(val id: String, val kind: String, val payload: JSONObject?)
+
 /** Системные папки владельца (GET /auth/me). */
 data class SystemFolders(val photoFolderId: String?, val phoneFolderId: String?)
 

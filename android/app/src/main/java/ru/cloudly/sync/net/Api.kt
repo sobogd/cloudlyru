@@ -147,6 +147,55 @@ class Api(private val prefs: Prefs) {
         }
     }
 
+    /**
+     * Телефон представляется серверу: получает id устройства и то, что для него накопилось.
+     * С этого момента веб видит телефон и может ставить ему команды.
+     */
+    fun deviceHello(label: String): Pair<String, List<DeviceCommand>> {
+        val o = parse(request("/devices/hello", "POST", JSONObject().put("label", label)))
+        return o.optString("deviceId") to commandsOf(o)
+    }
+
+    /** Снимок состояния: структура выбранных папок и что с файлами (в очереди, только на телефоне). */
+    fun deviceState(deviceId: String, entries: JSONArray): List<DeviceCommand> {
+        val body = JSONObject().put("deviceId", deviceId).put("entries", entries)
+        return commandsOf(parse(request("/devices/state", "POST", body)))
+    }
+
+    /** Забрать команды веба: сервер отдаёт их массивом, а не объектом. */
+    fun deviceCommands(deviceId: String): List<DeviceCommand> =
+        commandsOf(
+            request("/devices/$deviceId/commands").let { response ->
+                val text = response.body?.string().orEmpty()
+                if (text.isBlank()) JSONArray() else JSONArray(text)
+            },
+        )
+
+    /** Подтвердить выполнение команды. */
+    fun deviceAck(deviceId: String, commandId: String, error: String?) {
+        val body = JSONObject()
+        if (error != null) body.put("error", error)
+        request("/devices/$deviceId/commands/$commandId/ack", "POST", body)
+    }
+
+    private fun commandsOf(o: JSONObject): List<DeviceCommand> =
+        commandsOf(o.optJSONArray("commands") ?: JSONArray())
+
+    private fun commandsOf(arr: JSONArray): List<DeviceCommand> {
+        val out = ArrayList<DeviceCommand>(arr.length())
+        for (i in 0 until arr.length()) {
+            val c = arr.optJSONObject(i) ?: continue
+            out.add(
+                DeviceCommand(
+                    id = c.optString("id"),
+                    kind = c.optString("kind"),
+                    payload = if (c.isNull("payload")) null else c.optJSONObject("payload"),
+                ),
+            )
+        }
+        return out
+    }
+
     /** Идемпотентный mkdir: возвращает id папки по пути от корня. */
     fun ensurePath(path: String, parentId: String? = null): String {
         val body = JSONObject().put("path", path)

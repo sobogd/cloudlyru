@@ -104,6 +104,31 @@ class DeviceFiles(private val context: Context) {
     }
 
     /**
+     * Скелет папок с относительными путями — ровно в том виде, в каком структура уезжает
+     * в облако. Нужен снимку для сервера: пока ничего не выгружено, в вебе всё равно должно
+     * быть видно, какие папки на телефоне выбраны.
+     */
+    fun walkRelDirs(roots: List<String>, emit: (relPath: String, name: String) -> Unit, isCancelled: () -> Boolean) {
+        fun visit(dir: File, rel: String) {
+            if (isCancelled()) return
+            val children = dir.listFiles() ?: return
+            for (child in children) {
+                if (isCancelled()) return
+                if (!child.isDirectory || MediaRules.skipDir(child.name, dir.name)) continue
+                val childRel = "$rel/${child.name}"
+                emit(childRel, child.name)
+                visit(child, childRel)
+            }
+        }
+        for (root in SelectionRules.scanRoots(roots.toSet())) {
+            if (isCancelled()) return
+            val rootName = root.substringAfterLast('/')
+            emit(rootName, rootName)
+            visit(File(root), rootName)
+        }
+    }
+
+    /**
      * Файлы выбранных папок. Обход идёт в фоне и умеет останавливаться: на телефоне десятки
      * тысяч файлов, и держать из-за них интерфейс нельзя.
      *

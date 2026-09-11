@@ -15,6 +15,9 @@ import kotlin.math.min
  * размер части. Продолжение после обрыва на уровне очереди пока не сохраняется — повтор
  * начинается файл заново.
  */
+/** Выгрузку остановили снаружи (пауза из веба или из приложения). */
+class UploadPaused : Exception("выгрузка на паузе")
+
 class Uploader(private val api: Api) {
 
     /** Сколько частей льём одновременно: память ≈ parallelism × partSize. */
@@ -38,6 +41,8 @@ class Uploader(private val api: Api) {
         onProgress: (sent: Long, total: Long) -> Unit,
         /** true — лить через сервер: нужно, когда хранилище с телефона недоступно. */
         forceRelay: Boolean = false,
+        /** Проверка «пора остановиться»: пауза не должна ждать конца большого файла. */
+        shouldStop: () -> Boolean = { false },
     ): Result {
         val size = file.length()
         val mtime = file.lastModified()
@@ -62,7 +67,7 @@ class Uploader(private val api: Api) {
             return Result(init.entryId, cloudName, sha256, deduped = true)
         }
         onSession(init.uploadId)
-        return sendParts(init.uploadId, init.direct, init.partSize, file, sha256, onProgress)
+        return sendParts(init.uploadId, init.direct, init.partSize, file, sha256, onProgress, shouldStop)
     }
 
     private fun sendParts(
@@ -72,6 +77,7 @@ class Uploader(private val api: Api) {
         file: File,
         sha256: String,
         onProgress: (Long, Long) -> Unit,
+        shouldStop: () -> Boolean,
     ): Result {
         val total = file.length()
         val parts = max(1, ((total + partSize - 1) / partSize).toInt())
@@ -88,6 +94,7 @@ class Uploader(private val api: Api) {
         RandomAccessFile(file, "r").use { raf ->
             var part = 1
             while (part <= parts) {
+                if (shouldStop()) throw UploadPaused()
                 val batchEnd = min(parts, part + width - 1)
                 val batch = (part..batchEnd).toList()
                 val lock = Object()
