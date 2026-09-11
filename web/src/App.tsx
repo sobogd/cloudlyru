@@ -117,7 +117,14 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
             onDismissFailed={up.dismissFailed}
           />
         )}
-        {tab === 'files' && <Files photoFolderId={user.photoFolderId} up={up} uploadedAt={uploadedAt} />}
+        {tab === 'files' && (
+          <Files
+            photoFolderId={user.photoFolderId}
+            phoneFolderId={user.phoneFolderId}
+            up={up}
+            uploadedAt={uploadedAt}
+          />
+        )}
         {tab === 'photos' && <Photos photoFolderId={user.photoFolderId} up={up} uploadedAt={uploadedAt} />}
         {tab === 'shares' && <Shares />}
         {tab === 'albums' && <Albums />}
@@ -320,7 +327,7 @@ function UploadPanel({ rows, busy, onCancel, onRetryFailed, onDismissFailed }: {
   );
 }
 
-function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null; up: Uploader; uploadedAt: number }) {
+function Files({ photoFolderId, phoneFolderId, up, uploadedAt }: { photoFolderId: string | null; phoneFolderId: string | null; up: Uploader; uploadedAt: number }) {
   const [saved] = useState(() => readUi().files);
   const [stack, setStack] = useState<Array<{ id?: string; name: string }>>(
     () => (saved?.stack?.length ? saved.stack : [{ name: 'Главная' }]),
@@ -360,6 +367,7 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
     return (
       <FolderDetail
         folderId={currentId}
+        protectedId={phoneFolderId}
         onBack={() => { setFolderMeta(false); void load(currentId); }}
         onDeleted={() => {
           setFolderMeta(false);
@@ -597,7 +605,10 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
           style={meta?.keepOffline ? { opacity: 1 } : { opacity: 0.45 }}
           onClick={toggleOffline}
         >📌</button>
-        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+        {/* системную папку телефона удалить нельзя — кнопку не показываем вовсе */}
+        {folderId !== protectedId && (
+          <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+        )}
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       {job && (
@@ -655,7 +666,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
 
 // ===== Деталка папки (шестерёнка внутри папки): назад / удалить + метадата на фоне =====
 
-function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBack: () => void; onDeleted: () => void }) {
+function FolderDetail({ folderId, protectedId, onBack, onDeleted }: { folderId: string; protectedId?: string | null; onBack: () => void; onDeleted: () => void }) {
   const [meta, setMeta] = useState<api.FolderMeta | null>(null);
   const [err, setErr] = useState('');
   useEffect(() => {

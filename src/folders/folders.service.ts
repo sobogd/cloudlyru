@@ -25,10 +25,16 @@ export class FoldersService {
     private readonly changes: ChangesService,
   ) {}
 
-  /** Системную папку «Фото» нельзя переименовать/переместить/удалить. */
-  private async assertNotPhotoRoot(folder: { id: string }, userId: string, action: string) {
+  /**
+   * Системные папки («Фото» и «Телефон») нельзя переименовать, переместить или удалить.
+   * Клиент льёт в них по адресации, заведённой сервером: смена имени или места ломает
+   * и медиатеку, и зеркало телефона, а удаление уносит содержимое в корзину.
+   */
+  private async assertNotSystemRoot(folder: { id: string }, userId: string, action: string) {
     const photoId = await this.auth.photoRootIdOrNull(userId);
     if (photoId && folder.id === photoId) throw badRequest(`cannot ${action} photo library root`);
+    const phoneId = await this.auth.phoneRootIdOrNull(userId);
+    if (phoneId && folder.id === phoneId) throw badRequest(`cannot ${action} phone mirror root`);
   }
 
   private async rootId(userId: string): Promise<string> {
@@ -328,7 +334,7 @@ export class FoldersService {
     assertSafeName(name);
     this.assertNotReservedName(name);
     const folder = await this.resolveAccessible(id, userId);
-    await this.assertNotPhotoRoot(folder, userId, 'rename');
+    await this.assertNotSystemRoot(folder, userId, 'rename');
     if (isRoot(folder)) throw badRequest('cannot rename root');
     await this.assertNameFree(folder.parentId!, name, id);
     try {
@@ -360,7 +366,7 @@ export class FoldersService {
 
   async move(id: string, newParentId: string, userId: string) {
     const folder = await this.resolveAccessible(id, userId);
-    await this.assertNotPhotoRoot(folder, userId, 'move');
+    await this.assertNotSystemRoot(folder, userId, 'move');
     if (isRoot(folder)) throw badRequest('cannot move root');
     const target = await this.resolveAccessible(newParentId, userId);
     const subtree = await this.collectSubtreeIds(id);
@@ -401,7 +407,7 @@ export class FoldersService {
   /** Мягкое удаление папки вместе со всем поддеревом. */
   async softDelete(id: string, userId: string) {
     const folder = await this.resolveAccessible(id, userId);
-    await this.assertNotPhotoRoot(folder, userId, 'delete');
+    await this.assertNotSystemRoot(folder, userId, 'delete');
     if (isRoot(folder)) throw badRequest('cannot delete root');
     const ids = await this.collectSubtreeIds(id);
     await this.prisma.$transaction(async (tx) => {

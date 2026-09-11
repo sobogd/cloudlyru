@@ -36,6 +36,7 @@ export interface UserInfo {
   login: string;
   rootFolderId: string | null;
   photoFolderId: string | null; // системная папка «Фото» (медиа-зона)
+  phoneFolderId: string | null; // системная папка «Телефон» (зеркало папок телефона, неудаляемая)
 }
 export const login = (login: string, password: string) =>
   request<{ user: UserInfo }>('/auth/login', { method: 'POST', body: JSON.stringify({ login, password }) });

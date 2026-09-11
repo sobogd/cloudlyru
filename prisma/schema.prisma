@@ -24,6 +24,7 @@ model User {
   shares        Share[]
   rootFolderId  String? // корневая папка пользователя (создаётся при seed)
   photoFolderId String? // системная папка «Фото» (медиа-зона; создаётся при seed/lazy)
+  phoneFolderId String? // системная папка «Телефон» (зеркало папок телефона; создаётся lazy)
 }
 
 model Session {

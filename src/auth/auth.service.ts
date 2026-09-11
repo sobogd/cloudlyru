@@ -3,7 +3,7 @@ import * as argon2 from 'argon2';
 import { env } from '../config/env';
 import { PrismaService } from '../prisma/prisma.service';
 import { randomToken, sha256Hex } from '../common/utils';
-import { PHOTO_FOLDER_NAME, ZONE_PHOTOS } from '../common/zones';
+import { PHONE_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_PHOTOS } from '../common/zones';
 import { AuditService } from '../audit/audit.service';
 import { badRequest, notFound, unauthorized } from '../common/errors';
 
@@ -21,7 +21,7 @@ export class AuthService implements OnModuleInit {
     private readonly audit: AuditService,
   ) {}
 
-  /** При первом старте создаёт владельца, корневую папку и системную папку «Фото». */
+  /** При первом старте создаёт владельца, корневую папку и системные папки «Фото» и «Телефон». */
   async onModuleInit() {
     const count = await this.prisma.user.count();
     if (count === 0) {
@@ -35,11 +35,16 @@ export class AuthService implements OnModuleInit {
       const photo = await this.prisma.folder.create({
         data: { parentId: root.id, name: PHOTO_FOLDER_NAME, zone: ZONE_PHOTOS },
       });
+      const phone = await this.prisma.folder.create({
+        data: { parentId: root.id, name: PHONE_FOLDER_NAME },
+      });
       await this.prisma.user.update({
         where: { id: user.id },
-        data: { rootFolderId: root.id, photoFolderId: photo.id },
+        data: { rootFolderId: root.id, photoFolderId: photo.id, phoneFolderId: phone.id },
       });
-      this.logger.log(`Создан владелец "${env.ADMIN_LOGIN}", корневая папка и системная «${PHOTO_FOLDER_NAME}»`);
+      this.logger.log(
+        `Создан владелец "${env.ADMIN_LOGIN}", корневая папка и системные «${PHOTO_FOLDER_NAME}» и «${PHONE_FOLDER_NAME}»`,
+      );
     }
   }
 
@@ -78,7 +83,8 @@ export class AuthService implements OnModuleInit {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw unauthorized();
     const photoFolderId = await this.photoFolderId(userId).catch(() => null);
-    return { id: user.id, login: user.login, rootFolderId: user.rootFolderId, photoFolderId };
+    const phoneFolderId = await this.phoneFolderId(userId).catch(() => null);
+    return { id: user.id, login: user.login, rootFolderId: user.rootFolderId, photoFolderId, phoneFolderId };
   }
 
   /** Корневая папка пользователя (создаётся лениво, если отсутствует). */
@@ -98,6 +104,37 @@ export class AuthService implements OnModuleInit {
   async photoRootIdOrNull(userId: string): Promise<string | null> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { photoFolderId: true } });
     return user?.photoFolderId ?? null;
+  }
+
+  /** id системной папки «Телефон», если она уже есть (без побочных эффектов; для гардов). */
+  async phoneRootIdOrNull(userId: string): Promise<string | null> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { phoneFolderId: true } });
+    return user?.phoneFolderId ?? null;
+  }
+
+  /**
+   * Системная папка «Телефон» — корень зеркала папок телефона. Как и у «Фото», папка
+   * создаётся лениво, а существующую папку с таким именем «усыновляем»: она уже могла быть
+   * заведена руками, и плодить вторую «Телефон» рядом нельзя. Удалить её нельзя (гарды
+   * в Folders/Dav): клиент льёт в неё структуру, и потеря корня ломает адресацию.
+   */
+  async phoneFolderId(userId: string): Promise<string> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw unauthorized();
+    if (user.phoneFolderId) {
+      const current = await this.prisma.folder.findUnique({ where: { id: user.phoneFolderId } });
+      if (current && !current.deletedAt) return current.id;
+    }
+    const rootId = await this.rootFolderId(userId);
+
+    const existing = await this.prisma.folder.findFirst({
+      where: { parentId: rootId, name: PHONE_FOLDER_NAME },
+    });
+    const phone = existing
+      ? await this.prisma.folder.update({ where: { id: existing.id }, data: { deletedAt: null } })
+      : await this.prisma.folder.create({ data: { parentId: rootId, name: PHONE_FOLDER_NAME } });
+    await this.prisma.user.update({ where: { id: userId }, data: { phoneFolderId: phone.id } });
+    return phone.id;
   }
 
   /**
