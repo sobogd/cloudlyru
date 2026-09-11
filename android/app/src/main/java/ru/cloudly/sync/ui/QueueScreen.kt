@@ -73,11 +73,15 @@ fun QueueScreen() {
     var note by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
+    var total by remember { mutableStateOf(0) }
 
     suspend fun reload() {
         val loaded = withContext(Dispatchers.IO) { app.queueStore.items() }
         items = loaded
         waiting = withContext(Dispatchers.IO) { app.queueStore.waitingCount() }
+        // Очередь показывается порциями: если строк больше, об усечении надо сказать,
+        // иначе «в очереди 2000» выглядит как правда о всей очереди
+        total = withContext(Dispatchers.IO) { app.queueStore.counts().values.sum() }
     }
 
     suspend fun rebuild() {
@@ -155,6 +159,14 @@ fun QueueScreen() {
                         it,
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                    )
+                }
+                if (total > items.size) {
+                    Text(
+                        "показаны первые ${items.size} из $total строк",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                     )
                 }

@@ -38,9 +38,16 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
 
     private lateinit var app: App
 
-    /** Корневая папка владельца: спрашиваем один раз за жизнь процесса провайдера. */
+    /**
+     * Корневая папка владельца. Кэшируется вместе с признаком «чей это сервер и токен»:
+     * раньше значение висело навсегда, и после смены адреса или аккаунта провайдер продолжал
+     * ходить в дерево прежнего владельца.
+     */
     @Volatile
     private var rootFolder: String? = null
+
+    @Volatile
+    private var rootFolderKey: String? = null
 
     override fun onCreate(): Boolean {
         val ctx = context ?: return false
@@ -77,6 +84,9 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
                 Root.COLUMN_FLAGS to (Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_RECENTS),
                 Root.COLUMN_MIME_TYPES to "*/*",
                 Root.COLUMN_ICON to android.R.drawable.ic_menu_upload,
+                // свободное место: колонка запрошена системой, а значения не было — она
+                // показывала «доступно 0 байт»
+                Root.COLUMN_AVAILABLE_BYTES to app.cacheDir.usableSpace,
             ),
         )
         cursor
@@ -166,6 +176,7 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         val previewable = meta.mime.startsWith("image/") || meta.mime.startsWith("video/")
         if (sha.isBlank() || !previewable) throw FileNotFoundException("нет превью для ${meta.mime}")
         val thumbs = File(app.cacheDir, "thumbs").apply { mkdirs() }
+        trimThumbsCache(thumbs)
         val file = File(thumbs, "$sha.webp")
         if (!file.isFile || file.length() == 0L) {
             val bytes = app.api.previewBytes(sha, if (sizeHint.x > 512) 2048 else 512)
@@ -202,9 +213,11 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
     private fun isFileDoc(documentId: String) = documentId.startsWith(FILE_PREFIX)
 
     private fun rootFolderId(): String {
-        rootFolder?.takeIf { it.isNotBlank() }?.let { return it }
+        val key = "${app.prefs.serverUrl}|${app.prefs.token}"
+        rootFolder?.takeIf { it.isNotBlank() && rootFolderKey == key }?.let { return it }
         val id = app.api.rootFolderId()
         rootFolder = id
+        rootFolderKey = key
         return id
     }
 
@@ -258,6 +271,21 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
      * но не трогаем то, что открыли только что, и служебные файлы докачки (`.имя.cloudly-part`):
      * иначе чистка одного файла сносит недокачанный другой.
      */
+    /**
+     * Кэш миниатюр: по файлу на sha, за месяцы набегают тысячи. Чистим по времени обращения
+     * и раньше срока, если свободного места мало — раньше он не чистился вовсе.
+     */
+    private fun trimThumbsCache(thumbs: File) {
+        val cutoff = System.currentTimeMillis() - THUMBS_TTL_MS
+        val files = thumbs.listFiles()?.filter { it.isFile } ?: return
+        val tight = app.cacheDir.usableSpace < MIN_FREE_THUMBS
+        for (file in files.sortedBy { it.lastModified() }) {
+            if (file.lastModified() < cutoff || (tight && file.lastModified() < System.currentTimeMillis() - TRIM_GRACE_MS)) {
+                file.delete()
+            }
+        }
+    }
+
     private fun trimBrowseCache() {
         val cutoff = System.currentTimeMillis() - TRIM_GRACE_MS
         val files = File(app.cacheDir, "browse").listFiles()
@@ -273,6 +301,12 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
 
     companion object {
         private const val TAG = "cloudly-sync"
+
+        /** Сколько живёт миниатюра без обращений. */
+        private const val THUMBS_TTL_MS = 30L * 24 * 60 * 60 * 1000
+
+        /** Если свободного места мало, миниатюры чистим раньше срока. */
+        private const val MIN_FREE_THUMBS = 200L * 1024 * 1024
 
         /** Authority провайдера: тот же, что в манифесте. */
         const val AUTHORITY = "ru.cloudly.sync.documents"

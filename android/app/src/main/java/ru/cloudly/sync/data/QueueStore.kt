@@ -181,13 +181,17 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
     fun enqueue(items: List<Candidate>): Int {
         if (items.isEmpty()) return 0
         var added = 0
+        // Какие пары «файл + цель» уже стоят в очереди: раньше это был отдельный SELECT
+        // на каждый файл, то есть на фотоальбоме — десятки тысяч запросов при каждом входе
+        // в раздел. Один запрос вместо них, дальше только вставки и обновления.
+        val existing = HashSet<String>(items.size)
+        readableDatabase.rawQuery("SELECT path, target FROM queue", null).use { c ->
+            while (c.moveToNext()) existing.add(c.getString(0) + "\u0000" + c.getString(1))
+        }
         writableDatabase.beginTransaction()
         try {
             for (item in items) {
-                val exists = readableDatabase.rawQuery(
-                    "SELECT 1 FROM queue WHERE path = ? AND target = ?",
-                    arrayOf(item.path, item.target),
-                ).use { it.moveToFirst() }
+                val exists = (item.path + "\u0000" + item.target) in existing
                 if (exists) {
                     writableDatabase.execSQL(
                         """

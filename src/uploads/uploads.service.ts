@@ -544,6 +544,9 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     //    между финализацией и записью в дерево) идемпотентен.
     if (emptyWithoutParts) {
       await this.s3.putObject(row.uploadKey, Buffer.alloc(0), mime);
+      // multipart-сессия пустому файлу не нужна: объект записан одним PUT, а брошенная
+      // сессия висела бы в S3 до ручной уборки (части в неё никто не загружал)
+      await this.s3.abortMultipartUpload(row.uploadKey, row.s3UploadId).catch(() => undefined);
     } else if (!live?.finalized) {
       try {
         await this.s3.completeMultipartUpload(
