@@ -7,7 +7,7 @@ import { QueueService } from '../queue/queue.service';
 import { AuthService } from '../auth/auth.service';
 import { ChangesService } from '../sync/changes.service';
 import { IMAGE_MIMES, MediaService, VIDEO_MIMES } from '../media/media.service';
-import { RemoteZip, ZipEntryInfo, hashStream } from './s3-zip';
+import { RemoteZip, ZipEntryInfo, hashStream, mediaKey } from './s3-zip';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
@@ -89,11 +89,17 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
   private async takeoutDate(
     zip: RemoteZip,
     sidecars: Map<string, ZipEntryInfo>,
+    byKey: Map<string, ZipEntryInfo | null>,
     entryName: string,
   ): Promise<{ date: Date | null; geo: { latitude: number; longitude: number } | null } | null> {
     const dir = entryName.includes('/') ? entryName.slice(0, entryName.lastIndexOf('/') + 1) : '';
     const base = entryName.slice(dir.length);
-    for (const candidate of [`${entryName}.supplemental-metadata.json`, `${entryName}.json`, `${dir}${base}.supplemental-metadata.json`]) {
+    const candidates = [
+      `${entryName}.supplemental-metadata.json`,
+      `${entryName}.json`,
+      `${dir}${base}.supplemental-metadata.json`,
+    ];
+    for (const candidate of candidates) {
       const sidecar = sidecars.get(candidate);
       if (!sidecar || sidecar.uncompressedSize > 1_000_000) continue;
       try {
@@ -114,7 +120,21 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
         return null;
       }
     }
-    return null;
+    const fallback = byKey.get(mediaKey(entryName));
+    if (!fallback) return null;
+    try {
+      const parsed = JSON.parse((await zip.readEntryBuffer(fallback)).toString('utf8')) as {
+        photoTakenTime?: { timestamp?: string };
+        geoData?: { latitude?: number; longitude?: number };
+      };
+      const seconds = Number(parsed.photoTakenTime?.timestamp);
+      return {
+        date: Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000) : null,
+        geo: null,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -366,7 +386,15 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     const files = all.filter((e) => !e.isDirectory);
     // Google Takeout кладёт рядом с каждым фото и видео сайдкар с датой съёмки и координатами.
     // Дата самого файла в архиве — время упаковки архива, поэтому брать её нельзя.
-    const sidecars = new Map(all.filter((e) => !e.isDirectory && /\.json$/i.test(e.name)).map((e) => [e.name, e]));
+    const sidecarList = all.filter((e) => !e.isDirectory && /\.json$/i.test(e.name));
+    const sidecars = new Map(sidecarList.map((e) => [e.name, e]));
+    // нормализованный ключ: по нему находятся сайдкары с маркерами дублей; если ключ
+    // неоднозначен (два разных сайдкара), им не пользуемся — лучше без даты, чем чужая
+    const sidecarsByKey = new Map<string, ZipEntryInfo | null>();
+    for (const sidecar of sidecarList) {
+      const key = mediaKey(sidecar.name);
+      sidecarsByKey.set(key, sidecarsByKey.has(key) ? null : sidecar);
+    }
     const isTakeout = files.some((e) => e.name.startsWith('Takeout/'));
     const totalBytes = files.reduce((s, e) => s + e.uncompressedSize, 0);
     // последовательное чтение по возрастанию смещения — меньше Range-запросов
@@ -551,7 +579,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       // событие журнала идут одной транзакцией (раньше здесь была своя копия этой логики)
       // дата съёмки: сначала сайдкар Takeout, иначе дата файла из архива (у Takeout это время
       // упаковки, поэтому для него архивную дату не берём)
-      const taken = await this.takeoutDate(zip, sidecars, e.name);
+      const taken = await this.takeoutDate(zip, sidecars, sidecarsByKey, e.name);
       const fileDate = taken?.date ?? (isTakeout ? null : e.lastModified);
 
       await this.files.createEntry(folderId, createdName, assetId, {

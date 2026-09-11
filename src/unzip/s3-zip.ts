@@ -69,6 +69,22 @@ function unixTimeFromExtra(extra: Buffer): Date | null {
   return null;
 }
 
+/**
+ * Ключ сопоставления файла с сайдкаром. Google в выгрузках добавляет маркеры дублей
+ * (`IMG_1234.HEIC`, `IMG_1234 (2).HEIC`, `20220828_162655~4.mp4`) и суффиксы к самому
+ * сайдкару (`.supplemental-metadata(29).json`), поэтому сравнивать имена как есть нельзя.
+ */
+export function mediaKey(name: string): string {
+  const base = name.slice(name.lastIndexOf('/') + 1);
+  return base
+    .replace(/\.supplemental-metadata(\(\d+\))?\.json$/i, '')
+    .replace(/\.json$/i, '')
+    .replace(/~(?:copy )?\d+(?=\.[^.]+$)/i, '')
+    .replace(/[ _-](?:edited|copy)(?=\.[^.]+$)/i, '')
+    .replace(/ ?\(\d+\)(?=\.[^.]+$)/, '')
+    .toLowerCase();
+}
+
 const SIG_EOCD = 0x06054b50;
 const SIG_EOCD64 = 0x06064b50;
 const SIG_EOCD64_LOCATOR = 0x07064b50;
