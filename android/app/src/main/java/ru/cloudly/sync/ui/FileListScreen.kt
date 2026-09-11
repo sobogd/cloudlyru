@@ -31,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,6 +47,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Selection
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.data.SelectionRules
@@ -68,6 +70,10 @@ private const val LIST_LIMIT = 2000
 @Composable
 fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
     val context = LocalContext.current
+    val app = remember { App.of(context) }
+    // прогресс зеркала живёт в потоке состояния: цифры обновляются по ходу выгрузки,
+    // а не по таймеру — иначе они «отстают» и выглядят как глюк
+    val mirrorState by app.mirrorStatus.flow.collectAsState()
     val device = remember { DeviceFiles(context) }
     val selection = remember { Selection(context) }
     val roots = remember { SelectionRules.scanRoots(selection.paths(section)) }
@@ -77,6 +83,9 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
     var scanning by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("") }
     var reload by remember { mutableStateOf(0) }
+    // какие файлы уже лежат в облаке: считается по базе зеркала и обновляется после прохода,
+    // чтобы в списке было видно не только «всего», но и по каждому файлу
+    var synced by remember { mutableStateOf<Set<String>>(emptySet()) }
     val progress = remember { AtomicReference("") }
 
     LaunchedEffect(roots, reload) {
@@ -103,6 +112,17 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
             if (result.capped) append(", обход упёрся в предел")
         }
         scanning = false
+    }
+
+    LaunchedEffect(files, mirrorState.finishedAt, mirrorState.passUploadedFiles) {
+        if (section != Section.FILES) return@LaunchedEffect
+        synced = withContext(Dispatchers.IO) {
+            val rows = app.mirrorStore.files()
+            files.filter { file ->
+                val row = rows[file.path]
+                row != null && row.size == file.size && row.mtime == file.mtime
+            }.map { it.path }.toSet()
+        }
     }
 
     LaunchedEffect(scanning) {
@@ -158,6 +178,9 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
                 roots.isEmpty() -> NothingChosen(section, onOpenFolders)
                 files.isEmpty() && !scanning -> Centered("Ничего не найдено в выбранных папках")
                 else -> Column(Modifier.fillMaxSize()) {
+                    if (section == Section.FILES) {
+                        MirrorCard(mirrorState)
+                    }
                     Text(
                         roots.joinToString("\n"),
                         fontSize = 11.sp,
@@ -167,7 +190,9 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     )
                     LazyColumn(Modifier.fillMaxSize()) {
-                        items(files, key = { it.path }) { file -> FileRow(file) }
+                        items(files, key = { it.path }) { file ->
+                            FileRow(file, inCloud = if (section == Section.FILES) file.path in synced else null)
+                        }
                     }
                 }
             }
@@ -179,7 +204,7 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
 }
 
 @Composable
-private fun FileRow(file: DeviceFile) {
+private fun FileRow(file: DeviceFile, inCloud: Boolean?) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -204,6 +229,17 @@ private fun FileRow(file: DeviceFile) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (inCloud != null) {
+            Text(
+                if (inCloud) "в облаке" else "ждёт",
+                fontSize = 10.sp,
+                color = if (inCloud) {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
             )
         }
     }

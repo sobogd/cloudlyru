@@ -36,6 +36,8 @@ class MirrorEngine(
     private val api: Api,
     private val store: MirrorStore,
     private val selection: Selection,
+    /** Куда складывать прогресс: его читает интерфейс (раздел «Файлы» и настройки). */
+    private val status: MirrorStatusHolder = MirrorStatusHolder(),
 ) {
 
     /**
@@ -102,14 +104,35 @@ class MirrorEngine(
     ): Report {
         val startedAt = System.currentTimeMillis()
         val report = Report()
+        val inCloud = store.inCloud()
+        val local = store.localTotals()
+        status.update {
+            copy(
+                phase = MirrorStatus.Phase.SCAN,
+                currentName = null,
+                currentSent = 0,
+                currentTotal = 0,
+                passUploadedFiles = 0,
+                passUploadedBytes = 0,
+                passDownloaded = 0,
+                passFailed = 0,
+                blocked = 0,
+                error = null,
+                startedAt = startedAt,
+                inCloudFiles = inCloud.files,
+                inCloudBytes = inCloud.bytes,
+                localFiles = local.files,
+                localBytes = local.bytes,
+            )
+        }
 
         val me = try {
             api.meInfo()
         } catch (e: Exception) {
-            return report.apply { error = "нет связи с сервером: ${e.message}" }
+            return finish(report.apply { error = "нет связи с сервером: ${e.message}" })
         }
         val mirrorRootId = me.mirrorFolderId
-            ?: return report.apply { error = "сервер не отдал корень зеркала — проверьте подключение" }
+            ?: return finish(report.apply { error = "сервер не отдал корень зеркала — проверьте подключение" })
         store.setMeta(MirrorStore.KEY_DEVICE_ID, me.deviceId.orEmpty())
 
         val folders = MirrorFolders(api, store)
@@ -118,7 +141,7 @@ class MirrorEngine(
         // можно без повторной заливки и без удаления в облаке
         for (gone in store.roots().keys.filter { it !in roots }) store.dropRoot(gone)
         for (root in roots) {
-            if (isCancelled()) return report.apply { stopped = true }
+            if (isCancelled()) return finish(report.apply { stopped = true })
             val name = root.substringAfterLast('/')
             try {
                 store.putRoot(root, folders.ensure(name, root, mirrorRootId), name)
@@ -131,20 +154,19 @@ class MirrorEngine(
         // 1) облако → телефон
         val pull = MirrorPull(api, store, me.deviceId, onProgress)
         if (roots.isNotEmpty()) {
+            status.update { copy(phase = MirrorStatus.Phase.CLOUD) }
             onProgress("догоняю облако…")
             pull.catchUp()
         }
         fill(report, pull)
-        if (pull.fatal != null) return report.apply { error = pull.fatal }
+        if (pull.fatal != null) return finish(report.apply { error = pull.fatal })
 
         // 2) телефон → облако
         if (roots.isNotEmpty()) {
             pushLocal(roots, folders, mirrorRootId, pull, report, onProgress, isCancelled, startedAt, budgetMs)
         }
 
-        report.finishedAt = System.currentTimeMillis()
-        store.setMeta(MirrorStore.KEY_REPORT, report.text())
-        return report
+        return finish(report)
     }
 
     /**
@@ -175,12 +197,42 @@ class MirrorEngine(
             return report.apply { error = "нет связи с сервером: ${e.message}" }
         }
         store.setMeta(MirrorStore.KEY_DEVICE_ID, me.deviceId.orEmpty())
+        status.update { copy(phase = MirrorStatus.Phase.CLOUD, startedAt = System.currentTimeMillis()) }
         val pull = MirrorPull(api, store, me.deviceId, onProgress)
         pull.catchUp()
         fill(report, pull)
         report.error = pull.fatal
         report.stopped = isCancelled()
+        return finish(report)
+    }
+
+    /**
+     * Итог прохода: пишем отчёт в базу и гасим состояние. Одна точка выхода — иначе при любой
+     * новой ветке «рано вернулись» в интерфейсе навсегда осталось бы «выгружаю…».
+     */
+    private fun finish(report: Report): Report {
         report.finishedAt = System.currentTimeMillis()
+        store.setMeta(MirrorStore.KEY_REPORT, report.text())
+        val inCloud = store.inCloud()
+        status.update {
+            copy(
+                phase = if (phase == MirrorStatus.Phase.PAUSED) MirrorStatus.Phase.PAUSED else MirrorStatus.Phase.IDLE,
+                currentName = null,
+                currentSent = 0,
+                currentTotal = 0,
+                passUploadedFiles = report.uploaded,
+                passDownloaded = report.downloaded,
+                passFailed = report.failed,
+                inCloudFiles = inCloud.files,
+                inCloudBytes = inCloud.bytes,
+                waitingFiles = store.waitingTotals().files,
+                waitingBytes = store.waitingTotals().bytes,
+                finishedAt = report.finishedAt,
+                lastText = report.text(),
+                error = report.error,
+                blocked = report.blockedDeletes,
+            )
+        }
         return report
     }
 
@@ -208,6 +260,16 @@ class MirrorEngine(
         val snapshot = MirrorScanner().snapshot(roots, onProgress, isCancelled)
         report.unreadable = snapshot.unreadable
         report.capped = snapshot.capped
+        // сколько всего лежит в выбранных папках: от этого считается доля выгруженного
+        val localBytes = snapshot.files.sumOf { it.size }
+        store.setLocalTotals(snapshot.files.size, localBytes)
+        status.update {
+            copy(
+                phase = MirrorStatus.Phase.UPLOAD,
+                localFiles = snapshot.files.size,
+                localBytes = localBytes,
+            )
+        }
 
         // структура в облаке повторяет структуру телефона, включая пустые папки
         for (dir in snapshot.dirs) {
@@ -231,6 +293,18 @@ class MirrorEngine(
         val known = store.files().toMutableMap()
         val inRoots = MirrorRules.underRoots(known, roots)
         val plan = MirrorRules.plan(snapshot.files, inRoots, System.currentTimeMillis(), deletionsAllowed, confirmed)
+
+        val waitingBytes = plan.uploads.sumOf { it.size }
+        store.setWaitingTotals(plan.uploads.size, waitingBytes)
+        status.update {
+            copy(
+                waitingFiles = plan.uploads.size,
+                waitingBytes = waitingBytes,
+                blocked = plan.blockedCount,
+                localFiles = snapshot.files.size,
+                localBytes = localBytes,
+            )
+        }
 
         if (plan.blocked) {
             val reason = if (deletionsAllowed) {
@@ -285,6 +359,7 @@ class MirrorEngine(
             }
         }
 
+        if (plan.deletes.isNotEmpty()) status.update { copy(phase = MirrorStatus.Phase.DELETE, currentName = null) }
         for (row in plan.deletes) {
             if (outOfTime(startedAt, budgetMs) || isCancelled()) {
                 report.stopped = true
@@ -295,6 +370,12 @@ class MirrorEngine(
                 known.remove(row.path)
                 store.dropFile(row.path)
                 report.deletedInCloud += 1
+                status.update {
+                    copy(
+                        inCloudFiles = (inCloudFiles - 1).coerceAtLeast(0),
+                        inCloudBytes = (inCloudBytes - row.size).coerceAtLeast(0),
+                    )
+                }
                 onProgress("удалено в облаке: ${File(row.path).name}")
             } catch (e: ApiException) {
                 // 404 — записи в облаке уже нет: строку всё равно убираем, иначе будем
@@ -329,19 +410,39 @@ class MirrorEngine(
         val local = File(file.path)
         if (!local.isFile) return
         val row = known[file.path]
-        val sha = Hasher.sha256(local)
-        val result = try {
-            Uploader(api).upload(
-                folderId = folderId,
-                file = local,
-                cloudName = file.name,
-                mime = MediaRules.mimeOf(file.name),
-                sha256 = sha,
-                replace = row != null,
-                expectedSha256 = row?.sha256,
-                onSession = {},
-                onProgress = { sent, total -> onProgress("${file.name}: $sent из $total") },
+        status.update {
+            copy(
+                phase = MirrorStatus.Phase.UPLOAD,
+                currentName = file.name,
+                currentSent = 0,
+                currentTotal = file.size,
             )
+        }
+        val sha = Hasher.sha256(local)
+        val progress: (Long, Long) -> Unit = { sent, total ->
+            status.update { copy(currentSent = sent, currentTotal = total) }
+            onProgress("${file.name}: $sent из $total")
+        }
+        // Незавершённая выгрузка этого же содержимого — продолжаем с принятой части: заново
+        // лить двухгигабайтное видео после каждой остановки нельзя, и прогресс не должен
+        // прыгать назад. Хэш в слепке обязателен: если файл успели изменить, сессия не подходит.
+        val session = store.uploadSession(file.path)?.takeIf {
+            it.folderId == folderId && it.size == file.size && it.mtime == file.mtime && it.sha256 == sha
+        }
+        val result = try {
+            if (session != null) {
+                runCatching { Uploader(api).resume(session.uploadId, local, sha, progress) }
+                    .getOrElse {
+                        // сессия на сервере могла истечь — тогда только с начала
+                        Log.w(TAG, "докачка ${file.name} не удалась (${it.message}) — начинаю заново")
+                        runCatching { api.abort(session.uploadId) }
+                        store.dropUploadSession(file.path)
+                        startUpload(file, folderId, local, sha, row, progress)
+                    }
+            } else {
+                store.dropUploadSession(file.path)
+                startUpload(file, folderId, local, sha, row, progress)
+            }
         } catch (e: ApiException) {
             if (e.code == "stale_version" || e.code == "conflict" || e.code == "in_trash") {
                 resolveConflict(file, folderId, known, pull, report, onProgress)
@@ -354,9 +455,50 @@ class MirrorEngine(
         val fresh = MirrorRow(file.path, folderId, result.entryId, file.inode, file.size, file.mtime, sha)
         known[file.path] = fresh
         store.putFile(fresh)
+        // выгрузка завершена: незавершённой сессии больше нет
+        store.dropUploadSession(file.path)
         report.uploaded += 1
+        status.update {
+            copy(
+                passUploadedFiles = passUploadedFiles + 1,
+                passUploadedBytes = passUploadedBytes + file.size,
+                inCloudFiles = inCloudFiles + 1,
+                inCloudBytes = inCloudBytes + file.size,
+            )
+        }
         onProgress("выгружено: ${file.name}")
     }
+
+    /** Выгрузка с нуля: запоминаем сессию, чтобы после обрыва продолжить, а не начинать заново. */
+    private fun startUpload(
+        file: LocalFile,
+        folderId: String,
+        local: File,
+        sha: String,
+        row: MirrorRow?,
+        progress: (Long, Long) -> Unit,
+    ): Uploader.Result = Uploader(api).upload(
+        folderId = folderId,
+        file = local,
+        cloudName = file.name,
+        mime = MediaRules.mimeOf(file.name),
+        sha256 = sha,
+        replace = row != null,
+        expectedSha256 = row?.sha256,
+        onSession = { uploadId ->
+            store.putUploadSession(
+                UploadSessionRow(
+                    path = file.path,
+                    uploadId = uploadId,
+                    folderId = folderId,
+                    size = file.size,
+                    mtime = file.mtime,
+                    sha256 = sha,
+                ),
+            )
+        },
+        onProgress = progress,
+    )
 
     /**
      * Конфликт версий. Локальное содержимое сохраняется копией с пометкой, а по каноническому

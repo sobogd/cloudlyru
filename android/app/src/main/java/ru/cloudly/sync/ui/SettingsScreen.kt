@@ -33,6 +33,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,8 +57,10 @@ import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Selection
 import ru.cloudly.sync.data.Section
+import ru.cloudly.sync.device.MediaRules
 import ru.cloudly.sync.mirror.MirrorScheduler
 import ru.cloudly.sync.mirror.MirrorService
+import ru.cloudly.sync.mirror.MirrorStatus
 import ru.cloudly.sync.mirror.MirrorStore
 import ru.cloudly.sync.net.AppRelease
 import ru.cloudly.sync.update.Updater
@@ -93,7 +96,9 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
     val fileFolders = remember { selection.paths(Section.FILES).size }
     val photoFolders = remember { selection.paths(Section.PHOTOS).size }
 
-    // Зеркало: итог последнего прохода, приостановленные удаления и ручной запуск
+    // Зеркало: прогресс берём из потока состояния, а не из базы при открытии экрана —
+    // иначе настройки показывали бы то, что было в момент открытия
+    val mirrorState by app.mirrorStatus.flow.collectAsState()
     var mirrorReport by remember { mutableStateOf(app.mirrorStore.meta(MirrorStore.KEY_REPORT).orEmpty()) }
     var mirrorBlocked by remember { mutableStateOf(parseBlocked(app.mirrorStore.meta(MirrorStore.KEY_BLOCKED))) }
     var mirrorBusy by remember { mutableStateOf(false) }
@@ -149,10 +154,12 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
 
     fun setMirrorPaused() {
         if (mirrorPaused) {
+            app.mirrorStatus.update { copy(phase = MirrorStatus.Phase.PAUSED) }
             app.mirrorStore.setMeta(MirrorStore.KEY_PAUSED, "1")
             MirrorScheduler.cancel(context)
             MirrorService.stop(context)
         } else {
+            app.mirrorStatus.update { copy(phase = MirrorStatus.Phase.IDLE) }
             app.mirrorStore.clearMeta(MirrorStore.KEY_PAUSED)
             MirrorScheduler.schedulePeriodic(context)
             app.refreshMirrorWatch()
@@ -377,10 +384,42 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
                             "облака, удаление в облаке убирает его с телефона.",
                         fontSize = 12.sp,
                     )
+                    Text(
+                        buildString {
+                            append("в облаке: ${mirrorState.inCloudFiles} файлов · ")
+                            append(MediaRules.formatSize(mirrorState.inCloudBytes))
+                            if (mirrorState.localBytes > 0) {
+                                append(" из ${mirrorState.localFiles} · ")
+                                append(MediaRules.formatSize(mirrorState.localBytes))
+                                append(" (${mirrorState.percent}%)")
+                            }
+                        },
+                        fontSize = 12.sp,
+                    )
+                    Text(
+                        "состояние: ${phaseTitle(mirrorState)}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    mirrorState.currentName?.let { name ->
+                        Text(
+                            "сейчас: $name — ${mirrorState.currentPercent}% " +
+                                "(${MediaRules.formatSize(mirrorState.currentSent)} из " +
+                                "${MediaRules.formatSize(mirrorState.currentTotal)})",
+                            fontSize = 12.sp,
+                        )
+                    }
+                    if (mirrorState.waitingFiles > 0) {
+                        Text(
+                            "ждёт выгрузки: ${mirrorState.waitingFiles} файлов · " +
+                                MediaRules.formatSize(mirrorState.waitingBytes),
+                            fontSize = 12.sp,
+                        )
+                    }
                     if (mirrorReport.isNotBlank()) {
                         Text(
                             "последний проход: $mirrorReport",
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
                         )
                     }

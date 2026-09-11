@@ -72,6 +72,19 @@ class Uploader(private val api: Api) {
         return sendParts(init.uploadId, init.direct, init.partSize, file, sha256, onProgress)
     }
 
+    /**
+     * Продолжить начатую выгрузку: сервер помнит, какие части уже приняты.
+     *
+     * Нужно для больших файлов: без этого видео на гигабайт после каждого обрыва, перезапуска
+     * приложения или остановки системой начиналось бы с нуля, а прогресс прыгал бы назад.
+     * Содержимое сверяется по хэшу: если файл изменился, сессия не подходит — вызывающий
+     * начинает заново.
+     */
+    fun resume(uploadId: String, file: File, sha256: String, onProgress: (Long, Long) -> Unit): Result {
+        val status = api.uploadStatus(uploadId)
+        return sendParts(uploadId, status.direct, status.partSize, file, sha256, onProgress, fromPart = status.nextPart)
+    }
+
     private fun sendParts(
         uploadId: String,
         direct: Boolean,
@@ -79,10 +92,14 @@ class Uploader(private val api: Api) {
         file: File,
         sha256: String,
         onProgress: (Long, Long) -> Unit,
+        /** С какой части продолжать: 1 — с начала. */
+        fromPart: Int = 1,
     ): Result {
         val total = file.length()
         val parts = max(1, ((total + partSize - 1) / partSize).toInt())
-        var sent = 0L
+        val first = fromPart.coerceIn(1, parts + 1)
+        // уже принятые части считаются отправленными: прогресс продолжается, а не начинается заново
+        var sent = min(total, (first - 1).toLong() * partSize)
         onProgress(sent, total)
         // релей-режим (байты идут через сервер) требует строгого порядка частей;
         // на очень больших файлах ужимаем параллелизм: буферы частей держатся в памяти целиком
@@ -93,7 +110,7 @@ class Uploader(private val api: Api) {
         }
 
         RandomAccessFile(file, "r").use { raf ->
-            var part = 1
+            var part = first
             while (part <= parts) {
                 val batchEnd = min(parts, part + width - 1)
                 val batch = (part..batchEnd).toList()

@@ -28,6 +28,7 @@ class MirrorLive(
     private val api: Api,
     private val store: MirrorStore,
     private val engine: MirrorEngine,
+    private val status: MirrorStatusHolder,
     private val scope: CoroutineScope,
     /** Есть ли токен: без него опрашивать нечего и незачем. */
     private val hasToken: () -> Boolean,
@@ -54,6 +55,7 @@ class MirrorLive(
                     continue
                 }
                 failures = 0
+                status.update { copy(checkedAt = System.currentTimeMillis(), error = null) }
                 if (head <= cursor) continue
                 runCatching { engine.catchUpCloud(onProgress = { Log.i(TAG, "облако: $it") }) }
                     .onFailure { Log.w(TAG, "догон журнала: ${it.message}") }

@@ -56,6 +56,22 @@ data class MirrorRow(
     val sha256: String?,
 )
 
+/**
+ * Незавершённая выгрузка: сессия на сервере и слепок файла, по которому она начата.
+ * Нужна, чтобы после обрыва продолжить с принятой части, а не лить файл заново.
+ */
+data class UploadSessionRow(
+    val path: String,
+    val uploadId: String,
+    val folderId: String,
+    val size: Long,
+    val mtime: Long,
+    val sha256: String,
+)
+
+/** Сколько файлов и байт: одна пара чисел для итогов и прогресса. */
+data class Totals(val files: Int, val bytes: Long)
+
 /** Выбранная папка телефона и её папка в облаке — пара, заведённая один раз. */
 data class MirrorRoot(val localPath: String, val cloudId: String, val cloudPath: String)
 

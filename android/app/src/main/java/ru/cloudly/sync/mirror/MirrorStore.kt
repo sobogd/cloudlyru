@@ -55,14 +55,74 @@ class MirrorStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
         db.execSQL("CREATE INDEX files_entry ON files(entry_id)")
         db.execSQL("CREATE INDEX files_inode ON files(inode)")
         db.execSQL("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execSQL(
+            """
+            CREATE TABLE uploads(
+              path TEXT PRIMARY KEY,
+              upload_id TEXT NOT NULL,
+              folder_id TEXT NOT NULL,
+              size INTEGER NOT NULL,
+              mtime INTEGER NOT NULL,
+              sha256 TEXT NOT NULL,
+              at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         // Состояние зеркала не пересобирается «на глаз»: потеря строки означает удаление
-        // файла в облаке на следующем проходе. Поэтому апгрейд только добавляет колонки.
+        // файла в облаке на следующем проходе. Поэтому апгрейд только добавляет таблицы.
         if (oldVersion < 2) {
-            runCatching { db.execSQL("ALTER TABLE files ADD COLUMN sha256 TEXT") }
+            // незавершённые выгрузки: без этой таблицы большие файлы начинались бы заново
+            runCatching {
+                db.execSQL(
+                    """
+                    CREATE TABLE uploads(
+                      path TEXT PRIMARY KEY,
+                      upload_id TEXT NOT NULL,
+                      folder_id TEXT NOT NULL,
+                      size INTEGER NOT NULL,
+                      mtime INTEGER NOT NULL,
+                      sha256 TEXT NOT NULL,
+                      at INTEGER NOT NULL
+                    )
+                    """.trimIndent(),
+                )
+            }
         }
+    }
+
+    // ===== незавершённые выгрузки =====
+
+    fun uploadSession(path: String): UploadSessionRow? =
+        readableDatabase.rawQuery(
+            "SELECT path, upload_id, folder_id, size, mtime, sha256 FROM uploads WHERE path = ?",
+            arrayOf(path),
+        ).use { c ->
+            if (!c.moveToFirst()) return null
+            UploadSessionRow(c.getString(0), c.getString(1), c.getString(2), c.getLong(3), c.getLong(4), c.getString(5))
+        }
+
+    fun putUploadSession(row: UploadSessionRow) {
+        writableDatabase.insertWithOnConflict(
+            "uploads",
+            null,
+            ContentValues().apply {
+                put("path", row.path)
+                put("upload_id", row.uploadId)
+                put("folder_id", row.folderId)
+                put("size", row.size)
+                put("mtime", row.mtime)
+                put("sha256", row.sha256)
+                put("at", System.currentTimeMillis())
+            },
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    fun dropUploadSession(path: String) {
+        writableDatabase.delete("uploads", "path = ?", arrayOf(path))
     }
 
     // ===== корни зеркала =====
@@ -226,6 +286,31 @@ class MirrorStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
         }
     }
 
+    /** Что уже выгружено по данным зеркала: из этого считается «сколько реально в облаке». */
+    fun inCloud(): Totals =
+        readableDatabase.rawQuery("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files", null).use { c ->
+            if (c.moveToFirst()) Totals(c.getInt(0), c.getLong(1)) else Totals(0, 0L)
+        }
+
+    /** Сколько всего нашлось в выбранных папках на последнем обходе (переживает перезапуск). */
+    fun localTotals(): Totals = totals(KEY_LOCAL_FILES, KEY_LOCAL_BYTES)
+
+    fun setLocalTotals(files: Int, bytes: Long) {
+        setMeta(KEY_LOCAL_FILES, files.toString())
+        setMeta(KEY_LOCAL_BYTES, bytes.toString())
+    }
+
+    /** Сколько ждало выгрузки на момент последнего плана. */
+    fun waitingTotals(): Totals = totals(KEY_WAIT_FILES, KEY_WAIT_BYTES)
+
+    fun setWaitingTotals(files: Int, bytes: Long) {
+        setMeta(KEY_WAIT_FILES, files.toString())
+        setMeta(KEY_WAIT_BYTES, bytes.toString())
+    }
+
+    private fun totals(filesKey: String, bytesKey: String): Totals =
+        Totals(meta(filesKey)?.toIntOrNull() ?: 0, meta(bytesKey)?.toLongOrNull() ?: 0L)
+
     // ===== прочее =====
 
     fun meta(key: String): String? =
@@ -266,6 +351,12 @@ class MirrorStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
         /** Итог последнего прохода в человеческом виде. */
         const val KEY_REPORT = "last_report"
 
+        /** Итоги обхода диска и очередь выгрузки: по ним интерфейс считает прогресс. */
+        const val KEY_LOCAL_FILES = "local_files"
+        const val KEY_LOCAL_BYTES = "local_bytes"
+        const val KEY_WAIT_FILES = "wait_files"
+        const val KEY_WAIT_BYTES = "wait_bytes"
+
         /** Автоматические проходы выключены пользователем (ручная сверка работает). */
         const val KEY_PAUSED = "paused"
 
@@ -275,6 +366,6 @@ class MirrorStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
         const val KEY_DEVICE_ID = "device_id"
 
         private const val NAME = "cloudly-mirror.db"
-        private const val VERSION = 1
+        private const val VERSION = 2
     }
 }

@@ -13,6 +13,7 @@ import ru.cloudly.sync.mirror.MirrorEngine
 import ru.cloudly.sync.mirror.MirrorLive
 import ru.cloudly.sync.mirror.MirrorScheduler
 import ru.cloudly.sync.mirror.MirrorService
+import ru.cloudly.sync.mirror.MirrorStatusHolder
 import ru.cloudly.sync.mirror.MirrorStore
 import ru.cloudly.sync.mirror.MirrorWatcher
 import ru.cloudly.sync.net.Api
@@ -42,6 +43,9 @@ class App : Application() {
         private set
     lateinit var mirror: MirrorEngine
         private set
+
+    /** Прогресс зеркала: одна точка для интерфейса (раздел «Файлы» и настройки). */
+    val mirrorStatus = MirrorStatusHolder()
 
     /**
      * Мгновенный режим: опрос журнала облака и реакция на изменения файлов, пока жив процесс
@@ -75,8 +79,8 @@ class App : Application() {
         uploads = UploadRunner(api, queueStore, appScope)
 
         mirrorStore = MirrorStore(this)
-        mirror = MirrorEngine(api, mirrorStore, selection)
-        mirrorLive = MirrorLive(api, mirrorStore, mirror, appScope) { prefs.token.isNotBlank() }
+        mirror = MirrorEngine(api, mirrorStore, selection, mirrorStatus)
+        mirrorLive = MirrorLive(api, mirrorStore, mirror, mirrorStatus, appScope) { prefs.token.isNotBlank() }
         mirrorWatcher = MirrorWatcher { mirrorLive.onLocalChange() }
         // периодический проход: наблюдатель за файлами только ускоряет, но не заменяет его —
         // после выгрузки процесса наблюдать некому
