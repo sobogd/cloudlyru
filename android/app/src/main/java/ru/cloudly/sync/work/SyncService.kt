@@ -51,11 +51,7 @@ class SyncService : Service() {
             try {
                 val stats = app.engine().syncAll { line -> notifyProgress(line) }
                 app.db.putKv("last_run_at", System.currentTimeMillis().toString())
-                app.db.putKv(
-                    "last_run_stats",
-                    "загружено ${stats.uploaded}, дедуп ${stats.deduped}, пропущено ${stats.skipped}, " +
-                        "удалено ${stats.deleted}, ошибок ${stats.errors}",
-                )
+                app.db.putKv("last_run_stats", stats.text())
                 stats.fatal?.let { app.db.putKv("last_run_error", it) }
             } finally {
                 app.leaveSync()

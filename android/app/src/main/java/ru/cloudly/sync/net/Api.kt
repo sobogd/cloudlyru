@@ -330,6 +330,43 @@ class Api(private val prefs: Prefs) {
         }
     }
 
+    /** Метаданные файла: имя, размер, тип, хэш — нужны файловому браузеру системы. */
+    fun entryMeta(entryId: String): RemoteEntry {
+        val e = parse(request("/files/$entryId"))
+        return RemoteEntry(
+            id = e.optString("id"),
+            name = e.optString("name"),
+            size = e.optLong("size"),
+            mime = e.optString("mime"),
+            sha256 = e.optString("sha256"),
+            keepOffline = e.optBoolean("keepOffline", false),
+            clientMtime = if (e.isNull("clientMtime")) null else parseIsoMillis(e.optString("clientMtime")),
+            folderId = if (e.isNull("folderId")) null else e.optString("folderId"),
+        )
+    }
+
+    /** Удаление — «в корзину»: сервер помечает запись, восстановить можно из веба. */
+    fun deleteFolder(folderId: String) {
+        parse(request("/folders/$folderId", "DELETE"))
+    }
+
+    fun renameFolder(folderId: String, name: String) {
+        patchFolder(folderId, JSONObject().put("name", name))
+    }
+
+    /** Превью по хэшу содержимого: 512 — для сетки и миниатюр в файловом браузере. */
+    fun previewBytes(sha: String, w: Int = 512): ByteArray {
+        val req = Request.Builder()
+            .url(url("/previews/$sha?w=$w"))
+            .header("Authorization", "Bearer ${prefs.token}")
+            .header("Accept-Encoding", "identity")
+            .build()
+        downloadClient.newBuilder().readTimeout(30, TimeUnit.SECONDS).build().newCall(req).execute().use { res ->
+            if (!res.isSuccessful) throw IOException("превью недоступно (HTTP ${res.code})")
+            return res.body!!.bytes()
+        }
+    }
+
     fun patchFile(entryId: String, body: JSONObject) {
         parse(request("/files/$entryId", "PATCH", body))
     }

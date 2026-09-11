@@ -55,6 +55,20 @@
             </intent-filter>
         </activity>
 
+        <!-- Файловый браузер средствами системы: папки облака видны в «Файлах» и в диалогах
+             сохранения. Права MANAGE_DOCUMENTS у провайдера — требование Android. -->
+        <provider
+            android:name=".docs.CloudlyDocumentsProvider"
+            android:authorities="ru.cloudly.sync.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
         <!-- Короткий dataSync-сервис: живёт только на время активной передачи.
              Android 15 ограничивает этот тип 6 часами за сутки — поэтому фон в основном
              работает через WorkManager, а сервис включается для больших пачек. -->

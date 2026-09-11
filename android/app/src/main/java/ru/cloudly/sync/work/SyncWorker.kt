@@ -27,17 +27,12 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         }
         app.db.kv("auth_error")?.let { Notifications.notifyProblems(applicationContext, "нет доступа: $it") }
         app.db.putKv("last_run_at", System.currentTimeMillis().toString())
-        app.db.putKv(
-            "last_run_stats",
-            "загружено ${stats.uploaded}, дедуп ${stats.deduped}, пропущено ${stats.skipped}, " +
-                "удалено ${stats.deleted}, конфликтов ${stats.conflicts}, ошибок ${stats.errors}",
-        )
+        app.db.putKv("last_run_stats", stats.text())
         stats.fatal?.let { app.db.putKv("last_run_error", it) }
-        // молчаливая синхронизация — плохая: об ошибках и конфликтах сообщаем уведомлением
-        val problems = stats.errors + stats.conflicts
-        if (stats.fatal != null || problems > 0) {
+        // молчаливая синхронизация — плохая: о неудачах сообщаем уведомлением
+        if (stats.fatal != null || stats.errors > 0) {
             val detail = buildString {
-                append("ошибок ${stats.errors}, конфликтов ${stats.conflicts}")
+                append("ошибок ${stats.errors}")
                 stats.fatal?.let { append("; $it") }
                 val first = app.db.failedOps().firstOrNull()
                 first?.let { append("; например: ${it.relPath} — ${it.lastError}") }

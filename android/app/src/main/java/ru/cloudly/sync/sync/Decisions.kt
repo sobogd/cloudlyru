@@ -3,57 +3,22 @@ package ru.cloudly.sync.sync
 import ru.cloudly.sync.data.Db
 
 /**
- * Решения синхронизации, вынесенные в чистые функции: их проверяют юнит-тесты без Android,
- * а движок остаётся тонким. Здесь нет ни сети, ни файловой системы — только правила.
+ * Решения, вынесенные в чистые функции: их проверяют юнит-тесты без Android.
+ * Модель односторонняя (только выгрузка), поэтому здесь нет ни вытеснения,
+ * ни конфликтов — приложение ничего не удаляет и ничего не перезаписывает.
  */
 object Decisions {
 
     /** Ждать ли Wi-Fi для задачи. */
     fun shouldWaitForWifi(job: Db.Job, unmetered: Boolean): Boolean = job.wifiOnly && !unmetered
 
-    /**
-     * Нужно ли догонять файл из облака: зеркало (папка без вытеснения) или закрепление.
-     * Вытесненное обратно не тянем — иначе смысл вытеснения теряется.
-     */
-    fun shouldDownload(
-        state: String,
-        entryKeepOffline: Boolean,
-        itemKeepOffline: Boolean,
-        mirror: Boolean,
-        jobPinned: Boolean,
-    ): Boolean {
-        if (!mirror && !jobPinned && !entryKeepOffline && !itemKeepOffline) return false
-        // Закрепление перекрывает вытеснение: у закреплённой папки вытесненное возвращается,
-        // у обычной папки со сроком хранения — нет, иначе смысл вытеснения теряется
-        if (state == Db.STATE_EVICTED && !entryKeepOffline && !itemKeepOffline && !jobPinned) return false
-        return true
-    }
-
-    /** Можно ли вытеснять файл: только подтверждённое сервером содержимое и не закреплённое. */
-    fun canEvict(
-        state: String,
-        keepOffline: Boolean,
-        folderPinned: Boolean,
-        hasRemoteSha: Boolean,
-        uploadedAt: Long?,
-        now: Long,
-        keepDays: Int,
-        graceMs: Long,
-    ): Boolean {
-        if (state != Db.STATE_SYNCED) return false
-        if (keepOffline || folderPinned) return false
-        if (!hasRemoteSha || uploadedAt == null) return false
-        return now - uploadedAt >= keepDays.coerceAtLeast(0).toLong() * 24 * 60 * 60 * 1000 + graceMs
-    }
+    /** Файл, изменённый только что, может ещё дописываться — берём его следующим проходом. */
+    fun isTooFresh(ageMs: Long, thresholdMs: Long): Boolean = ageMs in 0 until thresholdMs
 
     /**
-     * Предохранитель от массового удаления: больше 20 файлов или больше 10 % базы —
-     * это почти всегда сбой чтения, а не воля пользователя.
+     * Свободное имя с суффиксом: `IMG_0001 (2).jpg`. Нужно, когда в целевой папке облака
+     * уже лежит другой файл с таким именем — перезаписывать чужое нельзя, добавляем рядом.
      */
-    fun looksLikeMassDeletion(toDelete: Int, base: Int): Boolean =
-        toDelete > 20 || (base > 0 && toDelete * 100 / base > 10)
-
-    /** Свободное имя с суффиксом: `IMG_0001 (2).jpg`. */
     fun freeName(name: String, taken: Set<String>): String {
         val dot = name.lastIndexOf('.')
         val base = if (dot > 0) name.substring(0, dot) else name
@@ -65,22 +30,13 @@ object Decisions {
         return "$base (${System.currentTimeMillis()})$ext"
     }
 
-    /** Имя конфликтной копии: «файл (конфликт 2026-09-10 21-57 Pixel-8).jpg». */
-    fun conflictName(name: String, stamp: String): String {
-        val dot = name.lastIndexOf('.')
-        return if (dot > 0) {
-            "${name.substring(0, dot)} (конфликт $stamp)${name.substring(dot)}"
-        } else {
-            "$name (конфликт $stamp)"
-        }
-    }
-
-    /** Считать ли файл «свежим» (ещё пишется прямо сейчас). Дату из будущего свежей не считаем. */
-    fun isTooFresh(ageMs: Long, thresholdMs: Long): Boolean = ageMs in 0 until thresholdMs
-
     /**
-     * Пары «исчезло/появилось» по содержимому: сначала внутри каталога (переименование),
-     * потом единственное совпадение по всему дереву (перенос в другую папку).
+     * Пары «исчезло на телефоне / появилось на телефоне» с одинаковым содержимым:
+     * это переименование, а не новый файл. Отправляем серверу move, чтобы в облаке
+     * не появлялась вторая запись с тем же содержимым.
+     *
+     * Сначала ищем пару в том же каталоге (обычное переименование), потом — единственное
+     * совпадение по всему дереву (перенос в другую папку). Неоднозначные не связываем.
      */
     fun matchMoves(
         vanished: List<Pair<String, String>>, // relPath → sha256
@@ -104,4 +60,19 @@ object Decisions {
         }
         return result
     }
+
+    /**
+     * Имя файла из внешнего источника — система «Поделиться», файловый браузер, чужое приложение.
+     * Оставляем только базовое имя: без разделителей, «..» и управляющих символов и с ограничением
+     * длины. Без этого имя «../../databases/app.db» записало бы или удалило файл вне каталога кэша.
+     */
+    fun cleanFileName(raw: String): String {
+        val base = raw.substringAfterLast('/').substringAfterLast('\\').trim().trimStart('.')
+        val cleaned = base.replace(Regex("[\\u0000-\\u001f]"), "_")
+        return if (cleaned.length > 160) cleaned.take(160) else cleaned
+    }
+
+    /** Можно ли считать файл уже выгруженным: совпало содержимое и размер. */
+    fun isAlreadyUploaded(cachedSha: String?, cachedSize: Long, sha256: String, size: Long): Boolean =
+        cachedSha == sha256 && cachedSize == size
 }

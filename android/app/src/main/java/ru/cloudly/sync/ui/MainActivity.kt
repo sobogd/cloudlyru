@@ -1,7 +1,6 @@
 package ru.cloudly.sync.ui
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -12,7 +11,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -47,23 +45,27 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import ru.cloudly.sync.App
-import ru.cloudly.sync.data.Db
-import ru.cloudly.sync.net.Api
-import ru.cloudly.sync.work.SyncService
-import ru.cloudly.sync.work.VerifyWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import ru.cloudly.sync.App
+import ru.cloudly.sync.data.Db
+import ru.cloudly.sync.work.SyncService
 import java.io.File
 
-private data class Quadruple<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
+/** Снимок состояния для интерфейса: читается одним заходом в базу, вне главного потока. */
+private data class Snapshot(
+    val lastRun: String = "",
+    val lastError: String = "",
+    val pending: Int = 0,
+    val failed: List<Db.Op> = emptyList(),
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,7 +84,7 @@ private fun hasAllFilesAccess(): Boolean =
 
 @Composable
 private fun Screen() {
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val app = remember { App.of(context) }
     val scope = rememberCoroutineScope()
 
@@ -92,46 +94,35 @@ private fun Screen() {
     var password by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
     var checkResult by remember { mutableStateOf("") }
-    var lastRun by remember { mutableStateOf(app.db.kv("last_run_stats").orEmpty()) }
-    var lastError by remember { mutableStateOf(app.db.kv("last_run_error").orEmpty()) }
-    var lastVerify by remember { mutableStateOf(app.db.kv("last_verify_stats").orEmpty()) }
-    var pending by remember { mutableStateOf(0) }
-    // тик обновления: карточки пересчитывают состояния по нему, иначе счётчики «залипают» на нуле
-    var tick by remember { mutableStateOf(0) }
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     var showAdd by remember { mutableStateOf(false) }
-    var openJob by remember { mutableStateOf<Long?>(null) }
+    var showFree by remember { mutableStateOf(false) }
+    var relay by remember { mutableStateOf(app.engine().relayMode()) }
+    // тик обновления: карточки пересчитывают счётчики по нему, иначе цифры «залипают»
+    var tick by remember { mutableStateOf(0) }
+    var snap by remember { mutableStateOf(Snapshot()) }
     val jobs = remember { mutableStateListOf<Db.Job>() }
 
-    fun reload() {
-        jobs.clear()
-        jobs.addAll(app.db.jobs())
-        lastRun = app.db.kv("last_run_stats").orEmpty()
-        lastError = app.db.kv("last_run_error").orEmpty()
-        lastVerify = app.db.kv("last_verify_stats").orEmpty()
-        pending = app.db.opCount()
-        allFiles = hasAllFilesAccess()
-    }
+    suspend fun readJobs() = withContext(Dispatchers.IO) { app.db.jobs() }
+
+    fun readSnapshot(): Snapshot = Snapshot(
+        lastRun = app.db.kv("last_run_stats").orEmpty(),
+        lastError = app.db.kv("last_run_error").orEmpty() + app.db.kv("auth_error").orEmpty(),
+        pending = app.db.opCount(),
+        failed = app.db.failedOps(5),
+    )
 
     LaunchedEffect(Unit) {
         // база читается вне главного потока: на большой библиотеке иначе подвисает интерфейс
-        withContext(Dispatchers.IO) { reload() }
+        jobs.clear()
+        jobs.addAll(readJobs())
+        snap = withContext(Dispatchers.IO) { readSnapshot() }
     }
     LaunchedEffect(Unit) {
         while (true) {
             delay(3000)
-            val (run, err, verify, count) = withContext(Dispatchers.IO) {
-                Quadruple(
-                    app.db.kv("last_run_stats").orEmpty(),
-                    app.db.kv("last_run_error").orEmpty() + app.db.kv("auth_error").orEmpty(),
-                    app.db.kv("last_verify_stats").orEmpty(),
-                    app.db.opCount(),
-                )
-            }
-            lastRun = run
-            lastError = err
-            lastVerify = verify
-            pending = count
+            snap = withContext(Dispatchers.IO) { readSnapshot() }
+            relay = withContext(Dispatchers.IO) { app.engine().relayMode() }
             tick += 1
         }
     }
@@ -145,9 +136,8 @@ private fun Screen() {
         }
     }
 
-    val open = openJob?.let { id -> jobs.firstOrNull { it.id == id } }
-    if (open != null) {
-        JobFilesScreen(job = open, app = app, onBack = { openJob = null })
+    if (showFree) {
+        FreeSpaceScreen(app = app, onBack = { showFree = false })
         return
     }
 
@@ -161,7 +151,8 @@ private fun Screen() {
         ) {
             Text("CloudlyRu Sync", fontSize = 22.sp, fontWeight = FontWeight.Bold)
             Text(
-                "Служебное приложение: держит выбранные папки телефона в облаке",
+                "Автозагрузка папок телефона в облако. Файлы только добавляются: приложение ничего " +
+                    "не удаляет и не перезаписывает ни на телефоне, ни в облаке.",
                 fontSize = 13.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -172,8 +163,9 @@ private fun Screen() {
                     Column(Modifier.padding(12.dp)) {
                         Text("Токен хранится без шифрования", fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Системное хранилище ключей недоступно, поэтому токен лежит в обычных настройках приложения. " +
-                                "Полный доступ к облаку в этом случае защищён только правами Android на файлы приложения.",
+                            "Системное хранилище ключей недоступно, поэтому токен лежит в обычных настройках " +
+                                "приложения. Полный доступ к облаку в этом случае защищён только правами Android " +
+                                "на файлы приложения.",
                             fontSize = 12.sp,
                         )
                     }
@@ -185,7 +177,8 @@ private fun Screen() {
                     Column(Modifier.padding(12.dp)) {
                         Text("Нужен доступ ко всем файлам", fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Без него не видно корень Download и произвольные папки. Приложение личное, поставляется APK-ом.",
+                            "Без него не видно корень Download и произвольные папки. Приложение личное, " +
+                                "поставляется APK-ом.",
                             fontSize = 12.sp,
                         )
                         Spacer(Modifier.height(8.dp))
@@ -254,13 +247,13 @@ private fun Screen() {
                                 val fresh = app.api.loginAndCreateToken(
                                     login.trim(),
                                     password,
-                                    "android-${android.os.Build.MODEL}",
+                                    "android-${Build.MODEL}",
                                 )
                                 app.prefs.token = fresh
                                 token = fresh
                                 password = ""
                                 "токен выпущен и сохранён"
-                            }.getOrElse { "ошибка: ${it.message}" }
+                            }.getOrElse { hint(it) }
                         }
                     }
                 }) { Text("Войти и создать токен") }
@@ -290,19 +283,20 @@ private fun Screen() {
             }
             if (checkResult.isNotEmpty()) Text(checkResult, fontSize = 12.sp)
 
-            if (app.engine().relayMode()) {
+            if (relay) {
                 Spacer(Modifier.height(6.dp))
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
                         Text("Загрузка идёт через сервер", fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Хранилище напрямую с телефона недоступно (DNS, блокировщик или VPN), " +
-                                "поэтому файлы идут через сервер. Это медленнее, но работает.",
+                            "Хранилище напрямую с телефона недоступно (DNS, блокировщик или VPN), поэтому " +
+                                "файлы идут через сервер. Это медленнее, но работает.",
                             fontSize = 12.sp,
                         )
                         Spacer(Modifier.height(6.dp))
                         OutlinedButton(onClick = {
                             app.engine().resetRelayMode()
+                            relay = false
                             checkResult = "попробую прямое подключение к хранилищу"
                         }) { Text("Вернуть прямую загрузку", fontSize = 12.sp) }
                     }
@@ -311,14 +305,20 @@ private fun Screen() {
 
             Spacer(Modifier.height(16.dp))
             Text("Папки", fontWeight = FontWeight.SemiBold)
-            LazyColumn(modifier = Modifier.height(if (jobs.isEmpty()) 1.dp else 240.dp)) {
+            if (jobs.isEmpty()) {
+                Text(
+                    "Пока ни одной папки. «Добавить папку» — выберите папку на телефоне и папку в облаке.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            LazyColumn(modifier = Modifier.height(if (jobs.isEmpty()) 1.dp else 260.dp)) {
                 items(jobs, key = { it.id }) { job ->
                     JobCard(
                         job = job,
                         app = app,
                         tick = tick,
-                        onChange = { reload() },
-                        onOpenFiles = { openJob = job.id },
+                        onChange = { scope.launch { jobs.clear(); jobs.addAll(readJobs()) } },
                     )
                 }
             }
@@ -329,32 +329,28 @@ private fun Screen() {
                 OutlinedButton(onClick = { SyncService.stop(context) }) { Text("Стоп") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = {
-                    scope.launch {
-                        status = "сверяю…"
-                        val text = withContext(Dispatchers.IO) {
-                            runCatching {
-                                val st = VerifyWorker.verify(app)
-                                "сверка: проверено ${st.checked}, изменилось ${st.changed}, нет на сервере ${st.missing}, ошибок ${st.errors}"
-                            }.getOrElse { "сверка не прошла: ${it.message}" }
-                        }
-                        status = text
-                        lastVerify = app.db.kv("last_verify_stats").orEmpty()
-                    }
-                }) { Text("Проверить сейчас") }
+                OutlinedButton(onClick = { showFree = true }) { Text("Освободить место") }
             }
             Spacer(Modifier.height(12.dp))
-            Text("В очереди: $pending", fontSize = 13.sp)
-            val failed = remember(pending) { runBlocking(Dispatchers.IO) { app.db.failedOps(5) } }
-            if (failed.isNotEmpty()) {
+            Text("В очереди: ${snap.pending}", fontSize = 13.sp)
+            if (snap.failed.isNotEmpty()) {
                 Text("Не прошло:", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                failed.forEach { op ->
-                    Text("• ${op.relPath}: ${op.lastError}", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                snap.failed.forEach { op ->
+                    Text(
+                        "• ${op.relPath}: ${op.lastError}",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
+                OutlinedButton(onClick = {
+                    app.db.resetOps()
+                    SyncService.start(context)
+                }) { Text("Повторить очередь", fontSize = 12.sp) }
             }
-            if (lastRun.isNotEmpty()) Text("Прошлый проход: $lastRun", fontSize = 13.sp)
-            if (lastVerify.isNotEmpty()) Text("Сверка: $lastVerify", fontSize = 13.sp)
-            if (lastError.isNotEmpty()) Text("Ошибка: $lastError", fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
+            if (snap.lastRun.isNotEmpty()) Text("Прошлый проход: ${snap.lastRun}", fontSize = 13.sp)
+            if (snap.lastError.isNotEmpty()) {
+                Text("Ошибка: ${snap.lastError}", fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
+            }
             status.takeIf { it.isNotEmpty() }?.let { Text(it, fontSize = 12.sp, fontFamily = FontFamily.Monospace) }
             Spacer(Modifier.height(24.dp))
         }
@@ -367,7 +363,7 @@ private fun Screen() {
             onCreated = { message ->
                 status = message
                 showAdd = false
-                reload()
+                scope.launch { jobs.clear(); jobs.addAll(readJobs()) }
                 // задача добавлена — сразу запускаем проход, иначе пользователь видит пустой список
                 // и думает, что приложение ничего не нашло
                 SyncService.start(context)
@@ -380,7 +376,7 @@ private fun Screen() {
 private fun hint(e: Throwable): String {
     val text = e.message.orEmpty()
     return when {
-        text.contains("cleartext", ignoreCase = true) || text.contains("CLEARTEXT") ->
+        text.contains("cleartext", ignoreCase = true) ->
             "ошибка: сервер по http — нужен https-адрес"
         text.contains("Unable to resolve host", ignoreCase = true) ->
             "сеть недоступна: имя хоста не разрешается. Проверьте мобильные данные для приложения " +
@@ -391,66 +387,58 @@ private fun hint(e: Throwable): String {
     }
 }
 
+/** Счётчики задачи: читаются из базы отдельным заходом, чтобы не трогать диск в главном потоке. */
+private data class JobInfo(
+    val uploaded: Int = 0,
+    val note: String = "",
+    val progress: String = "",
+    val stat: String = "",
+    val lastAt: Long = 0,
+    val queued: Int = 0,
+)
+
 @Composable
-private fun JobCard(
-    job: Db.Job,
-    app: App,
-    tick: Int,
-    onChange: () -> Unit,
-    onOpenFiles: () -> Unit,
-) {
-    val scope = rememberCoroutineScope()
-    var pinned by remember(job.id) { mutableStateOf(false) }
-    LaunchedEffect(job.id) {
-        pinned = withContext(Dispatchers.IO) { app.engine().folderPinned(job.targetFolderId) }
+private fun JobCard(job: Db.Job, app: App, tick: Int, onChange: () -> Unit) {
+    var info by remember(job.id) { mutableStateOf(JobInfo()) }
+    LaunchedEffect(job.id, tick) {
+        info = withContext(Dispatchers.IO) {
+            JobInfo(
+                uploaded = app.db.uploadedCount(job.id),
+                note = app.db.kv("job_note:${job.id}").orEmpty(),
+                progress = app.db.kv("job_progress:${job.id}").orEmpty(),
+                stat = app.db.kv("job_stat:${job.id}").orEmpty(),
+                lastAt = (app.db.kv("job_at:${job.id}") ?: "0").toLongOrNull() ?: 0L,
+                queued = app.db.opSummary().ready,
+            )
+        }
     }
+
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Column(Modifier.padding(12.dp)) {
             Text(job.sourceDir, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-            Text("→ ${job.targetPath}  ·  ${if (job.zone == "PHOTOS") "Фото" else "Файлы"}", fontSize = 12.sp)
-            val counts = remember(job.id, tick) {
-                runBlocking(Dispatchers.IO) { app.db.stateCounts(job.id) }
-            }
-            val note = remember(job.id, tick) { app.db.kv("job_note:${job.id}").orEmpty() }
-            val progress = remember(job.id, tick) { app.db.kv("job_progress:${job.id}").orEmpty() }
-            val lastAt = remember(job.id, tick) { (app.db.kv("job_at:${job.id}") ?: "0").toLongOrNull() ?: 0L }
-            val stat = remember(job.id, tick) { app.db.kv("job_stat:${job.id}").orEmpty() }
-            val queue = remember(job.id, tick) { runBlocking(Dispatchers.IO) { app.db.opSummary(job.id) } }
             Text(
-                "файлов: ${counts.values.sum()}  ·  выгружено ${counts["synced"] ?: 0}  ·  " +
-                    "вытеснено ${counts["evicted"] ?: 0}  ·  новых ${counts["new"] ?: 0}",
+                "→ ${job.targetPath}  ·  ${if (job.zone == "PHOTOS") "Фото" else "Файлы"}" +
+                    if (job.includeSubfolders) "  ·  с подпапками" else "",
                 fontSize = 12.sp,
             )
-            Text(
-                if (job.keepDays < 0) "хранение: не удалять (зеркало)"
-                else if (job.keepDays == 0) "хранение: удалять сразу после выгрузки"
-                else "хранение: ${job.keepDays} дн.",
-                fontSize = 12.sp,
-            )
-            if (progress.isNotEmpty()) {
-                Text(progress, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-            }
-            if (lastAt > 0) {
-                val mins = (System.currentTimeMillis() - lastAt) / 60_000
+            Text("выгружено файлов: ${info.uploaded}", fontSize = 12.sp)
+            if (info.progress.isNotEmpty()) Text(info.progress, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            if (info.lastAt > 0) {
+                val mins = (System.currentTimeMillis() - info.lastAt) / 60_000
                 Text(
                     if (mins < 1) "проход был только что" else "проход был $mins мин назад",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (stat.isNotEmpty()) {
-                Text("проход: $stat", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (info.stat.isNotEmpty()) {
+                Text("проход: ${info.stat}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (queue.ready + queue.waiting > 0) {
-                Text(
-                    "в очереди ${queue.ready}" + if (queue.waiting > 0) ", ждут повтора ${queue.waiting}" else "",
-                    fontSize = 11.sp,
-                    color = if (queue.waiting > 0) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            if (info.queued > 0) {
+                Text("в очереди ${info.queued}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (note.isNotEmpty()) {
-                Text(note, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+            if (info.note.isNotEmpty()) {
+                Text(info.note, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
@@ -472,31 +460,10 @@ private fun JobCard(
                 Text("только Wi-Fi", fontSize = 12.sp)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onOpenFiles) { Text("Файлы") }
-                if (queue.waiting > 0) {
-                    OutlinedButton(onClick = {
-                        app.db.resetOps(job.id)
-                        SyncService.start(app)
-                        onChange()
-                    }) { Text("Повторить", fontSize = 12.sp) }
-                }
-                OutlinedButton(onClick = {
-                    val next = !pinned
-                    scope.launch {
-                        val ok = withContext(Dispatchers.IO) {
-                            runCatching {
-                                app.engine().setFolderKeepOffline(job.targetFolderId, next)
-                                if (next) SyncService.start(app)
-                                true
-                            }.getOrDefault(false)
-                        }
-                        if (ok) pinned = next
-                    }
-                }) { Text(if (pinned) "● Держать офлайн" else "Держать офлайн") }
                 OutlinedButton(onClick = {
                     app.db.deleteJob(job.id)
                     onChange()
-                }) { Text("Удалить") }
+                }) { Text("Убрать из списка", fontSize = 12.sp) }
             }
         }
     }
@@ -510,7 +477,7 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
     var remoteId by remember { mutableStateOf("") }
     var remoteCrumbs by remember { mutableStateOf(listOf<Pair<String, String>>()) }
     var remotePath by remember { mutableStateOf("") }
-    var keepDays by remember { mutableStateOf(-1) }
+    var includeSubfolders by remember { mutableStateOf(true) }
     var wifiOnly by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
@@ -522,7 +489,7 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
         title = { Text("Новая папка") },
         text = {
             Column {
-                Text("Что синхронизировать", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text("Что загружать", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 OutlinedButton(
                     onClick = { pickLocal = true },
                     modifier = Modifier.fillMaxWidth(),
@@ -535,8 +502,13 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
                     Text(
                         if (exists) "файлов в папке: $fileCount" else "папки больше нет — выберите заново",
                         fontSize = 11.sp,
-                        color = if (exists) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                        color = if (exists) MaterialTheme.colorScheme.onSurfaceVariant
+                        else MaterialTheme.colorScheme.error,
                     )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = includeSubfolders, onCheckedChange = { includeSubfolders = it })
+                    Text("включая подпапки", fontSize = 13.sp)
                 }
                 Spacer(Modifier.height(10.dp))
 
@@ -562,14 +534,14 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
                     }
                 }
                 Text(
-                    if (zone == "PHOTOS") "Фото и видео: сервер сделает превью и покажет в таймлайне"
-                    else "Как есть: без конвертации, обычное хранилище",
+                    if (zone == "PHOTOS") "Фото и видео: сервер сделает превью и покажет в таймлайне. " +
+                        "Файлы ложатся одной папкой, без структуры подпапок."
+                    else "Как есть: обычное хранилище с подпапками",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(8.dp))
 
-                RetentionPicker(days = keepDays, onChange = { keepDays = it })
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Switch(checked = wifiOnly, onCheckedChange = { wifiOnly = it })
                     Text("загружать только по Wi-Fi", fontSize = 13.sp)
@@ -591,8 +563,8 @@ private fun AddJobDialog(app: App, onDismiss: () -> Unit, onCreated: (String) ->
                                     remoteId,
                                     remotePath.ifBlank { "Главная" },
                                     zone,
-                                    keepDays,
                                     wifiOnly,
+                                    includeSubfolders,
                                 )
                                 "добавлено: $dir → $remotePath"
                             }.getOrElse { "не получилось: ${it.message}" }

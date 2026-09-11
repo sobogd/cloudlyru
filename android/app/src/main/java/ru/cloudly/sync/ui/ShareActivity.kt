@@ -41,6 +41,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
+import ru.cloudly.sync.sync.Decisions
 import ru.cloudly.sync.sync.Hasher
 import ru.cloudly.sync.sync.LocalFile
 import ru.cloudly.sync.sync.Uploader
@@ -170,7 +171,8 @@ private fun uploadShared(
     val errors = ArrayList<String>()
     for ((index, uri) in uris.withIndex()) {
         if (isCancelled()) return ShareResult("остановлено: загружено $done из ${uris.size}", errors, true)
-        val name = safeName(displayName(app, uri) ?: "shared-${System.currentTimeMillis()}")
+        val name = Decisions.cleanFileName(displayName(app, uri).orEmpty())
+            .ifBlank { "shared-${System.currentTimeMillis()}" }
         val tmp = File(cacheDir, name)
         // Имя приходит от чужого приложения: без проверки канонического пути «../../databases/…»
         // записал бы или удалил файл вне кэша.
@@ -232,20 +234,6 @@ private fun uploadShared(
         failed = errors,
         cancelled = false,
     )
-}
-
-/**
- * Имя файла от чужого приложения: только базовое имя, без разделителей и «..»,
- * с ограничением длины — иначе получился бы выход за пределы каталога кэша.
- */
-private fun safeName(raw: String): String {
-    val base = raw.substringAfterLast('/').substringAfterLast('\\').trim().trimStart('.')
-    val cleaned = base.replace(Regex("[\\u0000-\\u001f]"), "_")
-    return when {
-        cleaned.isEmpty() -> "shared-${System.currentTimeMillis()}"
-        cleaned.length > 200 -> cleaned.take(200)
-        else -> cleaned
-    }
 }
 
 private fun displayName(app: App, uri: Uri): String? = runCatching {

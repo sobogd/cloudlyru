@@ -12,9 +12,8 @@ import androidx.work.WorkManager
 import ru.cloudly.sync.data.Db
 import ru.cloudly.sync.data.Prefs
 import ru.cloudly.sync.net.Api
-import ru.cloudly.sync.sync.Engine
+import ru.cloudly.sync.sync.UploadEngine
 import ru.cloudly.sync.work.SyncWorker
-import ru.cloudly.sync.work.VerifyWorker
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -31,7 +30,7 @@ class App : Application() {
         private set
 
     /** Движок создаётся по требованию: он лёгкий, но держать его в Application незачем. */
-    fun engine(): Engine = Engine(this, db, api)
+    fun engine(): UploadEngine = UploadEngine(this, db, api)
 
     /**
      * Один проход синхронизации за раз. Периодическая задача WorkManager и «Синхронизировать
@@ -77,14 +76,6 @@ class App : Application() {
             .build()
         WorkManager.getInstance(this)
             .enqueueUniquePeriodicWork(SyncWorker.PERIODIC, ExistingPeriodicWorkPolicy.KEEP, request)
-
-        // Недельная сверка: диск и файловая система молча портят файлы, а объект на сервере мог
-        // исчезнуть. Проверяем порциями по кругу, поэтому большая библиотека обходится за несколько недель.
-        val verify = PeriodicWorkRequestBuilder<VerifyWorker>(7, TimeUnit.DAYS)
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .build()
-        WorkManager.getInstance(this)
-            .enqueueUniquePeriodicWork(VerifyWorker.PERIODIC, ExistingPeriodicWorkPolicy.KEEP, verify)
     }
 
     companion object {

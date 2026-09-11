@@ -18,19 +18,13 @@ class Uploader(private val api: Api) {
     /** Части, которые клиент заливает в S3 напрямую (сколько успел — то и принято). */
     private var partSize = 16 * 1024 * 1024
 
-    /**
-     * Итог заливки. `stale` — сервер отказал из-за расхождения версий: файл на сервере
-     * уже другой, клиент должен сохранить локальную копию как конфликтную.
-     */
+    /** Итог выгрузки одного файла. */
+
     data class Result(
         val entryId: String,
         val name: String,
         val sha256: String,
         val deduped: Boolean,
-        val stale: Boolean,
-        val currentSha256: String?,
-        /** Имя занято корзиной сервера: сами не воскрешаем, решает пользователь. */
-        val inTrash: Boolean = false,
     )
 
     /**
@@ -62,15 +56,13 @@ class Uploader(private val api: Api) {
                 expectedSha256 = expectedSha256,
                 mode = if (forceRelay) "relay" else "direct",
             )
-            if (init.stale) return Result("", file.name, sha256, false, stale = true, currentSha256 = init.currentSha256)
-            if (init.inTrash) return Result("", file.name, sha256, false, stale = false, currentSha256 = null, inTrash = true)
-            if (init.nameTaken) {
-                // имя занято — движок разберётся: сверит хэш и либо зафиксирует, либо зальёт замену
-                throw ru.cloudly.sync.net.ApiException(409, "conflict", "file name already exists", null)
+            if (init.stale || init.inTrash || init.nameTaken) {
+                // имя занято — движок придумает свободное имя и вернётся к этому файлу
+                throw ru.cloudly.sync.net.ApiException(409, if (init.inTrash) "in_trash" else "conflict", "name taken", null)
             }
             if (init.deduped || init.uploadId == null) {
                 // содержимое уже в облаке: запись создана, байты не передавались
-                return Result(init.uploadId ?: "", file.name, sha256, deduped = true, stale = false, currentSha256 = null)
+                return Result(init.entryId, file.name, sha256, deduped = true)
             }
             onSession(init.uploadId)
             return sendParts(init.uploadId, init.direct, init.partSize, File(file.path), sha256, onProgress)
@@ -151,7 +143,7 @@ class Uploader(private val api: Api) {
             }
         }
         val entry = api.complete(uploadId, sha256)
-        return Result(entry.id, entry.name, sha256, deduped = false, stale = false, currentSha256 = null)
+        return Result(entry.id, entry.name, sha256, deduped = false)
     }
 
     /** Оценка числа частей для лога/прогресса. */

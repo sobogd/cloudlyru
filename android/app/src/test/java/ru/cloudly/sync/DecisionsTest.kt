@@ -8,8 +8,10 @@ import ru.cloudly.sync.data.Db
 import ru.cloudly.sync.sync.Decisions
 
 /**
- * Проверки правил синхронизации. Логика решений вынесена в чистые функции именно ради этого:
- * ошибка здесь стоит пользовательских файлов, а не «неудобного интерфейса».
+ * Проверки правил синхронизации. Логика вынесена в чистые функции именно ради этого: ошибка
+ * здесь стоит пользовательских файлов, а не «неудобного интерфейса». Модель односторонняя,
+ * поэтому проверяем только то, что решает: когда молчать, как не перезаписать чужое имя
+ * и как узнать переименование.
  */
 class DecisionsTest {
 
@@ -22,61 +24,11 @@ class DecisionsTest {
     }
 
     @Test
-    fun `вытесненное не скачиваем обратно`() {
-        assertFalse(
-            Decisions.shouldDownload(Db.STATE_EVICTED, false, false, mirror = true, jobPinned = false),
-        )
-    }
-
-    @Test
-    fun `закреплённое возвращаем даже если вытеснено`() {
-        assertTrue(
-            Decisions.shouldDownload(Db.STATE_EVICTED, true, false, mirror = false, jobPinned = false),
-        )
-        assertTrue(
-            Decisions.shouldDownload(Db.STATE_EVICTED, false, true, mirror = false, jobPinned = false),
-        )
-        assertTrue(
-            Decisions.shouldDownload(Db.STATE_EVICTED, false, false, mirror = false, jobPinned = true),
-        )
-    }
-
-    @Test
-    fun `в папке со сроком хранения обычный файл не скачиваем`() {
-        assertFalse(
-            Decisions.shouldDownload(Db.STATE_SYNCED, false, false, mirror = false, jobPinned = false),
-        )
-    }
-
-    @Test
-    fun `вытесняем только выгруженное и не закреплённое`() {
-        val now = 1_000_000_000_000L
-        val day = 24 * 60 * 60 * 1000L
-        val grace = 10 * 60 * 1000L
-        // 30 дней назад выгружено, срок 7 дней — можно
-        assertTrue(Decisions.canEvict(Db.STATE_SYNCED, false, false, true, now - 30 * day, now, 7, grace))
-        // закреплённое — нельзя
-        assertFalse(Decisions.canEvict(Db.STATE_SYNCED, true, false, true, now - 30 * day, now, 7, grace))
-        // папка закреплена — нельзя
-        assertFalse(Decisions.canEvict(Db.STATE_SYNCED, false, true, true, now - 30 * day, now, 7, grace))
-        // нет подтверждения сервером — нельзя
-        assertFalse(Decisions.canEvict(Db.STATE_SYNCED, false, false, false, now - 30 * day, now, 7, grace))
-        // ещё не истёк срок — нельзя
-        assertFalse(Decisions.canEvict(Db.STATE_SYNCED, false, false, true, now - day, now, 7, grace))
-        // «сразу после выгрузки» — только после грейса
-        assertFalse(Decisions.canEvict(Db.STATE_SYNCED, false, false, true, now - 60_000, now, 0, grace))
-        assertTrue(Decisions.canEvict(Db.STATE_SYNCED, false, false, true, now - grace - 1, now, 0, grace))
-        // не синхронизированное не трогаем
-        assertFalse(Decisions.canEvict(Db.STATE_NEW, false, false, true, now - 30 * day, now, 0, grace))
-    }
-
-    @Test
-    fun `предохранитель ловит массовое удаление`() {
-        assertFalse(Decisions.looksLikeMassDeletion(5, 1000))
-        assertTrue(Decisions.looksLikeMassDeletion(21, 1000))
-        assertTrue(Decisions.looksLikeMassDeletion(11, 100))
-        assertFalse(Decisions.looksLikeMassDeletion(10, 100))
-        assertFalse(Decisions.looksLikeMassDeletion(0, 0))
+    fun `свежим считается только недавнее прошлое`() {
+        assertTrue(Decisions.isTooFresh(5_000, 30_000))
+        assertFalse(Decisions.isTooFresh(60_000, 30_000))
+        // дата из будущего: разница отрицательная — файл выгружаем, а не пропускаем навсегда
+        assertFalse(Decisions.isTooFresh(-3_600_000, 30_000))
     }
 
     @Test
@@ -84,23 +36,27 @@ class DecisionsTest {
         assertEquals("IMG_0001 (2).jpg", Decisions.freeName("IMG_0001.jpg", emptySet()))
         assertEquals("IMG_0001 (3).jpg", Decisions.freeName("IMG_0001.jpg", setOf("IMG_0001 (2).jpg")))
         assertEquals("readme (2)", Decisions.freeName("readme", emptySet()))
+        // имя с точкой в начале — расширением не считается, суффикс идёт в конец
+        assertEquals(".hidden (2)", Decisions.freeName(".hidden", emptySet()))
     }
 
     @Test
-    fun `конфликтная копия сохраняет расширение и содержит устройство`() {
-        assertEquals(
-            "фото (конфликт 2026-09-10 21-57 Pixel-8).jpg",
-            Decisions.conflictName("фото.jpg", "2026-09-10 21-57 Pixel-8"),
-        )
-        assertEquals("без-точки (конфликт X)", Decisions.conflictName("без-точки", "X"))
+    fun `имя из внешнего источника теряет путь и управляющие символы`() {
+        assertEquals("photo.jpg", Decisions.cleanFileName("/etc/passwd/photo.jpg"))
+        assertEquals("app.db", Decisions.cleanFileName("../../databases/app.db"))
+        assertEquals("photo.jpg", Decisions.cleanFileName("C:\\Users\\me\\photo.jpg"))
+        assertEquals("_", Decisions.cleanFileName("\u0000"))
+        assertEquals("", Decisions.cleanFileName("..."))
+        assertEquals("", Decisions.cleanFileName("  "))
+        assertEquals(160, Decisions.cleanFileName("x".repeat(500)).length)
     }
 
     @Test
-    fun `свежим считается только недавнее прошлое`() {
-        assertTrue(Decisions.isTooFresh(5_000, 30_000))
-        assertFalse(Decisions.isTooFresh(60_000, 30_000))
-        // дата из будущего: разница отрицательная — файл синхронизируем, а не пропускаем навсегда
-        assertFalse(Decisions.isTooFresh(-3_600_000, 30_000))
+    fun `уже выгруженным считается только совпадение содержимого и размера`() {
+        assertTrue(Decisions.isAlreadyUploaded("sha1", 100, "sha1", 100))
+        assertFalse(Decisions.isAlreadyUploaded("sha1", 100, "sha1", 101))
+        assertFalse(Decisions.isAlreadyUploaded("sha1", 100, "sha2", 100))
+        assertFalse(Decisions.isAlreadyUploaded(null, 100, "sha1", 100))
     }
 
     @Test
@@ -121,7 +77,7 @@ class DecisionsTest {
     fun `два одинаковых файла в разных папках не путаются`() {
         val vanished = listOf("a/one.jpg" to "sha1", "b/two.jpg" to "sha1")
         val appeared = listOf("c/one.jpg" to "sha1")
-        // неоднозначно — перенос не выдумываем, пусть будет удаление и загрузка
+        // неоднозначно — перенос не выдумываем, файл просто уедет в облако ещё раз
         assertEquals(emptyList<Pair<String, String>>(), Decisions.matchMoves(vanished, appeared))
     }
 
@@ -138,7 +94,7 @@ class DecisionsTest {
         val appeared = listOf("a/one.jpg" to "sha1", "a/one-copy.jpg" to "sha1")
         val pairs = Decisions.matchMoves(vanished, appeared)
         assertEquals(1, pairs.size)
-        assertTrue(pairs[0].second == "a/one.jpg")
+        assertEquals("a/one.jpg", pairs[0].second)
     }
 
     private fun job(wifiOnly: Boolean) = Db.Job(
@@ -149,7 +105,6 @@ class DecisionsTest {
         zone = "PHOTOS",
         includeSubfolders = true,
         wifiOnly = wifiOnly,
-        keepDays = -1,
         enabled = true,
     )
 }
