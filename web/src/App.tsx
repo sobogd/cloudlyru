@@ -723,6 +723,32 @@ function FolderDetail({ folderId, protectedId, onBack, onDeleted }: { folderId: 
 // «Файлы» и WebDAV. Загрузка — иконки 📷/🎬 в шапке (только фото/видео), прогресс — панелью
 // над галереей, UI блокируется на время загрузки; удаление — из деталки в корзину.
 
+/** Превью в списке — квадрат 50×50 px (столько же отдаёт сервер); шире 50 px ячейку не делаем. */
+const GRID_CELL = 50;
+const GRID_GAP = 4;
+
+/**
+ * Сколько превью в ряд: колонок ровно столько, чтобы ячейка не стала шире GRID_CELL.
+ * Ширина 160 → 4, 150 → 3, 140 → 3. Меряем сам контейнер, поэтому одинаково работает
+ * и на компе, и на телефоне; при повороте экрана/ресайзе пересчитывается.
+ */
+function useGridCols(ref: React.RefObject<HTMLDivElement | null>) {
+  const [cols, setCols] = useState(() => Math.max(1, Math.ceil((window.innerWidth || GRID_CELL) / GRID_CELL)));
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const apply = () => {
+      const w = el.clientWidth;
+      if (w > 0) setCols(Math.max(1, Math.ceil(w / GRID_CELL)));
+    };
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref]);
+  return cols;
+}
+
 function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null; up: Uploader; uploadedAt: number }) {
   type Screen = { kind: 'grid' } | { kind: 'view'; idx: number };
   const [saved] = useState(() => readUi().photos);
@@ -730,6 +756,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const [trips, setTrips] = useState<api.Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<string | null>(null);
   const [screen, setScreen] = useState<Screen>({ kind: 'grid' });
+  const gridRef = useRef<HTMLDivElement>(null);
+  const cols = useGridCols(gridRef);
   // полноценная деталка (как в «Файлах»): открывается кнопкой ℹ️ из просмотра
   const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
   // открытый файл после F5 восстанавливаем по entryId (индекс в таймлайне мог сдвинуться)
@@ -889,22 +917,25 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
         </div>
       )}
       {activeTrip && <TripMap trip={trips.find((t) => t.id === activeTrip)!} />}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+      <div
+        ref={gridRef}
+        style={{ display: 'grid', gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, gap: GRID_GAP }}
+      >
         {media.map((it, idx) => (
-          <div key={it.entryId} style={{ width: '31.5%' }} onClick={() => setScreen({ kind: 'view', idx })}>
+          <div key={it.entryId} style={{ cursor: 'pointer' }} onClick={() => setScreen({ kind: 'view', idx })}>
             {!it.masterReady ? (
               <div
                 title={it.jobError || 'превью'}
-                style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6, color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 11, textAlign: 'center', padding: 4, cursor: 'pointer' }}
+                style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2, color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 8, textAlign: 'center', padding: 2, overflow: 'hidden', cursor: 'pointer' }}
               >
                 {it.jobState === 'failed' ? (
                   <>
-                    <span style={{ overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflowWrap: 'anywhere' }}>❌ {shortErr(it.jobError, 70)}</span>
+                    <span style={{ overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflowWrap: 'anywhere' }}>❌ {shortErr(it.jobError, 70)}</span>
                     <span style={{ display: 'flex', gap: 2 }}>
                       <button
                         className="iconbtn"
                         title="Пересобрать превью"
-                        style={{ fontSize: 16, padding: '2px 6px' }}
+                        style={{ fontSize: 12, padding: '0 3px' }}
                         onClick={(e) => { e.stopPropagation(); void retryPreview(it.entryId); }}
                       >⟳</button>
                       <a
@@ -912,7 +943,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                         title="Скачать оригинал"
                         href={api.fileUrl(it.entryId)}
                         download
-                        style={{ fontSize: 16, padding: '2px 6px' }}
+                        style={{ fontSize: 12, padding: '0 3px' }}
                         onClick={(e) => e.stopPropagation()}
                       >⬇️</a>
                     </span>
@@ -922,14 +953,14 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
             ) : it.sha256 ? (
               <div style={{ position: 'relative', cursor: 'pointer' }}>
                 <LoadImg src={api.previewUrl(it.sha256, 512)} style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
-                {isVid(it.mime) && <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 28, textShadow: '0 0 12px #000' }}>▶</span>}
+                {isVid(it.mime) && <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 14, textShadow: '0 0 12px #000' }}>▶</span>}
               </div>
             ) : (
               <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center' }}>📄</div>
             )}
           </div>
         ))}
-        {!media.length && <div className="copy">Нет фото и видео. Нажмите 📷 или 🎬 — медиа оптимизируется и появится здесь автоматически.</div>}
+        {!media.length && <div className="copy" style={{ gridColumn: '1 / -1' }}>Нет фото и видео. Нажмите 📷 или 🎬 — медиа оптимизируется и появится здесь автоматически.</div>}
       </div>
     </div>
   );
@@ -1092,13 +1123,14 @@ function PhotoZoom({ src }: { src: string }) {
   );
 }
 
-// #4: лоадер для изображений
+// #4: лоадер для изображений (высоту даёт сам <img> со своим aspectRatio: 1, поэтому
+// фиксированный minHeight не нужен — в списке ячейка всего до 50 px)
 function LoadImg({ src, style }: { src: string; style?: React.CSSProperties }) {
   const [ok, setOk] = useState(false);
   return (
     <div style={{ position: 'relative' }}>
       {!ok && (
-        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', minHeight: 120 }}>
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
           <span className="spin" />
         </div>
       )}

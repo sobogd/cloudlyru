@@ -34,7 +34,7 @@ export class MediaController {
     return (await this.auth.ownsAsset(user.id, asset.id)) ? asset : null;
   }
 
-  /** Превью для списка: ?w=512 (фото — кадр 512, видео — постер). */
+  /** Превью для списка: ?w=512 (фото — квадрат 50×50, видео — постер 50×50). */
   @Get('previews/:sha')
   async preview(
     @Param('sha') sha: string,
@@ -55,7 +55,8 @@ export class MediaController {
         cache: PREVIEW_CACHE,
       });
     }
-    // Фото: 512 — сетка, 2048 — полный экран (AVIF; у анимированных источников WebP).
+    // Фото: сетка (квадрат 50×50) — по умолчанию, 2048 — полный экран
+    // (AVIF; у анимированных источников WebP).
     const wantFull = Number(wRaw ?? 512) === 2048;
     const candidates = wantFull
       ? [MediaService.photoFullKey(sha), MediaService.legacyPhotoFullWebpKey(sha)]

@@ -6,7 +6,7 @@ import { join } from 'path';
 import sharp from 'sharp';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
-import { IMAGE_MIMES, MediaService, VIDEO_MIMES, parseIso6709, videoInstant } from '../media/media.service';
+import { GRID_SIZE, IMAGE_MIMES, MediaService, VIDEO_MIMES, parseIso6709, videoInstant } from '../media/media.service';
 import { ZONE_FILES } from '../common/zones';
 import { env } from '../config/env';
 
@@ -366,7 +366,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ============ Фото → превью 512 (список) + 2048 (полный экран) ============
+  // ============ Фото → превью 50×50 (список) + 2048 (полный экран) ============
   // Мастер-версия не создаётся: оригинал и есть мастер и отдаётся как есть
   // (при KEEP_ORIGINALS=true он не удаляется), поэтому метаданные исходника
   // (EXIF, GPS, ICC, MakerNotes, MPF/depth, gain map) не теряются вообще.
@@ -403,10 +403,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // заменять уже существующий блок). EXIF в превью не нужен — метаданные живут
     // в оригинале; ориентация уже запечена в пиксели через rotate().
     await this.setProgress(job.id, 40, true);
+    // Превью для списка — квадрат GRID_SIZE×GRID_SIZE: в сетке оно показывается
+    // не крупнее 50 px, поэтому кадрируем по центру (fit: cover) вместо «ширины 512».
     const grid = await base
       .clone()
       .keepIccProfile()
-      .resize({ width: 512, withoutEnlargement: true })
+      .resize({ width: GRID_SIZE, height: GRID_SIZE, fit: 'cover', withoutEnlargement: true })
       .webp({ quality: 78 })
       .toBuffer();
 
@@ -441,7 +443,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return animated ? { keepRaw: true } : {};
   }
 
-  // ============ Видео → постер 512 (список) + 1080 AV1 (полный экран) ============
+  // ============ Видео → постер 50×50 (список) + 1080 AV1 (полный экран) ============
   // Полноразмерный AV1-мастер не собирается: оригинал и есть мастер. Это заодно снимает
   // проблему памяти — энкодер больше не держит 4K-кадры, из-за которых libaom падал
   // под ulimit -v ("Failed to initialize encoder: Memory allocation error").
@@ -460,10 +462,13 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // 1) постер — быстро, чтобы ролик сразу появился в ленте.
     // -ss 1 за концом ролика (видео короче ~1 с) не даёт ни одного кадра: ffmpeg
     // завершается с кодом 0, но файла не создаёт — нужен фолбэк на первый кадр.
+    // Кадр режем сразу в квадрат для списка: апскейл по короткой стороне (increase) +
+    // центральный кроп — иначе постер 16:9 растянулся бы в квадратной ячейке сетки.
     const seek = src.duration > 1.5 ? '1' : '0';
-    await this.run(['ffmpeg', '-y', '-ss', seek, '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 180000);
+    const posterVf = `scale=${GRID_SIZE}:${GRID_SIZE}:force_original_aspect_ratio=increase,crop=${GRID_SIZE}:${GRID_SIZE}`;
+    await this.run(['ffmpeg', '-y', '-ss', seek, '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     if (!existsSync(posterRaw)) {
-      await this.run(['ffmpeg', '-y', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=512:-2', posterRaw], 180000);
+      await this.run(['ffmpeg', '-y', '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     }
     await this.setProgress(job.id, 5, true);
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();

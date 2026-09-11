@@ -9,7 +9,13 @@ import { ZONE_PHOTOS } from '../common/zones';
 
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
 export const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm', 'video/x-matroska', 'video/avi', 'video/ogg', 'video/mpeg'];
-export const GRID_SIZE = 512;
+/**
+ * Размер превью для списка (сетка галереи): квадрат 50×50. В сетке такое превью
+ * никогда не растягивается больше 50 px, поэтому больше пикселей не нужно.
+ * Ключ в S3 остался историческим `-512.webp`: у уже собранных ассетов там лежит
+ * старое превью 512 px, и оно продолжает отдаваться без пересборки.
+ */
+export const GRID_SIZE = 50;
 /** Сколько байт читать из начала файла для EXIF. */
 const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 export const FULL_SIZE = 2048;
@@ -139,7 +145,7 @@ export class MediaService {
   static viewKey(sha256: string, suffix: string): string {
     return `view/${sha256}${suffix}`;
   }
-  /** Превью для списка (сетка галереи): фото — кадр 512, видео — постер 512. */
+  /** Превью для списка (сетка галереи): квадрат 50×50, фото и видео одинаково. */
   static gridKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-512.webp');
   }
@@ -147,7 +153,7 @@ export class MediaService {
   static photoFullKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-2048.avif');
   }
-  /** Постер видео для списка. */
+  /** Постер видео для списка (тот же квадрат 50×50). */
   static videoPosterKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-poster.webp');
   }
