@@ -68,6 +68,24 @@ class Api(private val prefs: Prefs) {
     fun me(): String = parse(request("/auth/me")).optString("login").orEmpty()
 
     /**
+     * Системные папки владельца: «Фото» (медиатека) и «Телефон» (корень зеркала папок
+     * телефона). Их id сервер отдаёт готовыми — клиент в них только льёт, сам не заводит.
+     */
+    fun systemFolders(): SystemFolders {
+        val o = parse(request("/auth/me"))
+        return SystemFolders(
+            photoFolderId = idOrNull(o, "photoFolderId"),
+            phoneFolderId = idOrNull(o, "phoneFolderId"),
+        )
+    }
+
+    /** В JSON null и пустая строка значат одно и то же: id нет. */
+    private fun idOrNull(o: JSONObject, key: String): String? {
+        if (o.isNull(key)) return null
+        return o.optString(key).takeIf { it.isNotBlank() }
+    }
+
+    /**
      * Последняя опубликованная сборка приложения. Ручка без авторизации: обновиться нужно
      * и тогда, когда токен отозван, — иначе приложение осталось бы сломанным навсегда.
      */

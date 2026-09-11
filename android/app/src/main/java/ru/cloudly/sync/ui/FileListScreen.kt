@@ -90,7 +90,6 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
         val result = withContext(Dispatchers.IO) {
             device.scan(
                 paths = roots,
-                section = section,
                 limit = LIST_LIMIT,
                 onProgress = { progress.set(it) },
                 isCancelled = { !effect.isActive },
@@ -101,6 +100,7 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
             append("файлов: ${result.total}")
             if (result.total > result.files.size) append(", показаны первые ${result.files.size}")
             if (result.unreadable > 0) append(", папок без доступа: ${result.unreadable}")
+            if (result.capped) append(", обход упёрся в предел")
         }
         scanning = false
     }

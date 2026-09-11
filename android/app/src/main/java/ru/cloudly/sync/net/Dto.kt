@@ -43,6 +43,9 @@ data class RemoteEntry(
 
 data class FolderChildren(val folderIds: Map<String, String>, val entries: List<RemoteEntry>)
 
+/** Системные папки владельца (GET /auth/me). */
+data class SystemFolders(val photoFolderId: String?, val phoneFolderId: String?)
+
 /** Последняя опубликованная сборка приложения (GET /app/android). */
 data class AppRelease(
     val versionCode: Long,

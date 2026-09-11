@@ -53,10 +53,24 @@ class Prefs(context: Context) {
         get() = prefs.getString(KEY_S3_HOST, null)
         set(value) = prefs.edit().putString(KEY_S3_HOST, value).apply()
 
+    /**
+     * Системные папки сервера. Спрашиваются один раз и запоминаются: без них нельзя
+     * наполнить очередь, а очередь должна собираться и без сети (выгрузка всё равно ручная).
+     */
+    var phoneFolderId: String
+        get() = prefs.getString(KEY_PHONE_FOLDER, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_PHONE_FOLDER, value).apply()
+
+    var photoFolderId: String
+        get() = prefs.getString(KEY_PHOTO_FOLDER, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_PHOTO_FOLDER, value).apply()
+
     companion object {
         const val DEFAULT_URL = "https://files.iq-factura.com"
         private const val KEY_URL = "server_url"
         private const val KEY_TOKEN = "api_token"
         private const val KEY_S3_HOST = "last_s3_host"
+        private const val KEY_PHONE_FOLDER = "phone_folder_id"
+        private const val KEY_PHOTO_FOLDER = "photo_folder_id"
     }
 }
