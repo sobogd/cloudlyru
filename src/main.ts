@@ -9,6 +9,7 @@ import type { NextFunction, Request, Response } from 'express';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { env } from './config/env';
+import { runWithRequestContext } from './common/request-context';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
@@ -28,6 +29,13 @@ async function bootstrap() {
   app.set('trust proxy', 'loopback');
   // меньше информации о стеке наружу
   app.disable('x-powered-by');
+
+  // Контекст запроса заводим до роутера Nest: гард кладёт в него deviceId, а журнал изменений
+  // читает его из любой глубины сервисов (см. common/request-context.ts). Без ALS пришлось бы
+  // тащить deviceId аргументом через все вызовы changes.record.
+  app.use((_req: Request, _res: Response, next: NextFunction) => {
+    runWithRequestContext({}, () => next());
+  });
 
   // JSON-парсер ТОЛЬКО для application/json: бинарные чанки загрузок
   // приходят как stream (raw body) и не должны быть съедены парсером.

@@ -44,7 +44,56 @@ data class RemoteEntry(
 data class FolderChildren(val folderIds: Map<String, String>, val entries: List<RemoteEntry>)
 
 /** Системные папки владельца (GET /auth/me). */
-data class SystemFolders(val photoFolderId: String?, val phoneFolderId: String?)
+data class SystemFolders(
+    val photoFolderId: String?,
+    val phoneFolderId: String?,
+    /** Корень зеркала этого устройства («<Имя устройства> - Файлы»): сервер заводит его сам. */
+    val mirrorFolderId: String? = null,
+)
+
+/** Ответ GET /auth/me целиком: кроме папок — личность этого устройства. */
+data class MeInfo(
+    val login: String,
+    val photoFolderId: String?,
+    val phoneFolderId: String?,
+    val mirrorFolderId: String?,
+    /**
+     * id устройства в журнале изменений. По нему клиент отличает свои же правки от чужих:
+     * своя выгрузка не должна приезжать назад и зацикливать догон.
+     */
+    val deviceId: String?,
+)
+
+/**
+ * Строка журнала изменений (GET /sync/changes). Журнал append-only: клиент держит курсор
+ * по `seq` и применяет строки по порядку, а снимок в строке избавляет от запросов за деталями.
+ */
+data class CloudChange(
+    val seq: Long,
+    /** entry | folder */
+    val target: String,
+    /** create | update | move | delete | restore | pin */
+    val op: String,
+    val targetId: String,
+    /** родительская папка цели на момент события: по ней правка находится в зеркале */
+    val folderId: String?,
+    val name: String,
+    val sha256: String?,
+    val size: Long,
+    val mime: String?,
+    val clientMtime: Long?,
+    /** какое устройство сделало изменение; null — изменение из веба или от сервера */
+    val deviceId: String?,
+)
+
+/** Страница журнала: `hasMore` — догонять сразу, не дожидаясь следующего прохода. */
+data class ChangesPage(
+    val nextSeq: Long,
+    val hasMore: Boolean,
+    /** Курсор старше журнала (или впереди него): нужен полный проход по содержимому папки. */
+    val resetRequired: Boolean,
+    val changes: List<CloudChange>,
+)
 
 /** Последняя опубликованная сборка приложения (GET /app/android). */
 data class AppRelease(

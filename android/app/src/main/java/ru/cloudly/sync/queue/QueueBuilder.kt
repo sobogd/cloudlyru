@@ -36,17 +36,18 @@ class QueueBuilder(
     }
 
     /**
-     * @param phoneFolderId корень зеркала в облаке для раздела «Файлы»
      * @param photoFolderId медиатека для раздела «Фото» (туда льём плоско)
+     *
+     * Раздел «Файлы» здесь больше не сканируется: его ведёт зеркало (`ru.cloudly.sync.mirror`).
+     * Иначе один и тот же файл уезжал бы дважды — и в «Телефон» очередью, и в корень зеркала.
      */
     fun build(
         selection: Selection,
-        phoneFolderId: String?,
         photoFolderId: String?,
         onProgress: (String) -> Unit = {},
         isCancelled: () -> Boolean = { false },
     ): Result {
-        val targets = mapOf(Section.FILES to phoneFolderId, Section.PHOTOS to photoFolderId)
+        val targets = mapOf(Section.PHOTOS to photoFolderId)
         val problems = ArrayList<String>()
         val candidates = ArrayList<Candidate>()
         val scannedSections = HashSet<Section>()
@@ -56,17 +57,13 @@ class QueueBuilder(
 
         for (section in Section.entries) {
             if (isCancelled()) break
+            // «Файлы» ведёт зеркало: в очередь они не попадают
+            if (section == Section.FILES) continue
             val target = targets[section]
             if (target.isNullOrBlank()) {
                 // Цель раздела неизвестна (не выполнен вход) — раздел не сканируем и НЕ считаем
                 // пройденным: иначе уборка выкосила бы его строки из-за одной неполадки.
-                problems.add(
-                    if (section == Section.FILES) {
-                        "«Файлы»: папка «Телефон» неизвестна — войдите в аккаунт"
-                    } else {
-                        "«Фото»: медиатека неизвестна — войдите в аккаунт"
-                    },
-                )
+                problems.add("«Фото»: медиатека неизвестна — войдите в аккаунт")
                 continue
             }
             // Цель есть — раздел пройден целиком, даже если папок в нём не выбрано:
@@ -75,7 +72,7 @@ class QueueBuilder(
             scannedSections.add(section)
             val paths = selection.paths(section)
             if (paths.isEmpty()) continue
-            val label = if (section == Section.FILES) "Файлы" else "Фото"
+            val label = "Фото"
             val result = files.scan(
                 paths = paths,
                 limit = 0,
@@ -89,8 +86,8 @@ class QueueBuilder(
                 candidates.add(
                     Candidate(
                         path = file.path,
-                        // «Фото» ложится плоско: структуру повторяет только раздел «Файлы»
-                        relDir = if (section == Section.FILES) file.relDir else "",
+                        // «Фото» ложится плоско: медиатека — не дерево, а лента
+                        relDir = "",
                         name = file.name,
                         size = file.size,
                         mtime = file.mtime,
@@ -104,7 +101,8 @@ class QueueBuilder(
         val planned = QueuePlanner.plan(candidates, store.uploaded())
         val added = store.enqueue(planned)
         // и убираем то, чего в выбранных папках больше нет: иначе отключённая папка
-        // оставалась бы в очереди навсегда
+        // оставалась бы в очереди навсегда. Строки «Файлов» уборка тоже снимет: этот раздел
+        // больше не сканируется, а его старые строки в очереди смысла не имеют
         val keep = candidates.map { UploadedKey(it.path, it.target) }.toSet()
         val removed = store.prune(keep, scannedSections)
 

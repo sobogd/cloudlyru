@@ -54,8 +54,15 @@ class Uploader(private val api: Api) {
         )
         if (init.stale || init.inTrash || init.nameTaken) {
             // имя занято или версия на сервере другая — решает вызывающий: свободное имя
-            // или отказ, чтобы не затереть чужое
-            throw ApiException(409, if (init.inTrash) "in_trash" else "conflict", "name taken", null)
+            // или отказ, чтобы не затереть чужое.
+            // Коды разные намеренно: «версия на сервере другая» и «имя занято» — разные случаи,
+            // и зеркало разбирает их по-разному (конфликтная копия против свободного имени).
+            val code = when {
+                init.inTrash -> "in_trash"
+                init.stale -> "stale_version"
+                else -> "conflict"
+            }
+            throw ApiException(409, code, if (init.inTrash) "name in trash" else "name taken", null)
         }
         if (init.deduped || init.uploadId == null) {
             // содержимое уже в облаке: запись создана, байты не передавались

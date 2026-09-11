@@ -68,14 +68,67 @@ class Api(private val prefs: Prefs) {
     fun me(): String = parse(request("/auth/me")).optString("login").orEmpty()
 
     /**
-     * Системные папки владельца: «Фото» (медиатека) и «Телефон» (корень зеркала папок
-     * телефона). Их id сервер отдаёт готовыми — клиент в них только льёт, сам не заводит.
+     * Системные папки владельца: «Фото» (медиатека), легаси «Телефон» и корень зеркала
+     * этого устройства («<Имя> - Файлы»). Их id сервер отдаёт готовыми — клиент в них
+     * только льёт, сам не заводит. Корень зеркала у каждого устройства свой: общий на всех
+     * приводил бы к тому, что удаление на одном телефоне уносило файлы другого.
      */
     fun systemFolders(): SystemFolders {
         val o = parse(request("/auth/me"))
         return SystemFolders(
             photoFolderId = idOrNull(o, "photoFolderId"),
             phoneFolderId = idOrNull(o, "phoneFolderId"),
+            mirrorFolderId = idOrNull(o, "mirrorFolderId"),
+        )
+    }
+
+    /** Всё, что нужно зеркалу от /auth/me: корень зеркала и id этого устройства. */
+    fun meInfo(): MeInfo {
+        val o = parse(request("/auth/me"))
+        return MeInfo(
+            login = o.optString("login"),
+            photoFolderId = idOrNull(o, "photoFolderId"),
+            phoneFolderId = idOrNull(o, "phoneFolderId"),
+            mirrorFolderId = idOrNull(o, "mirrorFolderId"),
+            deviceId = idOrNull(o, "deviceId"),
+        )
+    }
+
+    /**
+     * Текущая голова журнала. Нужна, чтобы включить зеркало «с этого момента»: сначала
+     * голова, потом полный проход по содержимому папки, потом догон с головы — иначе
+     * изменения, случившиеся во время полного прохода, потерялись бы.
+     */
+    fun syncHead(): Long = parse(request("/sync/head")).optString("seq").toLongOrNull() ?: 0L
+
+    /** Изменения дерева после курсора: клиент применяет их по порядку и двигает курсор. */
+    fun changes(since: Long, limit: Int = 200): ChangesPage {
+        val o = parse(request("/sync/changes?since=$since&limit=$limit"))
+        val array = o.optJSONArray("changes") ?: JSONArray()
+        val list = ArrayList<CloudChange>(array.length())
+        for (i in 0 until array.length()) {
+            val c = array.getJSONObject(i)
+            list.add(
+                CloudChange(
+                    seq = c.optString("seq").toLongOrNull() ?: 0L,
+                    target = c.optString("target"),
+                    op = c.optString("op"),
+                    targetId = c.optString("targetId"),
+                    folderId = idOrNull(c, "folderId"),
+                    name = c.optString("name"),
+                    sha256 = idOrNull(c, "sha256"),
+                    size = if (c.isNull("size")) 0L else c.optLong("size"),
+                    mime = idOrNull(c, "mime"),
+                    clientMtime = if (c.isNull("clientMtime")) null else parseIsoMillis(c.optString("clientMtime")),
+                    deviceId = idOrNull(c, "deviceId"),
+                ),
+            )
+        }
+        return ChangesPage(
+            nextSeq = o.optString("nextSeq").toLongOrNull() ?: since,
+            hasMore = o.optBoolean("hasMore", false),
+            resetRequired = o.optBoolean("resetRequired", false),
+            changes = list,
         )
     }
 
@@ -406,6 +459,51 @@ class Api(private val prefs: Prefs) {
 
     fun moveFile(entryId: String, folderId: String, name: String) {
         parse(request("/files/$entryId", "PATCH", JSONObject().put("folderId", folderId).put("name", name)))
+    }
+
+    /** Переименование без переноса: сервер считает это отдельной операцией, а не «удалить + создать». */
+    fun renameFile(entryId: String, name: String) {
+        parse(request("/files/$entryId", "PATCH", JSONObject().put("name", name)))
+    }
+
+    /**
+     * Скачивание записи в файл с докачкой: оборвавшийся на середине файл не начинается заново.
+     * Пишем во временное имя рядом и переименовываем только после успеха — иначе сканирование
+     * подхватило бы недописанный файл. `expectedSha256` приходит из журнала: если содержимое
+     * не сошлось, файл не оставляем.
+     */
+    fun downloadToFile(entryId: String, dest: java.io.File, expectedSha256: String? = null) {
+        val tmp = java.io.File(dest.parentFile, ".${dest.name}.cloudly-tmp")
+        var lastError: Exception? = null
+        for (attempt in 0 until 3) {
+            try {
+                val from = if (tmp.isFile) tmp.length() else 0L
+                val stream = downloadStream(entryId, from)
+                java.io.RandomAccessFile(tmp, "rw").use { out ->
+                    out.seek(from)
+                    stream.use { input ->
+                        val buffer = ByteArray(256 * 1024)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            out.write(buffer, 0, read)
+                        }
+                    }
+                }
+                if (expectedSha256 != null && !expectedSha256.equals(ru.cloudly.sync.device.Hasher.sha256(tmp), ignoreCase = true)) {
+                    throw IOException("содержимое не сошлось с хэшем из журнала")
+                }
+                if (dest.exists()) dest.delete()
+                if (!tmp.renameTo(dest)) throw IOException("не удалось переименовать ${tmp.name}")
+                return
+            } catch (e: Exception) {
+                lastError = e
+                if (e is ApiException && e.status < 500) break
+                Thread.sleep(700L * (attempt + 1))
+            }
+        }
+        tmp.delete()
+        throw lastError ?: IOException("скачивание не удалось")
     }
 
     /** Скачивание с докачкой: `from` — с какого байта продолжать (сервер умеет Range). */

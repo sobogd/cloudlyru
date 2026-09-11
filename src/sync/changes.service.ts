@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { currentDeviceId } from '../common/request-context';
 
 /** Цель события журнала: файл в дереве или папка. */
 export type ChangeTarget = 'entry' | 'folder';
@@ -28,6 +29,11 @@ export interface ChangeInput {
   mime?: string | null;
   clientMtime?: Date | null;
   keepOffline?: boolean;
+  /**
+   * Источник изменения. Обычно не задаётся: берётся из контекста запроса (id ApiToken'а
+   * устройства-клиента), явно передаётся только там, где контекста нет или он не про это.
+   */
+  deviceId?: string | null;
 }
 
 /**
@@ -40,6 +46,10 @@ export interface ChangeInput {
  * Tombstones (op = delete) живут вечно и не связаны внешними ключами с деревом: строка
  * должна пережить физическое удаление FileEntry/Folder (trash purge), иначе клиент
  * зальёт удалённый файл обратно.
+ *
+ * Журнал знает и источник изменения (deviceId — id ApiToken'а устройства): клиент
+ * синхронизации по нему отличает свои же правки от чужих, а не гадает по содержимому.
+ * Источник подставляется из контекста запроса, а не аргументом в recordEntry/recordFolder.
  */
 @Injectable()
 export class ChangesService {
@@ -63,6 +73,7 @@ export class ChangesService {
         mime: input.mime ?? null,
         clientMtime: input.clientMtime ?? null,
         keepOffline: input.keepOffline ?? false,
+        deviceId: input.deviceId ?? currentDeviceId(),
       },
     });
   }

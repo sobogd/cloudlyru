@@ -163,7 +163,7 @@ class UploadRunner(
         if (first.isSuccess) return first.getOrThrow()
 
         val error = first.exceptionOrNull()!!
-        if (error is ApiException && error.code == "conflict") {
+        if (error is ApiException && (error.code == "conflict" || error.code == "stale_version")) {
             // в облаке чужой файл с таким именем: не затираем, кладём рядом под свободным именем
             val taken = withContext(Dispatchers.IO) {
                 runCatching { api.children(folderId).entries.map { it.name }.toHashSet() }.getOrDefault(emptySet())

@@ -40,7 +40,8 @@ export class AuthController {
 
   @Get('me')
   me(@CurrentUser() user: RequestUser) {
-    return this.auth.me(user.id);
+    // для Bearer-токена deviceId задан гардом: клиент получает корень зеркала своего устройства
+    return this.auth.me(user.id, user.deviceId ?? null);
   }
 
   // ===== App-password / device-токены =====

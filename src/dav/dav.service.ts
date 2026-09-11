@@ -309,10 +309,9 @@ export class DavService {
       : await this.prisma.folder.findFirst({ where: { parentId: null, name, deletedAt: null } });
     if (!folder) throw notFound('path not found');
     if (folder.name === '__root__') throw new BadRequestException('cannot delete root');
-    const photoId = await this.auth.photoRootIdOrNull(userId);
-    if (photoId && folder.id === photoId) throw new BadRequestException('cannot delete photo library root');
-    const phoneId = await this.auth.phoneRootIdOrNull(userId);
-    if (phoneId && folder.id === phoneId) throw new BadRequestException('cannot delete phone mirror root');
+    // корни «Фото», «Телефон» и зеркал устройств — одним списком (см. protectedFolderIds)
+    const protectedIds = await this.auth.protectedFolderIds(userId);
+    if (protectedIds.has(folder.id)) throw new BadRequestException(`cannot delete system folder "${folder.name}"`);
     // мягкое удаление поддерева
     const ids: string[] = [folder.id];
     const seen = new Set<string>([folder.id]);
@@ -387,10 +386,10 @@ export class DavService {
       : await this.prisma.folder.findFirst({ where: { parentId: null, name: srcParts[srcParts.length - 1], deletedAt: null } });
     if (!folder) throw notFound('path not found');
     if (folder.name === ROOT_FOLDER_NAME) throw new BadRequestException('cannot rename root');
-    const photoId = await this.auth.photoRootIdOrNull(userId);
-    if (photoId && folder.id === photoId) throw new BadRequestException('cannot rename photo library root');
-    const phoneId = await this.auth.phoneRootIdOrNull(userId);
-    if (phoneId && folder.id === phoneId) throw new BadRequestException('cannot rename phone mirror root');
+    const protectedIds = await this.auth.protectedFolderIds(userId);
+    if (protectedIds.has(folder.id)) {
+      throw new BadRequestException(`cannot rename/move system folder "${folder.name}"`);
+    }
     const dup = await this.prisma.folder.findFirst({ where: { parentId: dstParentId, name: newName, id: { not: folder.id } } });
     if (dup) throw new BadRequestException('already exists');
     if (newName === ROOT_FOLDER_NAME) throw new BadRequestException('reserved name');

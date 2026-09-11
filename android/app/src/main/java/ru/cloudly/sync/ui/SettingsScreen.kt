@@ -51,6 +51,8 @@ import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Selection
 import ru.cloudly.sync.data.Section
+import ru.cloudly.sync.mirror.MirrorScheduler
+import ru.cloudly.sync.mirror.MirrorStore
 import ru.cloudly.sync.net.AppRelease
 import ru.cloudly.sync.update.Updater
 
@@ -84,6 +86,55 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
     val versionCode = remember { Updater.currentVersionCode(context) }
     val fileFolders = remember { selection.paths(Section.FILES).size }
     val photoFolders = remember { selection.paths(Section.PHOTOS).size }
+
+    // Зеркало: итог последнего прохода, приостановленные удаления и ручной запуск
+    var mirrorReport by remember { mutableStateOf(app.mirrorStore.meta(MirrorStore.KEY_REPORT).orEmpty()) }
+    var mirrorBlocked by remember { mutableStateOf(parseBlocked(app.mirrorStore.meta(MirrorStore.KEY_BLOCKED))) }
+    var mirrorBusy by remember { mutableStateOf(false) }
+    var mirrorNote by remember { mutableStateOf("") }
+    var mirrorPaused by remember { mutableStateOf(app.mirrorStore.meta(MirrorStore.KEY_PAUSED) == "1") }
+
+    fun refreshMirrorState() {
+        mirrorReport = app.mirrorStore.meta(MirrorStore.KEY_REPORT).orEmpty()
+        mirrorBlocked = parseBlocked(app.mirrorStore.meta(MirrorStore.KEY_BLOCKED))
+    }
+
+    /**
+     * Проход зеркала по кнопке. Работает и когда автоматика выключена — это осознанное действие
+     * пользователя, а не фоновый запуск. `confirm` снимает предохранитель от массового удаления
+     * ровно на один проход.
+     */
+    fun syncNow(confirm: Boolean = false) {
+        if (mirrorBusy) return
+        mirrorBusy = true
+        mirrorNote = "сверяю…"
+        scope.launch {
+            if (confirm) withContext(Dispatchers.IO) { app.mirrorStore.setMeta(MirrorStore.KEY_CONFIRMED, "1") }
+            val result = withContext(Dispatchers.IO) {
+                runCatching { app.mirror.pass(onProgress = { mirrorNote = it }) }
+            }
+            mirrorBusy = false
+            result.fold(
+                onSuccess = { report ->
+                    mirrorNote = ""
+                    refreshMirrorState()
+                    if (report.error != null) mirrorNote = report.error.orEmpty()
+                },
+                onFailure = { mirrorNote = "не получилось: ${hint(it)}" },
+            )
+        }
+    }
+
+    fun setMirrorPaused() {
+        if (mirrorPaused) {
+            app.mirrorStore.setMeta(MirrorStore.KEY_PAUSED, "1")
+            MirrorScheduler.cancel(context)
+        } else {
+            app.mirrorStore.clearMeta(MirrorStore.KEY_PAUSED)
+            MirrorScheduler.schedulePeriodic(context)
+            app.refreshMirrorWatch()
+        }
+    }
 
     // доступ выдаётся на системном экране: без опроса галочка не появилась бы после возврата
     LaunchedEffect(Unit) {
@@ -292,6 +343,60 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
                 }
             }
 
+            Text("Зеркало", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Выбранные папки «Файлы» и папка «${account.ifBlank { "устройство" }} - Файлы» " +
+                            "в облаке хранят одно и то же: файл, появившийся или изменившийся с любой " +
+                            "стороны, доезжает до другой. Удаление на телефоне убирает файл в корзину " +
+                            "облака, удаление в облаке убирает его с телефона.",
+                        fontSize = 12.sp,
+                    )
+                    if (mirrorReport.isNotBlank()) {
+                        Text(
+                            "последний проход: $mirrorReport",
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                    mirrorBlocked?.let { (count, reason) ->
+                        Text(
+                            "удаления приостановлены: пропало файлов — $count ($reason)",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            "Если это вы удалили их на телефоне — подтвердите, и они уйдут в корзину " +
+                                "облака. Если нет — проверьте доступ к папке.",
+                            fontSize = 11.sp,
+                        )
+                        OutlinedButton(enabled = !mirrorBusy, onClick = { syncNow(confirm = true) }) {
+                            Text("Удалить эти $count в облаке")
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(enabled = !mirrorBusy, onClick = { syncNow() }) {
+                            Text(if (mirrorBusy) "сверяю…" else "Сверить сейчас")
+                        }
+                        OutlinedButton(
+                            enabled = !mirrorBusy && app.prefs.token.isNotBlank(),
+                            onClick = { mirrorPaused = !mirrorPaused; setMirrorPaused() },
+                        ) { Text(if (mirrorPaused) "включить" else "выключить") }
+                    }
+                    Text(
+                        if (mirrorPaused) {
+                            "Зеркало выключено: автоматические проходы не запускаются."
+                        } else {
+                            "Автоматически: раз в 15 минут и вскоре после изменений в папках."
+                        },
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (mirrorNote.isNotBlank()) Text(mirrorNote, fontSize = 12.sp)
+                }
+            }
+
             Text("Приложение", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -335,6 +440,17 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
             Spacer(Modifier.height(24.dp))
         }
     }
+}
+
+/**
+ * Что за предохранитель сработал: «<сколько>|<почему>». Значение пишет движок зеркала,
+ * а настройки показывают его человеческим текстом и дают подтвердить удаление.
+ */
+private fun parseBlocked(raw: String?): Pair<Int, String>? {
+    val text = raw?.takeIf { it.isNotBlank() } ?: return null
+    val count = text.substringBefore('|').toIntOrNull() ?: return null
+    if (count <= 0) return null
+    return count to text.substringAfter('|', "причина неизвестна")
 }
 
 @Composable

@@ -6,6 +6,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { AuthService } from '../../auth/auth.service';
 import { IS_PUBLIC_KEY, READ_ONLY_ALLOWED_KEY, SESSION_ONLY_KEY } from '../decorators';
 import { forbidden, unauthorized } from '../errors';
+import { setCurrentDeviceId } from '../request-context';
 
 const COOKIE = env.COOKIE_NAME;
 const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
@@ -63,7 +64,10 @@ export class AuthGuard implements CanActivate {
         select: { id: true, login: true },
       });
       if (!user) throw unauthorized('invalid token');
-      req.user = { id: user.id, login: user.login, scope: resolved.scope };
+      req.user = { id: user.id, login: user.login, scope: resolved.scope, deviceId: resolved.tokenId };
+      // id токена = identity устройства: из контекста его читает журнал изменений,
+      // иначе клиент не отличит свои правки от чужих (common/request-context.ts)
+      setCurrentDeviceId(resolved.tokenId);
       return true;
     }
 

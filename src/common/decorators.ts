@@ -36,6 +36,8 @@ export interface RequestUser {
   login: string;
   /** scope ApiToken'а (files:rw / files:ro); у веб-сессии не задан. */
   scope?: string;
+  /** id ApiToken'а (identity устройства) при аутентификации по Bearer; у веб-сессии не задан. */
+  deviceId?: string;
 }
 
 /** Текущий аутентифицированный пользователь (req.user), задаётся AuthGuard. */
