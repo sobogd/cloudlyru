@@ -127,7 +127,7 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
         scope.launch {
             if (confirm) withContext(Dispatchers.IO) { app.mirrorStore.setMeta(MirrorStore.KEY_CONFIRMED, "1") }
             val result = withContext(Dispatchers.IO) {
-                runCatching { app.mirror.pass(onProgress = { mirrorNote = it }) }
+                runCatching { app.mirror.pass(onProgress = { mirrorNote = it }, manual = true) }
             }
             mirrorBusy = false
             result.fold(
@@ -158,6 +158,8 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
             app.mirrorStore.setMeta(MirrorStore.KEY_PAUSED, "1")
             MirrorScheduler.cancel(context)
             MirrorService.stop(context)
+            // наблюдатели снимаются: иначе изменения файлов продолжали бы поднимать проходы
+            app.mirrorWatcher.stop()
         } else {
             app.mirrorStatus.update { copy(phase = MirrorStatus.Phase.IDLE) }
             app.mirrorStore.clearMeta(MirrorStore.KEY_PAUSED)

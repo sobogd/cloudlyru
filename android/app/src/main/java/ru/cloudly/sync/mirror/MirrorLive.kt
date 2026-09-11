@@ -32,6 +32,8 @@ class MirrorLive(
     private val scope: CoroutineScope,
     /** Есть ли токен: без него опрашивать нечего и незачем. */
     private val hasToken: () -> Boolean,
+    /** Выключено ли зеркало пользователем: тогда ни опрос, ни проходы не запускаются. */
+    private val paused: () -> Boolean,
 ) {
 
     private val polling = AtomicBoolean(false)
@@ -44,6 +46,8 @@ class MirrorLive(
             var failures = 0
             while (isActive) {
                 delay(if (failures == 0) POLL_MS else FAIL_BACKOFF_MS)
+                // «выключено» значит выключено: ни догона журнала, ни удалений из облака
+                if (paused()) continue
                 if (!hasToken()) continue
                 // курсора нет — зеркало ещё не сделало первый проход, догонять нечего
                 val cursor = runCatching { store.cursor() }.getOrNull() ?: continue
@@ -69,7 +73,7 @@ class MirrorLive(
      * (браузер качает файл частями, распаковка архива) не запускал десяток проходов подряд.
      */
     fun onLocalChange() {
-        if (!hasToken()) return
+        if (paused() || !hasToken()) return
         if (!pendingLocal.compareAndSet(false, true)) return
         scope.launch {
             try {

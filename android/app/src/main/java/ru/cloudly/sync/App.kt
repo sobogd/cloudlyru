@@ -13,6 +13,7 @@ import ru.cloudly.sync.mirror.MirrorEngine
 import ru.cloudly.sync.mirror.MirrorLive
 import ru.cloudly.sync.mirror.MirrorScheduler
 import ru.cloudly.sync.mirror.MirrorService
+import ru.cloudly.sync.mirror.MirrorStatus
 import ru.cloudly.sync.mirror.MirrorStatusHolder
 import ru.cloudly.sync.mirror.MirrorStore
 import ru.cloudly.sync.mirror.MirrorWatcher
@@ -80,7 +81,16 @@ class App : Application() {
 
         mirrorStore = MirrorStore(this)
         mirror = MirrorEngine(api, mirrorStore, selection, mirrorStatus)
-        mirrorLive = MirrorLive(api, mirrorStore, mirror, mirrorStatus, appScope) { prefs.token.isNotBlank() }
+        mirrorLive = MirrorLive(
+            api = api,
+            store = mirrorStore,
+            engine = mirror,
+            status = mirrorStatus,
+            scope = appScope,
+            hasToken = { prefs.token.isNotBlank() },
+            paused = { mirrorStore.meta(MirrorStore.KEY_PAUSED) == "1" },
+        )
+        seedMirrorStatus()
         mirrorWatcher = MirrorWatcher { mirrorLive.onLocalChange() }
         // периодический проход: наблюдатель за файлами только ускоряет, но не заменяет его —
         // после выгрузки процесса наблюдать некому
@@ -89,6 +99,35 @@ class App : Application() {
         if (MirrorService.isEnabled(this)) MirrorService.start(this)
         runCatching { mirrorWatcher.watch(selection.paths(Section.FILES)) }
         mirrorLive.start()
+    }
+
+    /**
+     * Заполнить состояние зеркала из базы при старте. Без этого после каждого перезапуска
+     * карточка показывала «в облаке: 0 файлов», хотя всё выгружено — база-то помнит.
+     */
+    private fun seedMirrorStatus() {
+        val inCloud = runCatching { mirrorStore.inCloud() }.getOrNull() ?: return
+        val local = mirrorStore.localTotals()
+        val waiting = mirrorStore.waitingTotals()
+        val blocked = mirrorStore.meta(MirrorStore.KEY_BLOCKED)?.substringBefore('|')?.toIntOrNull() ?: 0
+        val phase = if (mirrorStore.meta(MirrorStore.KEY_PAUSED) == "1") {
+            MirrorStatus.Phase.PAUSED
+        } else {
+            MirrorStatus.Phase.IDLE
+        }
+        mirrorStatus.update {
+            copy(
+                phase = phase,
+                inCloudFiles = inCloud.files,
+                inCloudBytes = inCloud.bytes,
+                localFiles = local.files,
+                localBytes = local.bytes,
+                waitingFiles = waiting.files,
+                waitingBytes = waiting.bytes,
+                blocked = blocked,
+                lastText = mirrorStore.meta(MirrorStore.KEY_REPORT).orEmpty(),
+            )
+        }
     }
 
     /** После изменения выбора папок наблюдение пересобирается: набор папок изменился. */

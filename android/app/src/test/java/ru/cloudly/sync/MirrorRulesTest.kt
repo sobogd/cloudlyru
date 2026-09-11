@@ -90,12 +90,42 @@ class MirrorRulesTest {
     }
 
     @Test
-    fun renameWithEditUploadsAgain() {
+    fun renameWithEditIsNotRename() {
+        // переименование и правка разом: размер разошёлся, значит это не переименование,
+        // а «пропал старый + появился новый» — так облачное содержимое не перезаписывается
         val moved = local(path = "/s/Download/отчёт.pdf", size = 200, inode = 42)
         val plan = MirrorRules.plan(listOf(moved), mapOf("/s/Download/doc.pdf" to row()), now, deletionsAllowed = true)
-        assertEquals(1, plan.renames.size)
+        assertTrue(plan.renames.isEmpty())
         assertEquals(listOf("/s/Download/отчёт.pdf"), plan.uploads.map { it.path })
+        assertEquals(listOf("entry-1"), plan.deletes.map { it.entryId })
+    }
+
+    @Test
+    fun reusedInodeWithOtherDateIsNotRename() {
+        // ядро отдало освободившийся inode новому файлу: размер совпал, дата нет — не переименование
+        val fresh = local(path = "/s/Download/new.pdf", size = 100, mtime = now - 5_000, inode = 42)
+        val plan = MirrorRules.plan(listOf(fresh), mapOf("/s/Download/doc.pdf" to row()), now, deletionsAllowed = true)
+        assertTrue(plan.renames.isEmpty())
+        assertEquals(listOf("entry-1"), plan.deletes.map { it.entryId })
+    }
+
+    @Test
+    fun hiddenAndJunkRowsAreNeverDeletedInCloud() {
+        // обход такие имена не показывает: «файла нет в снимке» — это правило показа, а не удаление
+        val known = mapOf(
+            "/s/Download/.nomedia" to row(path = "/s/Download/.nomedia", entryId = "hidden"),
+            "/s/Download/movie.mp4.part" to row(path = "/s/Download/movie.mp4.part", entryId = "junk"),
+            "/s/Download/doc.pdf" to row(path = "/s/Download/doc.pdf", entryId = "real"),
+        )
+        val plan = MirrorRules.plan(listOf(local()), known, now, deletionsAllowed = true)
+        assertTrue(plan.deletes.none { it.entryId == "hidden" || it.entryId == "junk" })
         assertTrue(plan.deletes.isEmpty())
+    }
+
+    @Test
+    fun futureMtimeIsStable() {
+        // файл из архива с датой в будущем не должен застрять навсегда
+        assertTrue(MirrorRules.isStable(now + 5_000, now))
     }
 
     @Test

@@ -56,8 +56,12 @@ class MirrorPull(
     fun catchUp() {
         val cursor = store.cursor()
         if (cursor == null) {
+            // Голову снимаем ДО полного прохода: правки, случившиеся во время прохода,
+            // приедут журналом с этой головы. Наоборот нельзя — курсор перепрыгнул бы их,
+            // и другого канала доставки нет.
+            val head = runCatching { api.syncHead() }.getOrNull()
             fullPull()
-            store.setCursor(runCatching { api.syncHead() }.getOrDefault(0L))
+            if (fatal == null && head != null) store.setCursor(head)
             return
         }
         var since: Long = cursor
@@ -70,10 +74,14 @@ class MirrorPull(
                 return
             }
             if (page.resetRequired) {
-                // по этому курсору часть изменений уже не восстановить: только полный проход
+                // по этому курсору часть изменений уже не восстановить: только полный проход.
+                // Курсор ставим ровно в голову, снятую до прохода: maxOf оставлял бы старый
+                // большой курсор (журнал откатили — восстановление из бэкапа), признак
+                // «нужен рескан» не гас бы никогда, и полный проход шёл бы на каждом событии.
                 Log.i(TAG, "журнал подрезан — полный проход по содержимому")
+                val head = runCatching { api.syncHead() }.getOrNull()
                 fullPull()
-                store.setCursor(maxOf(page.nextSeq, runCatching { api.syncHead() }.getOrDefault(0L)))
+                if (fatal == null && head != null) store.setCursor(head)
                 return
             }
             for (change in page.changes) {
@@ -156,14 +164,14 @@ class MirrorPull(
         val known = store.dirPath(change.targetId)
         if (change.op == "delete") {
             if (known == null) return
-            // в журнале на папку одно событие: поддерево удалено целиком
-            for (row in store.filesUnder(known)) {
-                if (File(row.path).delete()) deletedLocal += 1
-                store.dropFile(row.path)
+            // Папку сняли с выбора — её файлы трогать нельзя: удаление в облаке относится
+            // к облачной копии, а не к тому, что лежит на телефоне вне зеркала
+            if (!underRoots(known)) {
+                Log.i(TAG, "удаление вне выбранных папок пропущено: $known")
+                return
             }
-            for ((id, _) in store.dirsUnder(known)) store.dropDir(id)
-            File(known).deleteRecursively()
-            deletedLocal += 1
+            // в журнале на папку одно событие: поддерево удалено целиком
+            deleteKnownSubtree(known)
             return
         }
         // create | update | move | restore: папка должна существовать на телефоне
@@ -186,10 +194,12 @@ class MirrorPull(
         if (change.op == "pin") return
         val path = "$parent/${change.name}"
         if (change.op == "delete") {
-            val row = store.fileByEntry(change.targetId)
-            val file = row?.let { File(it.path) } ?: File(path)
-            if (file.isFile && file.delete()) deletedLocal += 1
-            if (row != null) store.dropFile(row.path) else store.dropFile(path)
+            val row = store.fileByEntry(change.targetId) ?: return
+            if (!underRoots(row.path)) {
+                Log.i(TAG, "удаление вне выбранных папок пропущено: ${row.path}")
+                return
+            }
+            deleteLocalFile(row)
             return
         }
         reconcile(
@@ -245,6 +255,12 @@ class MirrorPull(
 
         val file = File(path)
         if (!file.isFile) {
+            // Служебные и скрытые имена сканер не обходит: тянуть их к себе — значит завести
+            // строку, которой на следующем проходе «не будет», и унести облачный файл в корзину
+            if (ru.cloudly.sync.device.MediaRules.isHidden(name) || ru.cloudly.sync.device.MediaRules.isJunk(name)) {
+                Log.i(TAG, "служебное имя из облака пропущено: $name")
+                return
+            }
             downloadInto(entryId, folderId, path, sha256, size, clientMtime)
             return
         }
@@ -275,8 +291,7 @@ class MirrorPull(
         }
 
         // менялось и там, и тут: никто не затирается молча
-        val conflict = File(localDir, MirrorRules.conflictName(name, System.currentTimeMillis()))
-        if (!file.renameTo(conflict)) {
+        if (!saveConflictCopy(file)) {
             failed += 1
             onProgress("не удалось отодвинуть ${name} — конфликт не разрешён")
             return
@@ -285,6 +300,60 @@ class MirrorPull(
         // строку снимаем: конфликтную копию выгрузит следующий проход как новый файл
         row?.let { store.dropFile(it.path) }
         downloadInto(entryId, folderId, path, sha256, size, clientMtime)
+    }
+
+    /** Путь лежит внутри папки, которая выбрана сейчас: только такие удаления применяем. */
+    private fun underRoots(path: String): Boolean {
+        val roots = store.roots().keys
+        return roots.any { path == it || path.startsWith("$it/") }
+    }
+
+    /**
+     * Удаление папки, пришедшее из облака. Убираем ровно то, что знает зеркало: файлы — по
+     * своим строкам, папки — только пустые. Раньше здесь стоял `deleteRecursively()` по живому
+     * каталогу, и он сносил то, чего в облаке нет вовсе: только что скопированные файлы,
+     * служебные имена, файлы, которые не смогли уехать. Восстановить их было нечем.
+     */
+    private fun deleteKnownSubtree(localPath: String) {
+        for (row in store.filesUnder(localPath)) deleteLocalFile(row)
+        val dirs = store.dirsUnder(localPath).sortedByDescending { it.second.length }
+        for ((id, path) in dirs) {
+            File(path).takeIf { it.isDirectory && it.list()?.isEmpty() == true }?.delete()
+            store.dropDir(id)
+        }
+        val dir = File(localPath)
+        // папка уходит только если действительно опустела: незнакомые файлы остаются,
+        // и тогда она вернётся в облако следующим проходом
+        if (dir.isDirectory && dir.list()?.isEmpty() == true) dir.delete()
+        Log.i(TAG, "удаление папки из облака: $localPath")
+    }
+
+    /** Файл из облака удаляют: локальную правку, которая ещё не уехала, сохраняем копией. */
+    private fun deleteLocalFile(row: MirrorRow) {
+        val file = File(row.path)
+        if (file.isFile) {
+            val edited = file.length() != row.size || file.lastModified() != row.mtime
+            if (edited) {
+                if (saveConflictCopy(file)) conflicts += 1
+            } else if (file.delete()) {
+                deletedLocal += 1
+            }
+        }
+        store.dropFile(row.path)
+    }
+
+    /** Отодвинуть файл под свободным именем со пометкой конфликта: ничего не теряем. */
+    private fun saveConflictCopy(file: File): Boolean {
+        val dir = file.parentFile ?: return false
+        val taken = dir.list()?.toHashSet() ?: HashSet()
+        val base = MirrorRules.conflictName(file.name, System.currentTimeMillis())
+        var name = base
+        var counter = 1
+        while (name in taken && counter < 100) {
+            name = ru.cloudly.sync.queue.UploadPlan.freeName(base, taken)
+            counter += 1
+        }
+        return file.renameTo(File(dir, name))
     }
 
     /** Скачать запись в путь на телефоне и запомнить её как выгруженную. */

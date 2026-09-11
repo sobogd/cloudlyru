@@ -1,5 +1,6 @@
 package ru.cloudly.sync.mirror
 
+import ru.cloudly.sync.device.MediaRules
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -14,6 +15,7 @@ object MirrorRules {
 
     /** Файл, изменённый только что, ещё пишется: пусть устоится до следующего прохода. */
     const val STABLE_MS = 20_000L
+
 
     /**
      * Порог «пропало слишком много». Удаления приходят не только от пользователя: отозванное
@@ -38,8 +40,21 @@ object MirrorRules {
         val blockedCount: Int,
     )
 
-    /** Файл устоялся: его дата изменения не в последние секунды. */
-    fun isStable(mtime: Long, now: Long): Boolean = mtime <= now - STABLE_MS
+    /**
+     * Имя, которое обход не показывает (скрытое или служебное). Для сверки это не «файла нет»,
+     * а «правило показа»: такие строки не участвуют в удалениях.
+     */
+    fun excluded(path: String): Boolean {
+        val name = path.substringAfterLast('/')
+        return MediaRules.isHidden(name) || MediaRules.isJunk(name)
+    }
+
+    /**
+     * Файл устоялся: с последнего изменения прошло больше окна стабильности. Дата из будущего
+     * (кривые часы устройства, распакованный архив) тоже считается устоявшейся: писать файл
+     * «в будущем» нельзя, а вот застрять навсегда из-за такой даты он может.
+     */
+    fun isStable(mtime: Long, now: Long): Boolean = mtime > now || mtime <= now - STABLE_MS
 
     /**
      * Удаления допустимы только по полному и читаемому снимку: если папка не открылась или обход
@@ -88,8 +103,11 @@ object MirrorRules {
         val renames = ArrayList<Pair<MirrorRow, LocalFile>>()
         val renamedFrom = HashSet<String>()
 
-        // записи, чьих файлов на телефоне нет: либо удалены, либо переехали (ниже это видно по inode)
-        val lost = known.values.filter { it.path !in byPath }
+        // Записи, чьих файлов на телефоне нет: либо удалены, либо переехали (ниже это видно по inode).
+        // Служебные и скрытые имена сюда не попадают: обход их не показывает — значит «файла нет»
+        // означает «правило показа», а не «удалён». Иначе облачный `.nomedia` уезжал бы в корзину
+        // на следующем же проходе после того, как его скачали.
+        val lost = known.values.filter { it.path !in byPath && !excluded(it.path) }
         val byInode = lost.filter { it.inode > 0L }.associateBy { it.inode }
 
         for (file in local) {
@@ -100,16 +118,14 @@ object MirrorRules {
                 if (changed && isStable(file.mtime, now)) uploads += file
                 continue
             }
-            // пути в известных нет: либо файл новый, либо он переименован (совпал inode)
+            // пути в известных нет: либо файл новый, либо он переименован.
+            // Переименование признаём только при совпадении inode, размера И даты: одного inode
+            // мало — ядро отдаёт освободившийся номер новому файлу, и тогда «удалил A, создал B»
+            // выглядело бы переименованием, а облачная запись A перезаписывалась бы содержимым B.
             val moved = if (file.inode > 0L) byInode[file.inode] else null
-            if (moved != null && moved.path !in renamedFrom) {
+            if (moved != null && moved.path !in renamedFrom && moved.size == file.size && moved.mtime == file.mtime) {
                 renamedFrom += moved.path
                 renames += moved to file
-                // переименование и правка содержимого могут случиться разом: тогда после
-                // переноса записи файл надо ещё и выгрузить заново
-                if ((moved.size != file.size || moved.mtime != file.mtime) && isStable(file.mtime, now)) {
-                    uploads += file
-                }
                 continue
             }
             if (isStable(file.mtime, now)) uploads += file

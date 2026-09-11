@@ -57,8 +57,12 @@ class QueueBuilder(
 
         for (section in Section.entries) {
             if (isCancelled()) break
-            // «Файлы» ведёт зеркало: в очередь они не попадают
-            if (section == Section.FILES) continue
+            // «Файлы» ведёт зеркало: в очередь они не попадают, а строки от версий до 0.7.0
+            // (цель — папка «Телефон») считаются пройденными и уборка их снимает
+            if (section == Section.FILES) {
+                scannedSections.add(Section.FILES)
+                continue
+            }
             val target = targets[section]
             if (target.isNullOrBlank()) {
                 // Цель раздела неизвестна (не выполнен вход) — раздел не сканируем и НЕ считаем

@@ -88,7 +88,10 @@ class MirrorEngine(
         onProgress: (String) -> Unit = {},
         isCancelled: () -> Boolean = { false },
         budgetMs: Long = DEFAULT_BUDGET_MS,
+        /** Ручная сверка из настроек: работает и когда автоматика выключена. */
+        manual: Boolean = false,
     ): Report {
+        if (!manual && store.meta(MirrorStore.KEY_PAUSED) == "1") return Report(error = "зеркало выключено")
         if (!busy.compareAndSet(false, true)) return Report(error = "проход уже идёт")
         return try {
             passLocked(onProgress, isCancelled, budgetMs)
@@ -212,6 +215,10 @@ class MirrorEngine(
      */
     private fun finish(report: Report): Report {
         report.finishedAt = System.currentTimeMillis()
+        // подтверждение массового удаления живёт ровно один проход: если проход до разбора
+        // очереди не дошёл, флаг всё равно must сгореть, иначе он сработает в следующем —
+        // уже на другом наборе файлов
+        store.clearMeta(MirrorStore.KEY_CONFIRMED)
         store.setMeta(MirrorStore.KEY_REPORT, report.text())
         val inCloud = store.inCloud()
         status.update {
@@ -286,7 +293,6 @@ class MirrorEngine(
         }
 
         val confirmed = store.meta(MirrorStore.KEY_CONFIRMED) == "1"
-        if (confirmed) store.clearMeta(MirrorStore.KEY_CONFIRMED)
         val deletionsAllowed = MirrorRules.deletionsAllowed(snapshot)
         // строки, относящиеся к выбранным сейчас папкам: у папки, снятой с выбора, файлов
         // в снимке нет, и без этого фильтра сверка удалила бы её содержимое в облаке

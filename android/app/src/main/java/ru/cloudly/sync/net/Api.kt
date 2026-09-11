@@ -491,10 +491,24 @@ class Api(private val prefs: Prefs) {
                     }
                 }
                 if (expectedSha256 != null && !expectedSha256.equals(ru.cloudly.sync.device.Hasher.sha256(tmp), ignoreCase = true)) {
+                    // огрызок с чужим содержимым копить нельзя: следующая попытка начнётся с нуля,
+                    // иначе к нему приклеится ещё кусок и файл так и останется испорченным
+                    tmp.delete()
                     throw IOException("содержимое не сошлось с хэшем из журнала")
                 }
-                if (dest.exists()) dest.delete()
-                if (!tmp.renameTo(dest)) throw IOException("не удалось переименовать ${tmp.name}")
+                // прежний файл не удаляем, а уводим в сторону: если переименование не удастся,
+                // на месте останется рабочая версия, а не пустота (иначе зеркало сочло бы файл
+                // удалённым и унесло бы облачную копию в корзину)
+                val backup = java.io.File(dest.parentFile, "${dest.name}.cloudly-old")
+                if (dest.exists()) {
+                    backup.delete()
+                    if (!dest.renameTo(backup)) throw IOException("не удалось отодвинуть ${dest.name}")
+                }
+                if (!tmp.renameTo(dest)) {
+                    if (backup.exists()) backup.renameTo(dest)
+                    throw IOException("не удалось переименовать ${tmp.name}")
+                }
+                backup.delete()
                 return
             } catch (e: Exception) {
                 lastError = e

@@ -34,7 +34,10 @@ class MirrorService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            Log.i(TAG, "сервис остановлен пользователем")
+            // «Выключить» в уведомлении должно выключать режим целиком, а не только сервис:
+            // иначе переключатель врал бы, а сервис поднимался бы снова при следующем запуске
+            Log.i(TAG, "мгновенный режим выключен пользователем")
+            setEnabled(this, false)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -67,6 +70,21 @@ class MirrorService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "сервис остановлен системой")
         super.onDestroy()
+    }
+
+    /**
+     * Android 15 ограничивает суммарное время работы сервиса типа `dataSync` за сутки.
+     * Когда лимит исчерпан, система требует остановиться: выключаем режим честно, чтобы
+     * переключатель не врал и владелец понимал, почему мгновенности больше нет.
+     */
+    override fun onTimeout(startId: Int) {
+        Log.w(TAG, "система остановила сервис по лимиту времени — выключаю мгновенный режим")
+        setEnabled(this, false)
+        stopSelf()
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        onTimeout(startId)
     }
 
     private fun notification(): Notification {
