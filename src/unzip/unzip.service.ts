@@ -6,6 +6,7 @@ import { FilesService } from '../files/files.service';
 import { QueueService } from '../queue/queue.service';
 import { AuthService } from '../auth/auth.service';
 import { ChangesService } from '../sync/changes.service';
+import { IMAGE_MIMES, MediaService, VIDEO_MIMES } from '../media/media.service';
 import { RemoteZip, ZipEntryInfo, hashStream } from './s3-zip';
 import { assertSafeName } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
@@ -63,6 +64,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     private readonly queue: QueueService,
     private readonly auth: AuthService,
     private readonly changes: ChangesService,
+    private readonly media: MediaService,
   ) {}
 
   async onModuleInit() {
@@ -76,6 +78,23 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
 
   onModuleDestroy() {
     if (this.timer) clearInterval(this.timer);
+  }
+
+  /**
+   * Метаданные медиафайлов из архива: EXIF фото и ffprobe видео. Идём по списку по одному —
+   * так разбор не отбирает процессор у самой распаковки и у API, и не плодит параллельные ffprobe.
+   */
+  private async collectMeta(items: Array<{ assetId: string; sha256: string; size: number; mime: string }>): Promise<void> {
+    let done = 0;
+    for (const item of items) {
+      try {
+        await this.media.captureAny(item.assetId, item.sha256, item.size, item.mime);
+        done += 1;
+      } catch (e) {
+        this.logger.debug(`метаданные из архива пропущены: ${(e as Error).message}`);
+      }
+    }
+    if (done) this.logger.log(`метаданные из архива: разобрано ${done} из ${items.length}`);
   }
 
   // ================= API =================
@@ -390,6 +409,8 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     let skipped = job.skippedEntries;
     /** Медиа зоны «Фото» — ставим в очередь конвертации после распаковки (см. конец цикла). */
     const pendingMedia: Array<{ assetId: string; sha256: string; mime: string }> = [];
+    // Фото и видео из архива: метаданные разбираем после распаковки, из локальных файлов
+    const pendingMeta: Array<{ assetId: string; sha256: string; size: number; mime: string }> = [];
     if (startIndex > 0) {
       this.logger.log(
         `распаковка ${jobId}: продолжаем с файла ${startIndex + 1} из ${files.length} (${(doneBytes / 1e9).toFixed(1)} ГБ уже сделано)`,
@@ -474,9 +495,19 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       // вызов здесь блокировал бы разбор архива, а EXIF воркер возьмёт из локального файла.
       if (entry.zone === ZONE_PHOTOS) pendingMedia.push({ assetId, sha256, mime });
 
+      // Метаданные — любому фото и видео, независимо от зоны. Разбираем фоном и по одному:
+      // ffprobe на каждый файл внутри распаковки заметно удлинил бы импорт.
+      if (IMAGE_MIMES.includes(mime) || VIDEO_MIMES.includes(mime)) {
+        pendingMeta.push({ assetId, sha256, size: realSize, mime });
+      }
+
       doneEntries += 1;
       doneBytes += e.uncompressedSize;
       await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, fileName);
+    }
+
+    if (pendingMeta.length) {
+      void this.collectMeta(pendingMeta);
     }
 
     if (pendingMedia.length) {

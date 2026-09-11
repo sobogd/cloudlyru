@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import ru.cloudly.sync.data.Db
+import ru.cloudly.sync.net.ApiException
 import ru.cloudly.sync.sync.Decisions
 
 /**
@@ -49,6 +50,19 @@ class DecisionsTest {
         assertFalse(Decisions.isAlreadyUploaded("sha1", 100, "sha1", 101))
         assertFalse(Decisions.isAlreadyUploaded("sha1", 100, "sha2", 100))
         assertFalse(Decisions.isAlreadyUploaded(null, 100, "sha1", 100))
+    }
+
+    @Test
+    fun `через сервер повторяем только сетевые сбои и 5xx`() {
+        // не доехали байты: нет сети, не разрешается имя хранилища, отказ S3
+        assertTrue(Decisions.shouldRetryViaRelay(java.io.IOException("nbg1.your-objectstorage.com: timeout")))
+        assertTrue(Decisions.shouldRetryViaRelay(ApiException(500, "", "внутренняя ошибка", null)))
+        assertTrue(Decisions.shouldRetryViaRelay(ApiException(429, "", "слишком часто", null)))
+        // сервер ответил внятно: повтор через сервер не поможет, а режим спрячет причину
+        assertFalse(Decisions.shouldRetryViaRelay(ApiException(404, "upload_session_lost", "нет сессии", null)))
+        assertFalse(Decisions.shouldRetryViaRelay(ApiException(401, "", "нет доступа", null)))
+        assertFalse(Decisions.shouldRetryViaRelay(ApiException(409, "conflict", "имя занято", null)))
+        assertFalse(Decisions.shouldRetryViaRelay(IllegalStateException("что-то своё")))
     }
 
     @Test

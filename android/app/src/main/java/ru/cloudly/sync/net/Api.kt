@@ -32,13 +32,18 @@ class Api(private val prefs: Prefs) {
 
     private fun url(path: String) = prefs.serverUrl.trimEnd('/') + "/api/v1" + path
 
-    private fun request(path: String, method: String = "GET", body: JSONObject? = null, urlOverride: String? = null): Response {
-        val builder = Request.Builder().url(urlOverride ?: url(path))
+    private fun request(path: String, method: String = "GET", body: JSONObject? = null): Response {
+        val builder = Request.Builder().url(url(path))
         when (method) {
             "GET" -> builder.get()
             "POST" -> builder.post((body ?: JSONObject()).toString().toRequestBody(json))
+            // PUT здесь был пропущен, а `when` без совпадения молча оставлял GET: регистрация
+            // части уходила как GET /uploads/:id/parts/N, сервер отвечал 404, и прямая загрузка
+            // в S3 не работала вообще — всё уезжало через сервер (медленно и с нагрузкой на VPS).
+            "PUT" -> builder.put((body ?: JSONObject()).toString().toRequestBody(json))
             "PATCH" -> builder.patch((body ?: JSONObject()).toString().toRequestBody(json))
             "DELETE" -> builder.delete()
+            else -> throw IllegalArgumentException("неизвестный метод запроса: $method")
         }
         builder.header("Authorization", "Bearer ${prefs.token}")
         builder.header("Accept", "application/json")

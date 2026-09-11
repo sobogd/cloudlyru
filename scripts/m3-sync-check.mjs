@@ -52,7 +52,7 @@ const s3 = {
   createMultipartUpload: async () => 's3-init',
   abortMultipartUpload: async () => {},
 };
-const media = { captureMeta: async () => {}, extractDetail: async () => {} };
+const media = { captureMeta: async () => {}, extractDetail: async () => {}, captureAny: async () => {} };
 const queue = { enqueue: async () => {}, cancelForAssets: async () => {}, requeueForAssets: async () => {}, previewsAlive: async () => false };
 
 const audit = new AuditService(prisma);

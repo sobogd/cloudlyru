@@ -339,7 +339,7 @@ class UploadEngine(private val context: Context, private val db: Db, private val
                 onProgress = progress("выгрузка"),
             )
         }.getOrElse { e ->
-            if (relayMode()) throw e
+            if (relayMode() || !Decisions.shouldRetryViaRelay(e)) throw e
             Log.w(TAG, "прямая загрузка не удалась (${e.message}) — пробую через сервер")
             op.uploadId?.let { runCatching { api.abort(it) } }
             db.putKv(KV_RELAY_MODE, System.currentTimeMillis().toString())

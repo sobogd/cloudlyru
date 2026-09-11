@@ -238,11 +238,11 @@ export class DavService {
     }
     await this.s3.deleteObject(tmpKey).catch(() => undefined);
 
-    // EXIF + очередь конвертации — только для медиа-зоны («Фото»); в «Файлы» — как есть
+    // Метаданные — для любых фото и видео, независимо от зоны
+    await this.media.captureAny(assetId, sha256, size, mime).catch(() => undefined);
+
+    // Превью и конвертация — только для медиа-зоны («Фото»); в «Файлы» файл ложится как есть
     if (zone === ZONE_PHOTOS) {
-      try {
-        await this.media.captureMeta(assetId, sha256, size, mime);
-      } catch { /* ignore */ }
       await this.queue.enqueue(assetId, sha256, mime);
     }
 

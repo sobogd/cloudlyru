@@ -691,7 +691,7 @@ export class FilesService {
     // Файл переехал в медиа-зону: без EXIF и превью он не попадёт в таймлайн
     if (updated.zone === ZONE_PHOTOS && entry.zone !== ZONE_PHOTOS) {
       await this.media
-        .captureMeta(entry.assetId, entry.asset.sha256, Number(entry.asset.size), entry.asset.mime)
+        .captureAny(entry.assetId, entry.asset.sha256, Number(entry.asset.size), entry.asset.mime)
         .catch(() => undefined);
       await this.queue.enqueue(entry.assetId, entry.asset.sha256, entry.asset.mime).catch(() => undefined);
     }

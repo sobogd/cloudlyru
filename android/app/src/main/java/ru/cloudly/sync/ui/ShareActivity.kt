@@ -185,6 +185,7 @@ private fun shareUpload(
         )
     }
     runCatching { send(false) }.getOrElse { first ->
+        if (!Decisions.shouldRetryViaRelay(first)) throw first
         uploadId?.let { runCatching { api.abort(it) } }
         send(true)
     }

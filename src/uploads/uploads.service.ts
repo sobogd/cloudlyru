@@ -661,21 +661,13 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // Медиа-зона («Фото»): EXIF (дата/координаты) + очередь конвертации (best-effort).
-    // Зона «Файлы»: файл ложится как есть — без EXIF-обработки и без конвертации.
-    // Повторную загрузку того же содержимого метаданные не пересобирают: EXIF уже разобран,
-    // а чтение объекта из S3 ради этого — лишний трафик.
+    // Метаданные сохраняем для любых фото и видео, независимо от зоны: зона решает, где файл
+    // лежит и строятся ли для него превью, но не то, знаем ли мы дату съёмки, координаты, камеру
+    // и параметры кадра. Повторную загрузку того же содержимого не пересобираем.
+    await this.media.captureAny(params.assetId, params.sha256, params.size, params.mime).catch(() => undefined);
+
+    // Тяжёлое (превью и конвертация) — по-прежнему только для медиа-зоны «Фото»
     if (entry.zone === ZONE_PHOTOS) {
-      const hasMeta = await this.prisma.mediaMeta
-        .findUnique({ where: { assetId: params.assetId }, select: { assetId: true } })
-        .catch(() => null);
-      if (!hasMeta) {
-        try {
-          await this.media.captureMeta(params.assetId, params.sha256, params.size, params.mime);
-        } catch {
-          /* ignore */
-        }
-      }
       await this.queue.enqueue(params.assetId, params.sha256, params.mime);
     }
 

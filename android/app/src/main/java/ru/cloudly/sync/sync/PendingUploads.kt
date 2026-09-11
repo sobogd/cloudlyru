@@ -80,7 +80,9 @@ object PendingUploads {
             )
         }
         return runCatching { attempt(false) }.getOrElse { first ->
-            // прямое подключение к хранилищу могло не сработать (DNS, VPN, блокировщик)
+            // прямое подключение к хранилищу могло не сработать (DNS, VPN, блокировщик);
+            // на внятную ошибку сервера повтор через него ничего не изменит
+            if (!Decisions.shouldRetryViaRelay(first)) throw first
             Log.w(TAG, "прямая выгрузка не удалась (${first.message}) — пробую через сервер")
             attempt(true)
         }

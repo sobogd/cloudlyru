@@ -268,11 +268,11 @@ export class SharesService {
       userId: ownerId ?? undefined,
       asset: { sha256, size: body.length, mime },
     });
-    // конвертация/EXIF — только когда файл попал в медиа-зону («Фото»)
+    // метаданные — для любых фото и видео, независимо от зоны
+    await this.media.captureAny(asset.id, sha256, body.length, mime).catch(() => undefined);
+
+    // конвертация/превью — только когда файл попал в медиа-зону («Фото»)
     if (entry.zone === ZONE_PHOTOS) {
-      try {
-        await this.media.captureMeta(asset.id, sha256, body.length, mime);
-      } catch { /* ignore */ }
       await this.queue.enqueue(asset.id, sha256, mime);
     }
     return { ok: true, entryId: entry.id, size: body.length, deduped: Boolean(existing), zone: entry.zone };

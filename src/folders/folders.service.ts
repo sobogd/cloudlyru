@@ -536,11 +536,8 @@ export class FoldersService {
         select: { id: true, sha256: true, mime: true, size: true },
       });
       for (const a of assets) {
-        try {
-          await this.media.captureMeta(a.id, a.sha256, Number(a.size), a.mime);
-        } catch {
-          /* best-effort */
-        }
+        // метаданные — любому фото и видео; конвертация ниже только для медиа-зоны
+        await this.media.captureAny(a.id, a.sha256, Number(a.size), a.mime).catch(() => undefined);
         await this.queue.enqueue(a.id, a.sha256, a.mime);
       }
     } catch {

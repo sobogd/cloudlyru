@@ -1,6 +1,8 @@
 package ru.cloudly.sync.sync
 
 import ru.cloudly.sync.data.Db
+import ru.cloudly.sync.net.ApiException
+import java.io.IOException
 
 /**
  * Решения, вынесенные в чистые функции: их проверяют юнит-тесты без Android.
@@ -67,6 +69,18 @@ object Decisions {
         val base = raw.substringAfterLast('/').substringAfterLast('\\').trim().trimStart('.')
         val cleaned = base.replace(Regex("[\\u0000-\\u001f]"), "_")
         return if (cleaned.length > 160) cleaned.take(160) else cleaned
+    }
+
+    /**
+     * Стоит ли повторить заливку через сервер. Да — когда не доехали байты: нет сети, не
+     * разрешается имя хранилища, отказ S3, 5xx сервера. Нет — когда сервер ответил внятной
+     * ошибкой (400/401/403/404/409/429): повтор через сервер её не исправит, а режим «через
+     * сервер» запомнился бы навсегда и спрятал настоящую причину.
+     */
+    fun shouldRetryViaRelay(error: Throwable): Boolean = when (error) {
+        is ApiException -> error.status >= 500 || error.status == 408 || error.status == 429
+        is IOException -> true
+        else -> false
     }
 
     /** Можно ли считать файл уже выгруженным: совпало содержимое и размер. */
