@@ -28,6 +28,45 @@ export interface ZipEntryInfo {
   uncompressedSize: number;
   localHeaderOffset: number;
   isDirectory: boolean;
+  /**
+   * Время изменения файла из архива. Google Takeout кладёт сюда дату самого снимка, а не
+   * дату упаковки, поэтому это единственный способ узнать реальную дату файла при импорте:
+   * без него все распакованные файлы получали дату импорта.
+   */
+  lastModified: Date | null;
+}
+
+/**
+ * Время из полей DOS (2 байта даты, 2 байта времени) — формат ZIP по умолчанию.
+ * Секунды хранятся с точностью до двух, год — со смещением от 1980.
+ */
+function dosDateTime(dateRaw: number, timeRaw: number): Date | null {
+  if (dateRaw === 0) return null;
+  const day = dateRaw & 0x1f;
+  const month = (dateRaw >> 5) & 0x0f;
+  const year = 1980 + ((dateRaw >> 9) & 0x7f);
+  const seconds = (timeRaw & 0x1f) * 2;
+  const minutes = (timeRaw >> 5) & 0x3f;
+  const hours = (timeRaw >> 11) & 0x1f;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  // дата в архиве — локальная для того, кто упаковывал; читаем как UTC, чтобы не сдвигать
+  const ms = Date.UTC(year, month - 1, day, hours, minutes, seconds);
+  return Number.isFinite(ms) ? new Date(ms) : null;
+}
+
+/** Дополнительное поле 0x5455 (extended timestamp): unix-время, если упаковщик его положил. */
+function unixTimeFromExtra(extra: Buffer): Date | null {
+  let e = 0;
+  while (e + 4 <= extra.length) {
+    const id = extra.readUInt16LE(e);
+    const len = extra.readUInt16LE(e + 2);
+    if (id === 0x5455 && len >= 5) {
+      const flags = extra.readUInt8(e + 4);
+      if (flags & 0x1 && len >= 9) return new Date(extra.readUInt32LE(e + 5) * 1000);
+    }
+    e += 4 + len;
+  }
+  return null;
 }
 
 const SIG_EOCD = 0x06054b50;
@@ -140,6 +179,8 @@ export class RemoteZip {
       const extraLen = block.readUInt16LE(off + 30);
       const commentLen = block.readUInt16LE(off + 32);
       const localOffset32 = block.readUInt32LE(off + 42);
+      const dosTime = block.readUInt16LE(off + 12);
+      const dosDate = block.readUInt16LE(off + 14);
 
       await ensure(46 + nameLen + extraLen + commentLen);
       off = pos - blockStart;
@@ -175,6 +216,7 @@ export class RemoteZip {
         uncompressedSize,
         localHeaderOffset,
         isDirectory: name.endsWith('/'),
+        lastModified: unixTimeFromExtra(extra) ?? dosDateTime(dosDate, dosTime),
       });
       pos += 46 + nameLen + extraLen + commentLen;
     }

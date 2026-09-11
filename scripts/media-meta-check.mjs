@@ -19,6 +19,7 @@ const require = createRequire(import.meta.url);
 const dist = (p) => require(new URL(`../dist/${p}`, import.meta.url).pathname);
 
 const { MediaService } = dist('media/media.service.js');
+const { RemoteZip } = dist('unzip/s3-zip.js');
 const prisma = new PrismaClient();
 
 let failures = 0;
@@ -153,6 +154,56 @@ try {
   check('видео: ffprobe добрал длительность', Number(vraw.durationSec) > 1.5 && Number(vraw.durationSec) < 2.5, String(vraw.durationSec));
   check('видео: кодек и разрешение', vraw.videoCodec === 'h264' && vraw.width === 64 && vraw.height === 48, `${vraw.videoCodec} ${vraw.width}x${vraw.height}`);
   check('видео: дата из контейнера', String(vraw.createdAt ?? '').startsWith('2022-05-06'), String(vraw.createdAt));
+
+  // === сайдкары и даты архивов =========================================================
+  // Настоящие архивы Takeout: даты файлов внутри — время упаковки, поэтому дата съёмки
+  // берётся из сайдкара. Здесь проверяем, что обе вещи читаются из архива.
+  const archDir = join(dir, 'arch');
+  require('node:fs').mkdirSync(join(archDir, 'Takeout/Google Photos/2022'), { recursive: true });
+  const photoInZip = join(archDir, 'Takeout/Google Photos/2022/IMG_0001.jpg');
+  writeFileSync(photoInZip, jpegWithExif({ make: 'ZipCam', model: 'Z1', dateTimeOriginal: '2018:03:01 09:00:00' }));
+  writeFileSync(
+    join(archDir, 'Takeout/Google Photos/2022/IMG_0001.jpg.supplemental-metadata.json'),
+    JSON.stringify({
+      title: 'IMG_0001.jpg',
+      photoTakenTime: { timestamp: '1519999200' },
+      geoData: { latitude: 55.75, longitude: 37.61, altitude: 150 },
+    }),
+  );
+  execFileSync('zip', ['-q', '-r', join(dir, 'takeout.zip'), 'Takeout'], { cwd: archDir });
+
+  const archive = readFileSync(join(dir, 'takeout.zip'));
+  const zipOverFile = new RemoteZip({
+    size: () => archive.length,
+    readRange: async (start, end) => archive.subarray(start, end + 1),
+  });
+  const zipEntries = await zipOverFile.entries();
+  const photoEntry = zipEntries.find((e) => e.name.endsWith('IMG_0001.jpg'));
+  const sidecarEntry = zipEntries.find((e) => e.name.endsWith('.json'));
+  check('архив: даты файлов читаются', zipEntries.every((e) => e.lastModified instanceof Date), `${zipEntries.length} записей`);
+  const sidecarJson = JSON.parse((await zipOverFile.readEntryBuffer(sidecarEntry)).toString('utf8'));
+  check('архив: сайдкар читается и в нём дата съёмки', sidecarJson.photoTakenTime?.timestamp === '1519999200');
+  check('архив: имя сайдкара — имя файла плюс суффикс', sidecarEntry.name === `${photoEntry.name}.supplemental-metadata.json`);
+
+  // файл без EXIF (скриншот) + дата и координаты из сайдкара
+  const shot = join(dir, 'screenshot.png');
+  writeFileSync(shot, Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000a49444154789c6300010000050001', 'hex'));
+  const shotAsset = await seed('screenshot.png', 'image/png', shot, 'FILES');
+  await media.captureAny(shotAsset.assetId, shotAsset.sha256, shotAsset.size, 'image/png');
+  const beforeFill = await prisma.mediaMeta.findUnique({ where: { assetId: shotAsset.assetId } });
+  check('скриншот: EXIF нет — даты нет', !beforeFill?.capturedAt);
+  const takenDate = new Date(Number(sidecarJson.photoTakenTime.timestamp) * 1000);
+  await media.fillDateAndGeo(shotAsset.assetId, takenDate, {
+    latitude: sidecarJson.geoData.latitude,
+    longitude: sidecarJson.geoData.longitude,
+  });
+  const filled = await prisma.mediaMeta.findUnique({ where: { assetId: shotAsset.assetId } });
+  check('скриншот: дата съёмки взята из сайдкара', filled?.capturedAt?.toISOString() === takenDate.toISOString(), String(filled?.capturedAt));
+  check('скриншот: координаты из сайдкара', filled?.latitude === 55.75 && filled?.longitude === 37.61, `${filled?.latitude},${filled?.longitude}`);
+  // EXIF точнее сайдкара: уже найденную дату не перетираем
+  await media.fillDateAndGeo(image.assetId, new Date('1990-01-01T00:00:00Z'), { latitude: 1, longitude: 2 });
+  const kept = await prisma.mediaMeta.findUnique({ where: { assetId: image.assetId } });
+  check('EXIF не перетирается датой из архива', kept?.capturedAt?.toISOString().startsWith('2021-07-04') === true, String(kept?.capturedAt));
 
   // === не медиа: разбор не запускается ==================================================
   const other = join(dir, 'doc.txt');

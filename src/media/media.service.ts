@@ -301,6 +301,31 @@ export class MediaService {
     await this.extractDetail(assetId, sha256, size, mime).catch(() => undefined);
   }
 
+  /**
+   * Проставить дату съёмки и координаты, если разбор их не нашёл. Нужно для файлов без EXIF
+   * (скриншоты, картинки из мессенджеров) и для видео без creation_time: иначе у них нет даты
+   * вообще, и в ленте они не появляются. Уже найденные значения не перетираем: EXIF и ffprobe
+   * точнее, чем дата из архива или сайдкара.
+   */
+  async fillDateAndGeo(
+    assetId: string,
+    capturedAt: Date | null,
+    geo?: { latitude: number; longitude: number } | null,
+  ): Promise<void> {
+    if (!capturedAt && !geo) return;
+    const known = await this.prisma.mediaMeta
+      .findUnique({ where: { assetId }, select: { capturedAt: true, latitude: true, longitude: true } })
+      .catch(() => null);
+    const patch = {
+      ...(known?.capturedAt || !capturedAt ? {} : { capturedAt }),
+      ...(known?.latitude != null || !geo ? {} : { latitude: geo.latitude, longitude: geo.longitude }),
+    };
+    if (!Object.keys(patch).length) return;
+    await this.prisma.mediaMeta
+      .upsert({ where: { assetId }, create: { assetId, capturedAt, ...(geo ?? {}) }, update: patch })
+      .catch(() => undefined);
+  }
+
   /** Уже разбирали этот ассет: второй раз в S3 за тем же не ходим. */
   private async metaAlreadyParsed(assetId: string): Promise<boolean> {
     const known = await this.prisma.mediaMeta

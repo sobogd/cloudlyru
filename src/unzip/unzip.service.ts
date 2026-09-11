@@ -81,14 +81,65 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Дата съёмки и координаты из сайдкара Google Takeout. Сайдкар лежит рядом с файлом и
+   * называется `<имя файла>.supplemental-metadata.json` (в старых выгрузках — `<имя>.json`).
+   * Без него у импортированной библиотеки нет ни даты, ни места: в самом архиве дата —
+   * это время упаковки, а EXIF есть не у всех снимков.
+   */
+  private async takeoutDate(
+    zip: RemoteZip,
+    sidecars: Map<string, ZipEntryInfo>,
+    entryName: string,
+  ): Promise<{ date: Date | null; geo: { latitude: number; longitude: number } | null } | null> {
+    const dir = entryName.includes('/') ? entryName.slice(0, entryName.lastIndexOf('/') + 1) : '';
+    const base = entryName.slice(dir.length);
+    for (const candidate of [`${entryName}.supplemental-metadata.json`, `${entryName}.json`, `${dir}${base}.supplemental-metadata.json`]) {
+      const sidecar = sidecars.get(candidate);
+      if (!sidecar || sidecar.uncompressedSize > 1_000_000) continue;
+      try {
+        const parsed = JSON.parse((await zip.readEntryBuffer(sidecar)).toString('utf8')) as {
+          photoTakenTime?: { timestamp?: string };
+          geoData?: { latitude?: number; longitude?: number };
+        };
+        const seconds = Number(parsed.photoTakenTime?.timestamp);
+        const date = Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000) : null;
+        const lat = Number(parsed.geoData?.latitude);
+        const lon = Number(parsed.geoData?.longitude);
+        const geo =
+          Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && (lat !== 0 || lon !== 0)
+            ? { latitude: lat, longitude: lon }
+            : null;
+        return { date, geo };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Метаданные медиафайлов из архива: EXIF фото и ffprobe видео. Идём по списку по одному —
    * так разбор не отбирает процессор у самой распаковки и у API, и не плодит параллельные ffprobe.
    */
-  private async collectMeta(items: Array<{ assetId: string; sha256: string; size: number; mime: string }>): Promise<void> {
+  private async collectMeta(
+    items: Array<{
+      assetId: string;
+      sha256: string;
+      size: number;
+      mime: string;
+      date: Date | null;
+      geo: { latitude: number; longitude: number } | null;
+    }>,
+  ): Promise<void> {
     let done = 0;
     for (const item of items) {
       try {
         await this.media.captureAny(item.assetId, item.sha256, item.size, item.mime);
+        // EXIF/контейнер даты не дали (скриншот, мессенджер, вырезанные теги) — берём
+        // дату и координаты из сайдкара Takeout или из даты файла
+        if (item.date || item.geo) {
+          await this.media.fillDateAndGeo(item.assetId, item.date, item.geo);
+        }
         done += 1;
       } catch (e) {
         this.logger.debug(`метаданные из архива пропущены: ${(e as Error).message}`);
@@ -313,6 +364,10 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
 
     const all = await zip.entries();
     const files = all.filter((e) => !e.isDirectory);
+    // Google Takeout кладёт рядом с каждым фото и видео сайдкар с датой съёмки и координатами.
+    // Дата самого файла в архиве — время упаковки архива, поэтому брать её нельзя.
+    const sidecars = new Map(all.filter((e) => !e.isDirectory && /\.json$/i.test(e.name)).map((e) => [e.name, e]));
+    const isTakeout = files.some((e) => e.name.startsWith('Takeout/'));
     const totalBytes = files.reduce((s, e) => s + e.uncompressedSize, 0);
     // последовательное чтение по возрастанию смещения — меньше Range-запросов
     files.sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
@@ -410,7 +465,15 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     /** Медиа зоны «Фото» — ставим в очередь конвертации после распаковки (см. конец цикла). */
     const pendingMedia: Array<{ assetId: string; sha256: string; mime: string }> = [];
     // Фото и видео из архива: метаданные разбираем после распаковки, из локальных файлов
-    const pendingMeta: Array<{ assetId: string; sha256: string; size: number; mime: string }> = [];
+    /** Фото и видео из архива: метаданные и дата съёмки из сайдкаров — после распаковки */
+    const pendingMeta: Array<{
+      assetId: string;
+      sha256: string;
+      size: number;
+      mime: string;
+      date: Date | null;
+      geo: { latitude: number; longitude: number } | null;
+    }> = [];
     if (startIndex > 0) {
       this.logger.log(
         `распаковка ${jobId}: продолжаем с файла ${startIndex + 1} из ${files.length} (${(doneBytes / 1e9).toFixed(1)} ГБ уже сделано)`,
@@ -486,8 +549,15 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       const createdName = existing ? await this.uniqueName(folderId, fileName) : fileName;
       // через FilesService.createEntry: зона берётся у папки-приёмника, запись в дереве и
       // событие журнала идут одной транзакцией (раньше здесь была своя копия этой логики)
+      // дата съёмки: сначала сайдкар Takeout, иначе дата файла из архива (у Takeout это время
+      // упаковки, поэтому для него архивную дату не берём)
+      const taken = await this.takeoutDate(zip, sidecars, e.name);
+      const fileDate = taken?.date ?? (isTakeout ? null : e.lastModified);
+
       await this.files.createEntry(folderId, createdName, assetId, {
         userId: ownerId ?? undefined,
+        // без этого у всего импорта остаётся только дата импорта, а «дата файла» теряется
+        clientMtime: fileDate,
         asset: { sha256, size: realSize, mime },
       });
 
@@ -498,7 +568,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       // Метаданные — любому фото и видео, независимо от зоны. Разбираем фоном и по одному:
       // ffprobe на каждый файл внутри распаковки заметно удлинил бы импорт.
       if (IMAGE_MIMES.includes(mime) || VIDEO_MIMES.includes(mime)) {
-        pendingMeta.push({ assetId, sha256, size: realSize, mime });
+        pendingMeta.push({ assetId, sha256, size: realSize, mime, date: fileDate, geo: taken?.geo ?? null });
       }
 
       doneEntries += 1;
