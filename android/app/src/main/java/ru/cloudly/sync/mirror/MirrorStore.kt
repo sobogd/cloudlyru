@@ -269,6 +269,9 @@ class MirrorStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
         /** Автоматические проходы выключены пользователем (ручная сверка работает). */
         const val KEY_PAUSED = "paused"
 
+        /** Мгновенный режим включён: постоянный сервис держит процесс и уведомление висит. */
+        const val KEY_LIVE = "live_always"
+
         const val KEY_DEVICE_ID = "device_id"
 
         private const val NAME = "cloudly-mirror.db"

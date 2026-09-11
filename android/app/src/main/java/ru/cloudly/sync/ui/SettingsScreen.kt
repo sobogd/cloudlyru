@@ -1,5 +1,7 @@
 package ru.cloudly.sync.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -27,6 +29,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -44,6 +48,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -52,6 +57,7 @@ import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Selection
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.mirror.MirrorScheduler
+import ru.cloudly.sync.mirror.MirrorService
 import ru.cloudly.sync.mirror.MirrorStore
 import ru.cloudly.sync.net.AppRelease
 import ru.cloudly.sync.update.Updater
@@ -93,6 +99,11 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
     var mirrorBusy by remember { mutableStateOf(false) }
     var mirrorNote by remember { mutableStateOf("") }
     var mirrorPaused by remember { mutableStateOf(app.mirrorStore.meta(MirrorStore.KEY_PAUSED) == "1") }
+    var liveAlways by remember { mutableStateOf(MirrorService.isEnabled(context)) }
+
+    // Android 13+ без разрешения на уведомления сервис работает, но уведомление не покажет —
+    // а именно оно делает режим честным, поэтому спрашиваем разрешение при включении
+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     fun refreshMirrorState() {
         mirrorReport = app.mirrorStore.meta(MirrorStore.KEY_REPORT).orEmpty()
@@ -125,14 +136,27 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
         }
     }
 
+    fun setLiveAlways(on: Boolean) {
+        liveAlways = on
+        MirrorService.setEnabled(context, on)
+        if (on && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     fun setMirrorPaused() {
         if (mirrorPaused) {
             app.mirrorStore.setMeta(MirrorStore.KEY_PAUSED, "1")
             MirrorScheduler.cancel(context)
+            MirrorService.stop(context)
         } else {
             app.mirrorStore.clearMeta(MirrorStore.KEY_PAUSED)
             MirrorScheduler.schedulePeriodic(context)
             app.refreshMirrorWatch()
+            if (liveAlways) MirrorService.start(context)
         }
     }
 
@@ -384,13 +408,25 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
                             onClick = { mirrorPaused = !mirrorPaused; setMirrorPaused() },
                         ) { Text(if (mirrorPaused) "включить" else "выключить") }
                     }
+                    OutlinedButton(
+                        enabled = app.prefs.token.isNotBlank() && !mirrorPaused,
+                        onClick = { setLiveAlways(!liveAlways) },
+                    ) {
+                        Text(if (liveAlways) "Мгновенно: включено — выключить" else "Мгновенно всегда: включить")
+                    }
                     Text(
-                        if (mirrorPaused) {
-                            "Зеркало выключено: автоматические проходы не запускаются."
-                        } else {
-                            "Пока приложение работает, изменения уезжают за пару секунд и правки " +
-                                "из облака приезжают так же. Когда система выгрузит приложение " +
-                                "из памяти — страховочный проход раз в 15 минут."
+                        when {
+                            mirrorPaused -> "Зеркало выключено: автоматические проходы не запускаются."
+                            liveAlways ->
+                                "Изменения уезжают за пару секунд, правки из облака приезжают так же — " +
+                                    "и когда приложение открыто, и когда оно выгружено из памяти. " +
+                                    "За это в статусбаре висит уведомление: без него Android не разрешает " +
+                                    "долгоживущий фоновый процесс."
+                            else ->
+                                "Мгновенно, пока приложение работает. Когда система выгрузит его " +
+                                    "из памяти — страховочный проход раз в 15 минут (чаще задания " +
+                                    "Android не разрешает). Чтобы было мгновенно всегда, включите " +
+                                    "режим с уведомлением."
                         },
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

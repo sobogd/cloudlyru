@@ -12,9 +12,14 @@
     <!-- Обновление по кнопке: приложение скачивает свою новую сборку и отдаёт её системному
          установщику. Сама установка всё равно подтверждается диалогом системы. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-    <!-- Периодическое задание зеркала переживает перезагрузку (JobScheduler setPersisted):
-         без этого разрешения задание пришлось бы заводить заново после каждого включения. -->
+    <!-- Периодическое задание зеркала переживает перезагрузку (JobScheduler setPersisted),
+         а получатель перезагрузки поднимает сервис: без этого разрешения и задание, и сервис
+         пришлось бы заводить заново после каждого включения телефона. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Мгновенный режим: постоянный сервис и его уведомление (см. MirrorService). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".App"
@@ -42,6 +47,25 @@
             android:name=".mirror.MirrorJobService"
             android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- Возврат зеркала к жизни: ни сервис, ни задание перезагрузку не переживают,
+             поэтому после неё (и после обновления приложения) они ставятся заново. -->
+        <receiver
+            android:name=".mirror.MirrorBootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Мгновенный режим: постоянный сервис с уведомлением держит процесс живым, пока
+             приложение выгружено из памяти. Уведомление — обязательная цена: без него Android
+             долгоживущий фоновый процесс не разрешает. -->
+        <service
+            android:name=".mirror.MirrorService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- «Выбрать файл» из чужого приложения: отвечаем на системный запрос своим экраном,
              без прослойки системного выборщика. Отдаём ссылку на провайдера документов. -->

@@ -12,6 +12,7 @@ import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.mirror.MirrorEngine
 import ru.cloudly.sync.mirror.MirrorLive
 import ru.cloudly.sync.mirror.MirrorScheduler
+import ru.cloudly.sync.mirror.MirrorService
 import ru.cloudly.sync.mirror.MirrorStore
 import ru.cloudly.sync.mirror.MirrorWatcher
 import ru.cloudly.sync.net.Api
@@ -80,6 +81,8 @@ class App : Application() {
         // периодический проход: наблюдатель за файлами только ускоряет, но не заменяет его —
         // после выгрузки процесса наблюдать некому
         MirrorScheduler.schedulePeriodic(this)
+        // мгновенный режим: постоянный сервис держит процесс живым, пока приложение выгружено
+        if (MirrorService.isEnabled(this)) MirrorService.start(this)
         runCatching { mirrorWatcher.watch(selection.paths(Section.FILES)) }
         mirrorLive.start()
     }
