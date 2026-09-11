@@ -1,9 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">CloudlyRu Sync</string>
-    <string name="channel_sync">Синхронизация</string>
-    <string name="channel_sync_desc">Загрузка файлов в облако</string>
-    <string name="share_title">Загрузить в облако</string>
-    <string name="channel_problems">Проблемы синхронизации</string>
-    <string name="channel_problems_desc">Что не уехало в облако и где нужна проверка</string>
+    <string name="app_name">Cloudly</string>
 </resources>

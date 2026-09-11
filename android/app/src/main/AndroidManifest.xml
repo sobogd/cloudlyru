@@ -4,19 +4,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- «Доступ ко всем файлам»: без него не видно корень Download и произвольные папки.
+    <!-- «Доступ ко всем файлам»: без него не видно ни дерева папок, ни содержимого разделов.
          Приложение личное, поставляется APK-ом, в Google Play не идёт (см. ANDROID.md). -->
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Пользователь сам решает, отключать ли оптимизацию батареи: на агрессивных
-         прошивках без этого фоновые задачи убиваются (см. dontkillmyapp.com). -->
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- Обновление по кнопке: приложение скачивает свою новую сборку и отдаёт её системному
          установщику. Сама установка всё равно подтверждается диалогом системы. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -39,46 +31,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <!-- Приём файлов из «Поделиться»: приложение появляется в системном списке -->
-        <activity
-            android:name=".ui.ShareActivity"
-            android:exported="true"
-            android:label="@string/share_title"
-            android:excludeFromRecents="true">
-            <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="*/*" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.SEND_MULTIPLE" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="*/*" />
-            </intent-filter>
-        </activity>
-
-        <!-- Файловый браузер средствами системы: папки облака видны в «Файлах» и в диалогах
-             сохранения. Права MANAGE_DOCUMENTS у провайдера — требование Android. -->
-        <provider
-            android:name=".docs.CloudlyDocumentsProvider"
-            android:authorities="ru.cloudly.sync.documents"
-            android:exported="true"
-            android:grantUriPermissions="true"
-            android:label="@string/app_name"
-            android:permission="android.permission.MANAGE_DOCUMENTS">
-            <intent-filter>
-                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
-            </intent-filter>
-        </provider>
-
-        <!-- Короткий dataSync-сервис: живёт только на время активной передачи.
-             Android 15 ограничивает этот тип 6 часами за сутки — поэтому фон в основном
-             работает через WorkManager, а сервис включается для больших пачек. -->
-        <service
-            android:name=".work.SyncService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
 
         <!-- Скачанный APK уходит системному установщику через content-ссылку: файловые
              пути (file://) начиная с Android 7 установщику не отдаются вовсе. -->

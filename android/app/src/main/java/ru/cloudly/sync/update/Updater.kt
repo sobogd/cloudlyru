@@ -8,8 +8,8 @@ import android.provider.Settings
 import androidx.core.content.FileProvider
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import ru.cloudly.sync.device.Hasher
 import ru.cloudly.sync.net.AppRelease
-import ru.cloudly.sync.sync.Hasher
 import java.io.File
 import java.util.concurrent.TimeUnit
 
