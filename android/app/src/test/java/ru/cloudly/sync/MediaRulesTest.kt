@@ -71,4 +71,16 @@ class MediaRulesTest {
         assertEquals("1.5 МБ", MediaRules.formatSize(1024L * 1024 * 3 / 2))
         assertEquals("2.0 ГБ", MediaRules.formatSize(2L * 1024 * 1024 * 1024))
     }
+
+    /** Чужое приложение просит конкретный тип: показывать ему что-то другое нельзя. */
+    @Test
+    fun requestFilterMatchesOnlyWhatWasAsked() {
+        assertTrue(MediaRules.matchesRequest("image/*", "image/jpeg"))
+        assertFalse("просили картинку, а это видео", MediaRules.matchesRequest("image/*", "video/mp4"))
+        assertTrue(MediaRules.matchesRequest("application/pdf", "application/pdf"))
+        assertFalse(MediaRules.matchesRequest("application/pdf", "image/png"))
+        assertTrue("все типы — показываем всё", MediaRules.matchesRequest("*/" + "*", "video/mp4"))
+        assertTrue(MediaRules.matchesRequest(null, "video/mp4"))
+        assertFalse("тип неизвестен, а просили конкретный", MediaRules.matchesRequest("image/*", ""))
+    }
 }

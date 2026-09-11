@@ -48,6 +48,19 @@ object MediaRules {
     /** Имена на точку не показываем: это `.nomedia`, `.thumbnails`, чужой служебный мусор. */
     fun isHidden(name: String): Boolean = name.startsWith(".")
 
+    /**
+     * Подходит ли файл под запрос чужого приложения. Приложение, которое просит файл, указывает
+     * тип: картинки, PDF, видео или вообще любой. Показывать в таком выборе видео, когда просили
+     * картинку, — значит гарантированно получить отказ у получателя.
+     */
+    fun matchesRequest(requested: String?, mime: String): Boolean {
+        val want = requested?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        if (want.isEmpty() || want == "*/*") return true
+        val have = mime.trim().lowercase(Locale.ROOT)
+        if (have.isEmpty()) return false
+        return if (want.endsWith("/*")) have.startsWith(want.removeSuffix("*")) else have == want
+    }
+
     fun isJunk(name: String): Boolean = JUNK_SUFFIX.any { name.endsWith(it, ignoreCase = true) }
 
     /**

@@ -277,6 +277,13 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         /** Authority провайдера: тот же, что в манифесте. */
         const val AUTHORITY = "ru.cloudly.sync.documents"
 
+        /**
+         * Ссылка на файл облака для чужого приложения: `content://ru.cloudly.sync.documents/document/f:<id>`.
+         * По ней работает и системный выборщик, и наша activity выбора файла.
+         */
+        fun fileUri(entryId: String): android.net.Uri =
+            android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "$FILE_PREFIX$entryId")
+
         private const val ROOT_ID = "cloudly"
         const val ROOT_DOC_ID = "root"
         private const val FILE_PREFIX = "f:"
