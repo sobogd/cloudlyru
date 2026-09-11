@@ -16,6 +16,7 @@ import { QueueModule } from './queue/queue.module';
 import { HealthModule } from './health/health.module';
 import { UnzipModule } from './unzip/unzip.module';
 import { SyncModule } from './sync/sync.module';
+import { ReleaseModule } from './release/release.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { SyncModule } from './sync/sync.module';
     HealthModule,
     UnzipModule,
     SyncModule,
+    ReleaseModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },

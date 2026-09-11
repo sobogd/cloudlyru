@@ -1,101 +1,152 @@
-// Публикация APK в личное облако владельца: файл лежит в папке apk и скачивается по обычной
-// авторизованной ссылке /api/v1/files/<entryId>/content (в браузере, где открыта сессия
-// владельца). Если файл с таким именем уже есть, новая версия заменяет его: ссылка не меняется.
+// Публикация сборки Android-клиента: файл ложится в релизный артефакт S3
+// (release/android/), откуда его отдаёт постоянная ссылка https://files.iq-factura.com/apk.
 //
-// Токен выпускается на время публикации и сразу отзывается: постоянных секретов у скрипта нет.
-// Запуск:  node --env-file=$HOME/work/.env scripts/publish-apk.mjs android/app/build/outputs/apk/release/app-release.apk
-import { readFileSync } from 'node:fs';
+// Рядом с APK пишется latest.json — версия, размер, sha256. По нему приложение понимает,
+// что вышла новая версия (GET /api/v1/app/android), а /apk всегда отдаёт последнюю сборку.
+//
+// Ключи S3 берутся из окружения (S3_FILES_*), никаких других секретов скрипту не нужно:
+//   node --env-file=$HOME/work/.env scripts/publish-apk.mjs [путь-к-apk] [--dry-run] [--force]
+//
+// Защита от «обновления назад»: versionCode новой сборки обязан быть больше опубликованного.
+// Повторная публикация тех же самых байтов (перезапуск сборки) проходит молча.
 import { createHash } from 'node:crypto';
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { S3Client, PutObjectCommand, GetObjectCommand, NoSuchKey } from '@aws-sdk/client-s3';
 
-const API = process.env.CLOUDLY_API || 'https://files.iq-factura.com/api/v1';
-const login = process.env.CLOUDLY_ADMIN_LOGIN || 'admin';
-const password = process.env.CLOUDLY_ADMIN_PASSWORD;
-const file = process.argv[2];
-const remoteName = process.argv[3] || 'cloudlyru-sync.apk';
-const remotePath = process.argv[4] || 'apk';
+const APK_KEY = 'release/android/cloudlyru-sync.apk';
+const META_KEY = 'release/android/latest.json';
+const APK_MIME = 'application/vnd.android.package-archive';
+const PUBLIC_URL = (process.env.CLOUDLY_BASE_URL || 'https://files.iq-factura.com').replace(/\/+$/, '') + '/apk';
 
-if (!password) throw new Error('нужен CLOUDLY_ADMIN_PASSWORD (запускайте через node --env-file)');
-if (!file) throw new Error('укажите путь к APK');
+const args = process.argv.slice(2);
+const flags = new Set(args.filter((a) => a.startsWith('--')));
+const positional = args.filter((a) => !a.startsWith('--'));
+const apkPath = resolve(positional[0] || 'android/app/build/outputs/apk/release/app-release.apk');
+const dryRun = flags.has('--dry-run');
+const force = flags.has('--force');
 
-const apk = readFileSync(file);
+if (!existsSync(apkPath)) throw new Error(`нет файла сборки: ${apkPath}`);
+
+const { accessKeyId, secretAccessKey, endpoint, region, bucket, prefix } = {
+  accessKeyId: process.env.S3_FILES_ACCESS_KEY,
+  secretAccessKey: process.env.S3_FILES_SECRET_KEY,
+  endpoint: process.env.S3_FILES_ENDPOINT || 'https://nbg1.your-objectstorage.com',
+  region: process.env.S3_FILES_REGION || 'nbg1',
+  bucket: process.env.S3_FILES_BUCKET || 'cloudlyru',
+  prefix: normalizePrefix(process.env.S3_FILES_PREFIX || ''),
+};
+if (!accessKeyId || !secretAccessKey) {
+  throw new Error('нужны S3_FILES_ACCESS_KEY / S3_FILES_SECRET_KEY (запускайте через node --env-file)');
+}
+
+function normalizePrefix(raw) {
+  const p = raw.trim().replace(/^\/+/, '').replace(/\/+$/, '');
+  return p ? `${p}/` : '';
+}
+
+const key = (k) => prefix + k;
+
+/** versionCode/versionName сборки: их пишет AGP рядом с APK в output-metadata.json. */
+function readVersion(file) {
+  const metaPath = join(dirname(file), 'output-metadata.json');
+  if (!existsSync(metaPath)) {
+    throw new Error(
+      `рядом с APK нет ${metaPath} — не знаю versionCode. Соберите через ./gradlew :app:assembleRelease`,
+    );
+  }
+  const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+  const element = (meta.elements || [])[0] || {};
+  if (typeof element.versionCode !== 'number') throw new Error('в output-metadata.json нет versionCode');
+  return {
+    applicationId: String(meta.applicationId || ''),
+    versionCode: element.versionCode,
+    versionName: String(element.versionName || ''),
+    minSdk: Number(meta.minSdkVersionForDexing || 0),
+  };
+}
+
+const apk = readFileSync(apkPath);
 const sha256 = createHash('sha256').update(apk).digest('hex');
-console.log(`APK: ${file}, ${(apk.length / 1048576).toFixed(1)} МБ, sha256 ${sha256.slice(0, 16)}…`);
+const version = readVersion(apkPath);
 
-const loginRes = await fetch(`${API}/auth/login`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json', Origin: API.replace(/\/api\/v1$/, '') },
-  body: JSON.stringify({ login, password }),
+const s3 = new S3Client({
+  region,
+  endpoint,
+  // как в приложении: у Hetzner Object Storage путь в стиле S3 (/bucket/key)
+  forcePathStyle: (process.env.S3_FILES_FORCE_PATH_STYLE || 'true') !== 'false',
+  credentials: { accessKeyId, secretAccessKey },
 });
-if (!loginRes.ok) throw new Error(`вход не прошёл: HTTP ${loginRes.status} ${await loginRes.text()}`);
-const cookie = (loginRes.headers.getSetCookie?.() || [])[0]?.split(';')[0] || '';
-const session = { Cookie: cookie };
 
-const created = await (
-  await fetch(`${API}/auth/tokens`, {
-    method: 'POST',
-    headers: { ...session, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label: 'publish-apk' }),
-  })
-).json();
+async function readPublished() {
+  try {
+    const out = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key(META_KEY) }));
+    const text = await out.Body.transformToString();
+    return JSON.parse(text);
+  } catch (e) {
+    if (e instanceof NoSuchKey || e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) return null;
+    throw e;
+  }
+}
 
-const auth = { Authorization: `Bearer ${created.token}` };
-try {
-  const root = await (await fetch(`${API}/folders`, { headers: auth })).json();
-  const folderId = (
-    await (
-      await fetch(`${API}/folders/ensure-path`, {
-        method: 'POST',
-        headers: { ...auth, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: remotePath, parentId: root.parentId }),
-      })
-    ).json()
-  ).id;
-  if (!folderId) throw new Error(`не удалось получить папку ${remotePath}`);
-
-  const children = await (await fetch(`${API}/folders/${folderId}/children`, { headers: auth })).json();
-  const existing = (children.entries || []).find((e) => e.name === remoteName);
-
-  const init = await (
-    await fetch(`${API}/uploads`, {
-      method: 'POST',
-      headers: { ...auth, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        folderId,
-        name: remoteName,
-        size: apk.length,
-        mime: 'application/vnd.android.package-archive',
-        sha256,
-        mode: 'relay',
-        replace: Boolean(existing),
-        ...(existing ? { expectedSha256: existing.sha256 } : {}),
-      }),
-    })
-  ).json();
-  if (init.error) throw new Error(`init: ${JSON.stringify(init)}`);
-  if (init.deduped) {
-    console.log(`содержимое уже в облаке, запись: ${init.entry?.id}`);
+const published = await readPublished();
+console.log(
+  `сборка: ${version.versionName} (versionCode ${version.versionCode}), ` +
+    `${(apk.length / 1048576).toFixed(1)} МБ, sha256 ${sha256.slice(0, 16)}…`,
+);
+if (published) {
+  console.log(
+    `опубликовано: ${published.versionName} (versionCode ${published.versionCode}), sha256 ${String(published.sha256).slice(0, 16)}…`,
+  );
+  // Совсем те же байты — повторный запуск сборки: публиковать нечего.
+  if (published.versionCode === version.versionCode && published.sha256 === sha256) {
+    console.log('эта сборка уже в релизе — публиковать нечего (телефон увидит её как текущую)');
     process.exit(0);
   }
-
-  const chunk = await fetch(`${API}/uploads/${init.uploadId}/chunks/1`, {
-    method: 'PUT',
-    headers: { ...auth, 'Content-Type': 'application/octet-stream' },
-    body: apk,
-  });
-  if (!chunk.ok) throw new Error(`chunk: HTTP ${chunk.status} ${await chunk.text()}`);
-
-  const done = await (
-    await fetch(`${API}/uploads/${init.uploadId}/complete`, {
-      method: 'POST',
-      headers: { ...auth, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sha256 }),
-    })
-  ).json();
-  const entryId = done.entry?.id || init.entry?.id;
-  console.log(`готово: ${remoteName}${existing ? ' (обновлён)' : ''}`);
-  console.log(`ссылка: ${API}/files/${entryId}/content`);
-  console.log(`entryId: ${entryId}`);
-} finally {
-  // временный токен не должен остаться в списке устройств
-  await fetch(`${API}/auth/tokens/${created.id}`, { method: 'DELETE', headers: session });
+  // versionCode — единственное, по чему телефон понимает, что вышло обновление. Сборка
+  // с тем же или меньшим номером ляжет по ссылке, но кнопка «Обновить» её не увидит,
+  // и обновиться получится только руками — это и есть та возня, от которой уходим.
+  if (published.versionCode >= version.versionCode) {
+    if (!force) {
+      throw new Error(
+        `в релизе уже versionCode ${published.versionCode}: поднимите versionCode/versionName ` +
+          'в android/app/build.gradle.kts, иначе телефон это обновлением не увидит ' +
+          '(или передайте --force, если публикуете осознанно)',
+      );
+    }
+    console.warn(
+      `--force: публикую сборку с versionCode ${version.versionCode} поверх ${published.versionCode} — ` +
+        'в приложении она как обновление не появится',
+    );
+  }
 }
+
+const meta = {
+  ...version,
+  size: apk.length,
+  sha256,
+  builtAt: new Date().toISOString(),
+  url: PUBLIC_URL,
+};
+
+if (dryRun) {
+  console.log(`--dry-run: залил бы ${key(APK_KEY)} (${apk.length} Б) и ${key(META_KEY)}`);
+  console.log(`ссылка была бы: ${PUBLIC_URL}`);
+  process.exit(0);
+}
+
+await s3.send(
+  new PutObjectCommand({ Bucket: bucket, Key: key(APK_KEY), Body: apk, ContentType: APK_MIME }),
+);
+console.log(`залито: s3://${bucket}/${key(APK_KEY)}`);
+await s3.send(
+  new PutObjectCommand({
+    Bucket: bucket,
+    Key: key(META_KEY),
+    Body: Buffer.from(JSON.stringify(meta, null, 2) + '\n', 'utf8'),
+    ContentType: 'application/json; charset=utf-8',
+  }),
+);
+console.log(`залито: s3://${bucket}/${key(META_KEY)}`);
+console.log(`последняя сборка всегда здесь: ${PUBLIC_URL}`);
+console.log(`версия для проверки обновления: ${PUBLIC_URL.replace(/\/apk$/, '')}/api/v1/app/android`);

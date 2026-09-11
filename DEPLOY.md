@@ -59,7 +59,27 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 # логин: ADMIN_LOGIN/CLOUDLY_ADMIN_PASSWORD из ~/work/.env
 ```
 
-## Отдать файл по ссылке (APK, дамп и т.п.)
+## Android-клиент: постоянная ссылка на последнюю сборку
+
+`https://files.iq-factura.com/apk` отдаёт последнюю опубликованную сборку APK (ручки `/apk`
+и `/apk/version` в `src/release/`). Байты лежат в релизном артефакте S3
+(`release/android/cloudlyru-sync.apk`), рядом — `latest.json` с версией, размером и sha256:
+по нему приложение понимает, что вышло обновление (`GET /api/v1/app/android`).
+
+Публикация — push в `main` по `android/**` (workflow `.github/workflows/android.yml`), вручную
+нужен только поднятый `versionCode` в `android/app/build.gradle.kts`. Ручная публикация уже
+собранного APK:
+
+```bash
+node --env-file=$HOME/work/.env scripts/publish-apk.mjs \
+  android/app/build/outputs/apk/release/app-release.apk     # --dry-run: только показать
+```
+
+Секреты репозитория для этой сборки: `ANDROID_KEYSTORE_BASE64` (файл
+`~/.cloudly-android-release.jks` в base64), `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`,
+`ANDROID_KEY_PASSWORD`; S3-ключи берутся из уже установленных `S3_FILES_*`.
+
+## Отдать произвольный файл по ссылке (дамп и т.п.)
 
 ```bash
 cd /home/deploy/apps/cloudlyru   # или локально, где есть node_modules приложения
@@ -67,8 +87,8 @@ set -a; . .env; set +a
 export S3_FILES_BUCKET=cloudlyru S3_FILES_ENDPOINT=https://nbg1.your-objectstorage.com S3_FILES_REGION=nbg1
 
 # загрузить и получить временную ссылку (максимум 7 суток — ограничение S3)
-node deploy/scripts/s3-upload.mjs app-release.apk dist/cloudlyru-sync.apk application/vnd.android.package-archive
-node deploy/scripts/s3-presign.mjs dist/cloudlyru-sync.apk 604800
+node deploy/scripts/s3-upload.mjs dump.sql.gz dist/dump.sql.gz application/gzip
+node deploy/scripts/s3-presign.mjs dist/dump.sql.gz 604800
 ```
 
 Ссылка подписанная: кто её получил — скачает файл, пока не истёк срок. Бакет при этом остаётся

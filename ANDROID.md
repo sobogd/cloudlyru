@@ -69,6 +69,7 @@ android/app/src/main/java/ru/cloudly/sync/
   sync/PendingUploads.kt сохранённое из браузера, что не уехало: ждёт и догружается проходом
   sync/MediaCleanup.kt чистка медиатеки после удаления файла пользователем
   docs/CloudlyDocumentsProvider.kt файловый браузер для системы
+  update/Updater.kt скачивание и установка новой сборки приложения (обновление по кнопке)
   ui/               главный экран, выбор папок, «Поделиться», «Освободить место»
   work/             периодический воркер, короткий dataSync-сервис, уведомления
 ```
@@ -204,10 +205,36 @@ JAVA_HOME=/opt/homebrew/opt/openjdk@21 ./gradlew :app:testDebugUnitTest :app:ass
 ```
 
 Релиз подписывается ключом `~/.cloudly-android-release.jks` через `android/keystore.properties`
-(в git не попадает), после R8 — около 2,8 МБ. Готовый APK публикуется в облако владельца
-(`scripts/publish-apk.mjs` → папка `apk`, файл `cloudlyru-sync.apk`); обновление заменяет файл,
-ссылка `/api/v1/files/<entryId>/content` не меняется. GitHub Actions собирает серверную часть,
-Android собирается локально на маке (CI для Android нет).
+(в git не попадает), после R8 — около 2,8 МБ.
+
+**Поставка.** Постоянная ссылка <https://files.iq-factura.com/apk> всегда отдаёт последнюю
+сборку: `scripts/publish-apk.mjs` кладёт APK и `latest.json` (версия, размер, sha256) в
+релизный артефакт S3 (`release/android/`), откуда их и отдаёт сервер. Файла сборки в дереве
+личных файлов владельца больше нет: это артефакт поставки, а не файл библиотеки.
+
+Публикация автоматическая: push в `main` по `android/**` запускает
+`.github/workflows/android.yml` — юнит-тесты, подписанный релиз, публикация. Единственное,
+что делает человек, — поднимает `versionCode` (`android/app/build.gradle.kts`): сборка с тем
+же номером не появится в приложении как обновление, и скрипт публикации такое отвергает.
+
+**Обновление в самом приложении.** На старте (и по кнопке «Проверить обновление») клиент
+спрашивает у сервера `GET /api/v1/app/android`, сравнивает `versionCode` со своим и, если
+на сервере новее, показывает карточку с кнопкой «Обновить»: APK скачивается по `/apk` в кэш
+приложения, проверяется по размеру и sha256 и уходит системному установщику через
+FileProvider (`ru.cloudly.sync.files`). Диалог установки система показывает в любом случае —
+тихая установка APK доступна только системным приложениям; всё остальное (браузер, поиск
+файла в «Загрузках», ручной выбор APK) из процесса убрано.
+
+Ручная публикация (например, чтобы перезалить уже собранный APK):
+
+```bash
+node --env-file=$HOME/work/.env scripts/publish-apk.mjs \
+  android/app/build/outputs/apk/release/app-release.apk          # --dry-run: только показать
+```
+
+GitHub Actions собирает серверную часть и Android; для Android в секретах репозитория лежат
+ключ подписи (base64) и его пароли: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+`ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`.
 
 ## Отложено
 

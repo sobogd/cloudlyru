@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
+import { RequestMethod } from '@nestjs/common';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import express from 'express';
@@ -11,7 +12,14 @@ import { env } from './config/env';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
-  app.setGlobalPrefix('api/v1');
+  // /apk — постоянная ссылка на последнюю сборку Android-клиента, её открывают в браузере
+  // и вбивают в телефон: префикс api/v1 тут только мешал бы.
+  app.setGlobalPrefix('api/v1', {
+    exclude: [
+      { path: 'apk', method: RequestMethod.GET },
+      { path: 'apk/version', method: RequestMethod.GET },
+    ],
+  });
   app.enableShutdownHooks();
 
   // nginx проксирует с 127.0.0.1 и подставляет X-Forwarded-For. Без trust proxy
@@ -36,7 +44,16 @@ async function bootstrap() {
       // доступ сканера к файлу, а приложение зря рендерило страницу.
       const last = req.path.split('/').pop() ?? '';
       const looksLikeAsset = last.includes('.');
-      if (req.method === 'GET' && !req.path.startsWith('/api/') && !looksLikeAsset && req.accepts('html')) {
+      // /apk — не страница приложения, а скачивание APK: без этой проверки браузер
+      // получал бы на неё index.html SPA.
+      const isApk = req.path === '/apk' || req.path.startsWith('/apk/');
+      if (
+        req.method === 'GET' &&
+        !req.path.startsWith('/api/') &&
+        !isApk &&
+        !looksLikeAsset &&
+        req.accepts('html')
+      ) {
         return res.sendFile(join(webDist, 'index.html'), (err?: Error) => {
           if (err) next(err);
         });
