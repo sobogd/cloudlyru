@@ -45,6 +45,9 @@ class MirrorScanner {
                 if (visited % 100 == 0) onProgress("просмотрено папок: $visited, файлов: ${files.size}")
                 for (child in children) {
                     if (isCancelled()) break
+                    // Символическая ссылка уводит за пределы выбранной папки: содержимое чужого
+                    // каталога уехало бы в облако как «файлы выбранной папки». Не ходим по ссылкам.
+                    if (isLink(child)) continue
                     if (child.isDirectory) {
                         if (MediaRules.skipDir(child.name, dir.name)) continue
                         queue.addLast(child to "$relDir/${child.name}")
@@ -73,6 +76,10 @@ class MirrorScanner {
         }
         return LocalSnapshot(files = files, dirs = dirs, unreadable = unreadable, capped = capped)
     }
+
+    /** Символическая ссылка (или жёсткая на каталог): обход по ней уводит за пределы выбора. */
+    private fun isLink(file: File): Boolean =
+        runCatching { java.nio.file.Files.isSymbolicLink(file.toPath()) }.getOrDefault(false)
 
     private companion object {
         /** Предел на всякий случай: снимок держится в памяти целиком. */

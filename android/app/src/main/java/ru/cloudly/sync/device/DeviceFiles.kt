@@ -81,7 +81,8 @@ class DeviceFiles(private val context: Context) {
         val dir = File(path)
         val children = dir.listFiles() ?: return emptyList()
         return children
-            .filter { it.isDirectory && !MediaRules.skipDir(it.name, dir.name) }
+            // по символическим ссылкам не ходим: они уводят за пределы выбранной папки
+            .filter { it.isDirectory && !isLink(it) && !MediaRules.skipDir(it.name, dir.name) }
             .map { it.absolutePath }
             .sortedBy { it.substringAfterLast('/').lowercase() }
     }
@@ -140,6 +141,7 @@ class DeviceFiles(private val context: Context) {
                 if (dirs % 50 == 0) onProgress("просмотрено папок: $dirs, найдено файлов: ${found.size}")
                 for (child in children) {
                     if (isCancelled()) break
+                    if (isLink(child)) continue
                     if (child.isDirectory) {
                         if (MediaRules.skipDir(child.name, dir.name)) continue
                         queue.addLast(child to "$relDir/${child.name}")
@@ -179,6 +181,10 @@ class DeviceFiles(private val context: Context) {
             capped = capped,
         )
     }
+
+    /** Символическая ссылка: обход по ней показал бы и выгрузил чужой каталог. */
+    private fun isLink(file: File): Boolean =
+        runCatching { java.nio.file.Files.isSymbolicLink(file.toPath()) }.getOrDefault(false)
 
     private companion object {
         /** Предел на всякий случай: 20 000 файлов в списке всё равно никто не листает. */
