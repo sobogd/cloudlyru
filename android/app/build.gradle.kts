@@ -23,8 +23,8 @@ android {
         targetSdk = 35
         // versionCode обязан расти с каждой публикацией: по нему приложение понимает,
         // что вышло обновление (scripts/publish-apk.mjs не опубликует сборку без роста).
-        versionCode = 29
-        versionName = "0.7.6"
+        versionCode = 30
+        versionName = "0.7.7"
     }
 
     signingConfigs {
