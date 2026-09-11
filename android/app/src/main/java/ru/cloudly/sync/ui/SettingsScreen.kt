@@ -1,8 +1,6 @@
 package ru.cloudly.sync.ui
 
-import android.content.Intent
 import android.os.Build
-import android.provider.Settings
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -53,8 +51,6 @@ import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Selection
 import ru.cloudly.sync.data.Section
-import ru.cloudly.sync.work.SyncService
-import ru.cloudly.sync.work.SyncState
 import ru.cloudly.sync.net.AppRelease
 import ru.cloudly.sync.update.Updater
 
@@ -81,10 +77,6 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
     var tokenField by remember { mutableStateOf(false) }
     var addressField by remember { mutableStateOf(false) }
     var access by remember { mutableStateOf(hasAllFilesAccess()) }
-    var state by remember { mutableStateOf("") }
-    val notificationPermission = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
-    ) { }
     var update by remember { mutableStateOf<AppRelease?>(null) }
     var updateNote by remember { mutableStateOf("") }
     var updating by remember { mutableStateOf(false) }
@@ -98,14 +90,6 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
         while (true) {
             access = hasAllFilesAccess()
             delay(1500)
-        }
-    }
-
-    // состояние сервиса показываем живьём: он работает в фоне и сам себя не объявит
-    LaunchedEffect(Unit) {
-        while (true) {
-            state = SyncState.summary(context)
-            delay(2000)
         }
     }
 
@@ -286,41 +270,6 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
                     }
                     if (status.isNotEmpty()) {
                         Text(status, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
-                    }
-                }
-            }
-
-            Text("Синхронизация в фоне", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        if (SyncService.running) "сервис работает" else "сервис остановлен",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 14.sp,
-                    )
-                    Text(state, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = {
-                            val runner = app.uploads
-                            if (runner.isPaused()) runner.resume() else runner.pause()
-                            status = if (runner.isPaused()) "пауза" else "продолжаю"
-                        }) { Text(if (app.uploads.isPaused()) "Продолжить" else "Пауза") }
-                        OutlinedButton(onClick = {
-                            SyncService.start(context)
-                            status = "сервис запущен"
-                        }) { Text("Запустить") }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = {
-                            runCatching {
-                                context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                            }
-                        }) { Text("Батарея") }
-                        OutlinedButton(onClick = {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                            }
-                        }) { Text("Уведомления") }
                     }
                 }
             }

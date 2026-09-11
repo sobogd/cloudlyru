@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -33,14 +35,11 @@ import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.queue.QueueRefresher
-import ru.cloudly.sync.work.SyncService
-import ru.cloudly.sync.work.SyncSignals
 
-/**
- * Что показывает приложение: очередь загрузки и настройки. Управления файлами здесь нет —
- * просмотр, правка и всё остальное живут в вебе; приложение выгружает и показывает очередь.
- */
+/** Что показывает приложение: два раздела файлов, очередь загрузки и настройки. */
 private enum class Tab(val label: String) {
+    FILES("Файлы"),
+    PHOTOS("Фото"),
     QUEUE("Очередь"),
     SETTINGS("Настройки"),
 }
@@ -61,21 +60,16 @@ private fun Root() {
     val context = LocalContext.current
     val app = remember { App.of(context) }
 
-    var tab by remember { mutableStateOf(Tab.QUEUE) }
+    var tab by remember { mutableStateOf(Tab.FILES) }
     // выбор папок — отдельный экран, а не диалог: дерево телефона в окне поверх не показать
     var folderSection by remember { mutableStateOf<Section?>(null) }
     var waiting by remember { mutableIntStateOf(0) }
-
-    // сервис синхронизации поднимаем при открытии приложения: он держит связь с сервером,
-    // наполняет очередь и выполняет команды веба
-    LaunchedEffect(Unit) { runCatching { SyncService.start(context) } }
 
     // Счётчик очереди и фоновое наполнение: очередь должна собираться сама, а запуск остаётся
     // ручным. Наполняем при старте и после каждого изменения выбора папок.
     LaunchedEffect(folderSection) {
         if (folderSection != null) return@LaunchedEffect
         withContext(Dispatchers.IO) { runCatching { QueueRefresher.refresh(context) } }
-        SyncSignals.requestReport()
         waiting = withContext(Dispatchers.IO) { app.queueStore.waitingCount() }
     }
     LaunchedEffect(Unit) {
@@ -93,6 +87,18 @@ private fun Root() {
     Scaffold(
         bottomBar = {
             NavigationBar {
+                NavigationBarItem(
+                    selected = tab == Tab.FILES,
+                    onClick = { tab = Tab.FILES },
+                    icon = { Icon(Icons.Filled.Folder, contentDescription = null) },
+                    label = { Text(Tab.FILES.label) },
+                )
+                NavigationBarItem(
+                    selected = tab == Tab.PHOTOS,
+                    onClick = { tab = Tab.PHOTOS },
+                    icon = { Icon(Icons.Filled.PhotoLibrary, contentDescription = null) },
+                    label = { Text(Tab.PHOTOS.label) },
+                )
                 NavigationBarItem(
                     selected = tab == Tab.QUEUE,
                     onClick = { tab = Tab.QUEUE },
@@ -116,6 +122,14 @@ private fun Root() {
     ) { padding ->
         Box(Modifier.padding(padding)) {
             when (tab) {
+                Tab.FILES -> FileListScreen(
+                    section = Section.FILES,
+                    onOpenFolders = { folderSection = Section.FILES },
+                )
+                Tab.PHOTOS -> FileListScreen(
+                    section = Section.PHOTOS,
+                    onOpenFolders = { folderSection = Section.PHOTOS },
+                )
                 Tab.QUEUE -> QueueScreen()
                 Tab.SETTINGS -> SettingsScreen(onOpenFolders = { folderSection = it })
             }

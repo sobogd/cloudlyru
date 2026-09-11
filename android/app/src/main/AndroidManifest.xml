@@ -12,14 +12,6 @@
     <!-- Обновление по кнопке: приложение скачивает свою новую сборку и отдаёт её системному
          установщику. Сама установка всё равно подтверждается диалогом системы. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-    <!-- Синхронизация живёт в постоянном сервисе: у телефона нет своего адреса, поэтому
-         состояние и команды он забирает сам, пока сервис работает. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <!-- Просьба не убивать сервис: на агрессивных прошивках иначе фон не работает. -->
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:name=".App"
@@ -55,25 +47,6 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
-
-        <!-- Постоянный сервис синхронизации. Тип specialUse, а не dataSync: dataSync
-             Android 15 гасит после шести часов в сутки, и «вечного» из него не выйдет. -->
-        <service
-            android:name=".work.SyncService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="синхронизация файлов пользователя с его собственным сервером" />
-        </service>
-
-        <receiver
-            android:name=".work.BootReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
 
         <!-- Облако в системном выборе файлов: «Файлы», диалоги сохранения и «прикрепить файл»
              в других приложениях. Провайдер только читает; права MANAGE_DOCUMENTS у него —

@@ -15,7 +15,6 @@ import ru.cloudly.sync.device.Hasher
 import ru.cloudly.sync.device.MediaRules
 import ru.cloudly.sync.net.Api
 import ru.cloudly.sync.net.ApiException
-import ru.cloudly.sync.work.SyncSignals
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -46,10 +45,6 @@ class UploadRunner(
     }
 
     private val busy = AtomicBoolean(false)
-
-    /** Пауза: текущая выгрузка прерывается, новые не начинаются, пока не снимут. */
-    @Volatile
-    private var paused = false
     private val folders = ConcurrentHashMap<String, String>()
 
     private val _progress = MutableStateFlow<Progress?>(null)
@@ -57,26 +52,12 @@ class UploadRunner(
 
     fun isBusy(): Boolean = busy.get()
 
-    fun isPaused(): Boolean = paused
-
-    fun pause() {
-        paused = true
-    }
-
-    fun resume() {
-        paused = false
-    }
-
     /** Кнопка «play» на строке: одна выгрузка за раз, интерфейс при этом не блокируется. */
     fun start(itemId: Long) {
-        if (paused) return
         if (!busy.compareAndSet(false, true)) return
         scope.launch {
             try {
                 upload(itemId)
-            } catch (e: UploadPaused) {
-                // пауза — не ошибка: строка возвращается в ожидание и продолжит по команде
-                withContext(Dispatchers.IO) { store.markPending(itemId) }
             } catch (e: Exception) {
                 Log.w(TAG, "выгрузка $itemId: ${e.message}")
                 withContext(Dispatchers.IO) {
@@ -86,7 +67,6 @@ class UploadRunner(
             } finally {
                 _progress.value = null
                 busy.set(false)
-                SyncSignals.requestReport()
             }
         }
     }
@@ -104,7 +84,6 @@ class UploadRunner(
         val size = file.length()
         val mtime = file.lastModified()
         withContext(Dispatchers.IO) { store.markRunning(itemId) }
-        SyncSignals.requestReport()
         _progress.value = Progress(itemId, item.name, 0, size)
 
         val sha = shaOf(item, file, size, mtime)
@@ -121,9 +100,8 @@ class UploadRunner(
                 val entryId = alreadyUploaded?.entryId ?: return
                 withContext(Dispatchers.IO) {
                     store.markSkipped(itemId, entryId)
-                    store.markUploaded(item.path, item.target, entryId, size, mtime, sha)
+                    store.markUploaded(item.path, item.target, entryId, size, mtime)
                 }
-                SyncSignals.requestReport()
                 Log.i(TAG, "уже в облаке: ${item.name}")
                 return
             }
@@ -134,9 +112,8 @@ class UploadRunner(
                 val result = send(item, folderId, file, sha, replace, serverSha?.takeIf { replace })
                 withContext(Dispatchers.IO) {
                     if (result.deduped) store.markSkipped(itemId, result.entryId) else store.markDone(itemId, result.entryId)
-                    store.markUploaded(item.path, item.target, result.entryId, size, mtime, sha)
+                    store.markUploaded(item.path, item.target, result.entryId, size, mtime)
                 }
-                SyncSignals.requestReport()
                 Log.i(TAG, "выгружено ${item.name}${if (result.deduped) " (содержимое уже было)" else ""}")
             }
         }
@@ -179,7 +156,6 @@ class UploadRunner(
                 onSession = {},
                 onProgress = progress,
                 forceRelay = viaRelay,
-                shouldStop = { paused },
             )
         }
 
