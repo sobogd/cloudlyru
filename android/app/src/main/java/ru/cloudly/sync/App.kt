@@ -10,6 +10,7 @@ import ru.cloudly.sync.data.QueueStore
 import ru.cloudly.sync.data.Selection
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.mirror.MirrorEngine
+import ru.cloudly.sync.mirror.MirrorLive
 import ru.cloudly.sync.mirror.MirrorScheduler
 import ru.cloudly.sync.mirror.MirrorStore
 import ru.cloudly.sync.mirror.MirrorWatcher
@@ -41,6 +42,14 @@ class App : Application() {
     lateinit var mirror: MirrorEngine
         private set
 
+    /**
+     * Мгновенный режим: опрос журнала облака и реакция на изменения файлов, пока жив процесс
+     * приложения. Резидентного сервиса нет — когда система выгрузит процесс, останется
+     * страховочный периодический проход.
+     */
+    lateinit var mirrorLive: MirrorLive
+        private set
+
     /** Быстрый путь: изменение файла — повод не ждать пятнадцати минут. */
     lateinit var mirrorWatcher: MirrorWatcher
         private set
@@ -66,10 +75,13 @@ class App : Application() {
 
         mirrorStore = MirrorStore(this)
         mirror = MirrorEngine(api, mirrorStore, selection)
-        mirrorWatcher = MirrorWatcher { MirrorScheduler.scheduleSoon(this) }
-        // периодический проход: наблюдатель за файлами только ускоряет, но не заменяет его
+        mirrorLive = MirrorLive(api, mirrorStore, mirror, appScope) { prefs.token.isNotBlank() }
+        mirrorWatcher = MirrorWatcher { mirrorLive.onLocalChange() }
+        // периодический проход: наблюдатель за файлами только ускоряет, но не заменяет его —
+        // после выгрузки процесса наблюдать некому
         MirrorScheduler.schedulePeriodic(this)
         runCatching { mirrorWatcher.watch(selection.paths(Section.FILES)) }
+        mirrorLive.start()
     }
 
     /** После изменения выбора папок наблюдение пересобирается: набор папок изменился. */

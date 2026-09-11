@@ -11,6 +11,7 @@ import ru.cloudly.sync.net.ApiException
 import ru.cloudly.sync.queue.UploadPlan
 import ru.cloudly.sync.queue.Uploader
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Двустороннее зеркало выбранных папок раздела «Файлы»: содержимое телефона и папки в облаке
@@ -36,6 +37,13 @@ class MirrorEngine(
     private val store: MirrorStore,
     private val selection: Selection,
 ) {
+
+    /**
+     * Один проход за раз. Проход запускают трое: опрос журнала (мгновенный режим), событие
+     * файловой системы и периодическое задание системы. Без замка они наложились бы друг на
+     * друга и стали бы спорить за одни и те же строки состояния.
+     */
+    private val busy = AtomicBoolean(false)
 
     /** Итог прохода: что удалось, что нет и почему. */
     data class Report(
@@ -79,6 +87,19 @@ class MirrorEngine(
         isCancelled: () -> Boolean = { false },
         budgetMs: Long = DEFAULT_BUDGET_MS,
     ): Report {
+        if (!busy.compareAndSet(false, true)) return Report(error = "проход уже идёт")
+        return try {
+            passLocked(onProgress, isCancelled, budgetMs)
+        } finally {
+            busy.set(false)
+        }
+    }
+
+    private fun passLocked(
+        onProgress: (String) -> Unit = {},
+        isCancelled: () -> Boolean = { false },
+        budgetMs: Long = DEFAULT_BUDGET_MS,
+    ): Report {
         val startedAt = System.currentTimeMillis()
         val report = Report()
 
@@ -113,12 +134,7 @@ class MirrorEngine(
             onProgress("догоняю облако…")
             pull.catchUp()
         }
-        report.downloaded += pull.downloaded
-        report.deletedOnPhone += pull.deletedLocal
-        report.conflicts += pull.conflicts
-        report.renamed += pull.renamedLocal
-        report.failed += pull.failed
-        report.rescanned = pull.rescanned
+        fill(report, pull)
         if (pull.fatal != null) return report.apply { error = pull.fatal }
 
         // 2) телефон → облако
@@ -129,6 +145,53 @@ class MirrorEngine(
         report.finishedAt = System.currentTimeMillis()
         store.setMeta(MirrorStore.KEY_REPORT, report.text())
         return report
+    }
+
+    /**
+     * Только облачная сторона: догнать журнал, не трогая диск. Так работает мгновенный режим
+     * (`MirrorLive`): правка из веба приезжает за секунды, а полный обход папок ради этого
+     * не нужен — он остаётся за событиями файловой системы и периодическим проходом.
+     */
+    fun catchUpCloud(
+        onProgress: (String) -> Unit = {},
+        isCancelled: () -> Boolean = { false },
+    ): Report {
+        if (!busy.compareAndSet(false, true)) return Report(error = "проход уже идёт")
+        return try {
+            catchUpCloudLocked(onProgress, isCancelled)
+        } finally {
+            busy.set(false)
+        }
+    }
+
+    private fun catchUpCloudLocked(
+        onProgress: (String) -> Unit = {},
+        isCancelled: () -> Boolean = { false },
+    ): Report {
+        val report = Report()
+        val me = try {
+            api.meInfo()
+        } catch (e: Exception) {
+            return report.apply { error = "нет связи с сервером: ${e.message}" }
+        }
+        store.setMeta(MirrorStore.KEY_DEVICE_ID, me.deviceId.orEmpty())
+        val pull = MirrorPull(api, store, me.deviceId, onProgress)
+        pull.catchUp()
+        fill(report, pull)
+        report.error = pull.fatal
+        report.stopped = isCancelled()
+        report.finishedAt = System.currentTimeMillis()
+        return report
+    }
+
+    /** Перенести счётчики облачного прохода в общий итог. */
+    private fun fill(report: Report, pull: MirrorPull) {
+        report.downloaded += pull.downloaded
+        report.deletedOnPhone += pull.deletedLocal
+        report.conflicts += pull.conflicts
+        report.renamed += pull.renamedLocal
+        report.failed += pull.failed
+        report.rescanned = report.rescanned || pull.rescanned
     }
 
     private fun pushLocal(

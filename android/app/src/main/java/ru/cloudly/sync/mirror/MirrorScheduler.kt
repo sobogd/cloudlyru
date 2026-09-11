@@ -12,23 +12,18 @@ import android.content.Context
  * после перезагрузки, ждать появления сети и не тратить батарею, и при этом не тянет в сборку
  * новую зависимость ради одной задачи.
  *
- * Периодический проход — раз в 15 минут (меньше система не разрешает). События файловой системы
- * дают только быстрый путь: они теряются при перезапуске процесса, после перезагрузки и в Doze,
- * поэтому периодический проход обязателен, а наблюдатель — лишь ускоритель.
+ * Это страховка, а не основной путь: мгновенную реакцию даёт `MirrorLive`, пока жив процесс
+ * приложения. Здесь — редкий проход на случай, когда процесса нет: целиком выгружен из памяти,
+ * телефон перезагружали, система прибила приложение ради памяти. Меньше 15 минут система
+ * не разрешает, и разбудить приложение чаще без постоянного уведомления всё равно нельзя.
  */
 object MirrorScheduler {
 
     /** Периодический проход: минимум, который разрешает система. */
     const val PERIODIC_JOB = 4201
 
-    /** Проход «по событию»: один раз и почти сразу. */
-    const val SOON_JOB = 4202
-
     /** Раз в 15 минут — нижняя граница `JobInfo`. */
     private const val PERIOD_MS = 15 * 60_000L
-
-    /** Задержка после события: файл ещё дописывается, спешить некуда. */
-    private const val SOON_DELAY_MS = 5_000L
 
     fun schedulePeriodic(context: Context) {
         val job = JobInfo.Builder(PERIODIC_JOB, component(context))
@@ -40,19 +35,9 @@ object MirrorScheduler {
         runCatching { scheduler(context).schedule(job) }
     }
 
-    /** Быстрый путь после изменения файлов: один проход в ближайшие секунды. */
-    fun scheduleSoon(context: Context) {
-        val job = JobInfo.Builder(SOON_JOB, component(context))
-            .setMinimumLatency(SOON_DELAY_MS)
-            .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-            .build()
-        runCatching { scheduler(context).schedule(job) }
-    }
-
     fun cancel(context: Context) {
         runCatching {
             scheduler(context).cancel(PERIODIC_JOB)
-            scheduler(context).cancel(SOON_JOB)
         }
     }
 
