@@ -50,8 +50,23 @@ class App : Application() {
         prefs = Prefs(this)
         db = Db(this)
         api = Api(prefs)
+        forgetRelayModeOnUpdate()
         createChannels()
         schedulePeriodic()
+    }
+
+    /**
+     * Режим «через сервер» включается сам после сбоя прямой загрузки и запоминается, чтобы не
+     * тратить время на повторы. Но он же и маскирует исправления: обновив приложение, надо
+     * снова попробовать прямое подключение, иначе заливка так и останется через сервер.
+     */
+    private fun forgetRelayModeOnUpdate() {
+        val version = runCatching {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        }.getOrNull().orEmpty()
+        if (db.kv(KV_APP_VERSION) == version) return
+        db.putKv(KV_APP_VERSION, version)
+        engine().resetRelayMode()
     }
 
     private fun createChannels() {
@@ -79,6 +94,7 @@ class App : Application() {
     }
 
     companion object {
+        private const val KV_APP_VERSION = "app_version"
         const val CHANNEL_SYNC = "sync"
         const val CHANNEL_PROBLEMS = "problems"
         fun of(context: Context): App = context.applicationContext as App
