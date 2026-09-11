@@ -13,10 +13,21 @@ import {
   MAX_FILE_BYTES,
   MAX_UPLOAD_SESSIONS_PER_USER,
   PART_URL_TTL_SEC,
+  STORAGE_HOST,
 } from '../config/env';
 import { assertSafeName, parseOptionalDate, randomToken } from '../common/utils';
 import { ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound, payloadTooLarge, tooMany } from '../common/errors';
+
+/**
+ * Номер первой недополученной части в диапазоне 1..total. Если принято всё — total + 1:
+ * клиенту больше нечего отправлять, и это видно по его же арифметике частей.
+ */
+export function firstMissingPart(received: number[], total: number): number {
+  const have = new Set(received);
+  for (let i = 1; i <= total; i++) if (!have.has(i)) return i;
+  return total + 1;
+}
 
 /** Принятая часть multipart: ETag отдаёт S3, клиент передаёт его серверу. */
 /** Минимальный размер части multipart в S3 (кроме последней). */
@@ -403,6 +414,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       chunkMaxBytes: CHUNK_MAX_BYTES,
       partUrlTtlSec: PART_URL_TTL_SEC,
       nextPart: 1,
+      storageHost: STORAGE_HOST,
     };
   }
 
@@ -414,7 +426,13 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       direct: row.direct,
       partSize: DIRECT_PART_BYTES,
       chunkMaxBytes: CHUNK_MAX_BYTES,
-      nextPart: parts.length + 1,
+      // Первая НЕДОСТАЮЩАЯ часть, а не «сколько принято»: части идут параллельно, и при обрыве
+      // одной из них счётчик сдвинулся бы за дырку — клиент продолжил бы с дыркой и complete
+      // вечно отвечал бы «missing part N».
+      nextPart: firstMissingPart(
+        parts.map((p) => p.partNumber),
+        this.partCount(Number(row.size)),
+      ),
       receivedParts: parts.length,
       parts: parts.map((p) => p.partNumber),
       size: Number(row.size),

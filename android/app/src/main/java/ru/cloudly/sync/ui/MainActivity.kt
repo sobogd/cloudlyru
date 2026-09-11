@@ -47,6 +47,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -98,6 +100,7 @@ private fun Screen() {
     var showAdd by remember { mutableStateOf(false) }
     var showFree by remember { mutableStateOf(false) }
     var relay by remember { mutableStateOf(app.engine().relayMode()) }
+    var showToken by remember { mutableStateOf(false) }
     // тик обновления: карточки пересчитывают счётчики по нему, иначе цифры «залипают»
     var tick by remember { mutableStateOf(0) }
     var snap by remember { mutableStateOf(Snapshot()) }
@@ -221,6 +224,13 @@ private fun Screen() {
                 onValueChange = { token = it },
                 label = { Text("Токен устройства (ApiToken)") },
                 singleLine = true,
+                // токен даёт полный доступ к облаку: не показываем его на экране без спроса
+                visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    TextButton(onClick = { showToken = !showToken }) {
+                        Text(if (showToken) "скрыть" else "показать", fontSize = 12.sp)
+                    }
+                },
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
@@ -235,6 +245,7 @@ private fun Screen() {
                 onValueChange = { password = it },
                 label = { Text("Пароль (не сохраняется)") },
                 singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

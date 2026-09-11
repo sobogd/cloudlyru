@@ -41,6 +41,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import ru.cloudly.sync.App
+import ru.cloudly.sync.net.Api
 import ru.cloudly.sync.sync.Decisions
 import ru.cloudly.sync.sync.Hasher
 import ru.cloudly.sync.sync.LocalFile
@@ -156,6 +157,39 @@ private fun ShareScreen(uris: List<Uri>) {
 
 private data class ShareResult(val text: String, val failed: List<String>, val cancelled: Boolean)
 
+/**
+ * Заливка одного файла из «Поделиться»: прямое подключение к хранилищу, при неудаче — через
+ * сервер. Брошенную сессию прерываем, иначе она висит на сервере до чистки и занимает лимит.
+ */
+private fun shareUpload(
+    api: Api,
+    folderId: String,
+    name: String,
+    file: File,
+    sha256: String,
+    onProgress: (Long, Long) -> Unit,
+) {
+    val local = LocalFile(name, file.absolutePath, name, file.length(), file.lastModified())
+    var uploadId: String? = null
+    val send: (Boolean) -> Uploader.Result = { viaRelay ->
+        Uploader(api).upload(
+            folderId = folderId,
+            file = local,
+            sha256 = sha256,
+            replace = false,
+            expectedSha256 = null,
+            uploadIdFromQueue = null,
+            onSession = { uploadId = it },
+            onProgress = onProgress,
+            forceRelay = viaRelay,
+        )
+    }
+    runCatching { send(false) }.getOrElse { first ->
+        uploadId?.let { runCatching { api.abort(it) } }
+        send(true)
+    }
+}
+
 /** Копирование content:// в кэш, хэш, заливка, удаление временного файла. */
 private fun uploadShared(
     app: App,
@@ -192,26 +226,22 @@ private fun uploadShared(
             var uploaded = false
             var lastError: Exception? = null
             for (attempt in 0 until 3) {
-                val file = LocalFile(attemptName, tmp.absolutePath, attemptName, tmp.length(), tmp.lastModified())
                 try {
-                    Uploader(app.api).upload(
-                        folderId = folderId,
-                        file = file,
-                        sha256 = sha,
-                        replace = false,
-                        expectedSha256 = null,
-                        uploadIdFromQueue = null,
-                        onSession = {},
-                        onProgress = { sent, total ->
-                            val part = if (total > 0) sent.toFloat() / total else 1f
-                            onProgress((index + part) / uris.size)
-                        },
-                    )
+                    // сначала прямо в хранилище; если оно с телефона недоступно (DNS, VPN,
+                    // блокировщик) — тот же файл уходит через сервер, иначе «поделиться»
+                    // не работает там, где синхронизация работает
+                    shareUpload(app.api, folderId, attemptName, tmp, sha, onProgress = { sent, total ->
+                        val part = if (total > 0) sent.toFloat() / total else 1f
+                        onProgress((index + part) / uris.size)
+                    })
                     uploaded = true
                     break
                 } catch (e: ru.cloudly.sync.net.ApiException) {
                     lastError = e
-                    if (!(e.message ?: "").contains("already exists") && e.code != "conflict") throw e
+                    // «имя занято», в том числе записью из корзины сервера: даём свободное имя
+                    val nameTaken = e.code == "conflict" || e.code == "in_trash" ||
+                        (e.message ?: "").contains("already exists")
+                    if (!nameTaken) throw e
                     val dot = name.lastIndexOf('.')
                     attemptName = if (dot > 0) {
                         "${name.substring(0, dot)} (${attempt + 2})${name.substring(dot)}"

@@ -51,7 +51,9 @@ export class FoldersController {
    * Нужен клиенту синхронизации, чтобы не строить дерево руками.
    */
   @UseGuards(RateLimitGuard)
-  @RateLimit(60, 60_000)
+  // Клиент синхронизации заводит папки по мере обхода дерева: 60/мин упирались в лимит
+  // на первом проходе большой папки и роняли весь проход.
+  @RateLimit(600, 60_000)
   @Post('ensure-path')
   ensurePath(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {
     if (!isPlainObject(body)) throw badRequest('invalid body');

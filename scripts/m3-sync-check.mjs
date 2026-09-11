@@ -24,6 +24,8 @@ const { FilesService } = dist('files/files.service.js');
 const { FoldersService } = dist('folders/folders.service.js');
 const { TrashService } = dist('trash/trash.service.js');
 const { UploadsController } = dist('uploads/uploads.controller.js');
+const { UploadsService, firstMissingPart } = dist('uploads/uploads.service.js');
+const { STORAGE_HOST } = dist('config/env.js');
 
 const prisma = new PrismaClient();
 
@@ -47,6 +49,8 @@ const s3 = {
   copyObject: async () => {},
   putObject: async () => {},
   presignedGet: async () => '',
+  createMultipartUpload: async () => 's3-init',
+  abortMultipartUpload: async () => {},
 };
 const media = { captureMeta: async () => {}, extractDetail: async () => {} };
 const queue = { enqueue: async () => {}, cancelForAssets: async () => {}, requeueForAssets: async () => {}, previewsAlive: async () => false };
@@ -77,6 +81,7 @@ const head = async (n = 1) => {
 };
 
 const cleanupFolders = [];
+const sessionIds = [];
 try {
   // === 1. ensure-path: идемпотентность, лимиты, журнал ====================================
   const made = await folders.ensurePath(user.id, 'm3-check/2025/07');
@@ -222,6 +227,65 @@ try {
   check('HTTP: clientMtime доезжает до init', captured[0]?.clientMtime === '2026-09-01T10:00:00.000Z');
   check('HTTP: mode доезжает до init', captured[0]?.mode === 'direct');
 
+  // === 8b. Номера частей и хост хранилища ================================================
+  // «Сколько принято» вместо «первой дырки» навсегда запирало сессию: параллельный батч
+  // терял часть, счётчик уезжал за дырку, и complete вечно отвечал 400 «missing part N».
+  check('nextPart: первая пропущенная часть, а не счётчик', firstMissingPart([1, 3], 4) === 2, `→ ${firstMissingPart([1, 3], 4)}`);
+  check('nextPart: дырка в начале', firstMissingPart([2, 3], 3) === 1, `→ ${firstMissingPart([2, 3], 3)}`);
+  check('nextPart: ничего не принято', firstMissingPart([], 2) === 1, `→ ${firstMissingPart([], 2)}`);
+  check('nextPart: принято всё → на единицу больше', firstMissingPart([1, 2, 3], 3) === 4, `→ ${firstMissingPart([1, 2, 3], 3)}`);
+  check(
+    'клиент узнаёт хост хранилища при старте загрузки',
+    typeof STORAGE_HOST === 'string' && STORAGE_HOST.length > 0,
+    STORAGE_HOST,
+  );
+
+  // Сессия с «дыркой» в принятых частях: ровно тот случай, когда счётчик врал и complete
+  // потом вечно отвечал 400 «missing part N».
+  const uploads = new UploadsService(prisma, s3, files, auth, media, queue);
+  const gappy = await prisma.uploadSession.create({
+    data: {
+      userId: user.id,
+      folderId: cleanupFolders[0],
+      name: 'gappy.bin',
+      size: BigInt(3 * 16 * 1024 * 1024),
+      mime: 'application/octet-stream',
+      uploadKey: 'tmp/gappy.bin',
+      s3UploadId: 's3-gappy',
+      direct: true,
+      parts: [
+        { partNumber: 1, etag: 'a', size: 16 * 1024 * 1024 },
+        { partNumber: 3, etag: 'c', size: 16 * 1024 * 1024 },
+      ],
+    },
+  });
+  const gappyStatus = await uploads.status(gappy.id, user.id);
+  check('status: продолжать с первой пропущенной части', gappyStatus.nextPart === 2, `nextPart=${gappyStatus.nextPart}`);
+  const full = await prisma.uploadSession.create({
+    data: {
+      userId: user.id,
+      folderId: cleanupFolders[0],
+      name: 'full.bin',
+      size: BigInt(2 * 16 * 1024 * 1024),
+      mime: 'application/octet-stream',
+      uploadKey: 'tmp/full.bin',
+      s3UploadId: 's3-full',
+      direct: true,
+      parts: [
+        { partNumber: 1, etag: 'a', size: 16 * 1024 * 1024 },
+        { partNumber: 2, etag: 'b', size: 16 * 1024 * 1024 },
+      ],
+    },
+  });
+  const fullStatus = await uploads.status(full.id, user.id);
+  check('status: всё принято → следующей части нет', fullStatus.nextPart === 3, `nextPart=${fullStatus.nextPart}`);
+  sessionIds.push(gappy.id, full.id);
+
+  // Форма ответа init: хост хранилища нужен клиенту для диагностики DNS
+  const inited = await uploads.init({ folderId: cleanupFolders[0], name: 'init-check.bin', size: 10, mime: 'text/plain', mode: 'relay' }, user.id);
+  check('init отдаёт хост хранилища', inited.storageHost === STORAGE_HOST, String(inited.storageHost));
+  await prisma.uploadSession.deleteMany({ where: { id: inited.uploadId } });
+
   // === 9. Схема: новые поля на месте =====================================================
   const cols = await prisma.$queryRawUnsafe(
     `SELECT table_name, column_name FROM information_schema.columns
@@ -244,6 +308,7 @@ try {
     await prisma.fileEntry.deleteMany({ where: { folderId: { in: subtree } } }).catch(() => {});
     await prisma.folder.deleteMany({ where: { id: { in: subtree } } }).catch(() => {});
   }
+  await prisma.uploadSession.deleteMany({ where: { id: { in: sessionIds } } }).catch(() => {});
   await prisma.changeLog.deleteMany({ where: { userId: user.id, targetId: { in: [] } } }).catch(() => {});
   await prisma.$disconnect();
 }

@@ -24,9 +24,7 @@ import ru.cloudly.sync.App
 import ru.cloudly.sync.net.RemoteEntry
 import ru.cloudly.sync.sync.Decisions
 import ru.cloudly.sync.sync.Downloader
-import ru.cloudly.sync.sync.Hasher
-import ru.cloudly.sync.sync.LocalFile
-import ru.cloudly.sync.sync.Uploader
+import ru.cloudly.sync.sync.PendingUploads
 import ru.cloudly.sync.work.Notifications
 
 /**
@@ -43,7 +41,9 @@ import ru.cloudly.sync.work.Notifications
  *   • переименование и удаление: удаление уходит в корзину сервера и никогда не трогает
  *     файлы на телефоне.
  *
- * Все методы ходят в сеть: система вызывает их в фоновом потоке, а не в главном.
+ * Все методы ходят в сеть: система вызывает их в фоновом потоке, а не в главном. Наружу из
+ * провайдера можно бросать только [FileNotFoundException] — любое другое исключение уходит
+ * через Binder как RuntimeException в чужое приложение, поэтому тела обёрнуты в [safe].
  */
 class CloudlyDocumentsProvider : DocumentsProvider() {
 
@@ -52,8 +52,11 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
     private lateinit var handler: Handler
     private val uploads = Executors.newSingleThreadExecutor { r -> Thread(r, "cloudly-provider-upload") }
 
-    /** Файлы, созданные системой и ещё не выгруженные: id → что и куда сохранять. */
+    /** Созданные системой документы, ещё не выгруженные: id → что и куда сохранять. */
     private val pending = ConcurrentHashMap<String, Pending>()
+
+    /** id созданного документа → id записи в облаке: приложение-источник ещё может спросить о ней. */
+    private val saved = ConcurrentHashMap<String, String>()
 
     private data class Pending(val file: File, val folderId: String, val name: String, val mime: String)
 
@@ -65,9 +68,19 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         return true
     }
 
+    /** Провайдер не имеет права отдавать наружу ничего, кроме FileNotFoundException. */
+    private fun <T> safe(what: String, block: () -> T): T = try {
+        block()
+    } catch (e: FileNotFoundException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "$what: ${e.message}")
+        throw FileNotFoundException(e.message ?: "$what: не получилось")
+    }
+
     // ===== дерево =====
 
-    override fun queryRoots(projection: Array<out String>?): Cursor {
+    override fun queryRoots(projection: Array<out String>?): Cursor = safe("корни") {
         val cursor = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
         row(
             cursor,
@@ -85,20 +98,20 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
                 Root.COLUMN_ICON to android.R.drawable.ic_menu_upload,
             ),
         )
-        return cursor
+        cursor
     }
 
-    override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
+    override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor = safe("документ") {
         val cursor = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         row(cursor, describe(documentId))
-        return cursor
+        cursor
     }
 
     override fun queryChildDocuments(
         parentDocumentId: String,
         projection: Array<out String>?,
         sortOrder: String?,
-    ): Cursor {
+    ): Cursor = safe("содержимое папки") {
         val cursor = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         val children = app.api.children(folderIdOf(parentDocumentId))
         // папки первыми: так список читается сверху вниз
@@ -108,34 +121,37 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         for (entry in children.entries.sortedBy { it.name.lowercase() }) {
             row(cursor, entryRow(entry))
         }
-        return cursor
+        cursor
     }
 
     /** Свежие файлы: системный раздел «Последние» в «Файлах» — удобный вход в облако. */
-    override fun queryRecentDocuments(rootId: String, projection: Array<out String>?): Cursor {
-        val cursor = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
-        val children = runCatching { app.api.children(folderIdOf(ROOT_DOC_ID)) }.getOrNull() ?: return cursor
-        for (entry in children.entries.sortedByDescending { it.clientMtime ?: 0L }.take(50)) {
-            row(cursor, entryRow(entry))
+    override fun queryRecentDocuments(rootId: String, projection: Array<out String>?): Cursor =
+        safe("последние") {
+            val cursor = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
+            val children = runCatching { app.api.children(folderIdOf(ROOT_DOC_ID)) }.getOrNull()
+            if (children == null) return@safe cursor
+            for (entry in children.entries.sortedByDescending { it.clientMtime ?: 0L }.take(50)) {
+                row(cursor, entryRow(entry))
+            }
+            cursor
         }
-        return cursor
-    }
 
     /**
      * Создание документа системой: папку заводим на сервере сразу, а для файла запоминаем
      * будущее место и отдаём временный дескриптор — выгрузим, когда приложение допишет файл.
      */
-    override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
-        val name = cleanName(displayName)
-        val folderId = folderIdOf(parentDocumentId)
-        if (mimeType == Document.MIME_TYPE_DIR) return app.api.ensurePath(name, folderId)
+    override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String =
+        safe("создание документа") {
+            val name = cleanName(displayName)
+            val folderId = folderIdOf(parentDocumentId)
+            if (mimeType == Document.MIME_TYPE_DIR) return@safe app.api.ensurePath(name, folderId)
 
-        val dir = File(app.cacheDir, "pending").apply { mkdirs() }
-        val tmp = File(dir, "new-${System.nanoTime()}")
-        val id = NEW_PREFIX + java.util.UUID.randomUUID()
-        pending[id] = Pending(tmp, folderId, name, mimeType)
-        return id
-    }
+            val dir = File(app.cacheDir, "pending").apply { mkdirs() }
+            val tmp = File(dir, "new-${System.nanoTime()}")
+            val id = NEW_PREFIX + java.util.UUID.randomUUID()
+            pending[id] = Pending(tmp, folderId, name, mimeType)
+            id
+        }
 
     /**
      * Открытие документа. Для обычного файла скачиваем его в кэш целиком (с докачкой и проверкой
@@ -146,8 +162,13 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         documentId: String,
         mode: String,
         signal: CancellationSignal?,
-    ): ParcelFileDescriptor {
-        if (documentId.startsWith(NEW_PREFIX)) return openForWrite(documentId)
+    ): ParcelFileDescriptor = safe("открытие документа") {
+        if (documentId.startsWith(NEW_PREFIX)) {
+            // документ, созданный системой: пока пишут — временный файл, после выгрузки — облачный
+            if (pending.containsKey(documentId)) return@safe openForWrite(documentId)
+            saved[documentId]?.let { return@safe openDocument(FILE_PREFIX + it, mode, signal) }
+            throw FileNotFoundException("документ уже сохранён")
+        }
         if (mode.contains('w') || mode.contains('t')) {
             // правку файла в облаке не поддерживаем: новую версию можно сохранить рядом
             throw FileNotFoundException("файл в облаке доступен только для чтения")
@@ -157,6 +178,10 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         val meta = app.api.entryMeta(uuid)
         val target = browseFile(uuid, meta.name)
         if (!target.isFile || target.length() != meta.size) {
+            // без запаса на сам файл и на параллельные загрузки система останется без места
+            if (app.cacheDir.usableSpace < meta.size + MIN_FREE_CACHE) {
+                throw FileNotFoundException("мало места для кэша: нужно ещё ${meta.size / 1048576} МБ")
+            }
             Downloader.download(
                 api = app.api,
                 entryId = uuid,
@@ -168,7 +193,7 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         }
         target.setLastModified(System.currentTimeMillis()) // отметка «кэш ещё нужен»
         trimBrowseCache()
-        return ParcelFileDescriptor.open(target, ParcelFileDescriptor.MODE_READ_ONLY)
+        ParcelFileDescriptor.open(target, ParcelFileDescriptor.MODE_READ_ONLY)
     }
 
     /** Дескриптор на запись для только что созданного документа: выгрузка начнётся на закрытии. */
@@ -180,7 +205,7 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
             ParcelFileDescriptor.MODE_TRUNCATE
         val callback = SaveCallback(raf) {
             pending.remove(documentId)
-            uploads.execute { uploadSaved(item) }
+            uploads.execute { uploadSaved(documentId, item) }
         }
         return manager.openProxyFileDescriptor(mode, callback, handler)
     }
@@ -190,7 +215,7 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         documentId: String,
         sizeHint: Point,
         signal: CancellationSignal?,
-    ): AssetFileDescriptor {
+    ): AssetFileDescriptor = safe("миниатюра") {
         val meta = app.api.entryMeta(uuidOf(documentId))
         val sha = meta.sha256
         val previewable = meta.mime.startsWith("image/") || meta.mime.startsWith("video/")
@@ -207,21 +232,27 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
             }
         }
         val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-        return AssetFileDescriptor(fd, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
+        AssetFileDescriptor(fd, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
     }
 
-    override fun deleteDocument(documentId: String) {
-        pending.remove(documentId)?.file?.delete()
+    override fun deleteDocument(documentId: String) = safe("удаление") {
+        if (documentId.startsWith(NEW_PREFIX)) {
+            // ещё не выгруженный документ: убираем временный файл, на сервере его нет
+            pending.remove(documentId)?.file?.delete()
+            saved.remove(documentId)
+            return@safe
+        }
         if (isFileDoc(documentId)) {
             // «удалить» в системе = корзина сервера: файл на телефоне не трогаем
             app.api.deleteFile(uuidOf(documentId))
-            return
+            return@safe
         }
         if (documentId == ROOT_DOC_ID) throw FileNotFoundException("корень удалить нельзя")
         app.api.deleteFolder(uuidOf(documentId))
     }
 
-    override fun renameDocument(documentId: String, displayName: String): String? {
+    override fun renameDocument(documentId: String, displayName: String): String? = safe("переименование") {
+        if (documentId.startsWith(NEW_PREFIX)) return@safe null
         val name = cleanName(displayName)
         if (isFileDoc(documentId)) {
             val meta = app.api.entryMeta(uuidOf(documentId))
@@ -230,65 +261,40 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         } else {
             app.api.renameFolder(uuidOf(documentId), name)
         }
-        return null
+        null
     }
 
-    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
-        if (!isFileDoc(documentId)) return false
-        val parent = uuidOf(parentDocumentId)
-        return runCatching { app.api.entryMeta(uuidOf(documentId)).folderId == parent }.getOrDefault(false)
-    }
+    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean =
+        safe("проверка вложенности") {
+            if (!isFileDoc(documentId)) return@safe false
+            val parent = uuidOf(parentDocumentId)
+            runCatching { app.api.entryMeta(uuidOf(documentId)).folderId == parent }.getOrDefault(false)
+        }
 
     // ===== выгрузка сохранённого файла =====
 
-    private fun uploadSaved(item: Pending) {
-        val api = app.api
+    private fun uploadSaved(documentId: String, item: Pending) {
         try {
             if (item.file.length() == 0L) {
                 item.file.delete()
                 return
             }
-            val sha = Hasher.sha256(item.file)
-            // имя могло быть занято, пока файл писался: ставим свободное, чужое не перезаписываем
-            val taken = runCatching { api.children(item.folderId).entries.map { it.name }.toHashSet() }
-                .getOrDefault(emptySet())
-            val name = Decisions.freeName(item.name, taken)
-            val local = LocalFile(name, item.file.absolutePath, name, item.file.length(), item.file.lastModified())
-            val result = runCatching { upload(api, item.folderId, local, sha, viaRelay = false) }
-                .getOrElse { first ->
-                    // прямое подключение к хранилищу могло не сработать — повторяем через сервер
-                    Log.w(TAG, "прямая выгрузка не удалась (${first.message}) — пробую через сервер")
-                    upload(api, item.folderId, local, sha, viaRelay = true)
-                }
+            val result = PendingUploads.upload(app.api, item.folderId, item.file, item.name)
+            if (saved.size > SAVED_LIMIT) saved.clear()
+            saved[documentId] = result.entryId
             Log.i(TAG, "сохранено в облако: ${result.name}")
             item.file.delete()
         } catch (e: Exception) {
-            // файл, который сохранил пользователь, терять нельзя: оставляем и говорим, где он
+            // файл, который сохранил пользователь, терять нельзя: кэш система чистит первой,
+            // поэтому убираем его в надёжное место, откуда его догрузит следующий проход
             Log.w(TAG, "не удалось выгрузить ${item.name}: ${e.message}")
+            PendingUploads.keep(context!!, item.file, item.folderId, item.name)
             Notifications.notifyProblems(
                 context!!,
-                "не удалось выгрузить «${item.name}»: ${e.message}. Файл остался на телефоне: ${item.file.absolutePath}",
+                "«${item.name}» пока не уехал в облако: ${e.message}. Файл сохранён и уедет при следующей синхронизации.",
             )
         }
     }
-
-    private fun upload(
-        api: ru.cloudly.sync.net.Api,
-        folderId: String,
-        file: LocalFile,
-        sha256: String,
-        viaRelay: Boolean,
-    ) = Uploader(api).upload(
-        folderId = folderId,
-        file = file,
-        sha256 = sha256,
-        replace = false,
-        expectedSha256 = null,
-        uploadIdFromQueue = null,
-        onSession = {},
-        onProgress = { _, _ -> },
-        forceRelay = viaRelay,
-    )
 
     // ===== вспомогательное =====
 
@@ -313,15 +319,19 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
 
     private fun describe(documentId: String): Map<String, Any?> {
         if (documentId.startsWith(NEW_PREFIX)) {
-            val item = pending[documentId] ?: throw FileNotFoundException("документ уже сохранён")
-            return mapOf(
-                Document.COLUMN_DOCUMENT_ID to documentId,
-                Document.COLUMN_DISPLAY_NAME to item.name,
-                Document.COLUMN_MIME_TYPE to item.mime.ifBlank { "application/octet-stream" },
-                Document.COLUMN_SIZE to item.file.length(),
-                Document.COLUMN_LAST_MODIFIED to System.currentTimeMillis(),
-                Document.COLUMN_FLAGS to 0,
-            )
+            // пока файл пишется — показываем временный, после выгрузки — то, что лежит в облаке
+            pending[documentId]?.let { item ->
+                return mapOf(
+                    Document.COLUMN_DOCUMENT_ID to documentId,
+                    Document.COLUMN_DISPLAY_NAME to item.name,
+                    Document.COLUMN_MIME_TYPE to item.mime.ifBlank { "application/octet-stream" },
+                    Document.COLUMN_SIZE to item.file.length(),
+                    Document.COLUMN_LAST_MODIFIED to System.currentTimeMillis(),
+                    Document.COLUMN_FLAGS to (Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE),
+                )
+            }
+            val entryId = saved[documentId] ?: throw FileNotFoundException("документ уже сохранён")
+            return entryRow(app.api.entryMeta(entryId))
         }
         if (isFileDoc(documentId)) return entryRow(app.api.entryMeta(uuidOf(documentId)))
         val (name, _) = app.api.folderMeta(folderIdOf(documentId))
@@ -366,14 +376,17 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         File(File(app.cacheDir, "browse").apply { mkdirs() }, "$uuid-${cleanName(name)}")
 
     /**
-     * Кэш открытых файлов: держим не больше гигабайта и чистим по времени последнего
-     * использования — открытое недавно остаётся, старое освобождает место.
+     * Кэш открытых файлов: держим не больше гигабайта. Чистим по времени последнего обращения,
+     * но не трогаем то, что открыли только что, и служебные файлы докачки (`.имя.cloudly-part`):
+     * иначе чистка одного файла сносит недокачанный другой.
      */
     private fun trimBrowseCache() {
-        val files = File(app.cacheDir, "browse").listFiles()?.filter { it.isFile } ?: return
+        val cutoff = System.currentTimeMillis() - TRIM_GRACE_MS
+        val files = File(app.cacheDir, "browse").listFiles()
+            ?.filter { it.isFile && !it.name.startsWith(".") } ?: return
         var total = files.sumOf { it.length() }
         if (total <= MAX_BROWSE_CACHE) return
-        for (file in files.sortedBy { it.lastModified() }) {
+        for (file in files.filter { it.lastModified() < cutoff }.sortedBy { it.lastModified() }) {
             if (total <= MAX_BROWSE_CACHE) break
             val size = file.length()
             if (file.delete()) total -= size
@@ -434,6 +447,15 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
         private const val NEW_PREFIX = "new:"
         private const val KV_ROOT = "root_folder_id"
         private const val MAX_BROWSE_CACHE = 1L shl 30
+
+        /** Не удаляем из кэша то, что открыли в последние минуты: файл ещё читают. */
+        private const val TRIM_GRACE_MS = 10 * 60 * 1000L
+
+        /** Запас свободного места сверх размера файла — 64 МБ. */
+        private const val MIN_FREE_CACHE = 64L * 1024 * 1024
+
+        /** Сколько созданных документов помним в памяти процесса, чтобы не расти бесконечно. */
+        private const val SAVED_LIMIT = 200
 
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID,

@@ -2,47 +2,6 @@ package ru.cloudly.sync.net
 
 import org.json.JSONObject
 
-/** Строка журнала изменений: снимок цели на момент события. */
-data class Change(
-    val seq: Long,
-    val target: String,
-    val op: String,
-    val targetId: String,
-    val folderId: String?,
-    val name: String,
-    val zone: String?,
-    val sha256: String?,
-    val size: Long?,
-    val mime: String?,
-    val clientMtime: Long?,
-    val keepOffline: Boolean,
-) {
-    companion object {
-        fun from(o: JSONObject) = Change(
-            seq = o.getString("seq").toLong(),
-            target = o.optString("target", "entry"),
-            op = o.optString("op", "update"),
-            targetId = o.optString("targetId"),
-            folderId = if (o.isNull("folderId")) null else o.optString("folderId"),
-            name = o.optString("name"),
-            zone = if (o.isNull("zone")) null else o.optString("zone"),
-            sha256 = if (o.isNull("sha256")) null else o.optString("sha256"),
-            size = if (o.isNull("size")) null else o.optLong("size"),
-            mime = if (o.isNull("mime")) null else o.optString("mime"),
-            clientMtime = if (o.isNull("clientMtime")) null else o.optString("clientMtime").let(::parseIsoMillis),
-            keepOffline = o.optBoolean("keepOffline", false),
-        )
-    }
-}
-
-data class ChangesPage(
-    val nextSeq: Long,
-    val hasMore: Boolean,
-    val resetRequired: Boolean,
-    val minSeq: Long?,
-    val changes: List<Change>,
-)
-
 /** Что вернул сервер на попытку начать загрузку. */
 data class UploadInit(
     /** id записи в дереве: сервер отдаёт его и при дедупе (байты не передавались) */
@@ -54,6 +13,8 @@ data class UploadInit(
     val partSize: Int,
     val nextPart: Int,
     val partUrlTtlSec: Int,
+    /** Хост хранилища с сервера — для диагностики сети на телефоне. */
+    val storageHost: String? = null,
     /** 409 stale_version: на сервере другая версия — клиент делает конфликтную копию. */
     val stale: Boolean = false,
     /** 409 in_trash: имя занято записью из корзины — сами не воскрешаем. */

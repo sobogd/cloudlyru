@@ -109,31 +109,6 @@ class Api(private val prefs: Prefs) {
         }
     }
 
-    fun changes(since: String, limit: Int = 200): ChangesPage {
-        val o = parse(request("/sync/changes?since=$since&limit=$limit"))
-        val arr = o.optJSONArray("changes") ?: JSONArray()
-        val list = ArrayList<Change>(arr.length())
-        for (i in 0 until arr.length()) list.add(Change.from(arr.getJSONObject(i)))
-        return ChangesPage(
-            nextSeq = o.optString("nextSeq", since).toLong(),
-            hasMore = o.optBoolean("hasMore", false),
-            resetRequired = o.optBoolean("resetRequired", false),
-            minSeq = if (o.isNull("minSeq")) null else o.optString("minSeq").toLong(),
-            changes = list,
-        )
-    }
-
-    /** Что из содержимого уже есть на сервере (батч до 500). */
-    fun have(shas: List<String>): Set<String> {
-        if (shas.isEmpty()) return emptySet()
-        val body = JSONObject().put("sha256", JSONArray(shas))
-        val o = parse(request("/sync/have", "POST", body))
-        val present = o.optJSONArray("present") ?: JSONArray()
-        val out = HashSet<String>(present.length())
-        for (i in 0 until present.length()) out.add(present.getJSONObject(i).optString("sha256"))
-        return out
-    }
-
     /** Идемпотентный mkdir: возвращает id папки по пути от корня. */
     fun ensurePath(path: String, parentId: String? = null): String {
         val body = JSONObject().put("path", path)
@@ -250,6 +225,8 @@ class Api(private val prefs: Prefs) {
             )
         }
         val o = parse(response)
+        // хост хранилища приходит с сервера: без него диагностика DNS молчит до первой заливки
+        o.optString("storageHost").takeIf { it.isNotBlank() }?.let { prefs.lastS3Host = it }
         return UploadInit(
             entryId = o.optJSONObject("entry")?.optString("id").orEmpty(),
             uploadId = if (o.isNull("uploadId")) null else o.optString("uploadId"),
@@ -259,6 +236,7 @@ class Api(private val prefs: Prefs) {
             partSize = o.optInt("partSize", 16 * 1024 * 1024),
             nextPart = o.optInt("nextPart", 1),
             partUrlTtlSec = o.optInt("partUrlTtlSec", 900),
+            storageHost = o.optString("storageHost").takeIf { it.isNotBlank() },
         )
     }
 
@@ -367,10 +345,6 @@ class Api(private val prefs: Prefs) {
         }
     }
 
-    fun patchFile(entryId: String, body: JSONObject) {
-        parse(request("/files/$entryId", "PATCH", body))
-    }
-
     fun patchFolder(folderId: String, body: JSONObject) {
         parse(request("/folders/$folderId", "PATCH", body))
     }
@@ -395,8 +369,6 @@ class Api(private val prefs: Prefs) {
         if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
         return response.body!!.byteStream()
     }
-
-    fun ping(): Boolean = runCatching { me(); true }.getOrDefault(false)
 
     /**
      * Диагностика связи: что именно не работает — сеть, DNS, TLS или сервер.

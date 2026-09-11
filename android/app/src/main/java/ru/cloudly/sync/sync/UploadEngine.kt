@@ -51,6 +51,15 @@ class UploadEngine(private val context: Context, private val db: Db, private val
             onProgress(line)
             currentJobId?.let { db.putKv("job_progress:$it", line) }
         }
+        // Сначала то, что сохранили в облако из другого приложения и не смогли выгрузить:
+        // такие файлы лежат вне кэша и ждут именно этого момента.
+        val (lateUploaded, lateFailed) = PendingUploads.retryAll(context, api)
+        if (lateUploaded > 0) {
+            stats.uploaded += lateUploaded
+            report("догружено сохранённое ранее: $lateUploaded")
+        }
+        if (lateFailed > 0) stats.errors += lateFailed
+
         for (job in db.jobs(enabledOnly = true)) {
             if (Decisions.shouldWaitForWifi(job, Network.isUnmetered(context))) {
                 db.putKv("job_note:${job.id}", "ждём Wi-Fi: у задачи включено «только по Wi-Fi»")
@@ -79,9 +88,29 @@ class UploadEngine(private val context: Context, private val db: Db, private val
         if (job.zone == "PHOTOS") return job.targetFolderId
         if (relDir.isEmpty()) return job.targetFolderId
         folderCache["${job.id}:$relDir"]?.let { return it }
-        val id = api.ensurePath(relDir, job.targetFolderId)
+        val id = withRateLimitRetry("создание папки $relDir") { api.ensurePath(relDir, job.targetFolderId) }
         folderCache["${job.id}:$relDir"] = id
         return id
+    }
+
+    /**
+     * Сервер ограничивает частоту запросов (429). Первый проход по дереву с подпапками
+     * заводит их десятками, и упереться в лимит на середине — значит уронить весь проход
+     * и повторять это каждый раз. Ждём и повторяем, а не сдаёмся.
+     */
+    private fun <T> withRateLimitRetry(what: String, block: () -> T): T {
+        var waitMs = 2_000L
+        for (attempt in 0 until 4) {
+            try {
+                return block()
+            } catch (e: ApiException) {
+                if (e.status != 429 || attempt == 3) throw e
+                Log.w(TAG, "$what: сервер просит подождать — пауза ${waitMs / 1000} с")
+                Thread.sleep(waitMs)
+                waitMs *= 2
+            }
+        }
+        throw IllegalStateException("$what: сервер так и не принял запрос")
     }
 
     private fun syncJob(job: Db.Job, stats: Stats, onProgress: (String) -> Unit) {
@@ -165,11 +194,6 @@ class UploadEngine(private val context: Context, private val db: Db, private val
             Log.i(TAG, "перенос: $oldPath → $newPath")
         }
 
-        // Дедуп по содержимому: спрашиваем сервер одним батчем, что у него уже есть
-        val toCheck = hashed.filter { it.first.relPath !in movedNew && it.second?.sha256 != it.third }
-            .map { it.third }
-        val present = if (toCheck.isEmpty()) emptySet() else runCatching { api.have(toCheck.distinct().take(500)) }.getOrDefault(emptySet())
-
         for ((file, known, sha) in hashed) {
             if (file.relPath in movedNew) continue
             if (known != null && Decisions.isAlreadyUploaded(known.sha256, known.localSize, sha, file.size) && known.entryId != null) {
@@ -189,7 +213,6 @@ class UploadEngine(private val context: Context, private val db: Db, private val
                     uploadedAt = null,
                 ),
             )
-            if (sha in present) db.putKv("hint:${job.id}:${file.relPath}", sha)
             db.enqueue(job.id, file.relPath)
         }
 
@@ -213,7 +236,10 @@ class UploadEngine(private val context: Context, private val db: Db, private val
                 when {
                     // сервер потерял сессию (рестарт, чистка брошенных, повторный complete):
                     // сбрасываем upload_id и начинаем заново, иначе 404 будет вечно
-                    e.status == 404 || e.code == "upload_session_lost" || e.code == "upload_completed" -> {
+                    // сервер потерял сессию, файл на диске изменился (число частей другое) или
+                    // в сессии не хватает части: начинаем загрузку заново, иначе 404/400 навсегда
+                    e.status == 404 || e.code == "upload_session_lost" || e.code == "upload_completed" ||
+                        (e.status == 400 && (e.message ?: "").contains("missing part")) -> {
                         db.updateOp(op.id, mapOf("upload_id" to null, "next_attempt_at" to System.currentTimeMillis() + 3_000))
                     }
                     e.status == 401 || e.status == 403 -> {
@@ -236,12 +262,14 @@ class UploadEngine(private val context: Context, private val db: Db, private val
             db.deleteOp(op.id)
             return
         }
-        val sha = Hasher.sha256(file)
-        db.updateCache(
-            job.id,
-            op.relPath,
-            mapOf("sha256" to sha, "local_size" to file.length(), "local_mtime" to file.lastModified()),
-        )
+        // Хэш в кэше верен, если файл с тех пор не менялся: на большом видео повторное
+        // хэширование на каждую попытку — минуты работы и батарея.
+        val size = file.length()
+        val mtime = file.lastModified()
+        val sha = cached.sha256.takeIf {
+            it.isNotBlank() && cached.localSize == size && cached.localMtime == mtime
+        } ?: Hasher.sha256(file)
+        db.updateCache(job.id, op.relPath, mapOf("sha256" to sha, "local_size" to size, "local_mtime" to mtime))
         val folderId = remoteFolderFor(job, op.relPath.substringBeforeLast('/', ""))
         // Имя записи в облаке может отличаться от локального: если такое имя уже занято другим
         // содержимым, свободное имя получает только облачная запись. Локальный файл не трогаем —
@@ -261,7 +289,6 @@ class UploadEngine(private val context: Context, private val db: Db, private val
                         "sha256" to sha,
                     ),
                 )
-                db.putKv("hint:${job.id}:${op.relPath}", "")
                 db.deleteOp(op.id)
                 if (result.deduped) stats.deduped += 1 else stats.uploaded += 1
                 Log.i(TAG, "выгружено ${op.relPath}${if (result.deduped) " (содержимое уже было в облаке)" else ""}")

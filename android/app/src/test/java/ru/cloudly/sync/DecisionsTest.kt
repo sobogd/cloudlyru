@@ -24,14 +24,6 @@ class DecisionsTest {
     }
 
     @Test
-    fun `свежим считается только недавнее прошлое`() {
-        assertTrue(Decisions.isTooFresh(5_000, 30_000))
-        assertFalse(Decisions.isTooFresh(60_000, 30_000))
-        // дата из будущего: разница отрицательная — файл выгружаем, а не пропускаем навсегда
-        assertFalse(Decisions.isTooFresh(-3_600_000, 30_000))
-    }
-
-    @Test
     fun `свободное имя получает суффикс`() {
         assertEquals("IMG_0001 (2).jpg", Decisions.freeName("IMG_0001.jpg", emptySet()))
         assertEquals("IMG_0001 (3).jpg", Decisions.freeName("IMG_0001.jpg", setOf("IMG_0001 (2).jpg")))

@@ -12,9 +12,6 @@ object Decisions {
     /** Ждать ли Wi-Fi для задачи. */
     fun shouldWaitForWifi(job: Db.Job, unmetered: Boolean): Boolean = job.wifiOnly && !unmetered
 
-    /** Файл, изменённый только что, может ещё дописываться — берём его следующим проходом. */
-    fun isTooFresh(ageMs: Long, thresholdMs: Long): Boolean = ageMs in 0 until thresholdMs
-
     /**
      * Свободное имя с суффиксом: `IMG_0001 (2).jpg`. Нужно, когда в целевой папке облака
      * уже лежит другой файл с таким именем — перезаписывать чужое нельзя, добавляем рядом.

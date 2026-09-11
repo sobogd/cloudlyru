@@ -80,3 +80,15 @@ export const PART_URL_TTL_SEC = Math.floor(env.UPLOAD_PART_URL_TTL_MIN * 60);
 export const MAX_FILE_BYTES = Math.floor(env.MAX_FILE_SIZE_MB * 1024 * 1024);
 export const MAX_UPLOAD_SESSIONS_PER_USER = env.MAX_UPLOAD_SESSIONS_PER_USER;
 export const TRASH_RETENTION_MS = env.TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+/**
+ * Хост объектного хранилища. Отдаём клиенту при старте загрузки: телефон должен уметь
+ * показать, что именно не разрешается в DNS, ещё до первой попытки залить байты.
+ */
+export const STORAGE_HOST = (() => {
+  try {
+    return new URL(env.S3_FILES_ENDPOINT).host;
+  } catch {
+    return '';
+  }
+})();

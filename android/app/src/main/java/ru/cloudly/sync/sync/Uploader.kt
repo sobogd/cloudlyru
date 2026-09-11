@@ -145,7 +145,4 @@ class Uploader(private val api: Api) {
         val entry = api.complete(uploadId, sha256)
         return Result(entry.id, entry.name, sha256, deduped = false)
     }
-
-    /** Оценка числа частей для лога/прогресса. */
-    fun partCount(size: Long): Int = max(1, ((size + partSize - 1) / partSize).toInt())
 }
