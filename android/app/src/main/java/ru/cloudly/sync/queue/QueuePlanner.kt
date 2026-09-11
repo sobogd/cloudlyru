@@ -18,10 +18,10 @@ data class Candidate(
     val target: String,
 )
 
-/** Что приложение уже знает про файл на телефоне: размер и дату изменения. */
-data class Known(val size: Long, val mtime: Long)
+/** Что уже лежит в облаке: запись и слепок содержимого, по которому её выгружали. */
+data class Uploaded(val entryId: String, val size: Long, val mtime: Long)
 
-/** Что уже выгружено: ключ — файл и облачная папка, в которую он лёг. */
+/** Ключ выгруженного: файл и облачная папка, в которую он лёг. */
 data class UploadedKey(val path: String, val target: String)
 
 /**
@@ -45,7 +45,7 @@ object QueuePlanner {
      * Уже стоящий в очереди файл повторно в неё не попадает (в базе уникальность по паре
      * «файл + цель»), поэтому проход можно запускать сколько угодно раз.
      */
-    fun plan(candidates: List<Candidate>, uploaded: Map<UploadedKey, Known>): List<Candidate> {
+    fun plan(candidates: List<Candidate>, uploaded: Map<UploadedKey, Uploaded>): List<Candidate> {
         val out = ArrayList<Candidate>(candidates.size)
         val seen = HashSet<UploadedKey>(candidates.size)
         for (candidate in candidates) {

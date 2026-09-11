@@ -6,7 +6,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import ru.cloudly.sync.queue.Candidate
-import ru.cloudly.sync.queue.Known
+import ru.cloudly.sync.queue.Uploaded
 import ru.cloudly.sync.queue.UploadedKey
 
 /** Состояние файла в очереди. Автоматического запуска нет: пользователь жмёт «play» сам. */
@@ -26,6 +26,8 @@ data class QueueItem(
     val attempts: Int,
     val lastError: String?,
     val entryId: String?,
+    /** Посчитанный хэш содержимого: пока файл не менялся, второй раз не считаем. */
+    val sha256: String?,
     val createdAt: Long,
 )
 
@@ -72,7 +74,8 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
               created_at INTEGER NOT NULL,
               started_at INTEGER,
               finished_at INTEGER,
-              entry_id TEXT
+              entry_id TEXT,
+              sha256 TEXT
             )
             """.trimIndent(),
         )
@@ -81,18 +84,24 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Схема только появилась: обновлять пока нечего. Когда появится — переносить
-        // очередь не нужно (её пересоберёт проход), а вот uploaded терять нельзя.
+        // Очередь пересобирается проходом, а вот uploaded (что уже выгружено) терять нельзя.
+        if (oldVersion < 2) {
+            // кэш хэша: считать SHA-256 заново на каждую попытку большого видео — минуты работы
+            db.execSQL("ALTER TABLE queue ADD COLUMN sha256 TEXT")
+        }
     }
 
     // ===== что уже выгружено =====
 
     /** Ключ — файл и облачная папка: одна и та же запись может лежать в двух разделах. */
-    fun uploaded(): Map<UploadedKey, Known> =
-        readableDatabase.rawQuery("SELECT path, target, size, mtime FROM uploaded", null).use { c ->
+    fun uploaded(): Map<UploadedKey, Uploaded> =
+        readableDatabase.rawQuery("SELECT path, target, entry_id, size, mtime FROM uploaded", null).use { c ->
             buildMap {
                 while (c.moveToNext()) {
-                    put(UploadedKey(c.getString(0), c.getString(1)), Known(c.getLong(2), c.getLong(3)))
+                    put(
+                        UploadedKey(c.getString(0), c.getString(1)),
+                        Uploaded(c.getString(2), c.getLong(3), c.getLong(4)),
+                    )
                 }
             }
         }
@@ -225,6 +234,9 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
     )
 
     /** Вернуть в ожидание: кнопка повтора на строке с ошибкой. */
+    /** Запомнить посчитанный хэш: повторная попытка не должна перечитывать весь файл. */
+    fun setSha(id: Long, sha256: String) = update(id, mapOf("sha256" to sha256))
+
     fun markPending(id: Long) = update(id, mapOf("state" to QueueState.PENDING.name, "last_error" to null))
 
     private fun update(id: Long, values: Map<String, Any?>) {
@@ -252,12 +264,13 @@ class QueueStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSI
         attempts = c.getInt(c.getColumnIndexOrThrow("attempts")),
         lastError = c.getString(c.getColumnIndexOrThrow("last_error")),
         entryId = c.getString(c.getColumnIndexOrThrow("entry_id")),
+        sha256 = c.getString(c.getColumnIndexOrThrow("sha256")),
         createdAt = c.getLong(c.getColumnIndexOrThrow("created_at")),
     )
 
     private companion object {
         const val NAME = "cloudly-queue.db"
-        const val VERSION = 1
+        const val VERSION = 2
     }
 }
 

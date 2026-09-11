@@ -73,6 +73,34 @@ object MediaRules {
         return parentName == "Android" && (name == "data" || name == "obb")
     }
 
+    /**
+     * Mime по расширению. Сервер сам решает, конвертировать ли медиа, но тип нужен при записи:
+     * по нему же файл уходит получателю и открывается просмотрщиком.
+     */
+    fun mimeOf(name: String): String = when (extension(name)) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "png" -> "image/png"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "bmp" -> "image/bmp"
+        "heic" -> "image/heic"
+        "heif" -> "image/heif"
+        "avif" -> "image/avif"
+        "dng", "raw", "cr2", "cr3", "nef", "arw" -> "image/x-raw"
+        "tif", "tiff" -> "image/tiff"
+        "mp4", "m4v" -> "video/mp4"
+        "mov" -> "video/quicktime"
+        "mkv" -> "video/x-matroska"
+        "webm" -> "video/webm"
+        "avi" -> "video/avi"
+        "3gp", "3g2" -> "video/3gpp"
+        "pdf" -> "application/pdf"
+        "zip" -> "application/zip"
+        "txt" -> "text/plain"
+        "json" -> "application/json"
+        else -> "application/octet-stream"
+    }
+
     /** Размер в человеческом виде: «4.2 МБ» читается лучше, чем «4404019». */
     fun formatSize(bytes: Long): String {
         if (bytes < 1024) return "$bytes Б"

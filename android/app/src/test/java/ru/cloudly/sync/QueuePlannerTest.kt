@@ -5,7 +5,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.queue.Candidate
-import ru.cloudly.sync.queue.Known
+import ru.cloudly.sync.queue.Uploaded
 import ru.cloudly.sync.queue.QueuePlanner
 import ru.cloudly.sync.queue.UploadedKey
 
@@ -36,7 +36,7 @@ class QueuePlannerTest {
         val item = candidate()
         val planned = QueuePlanner.plan(
             candidates = listOf(item),
-            uploaded = mapOf(UploadedKey(item.path, item.target) to Known(item.size, item.mtime)),
+            uploaded = mapOf(UploadedKey(item.path, item.target) to Uploaded("entry", item.size, item.mtime)),
         )
         assertTrue(planned.isEmpty())
     }
@@ -46,7 +46,7 @@ class QueuePlannerTest {
         val item = candidate(size = 200, mtime = 2000)
         val planned = QueuePlanner.plan(
             candidates = listOf(item),
-            uploaded = mapOf(UploadedKey(item.path, item.target) to Known(100, 1000)),
+            uploaded = mapOf(UploadedKey(item.path, item.target) to Uploaded("entry", 100, 1000)),
         )
         // правка на телефоне должна доехать до облака, иначе перезаписи не будет никогда
         assertEquals(1, planned.size)
@@ -68,7 +68,7 @@ class QueuePlannerTest {
         val item = candidate(target = "photos", relDir = "")
         val planned = QueuePlanner.plan(
             candidates = listOf(item),
-            uploaded = mapOf(UploadedKey(item.path, "phone") to Known(item.size, item.mtime)),
+            uploaded = mapOf(UploadedKey(item.path, "phone") to Uploaded("entry", item.size, item.mtime)),
         )
         // «уже в облаке» в разделе «Файлы» не значит, что файл есть в медиатеке
         assertEquals(1, planned.size)

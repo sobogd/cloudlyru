@@ -29,6 +29,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,6 +53,7 @@ import ru.cloudly.sync.data.QueueState
 import ru.cloudly.sync.data.Section
 import ru.cloudly.sync.device.MediaRules
 import ru.cloudly.sync.queue.QueueRefresher
+import ru.cloudly.sync.queue.UploadRunner
 
 /**
  * Раздел «Очередь»: что нашлось нового и ждёт выгрузки. Очередь только формируется —
@@ -64,6 +66,8 @@ fun QueueScreen() {
     val app = remember { App.of(context) }
     val scope = rememberCoroutineScope()
 
+    val runner = remember { app.uploads }
+    val progress by runner.progress.collectAsState()
     var items by remember { mutableStateOf<List<QueueItem>>(emptyList()) }
     var waiting by remember { mutableStateOf(0) }
     var note by remember { mutableStateOf("") }
@@ -97,6 +101,11 @@ fun QueueScreen() {
     }
 
     LaunchedEffect(Unit) { rebuild() }
+
+    // выгрузка закончилась — показываем новое состояние строк
+    LaunchedEffect(progress) {
+        if (progress == null) reload()
+    }
 
     Scaffold(
         topBar = {
@@ -166,7 +175,15 @@ fun QueueScreen() {
                     }
                 }
                 LazyColumn(Modifier.fillMaxSize()) {
-                    items(items, key = { it.id }) { item -> QueueRow(item) }
+                    items(items, key = { it.id }) { item ->
+                        QueueRow(
+                            item = item,
+                            progress = progress?.takeIf { it.id == item.id },
+                            canStart = progress == null &&
+                                (item.state == QueueState.PENDING || item.state == QueueState.FAILED),
+                            onStart = { runner.start(item.id) },
+                        )
+                    }
                 }
             }
             if (busy) {
@@ -177,7 +194,12 @@ fun QueueScreen() {
 }
 
 @Composable
-private fun QueueRow(item: QueueItem) {
+private fun QueueRow(
+    item: QueueItem,
+    progress: UploadRunner.Progress?,
+    canStart: Boolean,
+    onStart: () -> Unit,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -197,7 +219,11 @@ private fun QueueRow(item: QueueItem) {
         Column(Modifier.weight(1f)) {
             Text(item.name, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
-                subtitle(item),
+                if (progress != null) {
+                    "выгрузка: ${progress.percent}% из ${MediaRules.formatSize(progress.total)}"
+                } else {
+                    subtitle(item)
+                },
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 2,
@@ -213,9 +239,9 @@ private fun QueueRow(item: QueueItem) {
                 )
             }
         }
-        // Запуск появится вместе с выгрузкой: сейчас очередь только формируется
-        IconButton(enabled = false, onClick = {}) {
-            Icon(Icons.Filled.PlayArrow, contentDescription = "Запуск (появится с выгрузкой)")
+        // Запуск ручной и по одному файлу: пока идёт выгрузка, остальные кнопки неактивны
+        IconButton(enabled = canStart, onClick = onStart) {
+            Icon(Icons.Filled.PlayArrow, contentDescription = "Выгрузить файл")
         }
     }
     HorizontalDivider()

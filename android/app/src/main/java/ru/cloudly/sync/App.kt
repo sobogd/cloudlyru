@@ -2,10 +2,14 @@ package ru.cloudly.sync
 
 import android.app.Application
 import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import ru.cloudly.sync.data.Prefs
 import ru.cloudly.sync.data.QueueStore
 import ru.cloudly.sync.data.Selection
 import ru.cloudly.sync.net.Api
+import ru.cloudly.sync.queue.UploadRunner
 
 /**
  * Ручная сборка зависимостей без DI-фреймворка: приложение маленькое, а лишний кодогенератор
@@ -23,12 +27,21 @@ class App : Application() {
     lateinit var queueStore: QueueStore
         private set
 
+    /**
+     * Выгрузка живёт в области приложения, а не экрана: ушёл с раздела «Очередь» —
+     * файл всё равно доедет. Запуск при этом ручной, по кнопке на строке.
+     */
+    val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    lateinit var uploads: UploadRunner
+        private set
+
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
         api = Api(prefs)
         selection = Selection(this)
         queueStore = QueueStore(this)
+        uploads = UploadRunner(api, queueStore, appScope)
     }
 
     companion object {
