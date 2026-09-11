@@ -26,10 +26,17 @@ export function asOptionalString(v: unknown, field: string): string | undefined 
   return v;
 }
 
-/** Валидация имён папок/файлов: запрет разделителей пути и управляющих символов. */
+/**
+ * Валидация имён папок/файлов: запрет разделителей пути и управляющих символов.
+ * Длина — в БАЙТАХ utf8, а не в символах: 255 — это предел файловых систем телефона
+ * (ext4/f2fs/APFS), и имя из 200 кириллических символов (400 байт) создавалось в облаке,
+ * но не создавалось на телефоне — файл молча не уезжал.
+ */
 export function assertSafeName(name: string): void {
   // именно badRequest: обычный Error превращался в 500, и клиент считал сервер сломанным
-  if (!name || name.length > 255) throw badRequest('invalid name length');
+  if (!name || name.length > 255 || Buffer.byteLength(name, 'utf8') > 255) {
+    throw badRequest('invalid name length');
+  }
   if (name.includes('/') || name.includes('\\') || name.includes('\0')) {
     throw badRequest('name contains path separators');
   }

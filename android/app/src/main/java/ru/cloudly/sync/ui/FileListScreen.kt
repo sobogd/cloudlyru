@@ -62,6 +62,39 @@ import java.util.concurrent.atomic.AtomicReference
 /** Сколько файлов показываем в списке: больше в ручном листании всё равно не нужно. */
 private const val LIST_LIMIT = 2000
 
+/** Сколько держим результат обхода: переключение вкладок не должно обходить диск заново. */
+private const val SCAN_FRESH_MS = 60_000L
+
+/**
+ * Последний обход раздела в памяти. Обход диска на десятках тысяч файлов — это секунды работы
+ * и сотни системных вызовов, а вкладки переключают туда-сюда; свежий результат переиспользуем,
+ * по кнопке «Обновить» обходим заново.
+ */
+private object ScanCache {
+    private var key: String? = null
+    private var at: Long = 0
+    private var files: List<DeviceFile> = emptyList()
+    private var note: String = ""
+
+    fun get(section: Section, roots: List<String>): Triple<List<DeviceFile>, String, Boolean>? {
+        val k = "${section.name}|${roots.joinToString("|")}"
+        if (k != key || System.currentTimeMillis() - at > SCAN_FRESH_MS) return null
+        return Triple(files, note, true)
+    }
+
+    /** Кнопка «Обновить»: кэш выбрасываем, обход идёт заново. */
+    fun clear() {
+        at = 0
+    }
+
+    fun put(section: Section, roots: List<String>, files: List<DeviceFile>, note: String) {
+        key = "${section.name}|${roots.joinToString("|")}"
+        at = System.currentTimeMillis()
+        this.files = files
+        this.note = note
+    }
+}
+
 /**
  * Раздел со списком файлов выбранных папок, свежие — сверху. Ни статусов, ни прогресса
  * загрузки здесь нет: раздел только показывает, что лежит на телефоне.
@@ -94,6 +127,13 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
             note = ""
             return@LaunchedEffect
         }
+        val cached = ScanCache.get(section, roots)
+        if (cached != null) {
+            // свежий обход уже есть в памяти: показываем сразу, диск не трогаем
+            files = cached.first
+            note = cached.second
+            return@LaunchedEffect
+        }
         scanning = true
         val effect = this
         val result = withContext(Dispatchers.IO) {
@@ -111,6 +151,7 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
             if (result.unreadable > 0) append(", папок без доступа: ${result.unreadable}")
             if (result.capped) append(", обход упёрся в предел")
         }
+        ScanCache.put(section, roots, files, note)
         scanning = false
     }
 
@@ -158,7 +199,7 @@ fun FileListScreen(section: Section, onOpenFolders: () -> Unit) {
                     }
                 },
                 actions = {
-                    IconButton(onClick = { reload += 1 }, enabled = roots.isNotEmpty() && !scanning) {
+                    IconButton(onClick = { ScanCache.clear(); reload += 1 }, enabled = roots.isNotEmpty() && !scanning) {
                         Icon(Icons.Filled.Refresh, contentDescription = "Обновить")
                     }
                     IconButton(onClick = onOpenFolders) {

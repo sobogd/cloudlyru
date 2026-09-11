@@ -1,16 +1,43 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { env } from '../config/env';
 import { PrismaService } from '../prisma/prisma.service';
-import { randomToken, sha256Hex } from '../common/utils';
-import { PHONE_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_PHOTOS, mirrorFolderName } from '../common/zones';
+import { randomToken, sha256Hex, assertSafeName } from '../common/utils';
+import { PHOTO_FOLDER_NAME, ZONE_PHOTOS, mirrorFolderName } from '../common/zones';
 import { AuditService } from '../audit/audit.service';
+import { ChangesService } from '../sync/changes.service';
 import { badRequest, notFound, unauthorized } from '../common/errors';
 
 export const ROOT_FOLDER_NAME = '__root__';
 
 /** Потолок живых device-токенов на пользователя. */
 export const MAX_API_TOKENS_PER_USER = 32;
+
+/** Потолок длины метки токена: из неё строится имя папки-зеркала (см. createToken). */
+const MAX_TOKEN_LABEL_BYTES = 64;
+
+/**
+ * Метка токена из запроса → безопасная метка. Из метки строится имя папки-зеркала
+ * (`<Метка> - Файлы`), поэтому разделители пути и управляющие символы — это 400:
+ * папку с таким именем телефон не создаст, а клиент потом не найдёт свой корень.
+ * Концевые точки и пробелы (Windows/SMB их не хранит) и длину санитизируем сами —
+ * это не ошибка клиента, а косметика.
+ */
+function cleanTokenLabel(raw: unknown): string {
+  const value = String(raw ?? '');
+  if (/[/\\\u0000-\u001f\u007f]/.test(value)) {
+    throw badRequest('label must not contain path separators or control characters');
+  }
+  let clean = value.trim();
+  while (clean.endsWith('.') || clean.endsWith(' ')) clean = clean.slice(0, -1);
+  if (!clean) return 'app';
+  // режем по байтам, а не по символам: 64 кириллических символа — это 128 байт, а имя
+  // папки ограничено 255 байтами вместе с суффиксом, и «обрезать» символ пополам нельзя
+  while (Buffer.byteLength(clean, 'utf8') > MAX_TOKEN_LABEL_BYTES) clean = clean.slice(0, -1);
+  assertSafeName(clean);
+  return clean;
+}
 
 @Injectable()
 export class AuthService implements OnModuleInit {
@@ -19,9 +46,10 @@ export class AuthService implements OnModuleInit {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly changes: ChangesService,
   ) {}
 
-  /** При первом старте создаёт владельца, корневую папку и системные папки «Фото» и «Телефон». */
+  /** При первом старте создаёт владельца, корневую папку и системную папку «Фото». */
   async onModuleInit() {
     const count = await this.prisma.user.count();
     if (count === 0) {
@@ -35,15 +63,15 @@ export class AuthService implements OnModuleInit {
       const photo = await this.prisma.folder.create({
         data: { parentId: root.id, name: PHOTO_FOLDER_NAME, zone: ZONE_PHOTOS },
       });
-      const phone = await this.prisma.folder.create({
-        data: { parentId: root.id, name: PHONE_FOLDER_NAME },
-      });
+      // «Телефон» больше не заводим: корень зеркала теперь свой у каждого устройства
+      // (ApiToken.mirrorFolderId), а общая на всех папка означала бы, что удаление файла
+      // на одном телефоне уносит файлы другого.
       await this.prisma.user.update({
         where: { id: user.id },
-        data: { rootFolderId: root.id, photoFolderId: photo.id, phoneFolderId: phone.id },
+        data: { rootFolderId: root.id, photoFolderId: photo.id },
       });
       this.logger.log(
-        `Создан владелец "${env.ADMIN_LOGIN}", корневая папка и системные «${PHOTO_FOLDER_NAME}» и «${PHONE_FOLDER_NAME}»`,
+        `Создан владелец "${env.ADMIN_LOGIN}", корневая папка и системная «${PHOTO_FOLDER_NAME}»`,
       );
     }
   }
@@ -88,7 +116,9 @@ export class AuthService implements OnModuleInit {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw unauthorized();
     const photoFolderId = await this.photoFolderId(userId).catch(() => null);
-    const phoneFolderId = await this.phoneFolderId(userId).catch(() => null);
+    // «Телефон» только читаем: папка больше не создаётся (корень зеркала свой у каждого
+    // устройства), но поле в ответе остаётся — на него завязан веб и старые сборки клиента
+    const phoneFolderId = await this.phoneRootIdOrNull(userId).catch(() => null);
     const mirrorFolderId = deviceId ? await this.deviceMirrorFolderId(deviceId).catch(() => null) : null;
     return {
       id: user.id,
@@ -120,43 +150,28 @@ export class AuthService implements OnModuleInit {
     return user?.photoFolderId ?? null;
   }
 
-  /** id системной папки «Телефон», если она уже есть (без побочных эффектов; для гардов). */
+  /**
+   * id легаси-папки «Телефон», если она уже есть (без побочных эффектов). Папка больше не
+   * создаётся и не защищается от удаления: корень зеркала теперь свой у каждого устройства,
+   * а старая общая папка нужна только чтобы веб и старые сборки клиента её видели.
+   */
   async phoneRootIdOrNull(userId: string): Promise<string | null> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { phoneFolderId: true } });
-    return user?.phoneFolderId ?? null;
-  }
-
-  /**
-   * Системная папка «Телефон» — корень зеркала папок телефона. Как и у «Фото», папка
-   * создаётся лениво, а существующую папку с таким именем «усыновляем»: она уже могла быть
-   * заведена руками, и плодить вторую «Телефон» рядом нельзя. Удалить её нельзя (гарды
-   * в Folders/Dav): клиент льёт в неё структуру, и потеря корня ломает адресацию.
-   */
-  async phoneFolderId(userId: string): Promise<string> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) throw unauthorized();
-    if (user.phoneFolderId) {
-      const current = await this.prisma.folder.findUnique({ where: { id: user.phoneFolderId } });
-      if (current && !current.deletedAt) return current.id;
-    }
-    const rootId = await this.rootFolderId(userId);
-
-    const existing = await this.prisma.folder.findFirst({
-      where: { parentId: rootId, name: PHONE_FOLDER_NAME },
+    if (!user?.phoneFolderId) return null;
+    const folder = await this.prisma.folder.findUnique({
+      where: { id: user.phoneFolderId },
+      select: { id: true, deletedAt: true },
     });
-    const phone = existing
-      ? await this.prisma.folder.update({ where: { id: existing.id }, data: { deletedAt: null } })
-      : await this.prisma.folder.create({ data: { parentId: rootId, name: PHONE_FOLDER_NAME } });
-    await this.prisma.user.update({ where: { id: userId }, data: { phoneFolderId: phone.id } });
-    return phone.id;
+    return folder && !folder.deletedAt ? folder.id : null;
   }
 
   /**
-   * Корень зеркала устройства «<Имя> - Файлы» в корне пользователя. Создаётся лениво, как и
-   * «Телефон», а существующую папку с таким именем «усыновляем» (снимаем deletedAt): она могла
-   * быть заведена руками или лежать в корзине, и плодить вторую рядом нельзя — клиент адресует
-   * файлы по имени корня. Удалить её нельзя (гарды в Folders/Dav через protectedFolderIds):
-   * потеря корня ломает адресацию всего зеркала.
+   * Корень зеркала устройства «<Имя> - Файлы» в корне пользователя. Ищем строго по
+   * ApiToken.mirrorFolderId: раньше папка искалась по имени и «усыновлялась» (в том числе
+   * воскрешалась из корзины), из-за чего чужая папка с подходящим именем молча становилась
+   * корнем зеркала, а два телефона одной модели вели один корень и удаляли файлы друг друга.
+   * Если своей папки нет или она в корзине — заводим НОВУЮ со свободным именем: корень
+   * адресуется по id из токена, а не по имени, поэтому имя в корне — только подпись.
    */
   async deviceMirrorFolderId(tokenId: string): Promise<string> {
     const token = await this.prisma.apiToken.findUnique({ where: { id: tokenId } });
@@ -166,13 +181,59 @@ export class AuthService implements OnModuleInit {
       if (current && !current.deletedAt) return current.id;
     }
     const rootId = await this.rootFolderId(token.userId);
-    const name = mirrorFolderName(token.label);
-    const existing = await this.prisma.folder.findFirst({ where: { parentId: rootId, name } });
-    const mirror = existing
-      ? await this.prisma.folder.update({ where: { id: existing.id }, data: { deletedAt: null } })
-      : await this.prisma.folder.create({ data: { parentId: rootId, name } });
-    await this.prisma.apiToken.update({ where: { id: tokenId }, data: { mirrorFolderId: mirror.id } });
-    return mirror.id;
+    const base = mirrorFolderName(token.label);
+
+    // Уникальный индекс (parentId, name) распространяется и на записи в корзине, поэтому
+    // имя мог занять параллельный запрос или удалённая тёзка — тогда берём уточнение «(2)».
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const name = await this.freeMirrorFolderName(rootId, base);
+      let mirror: { id: string };
+      try {
+        mirror = await this.prisma.folder.create({ data: { parentId: rootId, name } });
+      } catch (e) {
+        // имя занял параллельный запрос — берём следующее уточнение, а не чужую папку
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+          lastError = e;
+          continue;
+        }
+        throw e;
+      }
+      await this.prisma.apiToken.update({ where: { id: tokenId }, data: { mirrorFolderId: mirror.id } });
+      await this.audit.log('device.mirror.folder.create', {
+        userId: token.userId,
+        tokenId,
+        folderId: mirror.id,
+        name,
+        label: token.label,
+      });
+      // событие в журнал: остальные устройства пользователя увидят новую папку обычным
+      // проходом, без «папка появилась, а журнал про неё молчит»
+      await this.changes.recordFolder(token.userId, mirror.id, 'create');
+      this.logger.log(`Корень зеркала устройства «${token.label}»: ${name}`);
+      return mirror.id;
+    }
+    throw lastError;
+  }
+
+  /**
+   * Свободное имя для корня зеркала: «Имя - Файлы (2)», «(3)»… Уточнение дописывается
+   * в конец, а не перед расширением (как в клиенте): у папки расширения нет, а точка
+   * в метке устройства встречается («Pixel 7.2»).
+   */
+  private async freeMirrorFolderName(rootId: string, base: string): Promise<string> {
+    const siblings = await this.prisma.folder.findMany({
+      where: { parentId: rootId },
+      select: { name: true },
+    });
+    const taken = new Set(siblings.map((f) => f.name));
+    if (!taken.has(base)) return base;
+    for (let i = 2; i < 1000; i++) {
+      const candidate = `${base} (${i})`;
+      if (!taken.has(candidate)) return candidate;
+    }
+    // тысяча тёзок в корне: время как уточнение (как и в android-клиенте) гарантирует свободу
+    return `${base} (${Date.now()})`;
   }
 
   /**
@@ -195,20 +256,21 @@ export class AuthService implements OnModuleInit {
   }
 
   /**
-   * Папки, которые нельзя удалять, переименовывать и переносить: корень пользователя, живые
-   * «Фото» и «Телефон» и корни зеркал устройств. Собрано одним методом намеренно: пока гарды
-   * в Folders и Dav проверяли папки по отдельности, новую системную папку забывали защитить
-   * в одном из мест — и клиент терял адресацию.
+   * Папки, которые нельзя удалять, переименовывать и переносить: корень пользователя, «Фото»
+   * и корни зеркал устройств. «Телефона» в списке больше нет: он превратился в легаси-папку,
+   * которую владелец вправе удалить. Собрано одним методом намеренно: пока гарды в Folders
+   * и Dav проверяли папки по отдельности, новую системную папку забывали защитить в одном
+   * из мест — и клиент терял адресацию.
    */
   async protectedFolderIds(userId: string): Promise<Set<string>> {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { rootFolderId: true, photoFolderId: true, phoneFolderId: true },
+      select: { rootFolderId: true, photoFolderId: true },
     });
     const ids = new Set<string>();
     if (user?.rootFolderId) ids.add(user.rootFolderId);
-    // фото/телефон — только живые: удалённую системную папку незачем защищать от восстановления
-    const systemIds = [user?.photoFolderId, user?.phoneFolderId].filter((id): id is string => Boolean(id));
+    // «Фото» — только живая: удалённую системную папку незачем защищать от восстановления
+    const systemIds = [user?.photoFolderId].filter((id): id is string => Boolean(id));
     if (systemIds.length) {
       const alive = await this.prisma.folder.findMany({
         where: { id: { in: systemIds }, deletedAt: null },
@@ -383,7 +445,9 @@ export class AuthService implements OnModuleInit {
   // ============ App-password / device-токены (WebDAV, клиенты) ============
 
   async createToken(userId: string, label: string): Promise<{ id: string; token: string; label: string }> {
-    const clean = String(label ?? 'app').slice(0, 64) || 'app';
+    // метка раньше просто резалась до 64 символов и не проверялась, а из неё строится имя
+    // папки-зеркала: «..» или «имя/2» давали папку, которую телефон не создаст
+    const clean = cleanTokenLabel(label);
     // кап на число живых токенов: без него выпуск токенов бесконечен, а отзыв одного
     // ничего не значит (владелец не видит, сколько их всего)
     const alive = await this.prisma.apiToken.count({ where: { userId, revokedAt: null } });
@@ -414,13 +478,17 @@ export class AuthService implements OnModuleInit {
     return rows;
   }
 
-  async revokeToken(userId: string, tokenId: string) {
+  /**
+   * Отзыв токена. `bySelf` — токен отозвал сам себя (выход на телефоне, DELETE /auth/me/token):
+   * в аудите это отдельная причина, иначе «токен исчез» не отличить от отзыва из веба.
+   */
+  async revokeToken(userId: string, tokenId: string, bySelf = false) {
     const res = await this.prisma.apiToken.updateMany({
       where: { id: tokenId, userId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
     if (res.count === 0) throw badRequest('token not found');
-    await this.audit.log('auth.token.revoke', { tokenId });
+    await this.audit.log('auth.token.revoke', { tokenId, ...(bySelf ? { bySelf: true } : {}) });
     return { ok: true };
   }
 

@@ -321,9 +321,29 @@ fun SettingsScreen(onOpenFolders: (Section) -> Unit) {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(onClick = { checkConnection() }) { Text("Проверить подключение") }
                             OutlinedButton(onClick = {
-                                app.prefs.token = ""
-                                token = ""
-                                status = "вышли: токен удалён с телефона"
+                                scope.launch {
+                                    // Сначала отзываем токен на сервере: иначе он остаётся живым
+                                    // до истечения срока и даёт полный доступ к облаку
+                                    val revoked = withContext(Dispatchers.IO) {
+                                        runCatching { app.api.revokeOwnToken() }.isSuccess
+                                    }
+                                    withContext(Dispatchers.IO) {
+                                        MirrorScheduler.cancel(context)
+                                        MirrorService.stop(context)
+                                        runCatching { app.mirrorWatcher.stop() }
+                                        // состояние зеркала принадлежит аккаунту: оставлять его
+                                        // нельзя — при следующем входе всё выглядело бы выгруженным
+                                        runCatching { app.mirrorStore.wipe() }
+                                    }
+                                    app.prefs.token = ""
+                                    token = ""
+                                    liveAlways = false
+                                    status = if (revoked) {
+                                        "вышли: токен отозван на сервере и удалён с телефона"
+                                    } else {
+                                        "вышли: токен удалён с телефона (отозвать на сервере не вышло — сделайте это в вебе)"
+                                    }
+                                }
                             }) { Text("Выйти") }
                         }
                         TextButton(onClick = { tokenField = !tokenField }) {

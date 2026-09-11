@@ -145,13 +145,18 @@ class MirrorService : Service() {
             runCatching { context.stopService(Intent(context, MirrorService::class.java)) }
         }
 
+        /**
+         * База зеркала одна на приложение. Открывать её заново на каждый вызов нельзя:
+         * каждое открытие — лишнее соединение, которое никто не закрывает.
+         */
+        private fun store(context: Context): MirrorStore = App.of(context).mirrorStore
+
         /** Включён ли мгновенный режим по выбору пользователя. */
-        fun isEnabled(context: Context): Boolean =
-            MirrorStore(context).meta(MirrorStore.KEY_LIVE) == "1"
+        fun isEnabled(context: Context): Boolean = store(context).meta(MirrorStore.KEY_LIVE) == "1"
 
         /** Включить/выключить режим и запустить или остановить сервис. */
         fun setEnabled(context: Context, enabled: Boolean) {
-            val store = MirrorStore(context)
+            val store = store(context)
             if (enabled) {
                 store.setMeta(MirrorStore.KEY_LIVE, "1")
                 start(context)

@@ -216,9 +216,10 @@ class MirrorRulesTest {
             "/s/Download/doc.pdf" to row(path = "/s/Download/doc.pdf", entryId = "in-mirror"),
             "/s/DCIM/old.jpg" to row(path = "/s/DCIM/old.jpg", entryId = "not-selected"),
         )
-        val inRoots = MirrorRules.underRoots(known, listOf("/s/Download"))
-        assertEquals(setOf("/s/Download/doc.pdf"), inRoots.keys)
-        val plan = MirrorRules.plan(emptyList(), inRoots, now, deletionsAllowed = true)
+        val inRoots: (String) -> Boolean = { path -> MirrorRules.underRoots(path, listOf("/s/Download")) }
+        assertTrue(inRoots("/s/Download/doc.pdf"))
+        assertFalse(inRoots("/s/DCIM/old.jpg"))
+        val plan = MirrorRules.plan(emptyList(), known, now, deletionsAllowed = true, inScope = inRoots)
         assertEquals(listOf("in-mirror"), plan.deletes.map { it.entryId })
     }
 

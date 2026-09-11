@@ -25,6 +25,9 @@ export class UploadsController {
         // Перезапись существующего имени и mtime с устройства — часть контракта синхронизации
         // (контроллер собирает тело руками, поэтому поля надо перечислить здесь явно).
         replace: body.replace === true || body.replace === 'true',
+        // имя занято своей же записью из корзины: клиент синхронизации просит занять его,
+        // иначе файл с таким именем не уезжает в облако никогда (409 in_trash)
+        replaceTrashed: body.replaceTrashed === true || body.replaceTrashed === 'true',
         clientMtime: typeof body.clientMtime === 'string' || body.clientMtime === null ? body.clientMtime : undefined,
         // оптимистичная блокировка: какую версию файла клиент заменяет
         expectedSha256: typeof body.expectedSha256 === 'string' || body.expectedSha256 === null ? body.expectedSha256 : undefined,

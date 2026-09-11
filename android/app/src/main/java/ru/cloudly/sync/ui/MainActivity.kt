@@ -45,6 +45,16 @@ private enum class Tab(val label: String) {
 }
 
 class MainActivity : ComponentActivity() {
+    override fun onStart() {
+        super.onStart()
+        App.of(this).isForeground.set(true)
+    }
+
+    override fun onStop() {
+        App.of(this).isForeground.set(false)
+        super.onStop()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {

@@ -38,6 +38,8 @@ class Uploader(private val api: Api) {
         onProgress: (sent: Long, total: Long) -> Unit,
         /** true — лить через сервер: нужно, когда хранилище с телефона недоступно. */
         forceRelay: Boolean = false,
+        /** true — занять имя, которое держит наша же запись в корзине (зеркало телефона). */
+        replaceTrashed: Boolean = false,
     ): Result {
         val size = file.length()
         val mtime = file.lastModified()
@@ -51,6 +53,7 @@ class Uploader(private val api: Api) {
             clientMtime = mtime,
             expectedSha256 = expectedSha256,
             mode = if (forceRelay) "relay" else "direct",
+            replaceTrashed = replaceTrashed,
         )
         if (init.stale || init.inTrash || init.nameTaken) {
             // имя занято или версия на сервере другая — решает вызывающий: свободное имя
@@ -96,6 +99,14 @@ class Uploader(private val api: Api) {
         fromPart: Int = 1,
     ): Result {
         val total = file.length()
+        // Пустой файл: частей нет вовсе. Раньше для него считалась «одна часть» из нуля байт,
+        // и S3 получал часть нулевой длины — сервер же умеет записать пустой объект одним
+        // запросом, поэтому просто завершаем сессию.
+        if (total == 0L) {
+            onProgress(0, 0)
+            val entry = api.complete(uploadId, sha256)
+            return Result(entry.id, entry.name, sha256, deduped = false)
+        }
         val parts = max(1, ((total + partSize - 1) / partSize).toInt())
         val first = fromPart.coerceIn(1, parts + 1)
         // уже принятые части считаются отправленными: прогресс продолжается, а не начинается заново

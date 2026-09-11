@@ -2,6 +2,7 @@ package ru.cloudly.sync.mirror
 
 import android.util.Log
 import ru.cloudly.sync.net.Api
+import ru.cloudly.sync.net.ApiException
 import ru.cloudly.sync.net.CloudChange
 import java.io.File
 
@@ -69,6 +70,19 @@ class MirrorPull(
         while (guard++ < MAX_PAGES) {
             val page = try {
                 api.changes(since)
+            } catch (e: ApiException) {
+                // Сервер ограничивает частоту: это «повтори позже», а не поломка. Курсор
+                // не двигаем — следующий заход продолжит с того же места.
+                if (e.status == 429 || e.status >= 500) {
+                    Log.i(TAG, "журнал придержан сервером (${e.status}) — повторю позже")
+                    return
+                }
+                fatal = if (e.status == 401) {
+                    "токен отозван — войдите заново"
+                } else {
+                    "журнал изменений недоступен: ${e.message}"
+                }
+                return
             } catch (e: Exception) {
                 fatal = "журнал изменений недоступен: ${e.message}"
                 return
@@ -388,7 +402,18 @@ class MirrorPull(
             true
         } catch (e: Exception) {
             failed += 1
-            onProgress("не скачалось ${dest.name}: ${e.message}")
+            // Самая частая причина отказа файловой системы — имя: сервер разрешает символы
+            // и длину, которых на телефоне (особенно на карте памяти) не бывает
+            val nameProblem = dest.name.toByteArray().size > 255 ||
+                dest.name.any { it in "\\:*?\"<>|" } ||
+                dest.name.endsWith(".") || dest.name.endsWith(" ")
+            onProgress(
+                if (nameProblem) {
+                    "не скачалось «${dest.name}»: такое имя недопустимо на телефоне — переименуйте в облаке"
+                } else {
+                    "не скачалось ${dest.name}: ${e.message}"
+                },
+            )
             false
         }
     }

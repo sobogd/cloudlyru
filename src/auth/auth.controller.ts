@@ -4,6 +4,7 @@ import { AuthService } from './auth.service';
 import { CurrentUser, Public, RateLimit, RequestUser, SessionOnly } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { env } from '../config/env';
+import { badRequest } from '../common/errors';
 
 @Controller('auth')
 export class AuthController {
@@ -65,5 +66,19 @@ export class AuthController {
   @Delete('tokens/:id')
   revokeToken(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     return this.auth.revokeToken(user.id, id);
+  }
+
+  /**
+   * Токен отзывает сам себя («Выйти» на телефоне). Отдельная ручка нужна потому, что
+   * `DELETE /auth/tokens/:id` доступен только веб-сессии: выход на телефоне стирал токен
+   * лишь локально, а на сервере он оставался живым до 180 дней с полным files:rw по REST
+   * и WebDAV. SessionOnly здесь не ставим — иначе смысл теряется; отозвать можно только
+   * тот токен, которым пришёл запрос.
+   */
+  @HttpCode(200)
+  @Delete('me/token')
+  revokeOwnToken(@CurrentUser() user: RequestUser) {
+    if (!user.deviceId) throw badRequest('this endpoint requires an API token (Bearer), not a web session');
+    return this.auth.revokeToken(user.id, user.deviceId, true);
   }
 }

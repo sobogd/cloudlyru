@@ -137,6 +137,17 @@ class MirrorEngine(
         val mirrorRootId = me.mirrorFolderId
             ?: return finish(report.apply { error = "сервер не отдал корень зеркала — проверьте подключение" })
         store.setMeta(MirrorStore.KEY_DEVICE_ID, me.deviceId.orEmpty())
+        // Состояние зеркала принадлежит аккаунту: сменили сервер или логин — строки прошлого
+        // аккаунта сделали бы все локальные файлы «уже выгруженными», а папка нового аккаунта
+        // осталась бы пустой. Поэтому при смене — полная очистка и честная перевыгрузка.
+        val identity = "${api.serverUrl()}|${me.login}"
+        val was = store.meta(MirrorStore.KEY_ACCOUNT)
+        if (was != null && was != identity) {
+            Log.i(TAG, "аккаунт сменился ($was → $identity) — начинаю зеркало заново")
+            store.wipe()
+            status.update { copy(inCloudFiles = 0, inCloudBytes = 0, waitingFiles = 0, waitingBytes = 0) }
+        }
+        store.setMeta(MirrorStore.KEY_ACCOUNT, identity)
 
         val folders = MirrorFolders(api, store)
         val roots = SelectionRules.scanRoots(selection.paths(Section.FILES).toSet())
@@ -238,6 +249,7 @@ class MirrorEngine(
                 lastText = report.text(),
                 error = report.error,
                 blocked = report.blockedDeletes,
+                blockedReason = report.blockedReason,
             )
         }
         return report
@@ -294,12 +306,25 @@ class MirrorEngine(
 
         val confirmed = store.meta(MirrorStore.KEY_CONFIRMED) == "1"
         val deletionsAllowed = MirrorRules.deletionsAllowed(snapshot)
-        // строки, относящиеся к выбранным сейчас папкам: у папки, снятой с выбора, файлов
-        // в снимке нет, и без этого фильтра сверка удалила бы её содержимое в облаке
+        // строки, относящиеся к выбранным сейчас папкам, отсекаются признаком: копию таблицы
+        // на большой библиотеке делать нельзя, а без отсечения сверка удалила бы содержимое
+        // папки, снятой с выбора
         val known = store.files().toMutableMap()
-        val inRoots = MirrorRules.underRoots(known, roots)
-        val plan = MirrorRules.plan(snapshot.files, inRoots, System.currentTimeMillis(), deletionsAllowed, confirmed)
+        val plan = MirrorRules.plan(
+            local = snapshot.files,
+            known = known,
+            now = System.currentTimeMillis(),
+            deletionsAllowed = deletionsAllowed,
+            confirmed = confirmed,
+            inScope = { path -> MirrorRules.underRoots(path, roots) },
+        )
 
+        // отложенные файлы (ещё пишутся) не забываем: к ним вернёмся через окно стабильности
+        if (plan.unstable > 0) {
+            store.setMeta(MirrorStore.KEY_RETRY_AT, (System.currentTimeMillis() + MirrorRules.STABLE_MS).toString())
+        } else {
+            store.clearMeta(MirrorStore.KEY_RETRY_AT)
+        }
         val waitingBytes = plan.uploads.sumOf { it.size }
         store.setWaitingTotals(plan.uploads.size, waitingBytes)
         status.update {
@@ -504,6 +529,9 @@ class MirrorEngine(
             )
         },
         onProgress = progress,
+        // телефон — источник истины: если файл с таким именем лежит в корзине облака, это
+        // наша же удалённая версия, и место под именем надо занять, а не ждать очистки
+        replaceTrashed = true,
     )
 
     /**
@@ -530,8 +558,13 @@ class MirrorEngine(
         }
         val cloudEntry = remote.firstOrNull { it.name == file.name }
         if (cloudEntry == null) {
-            report.failed += 1
-            onProgress("«${file.name}»: имя занято записью в корзине облака — разберите корзину")
+            // записи с таким именем в облаке нет вовсе: строка устарела (её удалили в вебе
+            // или с другого устройства). Снимаем её и даём следующему проходу выгрузить файл
+            // как новый — иначе он не уедет никогда и в каждом проходе будет ошибка.
+            Log.i(TAG, "«${file.name}»: облачной записи нет — снимаю устаревшую строку")
+            known.remove(file.path)
+            store.dropFile(file.path)
+            onProgress("«${file.name}»: запись в облаке пропала — выгружу заново")
             return
         }
         val taken = remote.map { it.name }.toHashSet()

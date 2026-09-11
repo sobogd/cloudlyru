@@ -24,8 +24,8 @@ object QueueRefresher {
             val folders = runCatching { app.api.systemFolders() }.getOrNull()
             if (folders != null) {
                 folders.photoFolderId?.let { prefs.photoFolderId = it }
-                // «Телефон» больше не используется: раздел «Файлы» ведёт зеркало
-                folders.phoneFolderId?.let { prefs.phoneFolderId = it }
+                // «Телефон» не читаем даже для памяти: раздел «Файлы» ведёт зеркало,
+                // а корень зеркала у каждого устройства свой
             }
         }
 

@@ -28,6 +28,8 @@ object MirrorRules {
 
     /** Что делать в этом проходе. */
     data class Plan(
+        /** Сколько файлов отложено: они ещё пишутся, вернёмся к ним через окно стабильности. */
+        val unstable: Int = 0,
         /** Новые и изменившиеся файлы: их надо выгрузить. */
         val uploads: List<LocalFile>,
         /** Переименования: файл тот же (совпал inode), а путь другой. */
@@ -63,12 +65,15 @@ object MirrorRules {
     fun deletionsAllowed(snapshot: LocalSnapshot): Boolean = snapshot.unreadable == 0 && !snapshot.capped
 
     /**
-     * Строки, относящиеся к выбранным сейчас папкам. Обязательный шаг перед сверкой: папку могли
-     * снять с выбора, и её файлов в снимке нет — без этого фильтра «файла нет в снимке» означало
-     * бы удаление всей папки в облаке, хотя пользователь всего лишь снял галочку.
+     * Файл лежит внутри выбранной сейчас папки. Обязательная проверка перед удалениями: папку
+     * могли снять с выбора, и её файлов в снимке нет — без неё «файла нет в снимке» означало бы
+     * удаление всей папки в облаке, хотя пользователь всего лишь снял галочку.
+     *
+     * Функцией, а не отфильтрованной картой: на большой библиотеке лишняя копия таблицы — это
+     * ещё сотни мегабайт в момент прохода.
      */
-    fun underRoots(known: Map<String, MirrorRow>, roots: Collection<String>): Map<String, MirrorRow> =
-        known.filterKeys { path -> roots.any { path == it || path.startsWith("$it/") } }
+    fun underRoots(path: String, roots: Collection<String>): Boolean =
+        roots.any { path == it || path.startsWith("$it/") }
 
     /**
      * Слишком много пропало за один проход?
@@ -90,6 +95,7 @@ object MirrorRules {
      * @param now текущее время: по нему видно, устоялся ли файл
      * @param deletionsAllowed можно ли в этом проходе удалять в облаке (см. `deletionsAllowed`)
      * @param confirmed пользователь подтвердил удаление, приостановленное предохранителем
+     * @param inScope лежит ли путь внутри выбранной сейчас папки (см. `underRoots`)
      */
     fun plan(
         local: List<LocalFile>,
@@ -97,17 +103,19 @@ object MirrorRules {
         now: Long,
         deletionsAllowed: Boolean,
         confirmed: Boolean = false,
+        inScope: (String) -> Boolean = { true },
     ): Plan {
         val byPath = local.associateBy { it.path }
         val uploads = ArrayList<LocalFile>()
         val renames = ArrayList<Pair<MirrorRow, LocalFile>>()
         val renamedFrom = HashSet<String>()
+        var unstable = 0
 
         // Записи, чьих файлов на телефоне нет: либо удалены, либо переехали (ниже это видно по inode).
         // Служебные и скрытые имена сюда не попадают: обход их не показывает — значит «файла нет»
         // означает «правило показа», а не «удалён». Иначе облачный `.nomedia` уезжал бы в корзину
         // на следующем же проходе после того, как его скачали.
-        val lost = known.values.filter { it.path !in byPath && !excluded(it.path) }
+        val lost = known.values.filter { it.path !in byPath && inScope(it.path) && !excluded(it.path) }
         val byInode = lost.filter { it.inode > 0L }.associateBy { it.inode }
 
         for (file in local) {
@@ -115,7 +123,9 @@ object MirrorRules {
             if (row != null) {
                 // известный путь: выгружаем заново только если содержимое изменилось
                 val changed = row.size != file.size || row.mtime != file.mtime
-                if (changed && isStable(file.mtime, now)) uploads += file
+                if (changed) {
+                    if (isStable(file.mtime, now)) uploads += file else unstable += 1
+                }
                 continue
             }
             // пути в известных нет: либо файл новый, либо он переименован.
@@ -128,13 +138,14 @@ object MirrorRules {
                 renames += moved to file
                 continue
             }
-            if (isStable(file.mtime, now)) uploads += file
+            if (isStable(file.mtime, now)) uploads += file else unstable += 1
         }
 
         val gone = lost.filter { it.path !in renamedFrom }
         val blocked = gone.isNotEmpty() &&
             (!deletionsAllowed || (massDelete(gone.size, known.size) && !confirmed))
         return Plan(
+            unstable = unstable,
             uploads = uploads,
             renames = renames,
             deletes = if (blocked) emptyList() else gone,

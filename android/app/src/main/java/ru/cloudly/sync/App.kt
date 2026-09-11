@@ -49,6 +49,12 @@ class App : Application() {
     val mirrorStatus = MirrorStatusHolder()
 
     /**
+     * Приложение на экране. Нужно живому режиму: на переднем плане журнал спрашивается
+     * каждые 3 секунды, в фоне — раз в 30, иначе радио не даёт устройству спать.
+     */
+    val isForeground = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
      * Мгновенный режим: опрос журнала облака и реакция на изменения файлов, пока жив процесс
      * приложения. Резидентного сервиса нет — когда система выгрузит процесс, останется
      * страховочный периодический проход.
@@ -89,6 +95,7 @@ class App : Application() {
             scope = appScope,
             hasToken = { prefs.token.isNotBlank() },
             paused = { mirrorStore.meta(MirrorStore.KEY_PAUSED) == "1" },
+            foreground = { isForeground.get() },
         )
         seedMirrorStatus()
         mirrorWatcher = MirrorWatcher { mirrorLive.onLocalChange() }
@@ -109,7 +116,9 @@ class App : Application() {
         val inCloud = runCatching { mirrorStore.inCloud() }.getOrNull() ?: return
         val local = mirrorStore.localTotals()
         val waiting = mirrorStore.waitingTotals()
-        val blocked = mirrorStore.meta(MirrorStore.KEY_BLOCKED)?.substringBefore('|')?.toIntOrNull() ?: 0
+        val blockedMeta = mirrorStore.meta(MirrorStore.KEY_BLOCKED)
+        val blocked = blockedMeta?.substringBefore('|')?.toIntOrNull() ?: 0
+        val blockedReason = blockedMeta?.substringAfter('|', "")?.takeIf { it.isNotBlank() }
         val phase = if (mirrorStore.meta(MirrorStore.KEY_PAUSED) == "1") {
             MirrorStatus.Phase.PAUSED
         } else {
@@ -125,6 +134,7 @@ class App : Application() {
                 waitingFiles = waiting.files,
                 waitingBytes = waiting.bytes,
                 blocked = blocked,
+                blockedReason = blockedReason,
                 lastText = mirrorStore.meta(MirrorStore.KEY_REPORT).orEmpty(),
             )
         }

@@ -219,9 +219,12 @@ export class FoldersService {
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
     if (!segments.length) throw badRequest('empty path');
-    // без потолка глубины один запрос создаёт тысячи папок (и столько же строк журнала),
-    // а папки глубже 128 уровней всё равно недоступны: обход владельца упирается в лимит
-    const MAX_PATH_SEGMENTS = 32;
+    // Потолок глубины нужен только чтобы один запрос не создал тысячи папок (и столько же
+    // строк журнала): 64 сегмента — это потолок зеркала на клиенте, глубже дерево всё равно
+    // не появится. Владельца поддерева ищет рекурсивный CTE (ownerOfFolder), поэтому
+    // ограничение не связано с обходом дерева — раньше здесь стояло 32, и зеркало
+    // останавливалось на «too many path segments» задолго до клиентского предела.
+    const MAX_PATH_SEGMENTS = 64;
     if (segments.length > MAX_PATH_SEGMENTS) {
       throw badRequest(`too many path segments (max ${MAX_PATH_SEGMENTS})`);
     }

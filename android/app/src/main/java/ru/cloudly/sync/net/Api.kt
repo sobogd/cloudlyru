@@ -64,6 +64,17 @@ class Api(private val prefs: Prefs) {
         return if (text.isBlank()) JSONObject() else JSONObject(text)
     }
 
+    /** Адрес сервера: вместе с логином он и есть «какой это аккаунт». */
+    fun serverUrl(): String = prefs.serverUrl
+
+    /**
+     * Отозвать токен, которым пришёл запрос. Нужно при выходе: без этого серверный токен
+     * остаётся живым до истечения срока и даёт полный доступ к облаку.
+     */
+    fun revokeOwnToken() {
+        parse(request("/auth/me/token", "DELETE"))
+    }
+
     /** Проверка токена и адреса сервера. */
     fun me(): String = parse(request("/auth/me")).optString("login").orEmpty()
 
@@ -284,6 +295,12 @@ class Api(private val prefs: Prefs) {
         expectedSha256: String?,
         /** relay — байты идут через сервер: нужно, если S3 с телефона недоступен. */
         mode: String = "direct",
+        /**
+         * Занять имя, которое держит наша же запись в корзине. Телефон — источник истины:
+         * он удалил файл, а потом создал новый с тем же именем, и ждать тридцать дней,
+         * пока корзина очистится, незачем.
+         */
+        replaceTrashed: Boolean = false,
     ): UploadInit {
         val body = JSONObject().apply {
             put("folderId", folderId)
@@ -295,6 +312,7 @@ class Api(private val prefs: Prefs) {
             put("clientMtime", isoOf(clientMtime))
             if (sha256 != null) put("sha256", sha256)
             if (replace && expectedSha256 != null) put("expectedSha256", expectedSha256)
+            if (replaceTrashed) put("replaceTrashed", true)
         }
         val response = request("/uploads", "POST", body)
         if (response.code == 409) {

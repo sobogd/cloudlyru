@@ -61,6 +61,7 @@ type SessionRow = {
   declaredSha256: string | null;
   direct: boolean;
   replace: boolean;
+  replaceTrashed: boolean;
   clientMtime: Date | null;
   expectedSha256: string | null;
   expectedUpdatedAt: Date | null;
@@ -304,6 +305,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       sha256?: string;
       mode?: string;
       replace?: unknown;
+      replaceTrashed?: unknown;
       clientMtime?: unknown;
       expectedSha256?: unknown;
       expectedUpdatedAt?: unknown;
@@ -315,6 +317,9 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     const mime = String(body.mime ?? 'application/octet-stream');
     // перезапись существующего имени (зеркалирование): иначе каждый изменённый файл — 409
     const replace = body.replace === true || body.replace === 'true';
+    // имя занято СВОЕЙ ЖЕ записью из корзины: клиент синхронизации просит занять его
+    // (восстановить и перезаписать). Без флага поведение прежнее — 409 in_trash
+    const replaceTrashed = body.replaceTrashed === true || body.replaceTrashed === 'true';
     const clientMtime = parseOptionalDate(body.clientMtime) ?? null;
     // предполётное условие перезаписи: клиент называет версию, которую заменяет
     const expect =
@@ -327,12 +332,15 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     if (expect && expect.sha256 === undefined && expect.updatedAt == null) {
       throw badRequest('invalid expectedSha256/expectedUpdatedAt');
     }
-    if (expect && !replace) {
+    if (expect && !replace && !replaceTrashed) {
       // без replace сервер создаёт новую запись, и условие «я заменяю версию X» теряет смысл
       throw badRequest('expectedSha256/expectedUpdatedAt требуют replace: true');
     }
     assertSafeName(name);
-    if (!Number.isFinite(size) || size <= 0) throw badRequest('invalid size');
+    // 0 байт — обычный файл («Загрузки» телефона полны пустых файлов): раньше он отвергался,
+    // и такой файл не уезжал в облако никогда. BigInt требует целого, поэтому проверяем
+    // и целость: дробный size раньше падал 500'кой на BigInt(size) ниже.
+    if (!Number.isInteger(size) || size < 0) throw badRequest('invalid size');
     if (size > MAX_FILE_BYTES) throw payloadTooLarge('file too large');
     if (Math.ceil(size / DIRECT_PART_BYTES) > 10000) {
       // S3 не принимает multipart больше 10 000 частей — это конфиг, а не ошибка клиента
@@ -340,10 +348,11 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     }
     const folderId = await this.resolveFolder(body.folderId, userId);
     // предусловие проверяем сразу: иначе клиент зальёт гигабайты, а на complete получит 409
-    if (expect) await this.files.assertExpectedVersion(folderId, name, expect);
+    if (expect) await this.files.assertExpectedVersion(folderId, name, expect, { allowTrashed: replaceTrashed });
     // и отдельно имя из корзины: воскрешать удалённое сами не будем, но клиент должен узнать
-    // об этом ДО передачи байтов (раньше 409 приходил только на complete)
-    await this.files.assertNameNotInTrash(folderId, name);
+    // об этом ДО передачи байтов (раньше 409 приходил только на complete). С replaceTrashed
+    // запись из корзины — своя, и клиент явно разрешил её занять
+    if (!replaceTrashed) await this.files.assertNameNotInTrash(folderId, name);
     const declared = normalizeSha(body.sha256);
     const direct = body.mode !== 'relay' && this.s3.configured;
 
@@ -371,6 +380,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
             assetId: asset.id,
             deduped: true,
             replace,
+            restoreDeleted: replaceTrashed,
             clientMtime,
             expect,
           });
@@ -396,6 +406,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
         declaredSha256: declared ?? null,
         direct,
         replace,
+        replaceTrashed,
         clientMtime,
         expectedSha256: expect?.sha256 ?? null,
         expectedUpdatedAt: expect?.updatedAt ?? null,
@@ -518,7 +529,11 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     const mime = row.mime;
 
     const parts = storedParts(row.parts);
-    if (!parts.length) throw badRequest('no parts uploaded');
+    // Пустой файл: части могло не быть ни одной (передавать нечего), а multipart без частей
+    // S3 не собирает — кладём пустой объект одним PUT. Если клиент прислал пустую часть
+    // (телефон так и делает), собираем multipart как обычно.
+    const emptyWithoutParts = !parts.length && size === 0;
+    if (!parts.length && !emptyWithoutParts) throw badRequest('no parts uploaded');
     for (let i = 0; i < parts.length; i++) {
       if (parts[i].partNumber !== i + 1) {
         throw badRequest(`missing part ${i + 1} — загрузка неполная`);
@@ -527,7 +542,9 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
 
     // 1. Собираем объект. Повторный complete (сетевой ретрай клиента или рестарт сервиса
     //    между финализацией и записью в дерево) идемпотентен.
-    if (!live?.finalized) {
+    if (emptyWithoutParts) {
+      await this.s3.putObject(row.uploadKey, Buffer.alloc(0), mime);
+    } else if (!live?.finalized) {
       try {
         await this.s3.completeMultipartUpload(
           row.uploadKey,
@@ -542,6 +559,12 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     }
 
     // 2. Размер по факту в S3: недолитая загрузка не должна попасть в дерево.
+    //    headObject отдельно от objectSize: у отсутствующего объекта размер тоже 0,
+    //    и пустой файл (size 0) прошёл бы сверку, вообще не доехав до S3.
+    if (!(await this.s3.headObject(row.uploadKey))) {
+      await this.cleanup(row);
+      throw badRequest('объекта нет в S3 — загрузка неполная');
+    }
     const realSize = await this.s3.objectSize(row.uploadKey);
     if (realSize !== size) {
       await this.cleanup(row);
@@ -594,6 +617,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       assetId,
       deduped,
       replace: row.replace,
+      restoreDeleted: row.replaceTrashed,
       clientMtime: row.clientMtime,
       expect:
         row.expectedSha256 === null && row.expectedUpdatedAt === null
@@ -630,6 +654,8 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     assetId: string;
     deduped: boolean;
     replace?: boolean;
+    /** Имя занято своей же записью из корзины (кроме WebDAV — только по флагу replaceTrashed). */
+    restoreDeleted?: boolean;
     clientMtime?: Date | null;
     expect?: { sha256?: string | null; updatedAt?: Date | null };
   }): Promise<{
@@ -645,6 +671,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       entry = await this.files.createEntry(folderId, params.name, params.assetId, {
         userId: params.userId,
         replace: params.replace,
+        restoreDeleted: params.restoreDeleted,
         clientMtime: params.clientMtime ?? null,
         expect: params.expect,
         asset: { sha256: params.sha256, size: params.size, mime: params.mime },

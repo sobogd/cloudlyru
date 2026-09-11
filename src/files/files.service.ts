@@ -35,8 +35,10 @@ export interface CreateEntryOptions {
   asset?: AssetSnapshot;
   /**
    * Разрешить вернуть запись из корзины, если имя занято удалённым файлом.
-   * Только для WebDAV (Finder/rclone): они перезаписывают файл, не зная о нашей корзине.
-   * Клиент синхронизации такого разрешения не получает — он должен решить сам (409).
+   * WebDAV (Finder/rclone) перезаписывает файл, не зная о нашей корзине, поэтому получает
+   * это разрешение всегда; клиент синхронизации — только когда явно попросил
+   * (`replaceTrashed: true` в init): имя занято его же удалённой записью, и без этого файл
+   * не уехал бы в облако никогда. По умолчанию поведение прежнее — 409 `in_trash`.
    */
   restoreDeleted?: boolean;
   /**
@@ -185,16 +187,21 @@ export class FilesService {
    * Проверка предусловия перезаписи ДО начала загрузки: клиент не должен потратить
    * гигабайты на файл, который всё равно не примут из-за расхождения версий.
    * Та же проверка повторяется в createEntry — между init и complete версия могла измениться.
+   * `allowTrashed` — имя занято записью из корзины, которую клиент разрешил занять
+   * (replaceTrashed): живой версии, с которой можно сверяться, нет, запись будет
+   * восстановлена и перезаписана.
    */
   async assertExpectedVersion(
     folderId: string,
     name: string,
     expect?: { sha256?: string | null; updatedAt?: Date | null },
+    opts: { allowTrashed?: boolean } = {},
   ): Promise<void> {
     if (!expect) return;
     const existing = await this.prisma.fileEntry.findFirst({ where: { folderId, name } });
     if (!existing) throw this.staleVersionError({ entryId: null, name, sha256: null });
     if (existing.deletedAt) {
+      if (opts.allowTrashed) return;
       throw conflict('file with this name is in trash — restore or purge it first', 'in_trash', {
         entryId: existing.id,
         name,

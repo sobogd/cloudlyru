@@ -38,6 +38,8 @@ data class MirrorStatus(
     val lastText: String = "",
     val error: String? = null,
     val blocked: Int = 0,
+    /** Почему удаления приостановлены: «пропало слишком много» или «папка не читается». */
+    val blockedReason: String? = null,
 ) {
     enum class Phase {
         IDLE,

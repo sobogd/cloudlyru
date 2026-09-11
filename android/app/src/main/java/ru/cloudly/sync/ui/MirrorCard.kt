@@ -91,7 +91,11 @@ fun MirrorCard(status: MirrorStatus, modifier: Modifier = Modifier) {
             status.error?.let { Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.error) }
             if (status.blocked > 0) {
                 Text(
-                    "удаления приостановлены: ${status.blocked} — подтверждение в настройках",
+                    buildString {
+                        append("удаления приостановлены: ${status.blocked}")
+                        status.blockedReason?.let { append(" ($it)") }
+                        append(" — подтверждение в настройках")
+                    },
                     fontSize = 11.sp,
                 )
             }

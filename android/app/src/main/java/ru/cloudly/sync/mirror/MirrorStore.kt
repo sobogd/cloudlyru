@@ -311,6 +311,24 @@ class MirrorStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
     private fun totals(filesKey: String, bytesKey: String): Totals =
         Totals(meta(filesKey)?.toIntOrNull() ?: 0, meta(bytesKey)?.toLongOrNull() ?: 0L)
 
+    /**
+     * Полная очистка состояния: другой аккаунт или другой сервер. Без неё строки прошлого
+     * аккаунта делают все локальные файлы «уже выгруженными», и папка нового аккаунта
+     * остаётся пустой навсегда.
+     */
+    fun wipe() {
+        writableDatabase.beginTransaction()
+        try {
+            for (table in listOf("files", "dirs", "roots", "uploads", "meta")) {
+                writableDatabase.delete(table, null, null)
+            }
+            writableDatabase.setTransactionSuccessful()
+        } finally {
+            writableDatabase.endTransaction()
+        }
+    }
+
+    /** Папки, снятые с выбора, известны только в roots; остальное живёт долго. */
     // ===== прочее =====
 
     fun meta(key: String): String? =
@@ -359,6 +377,12 @@ class MirrorStore(context: Context) : SQLiteOpenHelper(context, NAME, null, VERS
 
         /** Автоматические проходы выключены пользователем (ручная сверка работает). */
         const val KEY_PAUSED = "paused"
+
+        /** Когда вернуться к файлам, отложенным окном стабильности (метка времени). */
+        const val KEY_RETRY_AT = "retry_at"
+
+        /** Кто именно выгружен: адрес сервера и логин. Сменились — состояние не годится. */
+        const val KEY_ACCOUNT = "account"
 
         /** Мгновенный режим включён: постоянный сервис держит процесс и уведомление висит. */
         const val KEY_LIVE = "live_always"
