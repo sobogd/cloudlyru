@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import sharp from 'sharp';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import {
@@ -205,30 +206,31 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
    * отменённое можно пересобрать кнопкой пересбора, а не с нуля.
    */
   async cancelAll(tree: string[]): Promise<number> {
-    const jobs = await this.prisma.job.findMany({
-      where: {
-        state: { in: ['pending', 'processing'] },
-        asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
-      },
-      select: { id: true },
-    });
+    const where: Prisma.JobWhereInput = {
+      state: { in: ['pending', 'processing'] },
+      asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
+    };
+    // id забираем только чтобы понять, наша ли задача сейчас считается: обновляем по тому же
+    // условию, а не списком id. Список id упирался в предел Postgres в 32767 bind-параметров:
+    // на 45 тыс. задач очистка очереди падала с 500 (Assertion violation ... received 45500).
+    const jobs = await this.prisma.job.findMany({ where, select: { id: true } });
     if (!jobs.length) return 0;
-    const ids = jobs.map((j) => j.id);
-    await this.prisma.job.updateMany({
-      where: { id: { in: ids } },
+    const res = await this.prisma.job.updateMany({
+      where,
       data: { state: 'failed', error: 'cancelled: очередь очищена', finishedAt: new Date() },
     });
     // Убиваем только свою активную задачу: чужие процессы отменять не наше дело.
-    if (this.activeJob && ids.includes(this.activeJob.id) && this.activeChild) {
+    if (this.activeJob && jobs.some((j) => j.id === this.activeJob!.id) && this.activeChild) {
       this.logger.warn(`очистка очереди: убиваю активную задачу ${this.activeJob.id}`);
       try { this.activeChild.kill('SIGKILL'); } catch { /* ignore */ }
     }
-    this.logger.log(`очередь очищена: отменено задач ${ids.length}`);
-    return ids.length;
+    this.logger.log(`очередь очищена: отменено задач ${res.count}`);
+    return res.count;
   }
 
   /** Вернуть в очередь отменённые задачи (файл восстановлен из корзины). */
-  async requeueForAssets(assetIds: string[]): Promise<void> {    if (!assetIds.length) return;
+  async requeueForAssets(assetIds: string[]): Promise<void> {
+    if (!assetIds.length) return;
     const rows = await this.prisma.job.findMany({
       where: { assetId: { in: assetIds }, state: 'failed', error: { contains: 'cancelled' } },
       select: { id: true, asset: { select: { sha256: true } } },
