@@ -71,7 +71,8 @@ model Folder {
   name      String
   // зона: FILES (обычный диск, медиа хранится как есть) | PHOTOS (поддерево системной папки «Фото», медиа конвертируется)
   zone      String      @default("FILES")
-  // «держать офлайн»: клиент обязан держать содержимое целиком и не вытеснять его ради места
+  // легаси: флаг «держать офлайн» снят с поддержки. Колонка оставлена, чтобы не делать
+  // миграцию по данным; код её больше не читает и не пишет.
   keepOffline Boolean   @default(false)
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
@@ -95,7 +96,7 @@ model FileEntry {
   // mtime файла на устройстве-источнике: без него синхронизация сравнивала бы даты,
   // которые сервер не знает, и каждый скан считал бы скачанный файл «изменённым»
   clientMtime DateTime?
-  // «держать офлайн» на отдельный файл: перекрывает вытеснение на клиенте
+  // легаси-поле файла: флаг «держать офлайн» снят с поддержки, код его не использует
   keepOffline Boolean     @default(false)
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
@@ -273,6 +274,7 @@ model ChangeLog {
   size        BigInt?
   mime        String?
   clientMtime DateTime?
+  // легаси: снимок флага «держать офлайн» в событии журнала; новые события его не пишут
   keepOffline Boolean  @default(false)
   // id ApiToken устройства, если изменение пришло от клиента синхронизации (иначе null)
   deviceId    String?

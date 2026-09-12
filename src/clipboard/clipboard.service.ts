@@ -157,9 +157,8 @@ export class ClipboardService {
           assetId: entry.assetId,
           name,
           zone: zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES,
-          keepOffline: entry.keepOffline,
         },
-        select: { id: true, name: true, folderId: true, zone: true, keepOffline: true },
+        select: { id: true, name: true, folderId: true, zone: true },
       });
       // Журнал изменений: без записи копия не доедет до других клиентов (Android, WebDAV)
       await this.changes.record(
@@ -174,7 +173,6 @@ export class ClipboardService {
           sha256: entry.asset.sha256,
           size: Number(entry.asset.size),
           mime: entry.asset.mime,
-          keepOffline: row.keepOffline,
         },
         tx,
       );

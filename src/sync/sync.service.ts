@@ -21,7 +21,6 @@ export interface SyncChangeDto {
   size: number | null;
   mime: string | null;
   clientMtime: string | null;
-  keepOffline: boolean;
   /** id ApiToken'а устройства-источника правки; null — правку сделал веб или фон. */
   deviceId: string | null;
   at: string;
@@ -114,7 +113,6 @@ export class SyncService {
         size: c.size === null ? null : Number(c.size),
         mime: c.mime,
         clientMtime: c.clientMtime ? c.clientMtime.toISOString() : null,
-        keepOffline: c.keepOffline,
         // клиент сравнивает с собственным deviceId из /auth/me и не применяет свои же правки
         deviceId: c.deviceId,
         at: c.at.toISOString(),

@@ -362,7 +362,6 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
             folderId: parentId,
             name: baseName,
             zone,
-            keepOffline: false,
           },
           tx,
         );
@@ -442,7 +441,6 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
                 folderId: parentId,
                 name,
                 zone,
-                keepOffline: row.keepOffline,
               },
               tx,
             );
@@ -469,7 +467,6 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
               folderId: parentId,
               name,
               zone: target.zone,
-              keepOffline: target.keepOffline,
             },
             tx,
           );

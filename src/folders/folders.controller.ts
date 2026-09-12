@@ -71,14 +71,12 @@ export class FoldersController {
     if (!isPlainObject(body)) throw badRequest('invalid body');
     const hasName = typeof body.name === 'string';
     const hasParent = typeof body.parentId === 'string';
-    const hasPin = typeof body.keepOffline === 'boolean';
-    if (!hasName && !hasParent && !hasPin) throw badRequest('provide name, parentId or keepOffline');
+    if (!hasName && !hasParent) throw badRequest('provide name or parentId');
     return this.folders.patch(
       id,
       {
         name: hasName ? (body.name as string) : undefined,
         parentId: hasParent ? (body.parentId as string) : undefined,
-        keepOffline: hasPin ? (body.keepOffline as boolean) : undefined,
       },
       user.id,
     );

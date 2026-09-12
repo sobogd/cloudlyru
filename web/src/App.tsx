@@ -647,14 +647,6 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
     if (!confirm(`Удалить «${meta?.name ?? 'файл'}» в корзину?`)) return;
     try { await api.deleteFile(entryId); onBack(); } catch (e) { alert((e as Error).message); }
   };
-  // «держать офлайн»: флаг живёт на сервере и перекрывает автоудаление на телефоне
-  const toggleOffline = async () => {
-    const next = !meta?.keepOffline;
-    try {
-      await api.setFileKeepOffline(entryId, next);
-      setMeta((m) => (m ? { ...m, keepOffline: next } : m));
-    } catch (e) { alert((e as Error).message); }
-  };
   // Копировать/вырезать: цель уезжает в серверный буфер, вставка — в шапке нужной папки
   const toClipboard = async (mode: 'copy' | 'cut') => {
     try {
@@ -698,12 +690,6 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
         {meta && (
           <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} download>⬇️</a>
         )}
-        <button
-          className="iconbtn"
-          title={meta?.keepOffline ? 'Держать офлайн: включено (нажмите, чтобы снять)' : 'Держать офлайн на телефоне'}
-          style={meta?.keepOffline ? { opacity: 1 } : { opacity: 0.45 }}
-          onClick={toggleOffline}
-        >📌</button>
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
@@ -910,13 +896,6 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
     if (!confirm(`Удалить папку «${meta?.name ?? ''}» с содержимым в корзину?`)) return;
     try { await api.deleteFolder(folderId); onDeleted(); } catch (e) { alert((e as Error).message); }
   };
-  const toggleOffline = async () => {
-    const next = !meta?.keepOffline;
-    try {
-      await api.setFolderKeepOffline(folderId, next);
-      setMeta((m) => (m ? { ...m, keepOffline: next } : m));
-    } catch (e) { alert((e as Error).message); }
-  };
   // Папку можно вырезать (перенести), но не копировать: копия поддерева — отдельная задача
   const cutFolder = async () => {
     try {
@@ -942,14 +921,6 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
         <span style={{ flex: 1 }} />
         <button className="iconbtn" title="Переименовать" onClick={rename}>✏️</button>
         <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={cutFolder}>✂️</button>
-        <button
-          className="iconbtn"
-          title={meta?.keepOffline
-            ? 'Держать офлайн: включено (нажмите, чтобы снять)'
-            : 'Держать офлайн на телефоне: папка не будет вытесняться'}
-          style={meta?.keepOffline ? { opacity: 1 } : { opacity: 0.45 }}
-          onClick={toggleOffline}
-        >📌</button>
         {/* защищать от удаления в этом разделе больше нечего: корень зеркала у каждого
             устройства свой и лежит в корне облака, а папка «Телефон» — легаси */}
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
@@ -963,7 +934,6 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
           <MetaRow k="Расположение" v={meta.path} />
           <MetaRow k="Вложенные папки" v={String(meta.folders)} />
           <MetaRow k="Файлы" v={String(meta.entries)} />
-          <MetaRow k="Держать офлайн" v={meta.keepOffline ? 'да (не вытесняется на телефоне)' : 'нет'} />
           <MetaRow k="Создана" v={new Date(meta.createdAt).toLocaleString()} />
           <MetaRow k="Изменена" v={new Date(meta.updatedAt).toLocaleString()} />
         </div>

@@ -107,7 +107,6 @@ export class TrashService {
         name: true,
         folderId: true,
         zone: true,
-        keepOffline: true,
         clientMtime: true,
         asset: { select: { sha256: true, size: true, mime: true } },
       },
@@ -118,7 +117,7 @@ export class TrashService {
         id: { in: tree },
         ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
       },
-      select: { id: true, name: true, parentId: true, zone: true, keepOffline: true },
+      select: { id: true, name: true, parentId: true, zone: true },
     });
     const entryIds = deletedEntries.map((e) => e.id);
     const folderIds = deletedFolders.map((f) => f.id);
@@ -142,7 +141,6 @@ export class TrashService {
           size: e.asset.size,
           mime: e.asset.mime,
           clientMtime: e.clientMtime,
-          keepOffline: e.keepOffline,
         }));
         const folderRows = deletedFolders.map((f) => ({
           userId,
@@ -152,7 +150,6 @@ export class TrashService {
           folderId: f.parentId,
           name: f.name,
           zone: f.zone,
-          keepOffline: f.keepOffline,
         }));
         for (const chunk of chunksOf(entryRows, 500)) await tx.changeLog.createMany({ data: chunk });
         for (const chunk of chunksOf(folderRows, 500)) await tx.changeLog.createMany({ data: chunk });

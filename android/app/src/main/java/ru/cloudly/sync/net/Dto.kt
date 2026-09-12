@@ -35,7 +35,6 @@ data class RemoteEntry(
     val size: Long,
     val mime: String,
     val sha256: String,
-    val keepOffline: Boolean,
     val clientMtime: Long?,
     /** Папка, в которой лежит запись — нужна для сопоставления при зеркале вниз. */
     val folderId: String? = null,
@@ -72,7 +71,7 @@ data class CloudChange(
     val seq: Long,
     /** entry | folder */
     val target: String,
-    /** create | update | move | delete | restore | pin */
+    /** create | update | move | delete | restore (в старых строках журнала встречается pin) */
     val op: String,
     val targetId: String,
     /** родительская папка цели на момент события: по ней правка находится в зеркале */

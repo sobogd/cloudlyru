@@ -97,7 +97,7 @@ export class FilesService {
    */
   private async recordEntryChange(input: {
     userId?: string;
-    op: 'create' | 'update' | 'move' | 'restore' | 'pin';
+    op: 'create' | 'update' | 'move' | 'restore';
     targetId: string;
     folderId: string;
     name: string;
@@ -106,7 +106,6 @@ export class FilesService {
     size: number;
     mime: string;
     clientMtime?: Date | null;
-    keepOffline: boolean;
     /** Транзакция мутации: журнал должен писаться вместе с ней, а не после. */
     tx?: Prisma.TransactionClient;
   }): Promise<void> {
@@ -129,7 +128,6 @@ export class FilesService {
         size: input.size,
         mime: input.mime,
         clientMtime: input.clientMtime ?? null,
-        keepOffline: input.keepOffline,
       },
       input.tx,
     );
@@ -302,7 +300,7 @@ export class FilesService {
               deletedAt: null,
               ...(opts.clientMtime !== undefined ? { clientMtime: opts.clientMtime } : {}),
             },
-            select: { id: true, zone: true, keepOffline: true, clientMtime: true },
+            select: { id: true, zone: true, clientMtime: true },
           });
           await this.recordEntryChange({
             userId: opts.userId,
@@ -316,7 +314,6 @@ export class FilesService {
             mime: snap.mime,
             // фактическое значение из БД: в снимок нельзя класть аргумент (DAV PUT его не шлёт)
             clientMtime: updated.clientMtime,
-            keepOffline: updated.keepOffline,
             tx,
           });
           return {
@@ -338,7 +335,7 @@ export class FilesService {
         });
         const entry = await tx.fileEntry.create({
           data: { folderId, assetId, name, zone, clientMtime: opts.clientMtime ?? null },
-          select: { id: true, keepOffline: true },
+          select: { id: true },
         });
         await this.recordEntryChange({
           userId: opts.userId,
@@ -351,7 +348,6 @@ export class FilesService {
           size: snap.size,
           mime: snap.mime,
           clientMtime: opts.clientMtime ?? null,
-          keepOffline: entry.keepOffline,
           tx,
         });
         return { id: entry.id, deduped: Boolean(sameAssetLive), zone, replaced: false };
@@ -439,7 +435,6 @@ export class FilesService {
       createdAt: entry.createdAt,
       updatedAt: entry.updatedAt,
       clientMtime: entry.clientMtime,
-      keepOffline: entry.keepOffline,
       folderId: entry.folderId,
       zone: entry.zone,
       path: await this.folderPath(entry.folder),
@@ -648,14 +643,14 @@ export class FilesService {
   }
 
   /**
-   * Правка записи клиентом синхронизации: переименование, перенос в другую папку,
-   * «держать офлайн» и запись mtime с устройства. Перенос — отдельная операция, а не
-   * «удали + создай»: id записи сохраняется, другие устройства видят move, а не новый файл.
+   * Правка записи клиентом синхронизации: переименование, перенос в другую папку и запись
+   * mtime с устройства. Перенос — отдельная операция, а не «удали + создай»: id записи
+   * сохраняется, другие устройства видят move, а не новый файл.
    */
   async patch(
     entryId: string,
     userId: string,
-    body: { folderId?: unknown; name?: unknown; keepOffline?: unknown; clientMtime?: unknown } = {},
+    body: { folderId?: unknown; name?: unknown; clientMtime?: unknown } = {},
   ) {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
@@ -664,8 +659,8 @@ export class FilesService {
     if (!entry || entry.deletedAt) throw notFound('file not found');
     if (!(await this.auth.folderOwnedBy(userId, entry.folderId))) throw notFound('file not found');
 
-    const data: { folderId?: string; name?: string; zone?: string; keepOffline?: boolean; clientMtime?: Date | null } = {};
-    let op: 'update' | 'move' | 'pin' = 'update';
+    const data: { folderId?: string; name?: string; zone?: string; clientMtime?: Date | null } = {};
+    let op: 'update' | 'move' = 'update';
 
     if (typeof body.name === 'string' && body.name !== entry.name) {
       try {
@@ -693,11 +688,6 @@ export class FilesService {
       op = 'move';
     }
 
-    if (typeof body.keepOffline === 'boolean' && body.keepOffline !== entry.keepOffline) {
-      data.keepOffline = body.keepOffline;
-      if (op === 'update') op = 'pin';
-    }
-
     if (body.clientMtime !== undefined) {
       const mtime = parseOptionalDate(body.clientMtime);
       if (mtime !== undefined) data.clientMtime = mtime;
@@ -709,7 +699,7 @@ export class FilesService {
       const row = await tx.fileEntry.update({
         where: { id: entryId },
         data,
-        select: { id: true, name: true, folderId: true, zone: true, keepOffline: true, clientMtime: true },
+        select: { id: true, name: true, folderId: true, zone: true, clientMtime: true },
       });
       await this.changes.record(
         {
@@ -724,7 +714,6 @@ export class FilesService {
           size: Number(entry.asset.size),
           mime: entry.asset.mime,
           clientMtime: row.clientMtime,
-          keepOffline: row.keepOffline,
         },
         tx,
       );

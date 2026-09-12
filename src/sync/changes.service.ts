@@ -8,13 +8,15 @@ export type ChangeTarget = 'entry' | 'folder';
 /**
  * Что произошло. `op` — подсказка клиенту, решение он принимает по снимку в строке:
  *   create  — цель появилась
- *   update  — у той же цели изменились имя/содержимое/keepOffline/clientMtime
+ *   update  — у той же цели изменились имя/содержимое/clientMtime
  *   move    — цель переехала в другую папку (folderId изменился)
  *   delete  — tombstone: цель удалена (для папки — вместе с поддеревом)
  *   restore — цель вернулась из корзины
- *   pin     — изменился флаг «держать офлайн»
+ *
+ * Историческая строка `pin` (флаг «держать офлайн», снят с поддержки) в журнале ещё
+ * встречается; `op` в строке — просто текст, поэтому такие строки просто дочитываются.
  */
-export type ChangeOp = 'create' | 'update' | 'move' | 'delete' | 'restore' | 'pin';
+export type ChangeOp = 'create' | 'update' | 'move' | 'delete' | 'restore';
 
 export interface ChangeInput {
   userId: string;
@@ -28,7 +30,6 @@ export interface ChangeInput {
   size?: bigint | number | null;
   mime?: string | null;
   clientMtime?: Date | null;
-  keepOffline?: boolean;
   /**
    * Источник изменения. Обычно не задаётся: берётся из контекста запроса (id ApiToken'а
    * устройства-клиента), явно передаётся только там, где контекста нет или он не про это.
@@ -72,13 +73,12 @@ export class ChangesService {
         size: input.size === undefined || input.size === null ? null : BigInt(input.size),
         mime: input.mime ?? null,
         clientMtime: input.clientMtime ?? null,
-        keepOffline: input.keepOffline ?? false,
         deviceId: input.deviceId ?? currentDeviceId(),
       },
     });
   }
 
-  /** Событие по файлу: снимок читается из БД по id (update/delete/restore/pin). */
+  /** Событие по файлу: снимок читается из БД по id (update/delete/restore). */
   async recordEntry(userId: string, entryId: string, op: ChangeOp, tx?: Prisma.TransactionClient): Promise<void> {
     const db = tx ?? this.prisma;
     const entry = await db.fileEntry.findUnique({
@@ -102,7 +102,6 @@ export class ChangesService {
       size: entry.asset.size,
       mime: entry.asset.mime,
       clientMtime: entry.clientMtime,
-      keepOffline: entry.keepOffline,
     }, tx);
   }
 
@@ -122,7 +121,6 @@ export class ChangesService {
       folderId: folder.parentId,
       name: folder.name,
       zone: folder.zone,
-      keepOffline: folder.keepOffline,
     }, tx);
   }
 

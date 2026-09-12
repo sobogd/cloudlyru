@@ -223,7 +223,7 @@ class CloudlyDocumentsProvider : DocumentsProvider() {
 
     private fun describe(documentId: String): Map<String, Any?> {
         if (isFileDoc(documentId)) return entryRow(app.api.entryMeta(uuidOf(documentId)))
-        val (name, _) = app.api.folderMeta(folderIdOf(documentId))
+        val name = app.api.folderMeta(folderIdOf(documentId))
         return folderRow(documentId, name.ifBlank { "Облако" })
     }
 

@@ -157,17 +157,17 @@ try {
     .catch((e) => e);
   const missingBody = expectMissing?.getResponse?.() ?? {};
   check('stale: ждали запись, её нет → 409', missingBody.statusCode === 409 && missingBody.code === 'stale_version', String(missingBody.code));
-  // === 4. journal: move / pin / restore ===================================================
+  // === 4. journal: move / restore ========================================================
   const dest = await folders.ensurePath(user.id, 'm3-check/other');
   cleanupFolders.push(dest.id);
-  const moved = await files.patch(first.id, user.id, { folderId: dest.id, name: 'y.bin', keepOffline: true, clientMtime: '2026-09-01T10:00:00.000Z' });
-  check('patch: перенос + переименование + pin', moved.changed && moved.entry.name === 'y.bin' && moved.entry.folderId === dest.id && moved.entry.keepOffline);
+  const moved = await files.patch(first.id, user.id, { folderId: dest.id, name: 'y.bin', clientMtime: '2026-09-01T10:00:00.000Z' });
+  check('patch: перенос + переименование', moved.changed && moved.entry.name === 'y.bin' && moved.entry.folderId === dest.id);
   check('patch: clientMtime записан', moved.entry.clientMtime instanceof Date);
   // одно событие на правку: op — подсказка, клиент применяет снимок целиком,
-  // поэтому перенос+pin приходят как move со keepOffline=true в снимке
+  // поэтому перенос+переименование приходят как move с новым именем в снимке
   const lastMove = (await head(1))[0];
   check('journal: перенос записан как move', lastMove.target === 'entry' && lastMove.op === 'move', `${lastMove.target}:${lastMove.op}`);
-  check('journal: снимок несёт pin и новое имя', lastMove.keepOffline === true && lastMove.name === 'y.bin');
+  check('journal: снимок несёт новое имя', lastMove.name === 'y.bin');
 
   const restoredFolder = await folders.ensurePath(user.id, 'm3-check/tree/inner');
   cleanupFolders.push(restoredFolder.id);
@@ -289,11 +289,11 @@ try {
   // === 9. Схема: новые поля на месте =====================================================
   const cols = await prisma.$queryRawUnsafe(
     `SELECT table_name, column_name FROM information_schema.columns
-     WHERE column_name IN ('updatedAt','clientMtime','keepOffline','completedAt','result','seq')
+     WHERE column_name IN ('updatedAt','clientMtime','completedAt','result','seq')
        AND table_name IN ('FileEntry','Folder','UploadSession','ChangeLog')`,
   );
   const colSet = new Set(cols.map((c) => `${c.table_name}.${c.column_name}`));
-  for (const need of ['FileEntry.updatedAt', 'FileEntry.clientMtime', 'FileEntry.keepOffline', 'Folder.keepOffline', 'UploadSession.completedAt', 'UploadSession.result', 'ChangeLog.seq']) {
+  for (const need of ['FileEntry.updatedAt', 'FileEntry.clientMtime', 'UploadSession.completedAt', 'UploadSession.result', 'ChangeLog.seq']) {
     check(`схема: ${need}`, colSet.has(need));
   }
 } finally {

@@ -80,7 +80,6 @@ export class FoldersService {
           id: true,
           name: true,
           createdAt: true,
-          keepOffline: true,
           clientMtime: true,
           asset: { select: { size: true, mime: true, sha256: true } },
         },
@@ -114,9 +113,7 @@ export class FoldersService {
         size: Number(e.asset.size),
         mime: e.asset.mime,
         sha256: e.asset.sha256,
-        // нужны клиенту синхронизации: mtime восстанавливается у скачанного файла,
-        // а «держать офлайн» перекрывает вытеснение на телефоне
-        keepOffline: e.keepOffline,
+        // нужен клиенту синхронизации: mtime восстанавливается у скачанного файла
         clientMtime: e.clientMtime ? e.clientMtime.toISOString() : null,
       })),
     };
@@ -136,7 +133,6 @@ export class FoldersService {
       path: await this.folderPath(folder),
       folders: folderCount,
       entries: entryCount,
-      keepOffline: folder.keepOffline,
       createdAt: folder.createdAt,
       updatedAt: folder.updatedAt,
     };
@@ -285,38 +281,10 @@ export class FoldersService {
     return { id: current.id, name: current.name, parentId: current.parentId, zone: current.zone, created: createdCount };
   }
 
-  /** Флаг «держать офлайн»: клиент обязан держать содержимое папки целиком и не вытеснять его. */
-  async setKeepOffline(id: string, keepOffline: boolean, userId: string) {
-    const folder = await this.resolveAccessible(id, userId);
-    if (folder.keepOffline !== keepOffline) {
-      await this.prisma.$transaction(async (tx) => {
-        await tx.folder.update({ where: { id: folder.id }, data: { keepOffline } });
-        await this.changes.record(
-          {
-            userId,
-            target: 'folder',
-            op: 'pin',
-            targetId: folder.id,
-            folderId: folder.parentId,
-            name: folder.name,
-            zone: folder.zone,
-            keepOffline,
-          },
-          tx,
-        );
-      });
-    }
-    return { ok: true, id: folder.id, keepOffline };
-  }
-
-  /**
-   * Правка папки одним запросом (клиент синхронизации): имя, переезд, «держать офлайн».
-   * Порядок важен: сначала переименование и переезд, потом флаг — каждое действие
-   * пишет своё событие, клиент применяет их по порядку seq.
-   */
+  /** Правка папки одним запросом (клиент синхронизации): имя и переезд. */
   async patch(
     id: string,
-    body: { name?: string; parentId?: string; keepOffline?: boolean },
+    body: { name?: string; parentId?: string },
     userId: string,
   ) {
     let renamed: { id: string; name: string } | null = null;
@@ -326,10 +294,9 @@ export class FoldersService {
       const res = await this.move(id, body.parentId, userId);
       moved = { id: res.id, parentId: res.parentId, zone: res.zone };
     }
-    if (body.keepOffline !== undefined) await this.setKeepOffline(id, body.keepOffline, userId);
     const folder = await this.prisma.folder.findUnique({
       where: { id },
-      select: { id: true, name: true, parentId: true, zone: true, keepOffline: true },
+      select: { id: true, name: true, parentId: true, zone: true },
     });
     return { ok: true, renamed, moved, folder };
   }
@@ -357,7 +324,6 @@ export class FoldersService {
             folderId: folder.parentId,
             name,
             zone: folder.zone,
-            keepOffline: folder.keepOffline,
           },
           tx,
         );
@@ -398,7 +364,6 @@ export class FoldersService {
           folderId: target.id,
           name: folder.name,
           zone: newZone,
-          keepOffline: folder.keepOffline,
         },
         tx,
       );
@@ -440,7 +405,7 @@ export class FoldersService {
         id: { in: ids },
         ...(cutoff ? { OR: [{ deletedAt: null }, { deletedAt: { gte: cutoff } }] } : {}),
       },
-      select: { id: true, parentId: true, name: true, zone: true, keepOffline: true },
+      select: { id: true, parentId: true, name: true, zone: true },
     });
     const restoreIds = folders.map((f) => f.id);
     const entries = await this.prisma.fileEntry.findMany({
@@ -451,7 +416,6 @@ export class FoldersService {
         name: true,
         zone: true,
         clientMtime: true,
-        keepOffline: true,
         asset: { select: { sha256: true, size: true, mime: true } },
       },
     });
@@ -469,7 +433,6 @@ export class FoldersService {
             folderId: f.parentId,
             name: f.name,
             zone: f.zone,
-            keepOffline: f.keepOffline,
           },
           tx,
         );
@@ -491,7 +454,6 @@ export class FoldersService {
               size: e.asset.size,
               mime: e.asset.mime,
               clientMtime: e.clientMtime,
-              keepOffline: e.keepOffline,
             })),
           });
         }

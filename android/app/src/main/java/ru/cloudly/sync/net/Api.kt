@@ -218,11 +218,8 @@ class Api(private val prefs: Prefs) {
         return parse(request("/folders/ensure-path", "POST", body)).optString("id")
     }
 
-    /** Метаданные папки: имя, путь, флаг «держать офлайн». */
-    fun folderMeta(folderId: String): Pair<String, Boolean> {
-        val o = parse(request("/folders/$folderId/meta"))
-        return o.optString("name") to o.optBoolean("keepOffline", false)
-    }
+    /** Метаданные папки: имя и путь. */
+    fun folderMeta(folderId: String): String = parse(request("/folders/$folderId/meta")).optString("name")
 
     /** Корень пользователя: от него начинается выбор папки при «поделиться». */
     fun rootFolderId(): String = parse(request("/folders")).optString("parentId")
@@ -252,7 +249,6 @@ class Api(private val prefs: Prefs) {
                     size = e.optLong("size"),
                     mime = e.optString("mime"),
                     sha256 = e.optString("sha256"),
-                    keepOffline = e.optBoolean("keepOffline", false),
                     clientMtime = if (e.isNull("clientMtime")) null else parseIsoMillis(e.optString("clientMtime")),
                 ),
             )
@@ -439,7 +435,6 @@ class Api(private val prefs: Prefs) {
             size = e.optLong("size"),
             mime = e.optString("mime"),
             sha256 = e.optString("sha256"),
-            keepOffline = e.optBoolean("keepOffline", false),
             clientMtime = if (e.isNull("clientMtime")) null else parseIsoMillis(e.optString("clientMtime")),
             folderId = if (e.isNull("folderId")) null else e.optString("folderId"),
         )

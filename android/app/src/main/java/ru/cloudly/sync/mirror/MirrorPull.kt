@@ -205,7 +205,6 @@ class MirrorPull(
 
     private fun applyEntry(change: CloudChange) {
         val parent = change.folderId?.let { store.dirPath(it) } ?: return
-        if (change.op == "pin") return
         val path = "$parent/${change.name}"
         if (change.op == "delete") {
             val row = store.fileByEntry(change.targetId) ?: return
