@@ -54,6 +54,17 @@ export class FilesController {
     return this.files.inlineImage(id, user.id, req, res);
   }
 
+  /** Миниатюра 50×50 для списка файлов (собранная очередью, а не оригинал). */
+  @Get(':id/thumb')
+  async thumb(
+    @Param('id') id: string,
+    @CurrentUser() user: RequestUser,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    return this.files.thumb(id, user.id, req, res);
+  }
+
   @Delete(':id')
   remove(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     return this.files.softDelete(id, user.id);

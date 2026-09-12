@@ -34,17 +34,29 @@ export class MediaController {
     return (await this.auth.ownsAsset(user.id, asset.id)) ? asset : null;
   }
 
-  /** Превью для списка: ?w=512 (фото — квадрат 50×50, видео — постер 50×50). */
+  /** Превью для списка: ?w=512 (фото — квадрат 50×50, видео — постер 50×50); PDF — ?page=N. */
   @Get('previews/:sha')
   async preview(
     @Param('sha') sha: string,
     @Query('w') wRaw: string | undefined,
+    @Query('page') pageRaw: string | undefined,
     @CurrentUser() user: RequestUser,
     @Req() req: Request,
     @Res() res: Response,
   ) {
     const asset = await this.ownAsset(sha, user);
     if (!asset) return res.status(404).end();
+    // Страница PDF: ключ на каждую страницу, нумерация с единицы. Верхнюю границу берём
+    // из pageCount, чтобы по ?page=999999 не ходить в S3 впустую.
+    const page = Number(pageRaw);
+    if (pageRaw !== undefined) {
+      if (!Number.isInteger(page) || page < 1 || page > (asset.pageCount ?? 0)) return res.status(404).end();
+      return sendObjectOr404(req, res, this.s3, MediaService.pdfPageKey(sha, page), {
+        mime: 'image/webp',
+        disposition: 'inline',
+        cache: PREVIEW_CACHE,
+      });
+    }
     const isVideo = String(asset.mime).startsWith('video/') || asset.masterMime === 'video/mp4';
     if (isVideo) {
       const poster = MediaService.videoPosterKey(sha);

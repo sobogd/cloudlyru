@@ -171,12 +171,12 @@ export class TrashService {
     // а объекты в S3 трогаем только после коммита и только у реально удалённых строк.
     const orphans = await this.prisma.asset.findMany({
       where: { entries: { none: {} } },
-      select: { id: true, sha256: true },
+      select: { id: true, sha256: true, pageCount: true },
     });
     let purgedAssets = 0;
     let retryAssets = 0;
     if (orphans.length) {
-      const removed: Array<{ id: string; sha256: string }> = [];
+      const removed: Array<{ id: string; sha256: string; pageCount: number | null }> = [];
       for (const a of orphans) {
         const res = await this.prisma.asset.deleteMany({ where: { id: a.id, entries: { none: {} } } });
         if (res.count > 0) removed.push(a);
@@ -197,7 +197,7 @@ export class TrashService {
         .filter((a) => !backAgain.has(a.sha256))
         .flatMap((a) => [
           S3Service.assetKey(a.sha256),
-          ...MediaService.derivativeKeys(a.sha256),
+          ...MediaService.derivativeKeys(a.sha256, a.pageCount),
         ]);
       const failed = keys.length
         ? await this.s3.deleteObjects(keys).catch((e: Error) => {

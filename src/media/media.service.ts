@@ -9,6 +9,21 @@ import { ZONE_PHOTOS } from '../common/zones';
 
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
 export const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm', 'video/x-matroska', 'video/avi', 'video/ogg', 'video/mpeg'];
+/** PDF рендерим сами (poppler): в списке — миниатюра первой страницы, в деталке — все страницы. */
+export const PDF_MIMES = ['application/pdf'];
+/** Ширина превью страницы PDF. */
+export const PDF_PAGE_WIDTH = 1080;
+/** Сколько страниц рисует одна задача: большое PDF иначе держало бы воркер минутами. */
+export const PDF_PAGES_PER_JOB = 40;
+
+/** Вид задачи конвейера по MIME; null — для такого типа превью не собираются. */
+export function mediaKindOf(mime: unknown): 'photo' | 'video' | 'pdf' | null {
+  const m = String(mime ?? '').toLowerCase();
+  if (IMAGE_MIMES.includes(m)) return 'photo';
+  if (VIDEO_MIMES.includes(m)) return 'video';
+  if (PDF_MIMES.includes(m)) return 'pdf';
+  return null;
+}
 /**
  * Размер превью для списка (сетка галереи): квадрат 50×50. В сетке такое превью
  * никогда не растягивается больше 50 px, поэтому больше пикселей не нужно.
@@ -161,6 +176,10 @@ export class MediaService {
   static video1080Key(sha256: string): string {
     return MediaService.viewKey(sha256, '-1080.mp4');
   }
+  /** Превью страницы PDF (1080 px по ширине, WebP): номер страницы с единицы. */
+  static pdfPageKey(sha256: string, page: number): string {
+    return MediaService.viewKey(sha256, `-p${page}-${PDF_PAGE_WIDTH}.webp`);
+  }
   private static readonly EXIF_HEAD_BYTES = EXIF_HEAD_BYTES;
 
   // ===== Устаревшие ключи: мастер-версии старого пайплайна =====
@@ -183,13 +202,20 @@ export class MediaService {
    * Все производные ассета — актуальные и устаревшие. Нужно для полного удаления:
    * до этого осиротевшие view/* не удалял никто, и они оставались в S3 навсегда.
    * Лишние ключи безвредны: удаление несуществующего объекта S3 игнорирует.
+   *
+   * pageCount нужен только для PDF: страничные превью — это переменный набор ключей,
+   * и перечислить их можно лишь по числу страниц из БД (оно там после рендера).
    */
-  static derivativeKeys(sha256: string): string[] {
+  static derivativeKeys(sha256: string, pageCount?: number | null): string[] {
+    const pages = pageCount && pageCount > 0
+      ? Array.from({ length: pageCount }, (_, i) => MediaService.pdfPageKey(sha256, i + 1))
+      : [];
     return [
       MediaService.gridKey(sha256),
       MediaService.photoFullKey(sha256),
       MediaService.videoPosterKey(sha256),
       MediaService.video1080Key(sha256),
+      ...pages,
       MediaService.legacyPhotoMasterKey(sha256),
       MediaService.legacyVideoMasterKey(sha256),
       MediaService.legacyVideo720Key(sha256),

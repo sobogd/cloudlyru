@@ -113,6 +113,8 @@ model Asset {
   createdAt     DateTime    @default(now())
   masterReadyAt DateTime?
   masterMime    String?
+  // Число страниц PDF: по нему перечисляются превью страниц при удалении файла.
+  pageCount     Int?
   entries       FileEntry[]
   media         MediaMeta?
   jobs          Job[]
@@ -279,7 +281,7 @@ model ChangeLog {
 model Job {
   id         String    @id @default(uuid())
   assetId    String
-  kind       String // 'photo' | 'video'
+  kind       String // 'photo' | 'video' | 'pdf'
   state      String    @default("pending") // pending|processing|done|failed
   error      String?
   attempts   Int       @default(0)

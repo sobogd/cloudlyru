@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import type { PDFDocumentLoadingTask, PDFDocumentProxy } from 'pdfjs-dist';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import * as api from './api';
@@ -410,7 +409,7 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
         ))}
         {(view?.entries || []).map((e) => (
           <div className="item" key={e.id} onClick={() => setOpenFile(e.id)}>
-            <span className="icon">{fileIcon(e.mime)}</span>
+            <FileThumb entry={e} />
             <span className="fname">{e.name}</span>
           </div>
         ))}
@@ -423,6 +422,24 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
 }
 
 // ===== Деталка файла: назад / скачать / удалить + вся метадата на фоне =====
+
+/**
+ * Миниатюра строки списка (50×50 — столько отдаёт сервер): собранное очередью превью,
+ * а не оригинал. Превью ещё нет — остаётся иконка типа файла.
+ */
+function FileThumb({ entry }: { entry: api.FolderEntry }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <span className="icon">{fileIcon(entry.mime)}</span>;
+  return (
+    <img
+      className="thumb"
+      src={api.thumbUrl(entry.id)}
+      alt=""
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  );
+}
 
 const rawNum = (v: unknown): number | undefined => {
   const n = Number(v);
@@ -548,6 +565,17 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
       .then((j) => { if (j && (j.state === 'pending' || j.state === 'processing' || j.state === 'done')) setJob(j); })
       .catch(() => undefined);
   }, [entryId]);
+
+  // Превью PDF собирает очередь уже после загрузки: пока числа страниц нет, файл открыт
+  // «на будущее» — спрашиваем мету заново, иначе деталка так и осталась бы со спиннером.
+  const waitingPages = meta?.mime === 'application/pdf' && !meta.pageCount;
+  useEffect(() => {
+    if (!waitingPages) return;
+    const t = setInterval(() => {
+      api.fileMeta(entryId).then(setMeta).catch(() => undefined);
+    }, 3000);
+    return () => clearInterval(t);
+  }, [waitingPages, entryId]);
 
   // опрос прогресса распаковки
   useEffect(() => {
@@ -740,118 +768,44 @@ function VideoPreview({ meta }: { meta: api.FileMeta }) {
   );
 }
 
-/** Размер растра под экран: retina учитываем, но выше 2× не идём — иначе память телефона. */
-const PDF_MAX_DPR = 2;
-
 /**
- * PDF рисуем сами (pdf.js), а не отдаём браузеру как документ с нашего домена:
- * так сохраняется правило «PDF наружу inline не отдаём» (`common/http-object.ts`),
- * а страница живёт в канвасе. Библиотека тяжёлая (~500 КБ + воркер), поэтому
- * грузится лениво — только когда PDF действительно открыли.
- *
- * Берём legacy-сборку: обычная использует совсем свежий JS (например `Promise.try`,
- * Chrome 128+ / Safari 18.2+) и на телефонах постарше просто не запустится.
+ * PDF показываем превью страниц, которые отрисовал сервер (poppler в очереди):
+ * страница = обычная картинка, поэтому в браузере ничего не парсится и не исполняется,
+ * а на телефоне не приходится тянуть рендерер. Число страниц приходит в мете файла —
+ * оно же появляется там только после того, как очередь отрисовала превью.
  */
 function PdfPreview({ meta }: { meta: api.FileMeta }) {
-  const [pages, setPages] = useState(0);
   const [page, setPage] = useState(1);
-  const [err, setErr] = useState('');
-  const [width, setWidth] = useState(0);
-  const doc = useRef<PDFDocumentProxy | null>(null);
-  const task = useRef<PDFDocumentLoadingTask | null>(null);
-  const box = useRef<HTMLDivElement>(null);
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const [failed, setFailed] = useState(false);
+  const pages = meta.pageCount ?? 0;
 
-  useEffect(() => {
-    let dead = false;
-    (async () => {
-      try {
-        const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-        const worker = await import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url');
-        pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
-        const loading = pdfjs.getDocument({
-          // Range сервер поддерживает, поэтому большой PDF тянется по частям, а не целиком
-          url: api.fileUrl(meta.id),
-          withCredentials: true, // ручка закрыта сессионной кукой
-          cMapUrl: '/pdfjs/cmaps/',
-          cMapPacked: true,
-          standardFontDataUrl: '/pdfjs/standard_fonts/',
-          wasmUrl: '/pdfjs/wasm/', // JBIG2/JPEG2000: сканы без этого не отрисуются
-        });
-        task.current = loading;
-        // закрыли деталку, пока шла загрузка задачи — держать воркер не за чем
-        if (dead) { void loading.destroy(); return; }
-        const loaded = await loading.promise;
-        if (dead) return;
-        doc.current = loaded;
-        setPages(loaded.numPages);
-      } catch (e) {
-        if (!dead) setErr((e as Error).message || 'не удалось открыть PDF');
-      }
-    })();
-    // destroy у задачи, а не у документа: в pdf.js 6 документ закрывается только так
-    return () => {
-      dead = true;
-      doc.current = null;
-      const loading = task.current;
-      task.current = null;
-      void loading?.destroy();
-    };
-  }, [meta.id]);
-
-  // ширина контейнера меняется при повороте телефона и ресайзе — перерисовываем под неё
-  useEffect(() => {
-    const el = box.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => setWidth(el.clientWidth));
-    ro.observe(el);
-    setWidth(el.clientWidth);
-    return () => ro.disconnect();
-  }, [pages]);
-
-  useEffect(() => {
-    const d = doc.current;
-    const c = canvas.current;
-    if (!d || !c || !pages || !width) return;
-    let dead = false;
-    let render: { promise: Promise<void>; cancel(): void } | null = null;
-    (async () => {
-      try {
-        const p = await d.getPage(page);
-        if (dead) return;
-        const dpr = Math.min(PDF_MAX_DPR, window.devicePixelRatio || 1);
-        const base = p.getViewport({ scale: 1 });
-        const viewport = p.getViewport({ scale: Math.max(0.1, (width - 2) / base.width) * dpr });
-        c.width = Math.floor(viewport.width);
-        c.height = Math.floor(viewport.height);
-        c.style.width = `${Math.floor(viewport.width / dpr)}px`;
-        c.style.height = `${Math.floor(viewport.height / dpr)}px`;
-        // pdf.js 6 сам берёт контекст у канваса: передавать canvasContext не нужно
-        render = p.render({ canvas: c, viewport });
-        await render.promise;
-        // страница отрисована — её внутренние данные больше не нужны (канвас уже нарисован)
-        if (!dead) p.cleanup();
-      } catch (e) {
-        // отмена прошлого рендера (перелистнули страницу) — это не ошибка
-        if (!dead && !/cancel/i.test(String((e as Error)?.message))) setErr('не удалось отрисовать страницу');
-      }
-    })();
-    return () => { dead = true; render?.cancel(); };
-  }, [page, pages, width]);
-
-  if (err) return <PreviewNote text={err} url={api.fileUrl(meta.id)} />;
+  if (!pages) {
+    return (
+      <div className="pmedia">
+        <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
+          <span className="spin" />
+          <span className="copy">⏳ Готовлю превью страниц…</span>
+        </div>
+      </div>
+    );
+  }
+  if (failed) {
+    return <PreviewNote text="Превью этой страницы не собралось — посмотрите очередь конвертации в настройках" url={api.fileUrl(meta.id)} />;
+  }
   return (
     <>
-      <div className="pmedia" ref={box}>
-        {!pages ? <span className="spin" /> : <canvas ref={canvas} />}
+      <div className="pmedia">
+        <img
+          src={api.pdfPageUrl(meta.sha256, page)}
+          alt={`${meta.name} — страница ${page}`}
+          onError={() => setFailed(true)}
+        />
       </div>
-      {pages > 1 && (
-        <div className="pbar">
-          <button className="iconbtn" title="Предыдущая страница" disabled={page <= 1} onClick={() => setPage(page - 1)}>◀️</button>
-          <span className="meta">{page} / {pages}</span>
-          <button className="iconbtn" title="Следующая страница" disabled={page >= pages} onClick={() => setPage(page + 1)}>▶️</button>
-        </div>
-      )}
+      <div className="pbar">
+        <button className="iconbtn" title="Предыдущая страница" disabled={page <= 1} onClick={() => { setFailed(false); setPage(page - 1); }}>◀️</button>
+        <span className="meta">{page} / {pages}</span>
+        <button className="iconbtn" title="Следующая страница" disabled={page >= pages} onClick={() => { setFailed(false); setPage(page + 1); }}>▶️</button>
+      </div>
     </>
   );
 }
@@ -1488,6 +1442,87 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
         ))}
         {!tokens.length && <div className="copy">Токенов нет — нужен для Finder/WebDAV</div>}
       </div>
+      <QueuePanel />
+    </div>
+  );
+}
+
+// ================= Очередь конвертации (превью фото/видео/PDF) =================
+
+const JOB_KIND: Record<string, string> = { photo: '🖼️ фото', video: '🎬 видео', pdf: '📄 PDF' };
+const JOB_STATE: Record<string, string> = { pending: 'в очереди', processing: 'в работе', done: 'готово', failed: 'ошибка' };
+
+function QueuePanel() {
+  const [q, setQ] = useState<api.QueueStatus | null>(null);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const load = () => api.queueStatus().then(setQ).catch((e) => setErr((e as Error).message));
+  // пока очередь не пуста — обновляем чаще, чтобы был виден прогресс
+  useEffect(() => {
+    void load();
+    const t = setInterval(() => { void load(); }, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  const rebuild = async () => {
+    setBusy(true);
+    setNotice('');
+    try {
+      const r = await api.rebuildPreviews();
+      setNotice(`Задачи поставлены: ${r.queued}${r.skipped ? `, пропущено ${r.skipped}` : ''}`);
+      await load();
+    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+
+  const by = q?.byState ?? {};
+  return (
+    <div className="panel">
+      <div className="row">
+        <strong>Очередь превью</strong>
+        <span style={{ flex: 1 }} />
+        <button className="btn ghost" disabled={busy} onClick={rebuild}>
+          {busy ? '…' : '⟳ Пересобрать у существующих'}
+        </button>
+      </div>
+      {err && <div className="err">{err}</div>}
+      {notice && <div className="notice">{notice}</div>}
+      {!q && !err && <div className="copy">Загрузка…</div>}
+      {q && (
+        <>
+          <div className="copy">
+            в очереди {by.pending ?? 0} · в работе {by.processing ?? 0} · готово {by.done ?? 0} · ошибок {by.failed ?? 0}
+          </div>
+          {q.processing && (
+            <div className="panel" style={{ background: '#1c2430' }}>
+              <div className="row">
+                <span className="icon">{JOB_KIND[q.processing.kind] ?? q.processing.kind}</span>
+                <span className="fname">{q.processing.sha256}…</span>
+                <span className="meta">{q.processing.progress}% · идёт {q.processing.startedMinAgo} мин</span>
+              </div>
+              <div className="ubar"><i style={{ width: `${q.processing.progress}%` }} /></div>
+            </div>
+          )}
+          {q.recent.map((j) => (
+            <div className="item" key={j.id} style={{ alignItems: 'flex-start' }}>
+              <span className="icon">{JOB_KIND[j.kind] ?? j.kind}</span>
+              <span className="fname" style={{ whiteSpace: 'normal' }}>
+                {j.sha256}… — {JOB_STATE[j.state] ?? j.state}
+                {j.state === 'failed' && j.error && (
+                  <div className="err" style={{ fontWeight: 400 }}>{j.error}</div>
+                )}
+              </span>
+              <span className="meta">{new Date(j.updatedAt).toLocaleString()}</span>
+            </div>
+          ))}
+          {!q.recent.length && <div className="copy">Задач не было — превью собираются автоматически при загрузке</div>}
+          <div className="copy">
+            «Пересобрать у существующих» ставит задачи тем файлам, у которых превью так и не собрались:
+            фото и видео из старых загрузок, а также всем PDF (их страницы рисуются заново).
+          </div>
+        </>
+      )}
     </div>
   );
 }

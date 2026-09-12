@@ -45,6 +45,15 @@ ssh root@46.225.143.221 'certbot --nginx -d files.iq-factura.com'
 Скрипт: каталог `/home/deploy/apps/cloudlyru`, роль+БД Postgres из `CLOUDLY_DATABASE_URL`,
 nginx server-блок (отдельный, блоки iq-rest не трогает). Идемпотентен — можно перезапускать.
 
+Медиа-инструменты bootstrap ставит сам: `ffmpeg`/`ffprobe` (видео), `libheif-examples`
+(HEIC), `poppler-utils` — `pdfinfo` и `pdftoppm` для превью страниц PDF. На уже
+настроенном сервере, где poppler ещё нет, достаточно один раз:
+
+```bash
+ssh root@46.225.143.221 'apt-get install -y --no-install-recommends poppler-utils'
+# проверка: curl -s https://files.iq-factura.com/api/v1/healthz  (в логе — какие бинари нашлись)
+```
+
 ## Первый деплой
 
 ```bash

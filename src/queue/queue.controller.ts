@@ -1,7 +1,9 @@
 import { Body, Controller, Get, Post } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from '../auth/auth.service';
+import { S3Service } from '../s3/s3.service';
 import { QueueService } from './queue.service';
+import { PDF_MIMES, mediaKindOf } from '../media/media.service';
 import { CurrentUser, RequestUser } from '../common/decorators';
 import { asString, isPlainObject } from '../common/utils';
 import { badRequest, notFound } from '../common/errors';
@@ -12,6 +14,7 @@ export class QueueController {
     private readonly prisma: PrismaService,
     private readonly auth: AuthService,
     private readonly queue: QueueService,
+    private readonly s3: S3Service,
   ) {}
 
   /** Статус очереди конвертации (для UI-монитора) — только по своим файлам. */
@@ -60,6 +63,49 @@ export class QueueController {
         masterReady: Boolean(j.asset.masterReadyAt),
       })),
     };
+  }
+
+  /**
+   * Пересобрать превью у уже загруженных файлов: очередь ставит задачи тем ассетам своего
+   * дерева, у которых превью так и не собрались (в т.ч. всем PDF — до появления их рендера
+   * они лежали без превью). Дальше это видно в /queue/status.
+   */
+  @Post('rebuild')
+  async rebuild(@CurrentUser() user: RequestUser) {
+    const tree = await this.auth.subtreeIds(user.id);
+    const assets = await this.prisma.asset.findMany({
+      where: {
+        entries: { some: { folderId: { in: tree }, deletedAt: null } },
+        OR: [
+          { masterReadyAt: null },
+          // PDF мог отрисоваться частично (страницы добираются задачами): догоняем остаток
+          { mime: { in: PDF_MIMES }, pageCount: null },
+        ],
+      },
+      select: { id: true, sha256: true, mime: true },
+    });
+    let queued = 0;
+    let skipped = 0;
+    // Проверяем оригиналы пачками: на большой медиатеке последовательные HEAD-запросы
+    // к S3 растянули бы ответ ручки на минуты.
+    const candidates = assets.filter((a) => mediaKindOf(a.mime));
+    skipped += assets.length - candidates.length;
+    for (let i = 0; i < candidates.length; i += 8) {
+      const chunk = candidates.slice(i, i + 8);
+      const alive = await Promise.all(
+        chunk.map((a) => this.s3.headObject(S3Service.assetKey(a.sha256)).catch(() => false)),
+      );
+      for (let j = 0; j < chunk.length; j++) {
+        // без оригинала превью не собрать: он единственный источник пикселей
+        if (!alive[j]) {
+          skipped++;
+          continue;
+        }
+        await this.queue.enqueue(chunk[j].id, chunk[j].sha256, chunk[j].mime);
+        queued++;
+      }
+    }
+    return { queued, skipped, total: assets.length };
   }
 
   /**

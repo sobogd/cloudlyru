@@ -4,7 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { Public } from '../common/decorators';
 
 /** Бинари, без которых конвертация медиа молча не работает. */
-const MEDIA_BINS = ['ffmpeg', 'ffprobe', 'heif-convert'] as const;
+const MEDIA_BINS = ['ffmpeg', 'ffprobe', 'heif-convert', 'pdfinfo', 'pdftoppm'] as const;
 const TOOLCHECK_TTL_MS = 10 * 60 * 1000;
 
 interface Toolchain {

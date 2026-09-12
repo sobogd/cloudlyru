@@ -385,7 +385,7 @@ export class FilesService {
    * (плановый GC есть только в очистке корзины, а перезапись при синхронизации — частый путь).
    */
   async gcOrphanAsset(assetId: string): Promise<boolean> {
-    const asset = await this.prisma.asset.findUnique({ where: { id: assetId }, select: { sha256: true } });
+    const asset = await this.prisma.asset.findUnique({ where: { id: assetId }, select: { sha256: true, pageCount: true } });
     if (!asset) return false;
     // строка удаляется только при отсутствии ссылок (двойная защита: условие в where + FK Restrict)
     const res = await this.prisma.asset.deleteMany({ where: { id: assetId, entries: { none: {} } } });
@@ -395,7 +395,7 @@ export class FilesService {
     // и удаление ключей убило бы байты живого файла.
     const alive = await this.prisma.asset.count({ where: { sha256: asset.sha256 } });
     if (alive > 0) return false;
-    const keys = [S3Service.assetKey(asset.sha256), ...MediaService.derivativeKeys(asset.sha256)];
+    const keys = [S3Service.assetKey(asset.sha256), ...MediaService.derivativeKeys(asset.sha256, asset.pageCount)];
     const failed = await this.s3.deleteObjects(keys).catch((e: Error) => {
       this.logger.warn(`S3 не подтвердил удаление объектов ${asset.sha256}: ${e.message}`);
       return keys;
@@ -446,6 +446,7 @@ export class FilesService {
       ext: entry.asset.ext ?? undefined,
       sha256: entry.asset.sha256,
       masterMime: entry.asset.masterMime && entry.asset.masterReadyAt ? entry.asset.masterMime : null,
+      pageCount: entry.asset.pageCount ?? undefined,
       media: m
         ? {
             capturedAt: m.capturedAt ? m.capturedAt.toISOString() : null,
@@ -576,6 +577,38 @@ export class FilesService {
       // содержимое неизменяемо (ключ = sha256), но приватно: кэширует только браузер
       cache: 'private, max-age=600',
     });
+  }
+
+  /**
+   * Миниатюра для списка файлов (50×50): производные, собранные очередью, а не оригинал.
+   * Одна ручка на все типы, потому что в списке известен только id записи, а не sha256.
+   * Нет превью (задача ещё идёт или упала) — 404, клиент показывает иконку.
+   */
+  async thumb(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
+    const entry = await this.requireOwnEntry(entryId, userId);
+    // Превью нет и не будет (задача не дошла до конца) — отвечаем сразу, без похода в S3:
+    // список файлов запрашивает миниатюру на каждую строку.
+    if (!entry.asset.masterReadyAt) {
+      res.status(404).end();
+      return;
+    }
+    const sha = entry.asset.sha256;
+    const isVideo = String(entry.asset.mime).startsWith('video/');
+    // у видео миниатюра — постер, у фото и PDF — превью для сетки
+    const candidates = isVideo
+      ? [MediaService.videoPosterKey(sha), MediaService.gridKey(sha)]
+      : [MediaService.gridKey(sha)];
+    for (const key of candidates) {
+      if (await this.s3.headObject(key).catch(() => false)) {
+        return sendObjectOr404(req, res, this.s3, key, {
+          mime: 'image/webp',
+          disposition: 'inline',
+          // ключ = sha256, содержимое неизменяемо: кэширует только браузер пользователя
+          cache: 'private, max-age=600',
+        });
+      }
+    }
+    res.status(404).end();
   }
 
   async softDelete(entryId: string, userId: string) {

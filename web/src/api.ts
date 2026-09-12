@@ -78,6 +78,8 @@ export interface FileMeta {
   id: string; name: string; createdAt: string; folderId: string; zone: string; path: string;
   size: number; mime: string; ext?: string; sha256: string; masterMime?: string | null;
   keepOffline?: boolean;
+  /** Число страниц PDF (есть после того, как очередь отрисовала превью страниц). */
+  pageCount?: number;
   media?: FileMedia | null;
 }
 export const fileMeta = (id: string) => request<FileMeta>(`/files/${id}`);
@@ -464,9 +466,13 @@ export interface AlbumInfo { id: string; name: string; createdAt: string; count:
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
 export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
+/** Страница PDF: превью, отрисованное сервером (нумерация с единицы). */
+export const pdfPageUrl = (sha: string, page: number) => `/api/v1/previews/${sha}?page=${page}`;
 /** Превью видео (1080, AV1); original=true — сам файл: фолбэк для браузеров без AV1. */
 export const videoPreviewUrl = (sha: string, original = false) =>
   `/api/v1/video-preview/${sha}${original ? '?src=original' : ''}`;
+/** Миниатюра 50×50 для списка файлов (по id записи, sha256 в списке нет). */
+export const thumbUrl = (entryId: string) => `${BASE}/files/${entryId}/thumb`;
 export interface QueueStatus {
   byState: Record<string, number>;
   processing: { id: string; kind: string; sha256: string; startedMinAgo: number; progress: number } | null;
@@ -476,6 +482,9 @@ export const queueStatus = () => request<QueueStatus>('/queue/status');
 /** Пересобрать превью упавшего файла: задача конвертации ставится в очередь заново. */
 export const retryPreview = (entryId: string) =>
   request<{ ok: boolean }>('/queue/retry', { method: 'POST', body: JSON.stringify({ entryId }) });
+/** Пересобрать превью у уже загруженных файлов, у которых их нет (в т.ч. у всех PDF). */
+export const rebuildPreviews = () =>
+  request<{ queued: number; skipped: number; total: number }>('/queue/rebuild', { method: 'POST', body: JSON.stringify({}) });
 export const timeline = () => request<TimelineItem[]>('/timeline');
 export const trips = () => request<Trip[]>('/trips');
 export const listAlbums = () => request<AlbumInfo[]>('/albums');

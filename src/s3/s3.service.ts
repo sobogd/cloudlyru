@@ -7,6 +7,7 @@ import {
   CompleteMultipartUploadCommand,
   DeleteObjectCommand,
   DeleteObjectsCommand,
+  ListObjectsV2Command,
   CopyObjectCommand,
   PutObjectCommand,
   GetObjectCommand,
@@ -158,6 +159,29 @@ export class S3Service implements OnModuleDestroy {
   async deleteObject(key: string): Promise<void> {
     const cmd = new DeleteObjectCommand({ Bucket: this.bucket, Key: this.k(key) });
     await this.s3().send(cmd);
+  }
+
+  /**
+   * Ключи по префиксу (без префикса инстанса, как их знают вызывающие).
+   * Нужно там, где производных у ассета переменное число и перечислить их заранее
+   * нельзя: у PDF превью каждой страницы лежат отдельным ключом.
+   */
+  async listKeys(prefix: string): Promise<string[]> {
+    const keys: string[] = [];
+    let token: string | undefined;
+    do {
+      const out = await this.s3().send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: this.k(prefix),
+          ContinuationToken: token,
+          MaxKeys: 1000,
+        }),
+      );
+      for (const o of out.Contents ?? []) if (o.Key) keys.push(this.un(o.Key));
+      token = out.IsTruncated ? out.NextContinuationToken : undefined;
+    } while (token);
+    return keys;
   }
 
   /**

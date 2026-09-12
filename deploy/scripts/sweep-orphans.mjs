@@ -53,6 +53,7 @@ const s3 = new S3Client({
 });
 
 // Производные медиа (view/<sha><суффикс>) — список из MediaService.derivativeKeys().
+// Плюс превью страниц PDF: view/<sha>-p<N>-1080.webp — их число переменно, поэтому шаблон.
 const SUFFIXES = [
   '-512.webp',
   '-2048.avif',
@@ -65,6 +66,7 @@ const SUFFIXES = [
   '.webp',
   '',
 ];
+const PAGE_KEY = /-p\d+-1080\.webp$/;
 
 // Префикс ключей инстанса (S3_FILES_PREFIX): у прода пусто, у dev/тестов свой.
 const PREFIX = (process.env.S3_FILES_PREFIX || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
@@ -78,6 +80,12 @@ function shaOf(key) {
   }
   if (key.startsWith('view/')) {
     const rest = key.slice('view/'.length);
+    // страницы PDF: view/<sha>-p<N>-1080.webp (суффиксов переменное число)
+    const page = PAGE_KEY.exec(rest);
+    if (page) {
+      const sha = rest.slice(0, page.index);
+      return /^[0-9a-f]{64}$/.test(sha) ? sha : null;
+    }
     for (const sfx of SUFFIXES) {
       if (sfx && rest.endsWith(sfx)) {
         const sha = rest.slice(0, -sfx.length);

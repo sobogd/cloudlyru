@@ -6,7 +6,15 @@ import { join } from 'path';
 import sharp from 'sharp';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
-import { GRID_SIZE, IMAGE_MIMES, MediaService, VIDEO_MIMES, parseIso6709, videoInstant } from '../media/media.service';
+import {
+  GRID_SIZE,
+  MediaService,
+  PDF_PAGES_PER_JOB,
+  PDF_PAGE_WIDTH,
+  mediaKindOf,
+  parseIso6709,
+  videoInstant,
+} from '../media/media.service';
 import { ZONE_FILES } from '../common/zones';
 import { env } from '../config/env';
 
@@ -121,14 +129,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
    * (включая легаси-ключи старого пайплайна: у части ассетов оригинал был удалён).
    */
   private fullPreviewKeys(kind: string, sha256: string): string[] {
-    return kind === 'photo'
-      ? [MediaService.photoFullKey(sha256), MediaService.legacyPhotoFullWebpKey(sha256)]
-      : [MediaService.video1080Key(sha256), MediaService.legacyVideo720Key(sha256)];
+    if (kind === 'photo') return [MediaService.photoFullKey(sha256), MediaService.legacyPhotoFullWebpKey(sha256)];
+    if (kind === 'pdf') return [MediaService.pdfPageKey(sha256, 1)];
+    return [MediaService.video1080Key(sha256), MediaService.legacyVideo720Key(sha256)];
   }
 
   /** Есть ли чем показать содержимое, кроме оригинала. */
   async previewsAlive(mime: string, sha256: string): Promise<boolean> {
-    const kind = IMAGE_MIMES.includes(mime) ? 'photo' : VIDEO_MIMES.includes(mime) ? 'video' : null;
+    const kind = mediaKindOf(mime);
     if (!kind) return false;
     for (const key of this.fullPreviewKeys(kind, sha256)) {
       if (await this.s3.headObject(key).catch(() => false)) return true;
@@ -138,7 +146,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   /** Ставит задачу, если для ассета ещё нет активной. */
   async enqueue(assetId: string, sha256: string, mime: string): Promise<void> {
-    const kind = IMAGE_MIMES.includes(mime) ? 'photo' : VIDEO_MIMES.includes(mime) ? 'video' : null;
+    const kind = mediaKindOf(mime);
     if (!kind) return;
     // Превью уже есть, а оригинала нет (KEEP_ORIGINALS=false) — задача обречена на три
     // падения при скачивании files/<sha>. Ставим её только если превью на самом деле нет.
@@ -217,7 +225,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       .findUnique({ where: { id: assetId }, select: { sha256: true, mime: true } })
       .catch(() => null);
     if (!asset) return { ok: false, reason: 'файл не найден' };
-    const kind = IMAGE_MIMES.includes(asset.mime) ? 'photo' : VIDEO_MIMES.includes(asset.mime) ? 'video' : null;
+    const kind = mediaKindOf(asset.mime);
     if (!kind) return { ok: false, reason: 'превью для такого типа файла не собираются' };
     const rawAlive = await this.s3.headObject(S3Service.assetKey(asset.sha256)).catch(() => false);
     if (!rawAlive) return { ok: false, reason: 'оригинала больше нет в хранилище — залейте файл заново' };
@@ -311,6 +319,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       let res: ConvertResult = {};
       if (job.kind === 'photo') res = await this.convertPhoto(job, rawPath);
       else if (job.kind === 'video') res = await this.convertVideo(job, rawPath);
+      else if (job.kind === 'pdf') res = await this.convertPdf(job, rawPath);
       else throw new Error('unknown kind');
 
       // Сырьё из S3 удаляем, только если это разрешено конфигом и ни одна живая копия
@@ -443,8 +452,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return animated ? { keepRaw: true } : {};
   }
 
-  // ============ Видео → постер 50×50 (список) + 1080 AV1 (полный экран) ============
-  // Полноразмерный AV1-мастер не собирается: оригинал и есть мастер. Это заодно снимает
+  // ============ Видео → постер 50×50 (список) + 1080 AV1 (полный экран) ============  // Полноразмерный AV1-мастер не собирается: оригинал и есть мастер. Это заодно снимает
   // проблему памяти — энкодер больше не держит 4K-кадры, из-за которых libaom падал
   // под ulimit -v ("Failed to initialize encoder: Memory allocation error").
 
@@ -501,6 +509,94 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: null, masterReadyAt: new Date() } });
     await this.setProgress(job.id, 100, true);
     return {};
+  }
+
+  // ============ PDF → миниатюра первой страницы (список) + превью всех страниц (деталка) ============
+  // Рисует poppler (pdfinfo/pdftoppm): ffmpeg PDF не умеет, а JS-рендереры (mupdf, pdfjs)
+  // собираются только в ESM, а сервис — CommonJS. Оригинал НЕ удаляем никогда: страницы —
+  // это картинки, самого документа (текст, страницы сверх отрисованных) в них нет.
+  //
+  // Одна задача рисует не больше PDF_PAGES_PER_JOB страниц: PDF на сотни страниц иначе
+  // занял бы единственный воркер на минуты, и превью фото ждали бы в очереди. Если
+  // страницы остались — задача ставится заново и продолжает с того места, где встала
+  // (уже отрисованные страницы видны в S3 и не перерисовываются).
+
+  private async convertPdf(job: JobRow, rawPath: string): Promise<ConvertResult> {
+    const sha = job.sha256;
+    const total = await this.pdfPageCount(rawPath);
+    if (!total) throw new Error('в PDF не найдено ни одной страницы');
+
+    // Что уже отрисовано: у PDF превью каждой страницы — отдельный ключ, и после
+    // рестарта/падения задача должна продолжить, а не начинать с нуля.
+    const existing = new Set(
+      (await this.s3.listKeys(`view/${sha}-p`).catch(() => []))
+        .map((k) => /-p(\d+)-/.exec(k)?.[1])
+        .filter(Boolean)
+        .map(Number),
+    );
+    const missing: number[] = [];
+    for (let p = 1; p <= total; p++) if (!existing.has(p)) missing.push(p);
+    if (!missing.length) {
+      await this.finishPdf(job, total);
+      return { keepRaw: true };
+    }
+    const batch = missing.slice(0, PDF_PAGES_PER_JOB);
+
+    for (const page of batch) {
+      const png = join(tmpdir(), `clq-${job.id}-p${page}.png`);
+      try {
+        // -scale-to-x/-scale-to-y -1: ширина ровно PDF_PAGE_WIDTH, высота по пропорциям
+        await this.run(
+          ['pdftoppm', '-png', '-f', String(page), '-l', String(page), '-scale-to-x', String(PDF_PAGE_WIDTH), '-scale-to-y', '-1', '-singlefile', rawPath, png.replace(/\.png$/, '')],
+          180000,
+        );
+      } catch (e) {
+        const why = String((e as { stderr?: string }).stderr || (e as Error).message).split('\n').filter(Boolean).pop();
+        throw new Error(`страница ${page}: pdftoppm не смог (${why?.slice(0, 200) ?? 'без вывода'})`);
+      }
+      const webp = await sharp(png)
+        .flatten({ background: '#ffffff' }) // страница прозрачной не бывает, но JPEG-подложка серую не даёт
+        .webp({ quality: 78 })
+        .toBuffer();
+      await this.s3.putObject(MediaService.pdfPageKey(sha, page), webp, 'image/webp');
+      if (page === 1) await this.s3.putObject(MediaService.gridKey(sha), await this.pdfGrid(png), 'image/webp');
+      rmSync(png, { force: true });
+      const doneCount = total - missing.length + batch.indexOf(page) + 1;
+      await this.setProgress(job.id, Math.round((doneCount / total) * 100));
+    }
+
+    await this.finishPdf(job, total);
+    // страницы остались — дорисовываем следующей задачей (идемпотентно: готовые пропустятся)
+    if (missing.length > batch.length) {
+      await this.prisma.job.create({ data: { assetId: job.assetId, kind: 'pdf', state: 'pending' } }).catch(() => undefined);
+      this.logger.log(`△ pdf ${sha.slice(0, 8)}: отрисовано ${batch.length} из ${missing.length} оставшихся страниц`);
+    }
+    return { keepRaw: true };
+  }
+
+  /** Миниатюра для списка: первая страница, вписанная в квадрат GRID_SIZE на белом фоне. */
+  private async pdfGrid(pagePng: string): Promise<Buffer> {
+    return sharp(pagePng)
+      .resize({ width: GRID_SIZE, height: GRID_SIZE, fit: 'contain', background: '#ffffff', withoutEnlargement: true })
+      .flatten({ background: '#ffffff' })
+      .webp({ quality: 78 })
+      .toBuffer();
+  }
+
+  /** Число страниц из pdfinfo (та же poppler). Без страниц считать нечего — это ошибка. */
+  private async pdfPageCount(rawPath: string): Promise<number> {
+    // execFileSync, а не run(): нужен stdout, а run() отдаёт только код выхода и stderr.
+    const out = execFileSync('pdfinfo', [rawPath], { encoding: 'utf8', timeout: 60000 });
+    const m = /^Pages:\s+(\d+)/m.exec(out);
+    return m ? Number(m[1]) : 0;
+  }
+
+  /** Превью готовы (даже если это только часть страниц): деталка уже есть чем показать. */
+  private async finishPdf(job: JobRow, total: number): Promise<void> {
+    await this.prisma.asset.update({
+      where: { id: job.assetId },
+      data: { masterMime: null, masterReadyAt: new Date(), pageCount: total },
+    });
   }
 
   /**

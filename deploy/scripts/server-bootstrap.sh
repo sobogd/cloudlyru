@@ -33,7 +33,7 @@ echo "==> 1/4 Каталог приложения"
 mkdir -p "$APP_DIR"
 chown -R deployer:deployer "$APP_DIR"
 
-echo "==> 2/4 Медиа-инструменты (ffmpeg / ffprobe / heif-convert)"
+echo "==> 2/4 Медиа-инструменты (ffmpeg / ffprobe / heif-convert / pdfinfo+pdftoppm)"
 # Конвертация медиа в зоне «Фото» требует этих бинарей. Без них задачи очереди падают
 # с ENOENT, а /api/v1/healthz отдаёт media.ok=false (раньше это выяснялось только
 # по «навсегда зависшим» задачам). exiftool приложению больше не нужен: метаданные
@@ -47,7 +47,12 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   apt-get install -y --no-install-recommends ffmpeg \
     || echo "  ВНИМАНИЕ: ffmpeg не установился — видео не будет конвертироваться"
 fi
-for b in ffmpeg ffprobe heif-convert; do
+# Превью PDF рисует poppler (pdfinfo — число страниц, pdftoppm — страницы в PNG).
+if ! command -v pdftoppm >/dev/null 2>&1; then
+  apt-get install -y --no-install-recommends poppler-utils \
+    || echo "  ВНИМАНИЕ: poppler-utils не установился — превью PDF не будут собираться"
+fi
+for b in ffmpeg ffprobe heif-convert pdfinfo pdftoppm; do
   if command -v "$b" >/dev/null 2>&1; then
     echo "  ok: $b → $(command -v "$b")"
   else

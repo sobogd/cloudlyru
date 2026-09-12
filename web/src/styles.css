@@ -115,6 +115,9 @@ html, body { overscroll-behavior: none; }
 .fileslist .item { padding: 13px 6px; cursor: pointer; }
 .fileslist .icon { width: 30px; font-size: 22px; }
 .fileslist .fname { font-size: 15px; }
+/* Миниатюра строки: сервер отдаёт квадрат 50×50, показываем меньше — строка не «толстеет» */
+.fileslist .thumb { width: 36px; height: 36px; object-fit: cover; border-radius: 6px;
+  background: #1b212b; flex: none; }
 
 /* Деталка файла/папки */
 .filehead strong.detname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
