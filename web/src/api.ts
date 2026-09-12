@@ -83,6 +83,27 @@ export interface FileMeta {
   media?: FileMedia | null;
 }
 export const fileMeta = (id: string) => request<FileMeta>(`/files/${id}`);
+
+// ===== буфер копирования/вырезания =====
+export interface ClipboardView {
+  kind: 'file' | 'folder';
+  mode: 'copy' | 'cut';
+  id: string;
+  name: string;
+  /** false — цели больше нет (удалена или в корзине): вставка скажет об этом. */
+  available: boolean;
+  at: string | null;
+}
+/** Буфер живёт на сервере (один на аккаунт), поэтому виден с любого устройства. */
+export const clipboard = () => request<ClipboardView | null>('/clipboard');
+export const setClipboard = (kind: 'file' | 'folder', id: string, mode: 'copy' | 'cut') =>
+  request<ClipboardView>('/clipboard', { method: 'POST', body: JSON.stringify({ kind, id, mode }) });
+export const clearClipboard = () => request<{ ok: boolean }>('/clipboard', { method: 'DELETE' });
+export const pasteClipboard = (folderId: string) =>
+  request<{ ok: boolean; action: 'moved' | 'copied'; name: string }>('/clipboard/paste', {
+    method: 'POST',
+    body: JSON.stringify({ folderId }),
+  });
 export interface FolderMeta {
   id: string; name: string; zone: string; path: string;
   folders: number; entries: number; keepOffline?: boolean; createdAt: string; updatedAt: string;

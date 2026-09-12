@@ -110,6 +110,12 @@ html, body { overscroll-behavior: none; }
 .upcount { font-size: 13px; color: #cfd6e0; }
 .uppanel .uprow { padding: 6px 2px; }
 
+/* Буфер копирования/вырезания в шапке папки: что лежит и кнопка очистки */
+.clipnote { display: inline-flex; align-items: center; gap: 2px; max-width: 140px;
+  font-size: 11px; color: #cfd6e0; background: #1c2430; border-radius: 8px; padding: 2px 2px 2px 8px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.clipnote .iconbtn { font-size: 13px; padding: 2px 5px; }
+
 /* Файлы: плоский список на фоне, без «карточки»; строка = только иконка + имя */
 .fileslist { margin: 0; }
 .fileslist .item { padding: 13px 6px; cursor: pointer; }

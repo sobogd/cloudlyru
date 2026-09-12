@@ -25,6 +25,12 @@ model User {
   rootFolderId  String? // корневая папка пользователя (создаётся при seed)
   photoFolderId String? // системная папка «Фото» (медиа-зона; создаётся при seed/lazy)
   phoneFolderId String? // системная папка «Телефон» (зеркало папок телефона; создаётся lazy)
+  // Буфер копирования/вырезания. В БД, а не в localStorage браузера: буфер должен быть
+  // один на аккаунт — скопировал на телефоне, вставил на ноутбуке. Одна цель за раз.
+  clipboardKind String? // 'file' | 'folder'
+  clipboardId   String?
+  clipboardMode String? // 'copy' | 'cut'
+  clipboardAt   DateTime?
 }
 
 model Session {

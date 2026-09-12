@@ -335,6 +335,8 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
   const [err, setErr] = useState('');
   const [openFile, setOpenFile] = useState<string | null>(saved?.openFile ?? null);
   const [folderMeta, setFolderMeta] = useState(!!saved?.folderMeta);
+  const [clip, setClip] = useState<api.ClipboardView | null>(null);
+  const [notice, setNotice] = useState('');
   const currentId = stack[stack.length - 1]?.id;
 
   // запоминаем экран, чтобы F5 возвращал в ту же папку/файл
@@ -348,6 +350,12 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
   // очередной файл догрузился — показываем его в текущей папке
   useEffect(() => { if (uploadedAt) void load(currentId); }, [uploadedAt]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Буфер перечитываем при возврате из деталки: там его и наполняют (копировать/вырезать)
+  useEffect(() => {
+    if (openFile || folderMeta) return;
+    api.clipboard().then(setClip).catch(() => undefined);
+  }, [openFile, folderMeta, currentId]);
+
   const busy = up.busy;
 
   const mkdir = async () => {
@@ -356,6 +364,25 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
     try { await api.mkdir(name, currentId); await load(currentId); } catch (e) { setErr((e as Error).message); }
   };
   const goUp = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
+
+  const pasteHere = async () => {
+    // На верхнем уровне в стеке нет id (это «Главная»), но сервер вернул настоящий id папки
+    const target = view?.parentId ?? currentId;
+    if (!target) return;
+    setNotice('');
+    try {
+      const r = await api.pasteClipboard(target);
+      await load(currentId);
+      await api.clipboard().then(setClip).catch(() => undefined);
+      setNotice(r.action === 'copied' ? `Скопировано: ${r.name}` : `Перенесено: ${r.name}`);
+    } catch (e) { setErr((e as Error).message); }
+  };
+  const clearClip = async () => {
+    try {
+      await api.clearClipboard();
+      setClip(null);
+    } catch (e) { setErr((e as Error).message); }
+  };
   const closeFile = () => { setOpenFile(null); void load(currentId); };
 
   // ===== Деталка файла (из списка) =====
@@ -383,6 +410,23 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
           <button className="iconbtn" title="Инфо о папке" onClick={() => setFolderMeta(true)} disabled={busy}>ℹ️</button>
         )}
         <span style={{ flex: 1 }} />
+        {/* «Вставить» живёт в шапке любой папки: буфер серверный, поэтому он одинаков
+            и в списке файлов, и на другом устройстве */}
+        {clip && (
+          <>
+            <button
+              className="iconbtn"
+              title={clip.available
+                ? `Вставить сюда: ${clip.mode === 'cut' ? 'перенести' : 'скопировать'} «${clip.name}»`
+                : `Источник «${clip.name}» больше недоступен`}
+              onClick={pasteHere}
+            >📥</button>
+            <span className="clipnote" title={`${clip.mode === 'cut' ? 'вырезано' : 'скопировано'}: ${clip.name}`}>
+              {clip.mode === 'cut' ? '✂️' : '📋'} {clip.name}
+              <button className="iconbtn" title="Очистить буфер" onClick={clearClip}>✕</button>
+            </span>
+          </>
+        )}
         <button className="iconbtn" title="Новая папка" onClick={mkdir} disabled={busy}>📂</button>
         <label className="iconbtn" title="Загрузить файлы (любого типа)">
           📄
@@ -400,6 +444,7 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
       </div>
 
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
+      {notice && <div className="notice" style={{ margin: '10px 2px' }}>{notice}</div>}
       <div className="fileslist">
         {(view?.folders || []).filter((f) => f.id !== photoFolderId).map((f) => (
           <div className="item" key={f.id} onClick={() => setStack((s) => [...s, { id: f.id, name: f.name }])}>
@@ -609,12 +654,27 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
       setMeta((m) => (m ? { ...m, keepOffline: next } : m));
     } catch (e) { alert((e as Error).message); }
   };
+  // Копировать/вырезать: цель уезжает в серверный буфер, вставка — в шапке нужной папки
+  const toClipboard = async (mode: 'copy' | 'cut') => {
+    try {
+      await api.setClipboard('file', entryId, mode);
+      alert(mode === 'copy'
+        ? 'Скопировано. Откройте нужную папку и нажмите 📥 в её шапке.'
+        : 'Вырезано. Откройте нужную папку и нажмите 📥 в её шапке.');
+    } catch (e) { alert((e as Error).message); }
+  };
 
   return (
     <div>
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
         <span style={{ flex: 1 }} />
+        {meta && (
+          <>
+            <button className="iconbtn" title="Копировать в другую папку" onClick={() => toClipboard('copy')}>📋</button>
+            <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={() => toClipboard('cut')}>✂️</button>
+          </>
+        )}
         {isZip && (
           <button
             className="iconbtn"
@@ -840,12 +900,20 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
       setMeta((m) => (m ? { ...m, keepOffline: next } : m));
     } catch (e) { alert((e as Error).message); }
   };
+  // Папку можно вырезать (перенести), но не копировать: копия поддерева — отдельная задача
+  const cutFolder = async () => {
+    try {
+      await api.setClipboard('folder', folderId, 'cut');
+      alert('Папка вырезана. Откройте нужную папку и нажмите 📥 в её шапке.');
+    } catch (e) { alert((e as Error).message); }
+  };
 
   return (
     <div>
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
         <span style={{ flex: 1 }} />
+        <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={cutFolder}>✂️</button>
         <button
           className="iconbtn"
           title={meta?.keepOffline

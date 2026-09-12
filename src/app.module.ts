@@ -17,6 +17,7 @@ import { HealthModule } from './health/health.module';
 import { UnzipModule } from './unzip/unzip.module';
 import { SyncModule } from './sync/sync.module';
 import { ReleaseModule } from './release/release.module';
+import { ClipboardModule } from './clipboard/clipboard.module';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { ReleaseModule } from './release/release.module';
     UnzipModule,
     SyncModule,
     ReleaseModule,
+    ClipboardModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },
