@@ -474,6 +474,8 @@ export const videoPreviewUrl = (sha: string, original = false) =>
 /** Миниатюра 50×50 для списка файлов (по id записи, sha256 в списке нет). */
 export const thumbUrl = (entryId: string) => `${BASE}/files/${entryId}/thumb`;
 export interface QueueStatus {
+  /** Конвертация на паузе: состояние хранится в БД, живёт до снятия. */
+  paused: boolean;
   byState: Record<string, number>;
   processing: { id: string; kind: string; sha256: string; startedMinAgo: number; progress: number } | null;
   recent: Array<{ id: string; kind: string; state: string; error: string | null; updatedAt: string; sha256: string; progress: number; masterReady: boolean }>;
@@ -488,6 +490,9 @@ export const rebuildPreviews = () =>
 /** Сколько файлов осталось без превью — для кнопки пересбора. */
 export interface MissingPreviews { total: number; byKind: Record<string, number> }
 export const missingPreviews = () => request<MissingPreviews>('/queue/missing');
+/** Пауза конвертации (мягкая: текущая задача докачивается, новые не берутся). */
+export const setQueuePaused = (paused: boolean) =>
+  request<{ paused: boolean }>('/queue/pause', { method: 'POST', body: JSON.stringify({ paused }) });
 export const timeline = () => request<TimelineItem[]>('/timeline');
 export const trips = () => request<Trip[]>('/trips');
 export const listAlbums = () => request<AlbumInfo[]>('/albums');

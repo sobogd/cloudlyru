@@ -1502,11 +1502,23 @@ function QueuePanel() {
     kinds.pdf ? `PDF ${kinds.pdf}` : '',
   ].filter(Boolean).join(' · ');
 
+  // Пауза мягкая: новые задачи не берутся, текущая докачивается (для видео это важно —
+  // прерванный AV1-энкод означает часы работы заново), PDF встаёт между страницами.
+  const togglePause = async () => {
+    try {
+      await api.setQueuePaused(!q?.paused);
+      await load();
+    } catch (e) { setErr((e as Error).message); }
+  };
+
   return (
     <div className="panel">
       <div className="row">
         <strong>Очередь превью</strong>
         <span style={{ flex: 1 }} />
+        <button className={q?.paused ? 'btn' : 'btn ghost'} disabled={!q} onClick={togglePause}>
+          {q?.paused ? '▶️ Продолжить' : '⏸ Пауза'}
+        </button>
         <button className="btn" disabled={busy || !left} onClick={rebuild}>
           {busy ? '…' : left ? `⟳ Пересобрать там, где нет (${left})` : '⟳ Всё собрано'}
         </button>
@@ -1517,6 +1529,7 @@ function QueuePanel() {
       {q && (
         <>
           <div className="copy">
+            {q.paused ? '⏸ конвертация на паузе — задачи ждут в очереди · ' : ''}
             без превью {left}{leftText ? ` (${leftText})` : ''} · в очереди {by.pending ?? 0} · в работе {by.processing ?? 0} · готово {by.done ?? 0} · ошибок {by.failed ?? 0}
           </div>
           {q.processing && (

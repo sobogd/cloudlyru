@@ -43,6 +43,7 @@ export class QueueController {
     for (const g of groups) byState[g.state] = g._count;
 
     return {
+      paused: await this.queue.isPaused(),
       byState,
       processing: processing
         ? {
@@ -136,6 +137,17 @@ export class QueueController {
       }
     }
     return { queued, skipped, total: assets.length };
+  }
+
+  /**
+   * Пауза конвертации. Мягкая: очередь перестаёт брать новые задачи, текущая докачивается
+   * (прерванный AV1-энкод — это часы работы впустую), PDF останавливается между страницами.
+   * Флаг лежит в БД, поэтому переживает рестарт и действует для всех процессов.
+   */
+  @Post('pause')
+  async pause(@Body() body: Record<string, unknown>) {
+    if (!isPlainObject(body) || typeof body.paused !== 'boolean') throw badRequest('paused: boolean required');
+    return { paused: await this.queue.setPaused(body.paused) };
   }
 
   /**

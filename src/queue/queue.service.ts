@@ -256,10 +256,32 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     await this.prisma.job.update({ where: { id: jobId }, data: { progress: Math.max(0, Math.min(100, Math.round(value))) } }).catch(() => undefined);
   }
 
+  /**
+   * Пауза конвертации. Мягкая: новые задачи не берутся, текущая докачивается —
+   * прервать AV1-энкод на середине значит потерять часы работы (промежуточных
+   * производных нет). PDF останавливается между страницами: там шаг меньше секунды.
+   */
+  async isPaused(): Promise<boolean> {
+    const row = await this.prisma.queueState.findUnique({ where: { id: 1 } }).catch(() => null);
+    return Boolean(row?.paused);
+  }
+
+  async setPaused(paused: boolean): Promise<boolean> {
+    await this.prisma.queueState.upsert({
+      where: { id: 1 },
+      create: { id: 1, paused },
+      update: { paused },
+    });
+    this.logger.log(paused ? 'конвертация поставлена на паузу' : 'конвертация продолжена');
+    return paused;
+  }
+
   private async tick() {
     if (this.stopped || this.running) return;
     this.running = true;
     try {
+      // на паузе задачи просто ждут в БД: ничего не теряется, снятие паузы продолжит с места
+      if (await this.isPaused()) return;
       const job = await this.next();
       if (job) await this.process(job);
     } catch (e) {
@@ -542,7 +564,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
     const batch = missing.slice(0, PDF_PAGES_PER_JOB);
 
+    let rendered = 0;
     for (const page of batch) {
+      // Пауза посреди длинного PDF: досчитывать десятки страниц, пока просили остановиться,
+      // ни к чему — остаток доедет следующей задачей после снятия паузы.
+      if (await this.isPaused()) break;
       const png = join(tmpdir(), `clq-${job.id}-p${page}.png`);
       try {
         // -scale-to-x/-scale-to-y -1: ширина ровно PDF_PAGE_WIDTH, высота по пропорциям
@@ -561,15 +587,19 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       await this.s3.putObject(MediaService.pdfPageKey(sha, page), webp, 'image/webp');
       if (page === 1) await this.s3.putObject(MediaService.gridKey(sha), await this.pdfGrid(png), 'image/webp');
       rmSync(png, { force: true });
+      rendered++;
       const doneCount = total - missing.length + batch.indexOf(page) + 1;
       await this.setProgress(job.id, Math.round((doneCount / total) * 100));
     }
 
-    await this.finishPdf(job, total);
-    // страницы остались — дорисовываем следующей задачей (идемпотентно: готовые пропустятся)
-    if (missing.length > batch.length) {
+    // «Есть чем показать» — только если хотя бы одна страница реально лежит в S3: иначе
+    // деталка показала бы число страниц и битые картинки вместо «превью готовится».
+    if (existing.size + rendered > 0) await this.finishPdf(job, total);
+    // Остались страницы (упёрлись в лимит задачи или встали на паузу) — дорисуем следующей
+    // задачей: готовые страницы она пропустит по списку ключей.
+    if (missing.length > rendered) {
       await this.prisma.job.create({ data: { assetId: job.assetId, kind: 'pdf', state: 'pending' } }).catch(() => undefined);
-      this.logger.log(`△ pdf ${sha.slice(0, 8)}: отрисовано ${batch.length} из ${missing.length} оставшихся страниц`);
+      this.logger.log(`△ pdf ${sha.slice(0, 8)}: отрисовано ${rendered} из ${missing.length} оставшихся страниц`);
     }
     return { keepRaw: true };
   }
