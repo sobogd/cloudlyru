@@ -464,7 +464,9 @@ export interface AlbumInfo { id: string; name: string; createdAt: string; count:
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
 export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
-export const videoPreviewUrl = (sha: string) => `/api/v1/video-preview/${sha}`;
+/** Превью видео (1080, AV1); original=true — сам файл: фолбэк для браузеров без AV1. */
+export const videoPreviewUrl = (sha: string, original = false) =>
+  `/api/v1/video-preview/${sha}${original ? '?src=original' : ''}`;
 export interface QueueStatus {
   byState: Record<string, number>;
   processing: { id: string; kind: string; sha256: string; startedMinAgo: number; progress: number } | null;

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import type { PDFDocumentLoadingTask, PDFDocumentProxy } from 'pdfjs-dist';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import * as api from './api';
@@ -651,11 +652,207 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
               ) : null}
             </>
           )}
-          {rows.map(([k, v]) => <MetaRow key={k} k={k} v={v} />)}
           <MetaRow k="SHA-256" v={meta.sha256} mono />
         </div>
       )}
+      {meta && <FilePreview meta={meta} />}
+      {/* Дамп тегов (EXIF/ffprobe) — десятки строк: он не должен отодвигать превью вниз,
+          поэтому по умолчанию свёрнут, а сам дамп никуда не делся. */}
+      {!!rows.length && (
+        <details className="tags">
+          <summary className="copy">Все теги из файла ({rows.length})</summary>
+          <div className="detbody">
+            {rows.map(([k, v]) => <MetaRow key={k} k={k} v={v} />)}
+          </div>
+        </details>
+      )}
     </div>
+  );
+}
+
+// ================= Превью содержимого в деталке файла =================
+// Показываем только то, что браузер рисует сам или что уже собрано сервером:
+// фото — готовое превью (AVIF; заодно HEIC/TIFF/RAW, которые браузер не показывает),
+// видео — превью 1080, а если браузер без AV1 — оригинал, PDF — pdf.js в канвасе.
+// Оригинал картинки в <img> не подставляем как основной путь: у файлов в «Файлах»
+// он всегда на месте, но это лишний трафик, а превью кэшируется браузером.
+
+function previewKind(mime: string, name: string): 'image' | 'video' | 'pdf' | null {
+  if (/^image\//.test(mime)) return 'image';
+  if (/^video\//.test(mime)) return 'video';
+  if (mime === 'application/pdf' || /\.pdf$/i.test(name)) return 'pdf';
+  return null;
+}
+
+function FilePreview({ meta }: { meta: api.FileMeta }) {
+  const kind = previewKind(meta.mime, meta.name);
+  if (!kind) return null;
+  return (
+    <div className="preview">
+      {/* key по id: при переходе к другому файлу состояние фолбэков сбрасывается */}
+      {kind === 'image' && <ImagePreview key={meta.id} meta={meta} />}
+      {kind === 'video' && <VideoPreview key={meta.id} meta={meta} />}
+      {kind === 'pdf' && <PdfPreview key={meta.id} meta={meta} />}
+    </div>
+  );
+}
+
+/** Нечем показать — говорим об этом прямо и оставляем кнопку скачивания. */
+function PreviewNote({ text, url }: { text: string; url: string }) {
+  return (
+    <div className="pnote">
+      <span className="copy">{text}</span>
+      <a className="btn ghost" href={url} download>⬇️ Скачать</a>
+    </div>
+  );
+}
+
+function ImagePreview({ meta }: { meta: api.FileMeta }) {
+  // 0 — превью, собранное сервером; 1 — оригинал (inline); 2 — показать нечем
+  // (превью ещё не готово, а формат браузер не рисует — например RAW или SVG)
+  const [stage, setStage] = useState(0);
+  if (stage > 1) {
+    return <PreviewNote text="Превью ещё не собрано, а этот формат браузер не показывает" url={api.fileUrl(meta.id)} />;
+  }
+  const src = stage === 0 ? api.previewUrl(meta.sha256, 2048) : api.fileInlineUrl(meta.id);
+  return (
+    <div className="pmedia">
+      <img src={src} alt={meta.name} onError={() => setStage((s) => s + 1)} />
+    </div>
+  );
+}
+
+function VideoPreview({ meta }: { meta: api.FileMeta }) {
+  // 0 — превью 1080 (AV1), 1 — оригинал: AV1 умеют не все браузеры (Safari/iOS — частично)
+  const [stage, setStage] = useState(0);
+  if (stage > 1) return <PreviewNote text="Видео не проигрывается в этом браузере" url={api.fileUrl(meta.id)} />;
+  return (
+    <div className="pmedia">
+      <video
+        key={stage}
+        src={api.videoPreviewUrl(meta.sha256, stage === 1)}
+        controls
+        playsInline
+        preload="metadata"
+        onError={() => setStage((s) => s + 1)}
+      />
+    </div>
+  );
+}
+
+/** Размер растра под экран: retina учитываем, но выше 2× не идём — иначе память телефона. */
+const PDF_MAX_DPR = 2;
+
+/**
+ * PDF рисуем сами (pdf.js), а не отдаём браузеру как документ с нашего домена:
+ * так сохраняется правило «PDF наружу inline не отдаём» (`common/http-object.ts`),
+ * а страница живёт в канвасе. Библиотека тяжёлая (~500 КБ + воркер), поэтому
+ * грузится лениво — только когда PDF действительно открыли.
+ *
+ * Берём legacy-сборку: обычная использует совсем свежий JS (например `Promise.try`,
+ * Chrome 128+ / Safari 18.2+) и на телефонах постарше просто не запустится.
+ */
+function PdfPreview({ meta }: { meta: api.FileMeta }) {
+  const [pages, setPages] = useState(0);
+  const [page, setPage] = useState(1);
+  const [err, setErr] = useState('');
+  const [width, setWidth] = useState(0);
+  const doc = useRef<PDFDocumentProxy | null>(null);
+  const task = useRef<PDFDocumentLoadingTask | null>(null);
+  const box = useRef<HTMLDivElement>(null);
+  const canvas = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    let dead = false;
+    (async () => {
+      try {
+        const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+        const worker = await import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url');
+        pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
+        const loading = pdfjs.getDocument({
+          // Range сервер поддерживает, поэтому большой PDF тянется по частям, а не целиком
+          url: api.fileUrl(meta.id),
+          withCredentials: true, // ручка закрыта сессионной кукой
+          cMapUrl: '/pdfjs/cmaps/',
+          cMapPacked: true,
+          standardFontDataUrl: '/pdfjs/standard_fonts/',
+          wasmUrl: '/pdfjs/wasm/', // JBIG2/JPEG2000: сканы без этого не отрисуются
+        });
+        task.current = loading;
+        // закрыли деталку, пока шла загрузка задачи — держать воркер не за чем
+        if (dead) { void loading.destroy(); return; }
+        const loaded = await loading.promise;
+        if (dead) return;
+        doc.current = loaded;
+        setPages(loaded.numPages);
+      } catch (e) {
+        if (!dead) setErr((e as Error).message || 'не удалось открыть PDF');
+      }
+    })();
+    // destroy у задачи, а не у документа: в pdf.js 6 документ закрывается только так
+    return () => {
+      dead = true;
+      doc.current = null;
+      const loading = task.current;
+      task.current = null;
+      void loading?.destroy();
+    };
+  }, [meta.id]);
+
+  // ширина контейнера меняется при повороте телефона и ресайзе — перерисовываем под неё
+  useEffect(() => {
+    const el = box.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => setWidth(el.clientWidth));
+    ro.observe(el);
+    setWidth(el.clientWidth);
+    return () => ro.disconnect();
+  }, [pages]);
+
+  useEffect(() => {
+    const d = doc.current;
+    const c = canvas.current;
+    if (!d || !c || !pages || !width) return;
+    let dead = false;
+    let render: { promise: Promise<void>; cancel(): void } | null = null;
+    (async () => {
+      try {
+        const p = await d.getPage(page);
+        if (dead) return;
+        const dpr = Math.min(PDF_MAX_DPR, window.devicePixelRatio || 1);
+        const base = p.getViewport({ scale: 1 });
+        const viewport = p.getViewport({ scale: Math.max(0.1, (width - 2) / base.width) * dpr });
+        c.width = Math.floor(viewport.width);
+        c.height = Math.floor(viewport.height);
+        c.style.width = `${Math.floor(viewport.width / dpr)}px`;
+        c.style.height = `${Math.floor(viewport.height / dpr)}px`;
+        // pdf.js 6 сам берёт контекст у канваса: передавать canvasContext не нужно
+        render = p.render({ canvas: c, viewport });
+        await render.promise;
+        // страница отрисована — её внутренние данные больше не нужны (канвас уже нарисован)
+        if (!dead) p.cleanup();
+      } catch (e) {
+        // отмена прошлого рендера (перелистнули страницу) — это не ошибка
+        if (!dead && !/cancel/i.test(String((e as Error)?.message))) setErr('не удалось отрисовать страницу');
+      }
+    })();
+    return () => { dead = true; render?.cancel(); };
+  }, [page, pages, width]);
+
+  if (err) return <PreviewNote text={err} url={api.fileUrl(meta.id)} />;
+  return (
+    <>
+      <div className="pmedia" ref={box}>
+        {!pages ? <span className="spin" /> : <canvas ref={canvas} />}
+      </div>
+      {pages > 1 && (
+        <div className="pbar">
+          <button className="iconbtn" title="Предыдущая страница" disabled={page <= 1} onClick={() => setPage(page - 1)}>◀️</button>
+          <span className="meta">{page} / {pages}</span>
+          <button className="iconbtn" title="Следующая страница" disabled={page >= pages} onClick={() => setPage(page + 1)}>▶️</button>
+        </div>
+      )}
+    </>
   );
 }
 

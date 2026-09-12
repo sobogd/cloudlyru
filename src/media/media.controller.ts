@@ -78,12 +78,24 @@ export class MediaController {
   @Get('video-preview/:sha')
   async videoPreview(
     @Param('sha') sha: string,
+    @Query('src') srcRaw: string | undefined,
     @CurrentUser() user: RequestUser,
     @Req() req: Request,
     @Res() res: Response,
   ) {
     const asset = await this.ownAsset(sha, user);
     if (!asset) return res.status(404).end();
+    // ?src=original — фолбэк для браузеров без AV1 (Safari и iOS умеют его лишь частично,
+    // с 17.0 и не на всяком железе). Превью 1080 собирается в AV1, и без этого параметра
+    // такой браузер остался бы без картинки вовсе: производное есть, но не декодируется.
+    if (srcRaw === 'original') {
+      if (!String(asset.mime).startsWith('video/')) return res.status(404).end();
+      return sendObjectOr404(req, res, this.s3, S3Service.assetKey(sha), {
+        mime: String(asset.mime),
+        disposition: 'inline',
+        cache: 'private, no-store',
+      });
+    }
     for (const key of [MediaService.video1080Key(sha), MediaService.legacyVideo720Key(sha)]) {
       if (await this.s3.headObject(key).catch(() => false)) {
         return sendObjectOr404(req, res, this.s3, key, {

@@ -5,6 +5,8 @@ node_modules/
 # builds
 dist/
 build/
+# данные pdf.js (wasm/cmaps/шрифты) копируются из node_modules при сборке веб-клиента
+web/public/pdfjs/
 
 # env & secrets (никогда в git)
 .env
