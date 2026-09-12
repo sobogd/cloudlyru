@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Post } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from '../auth/auth.service';
 import { S3Service } from '../s3/s3.service';
@@ -66,6 +67,42 @@ export class QueueController {
   }
 
   /**
+   * Что именно означает «нет превью»: ассет своего дерева, который конвейер так и не
+   * обработал, либо PDF без отрисованных страниц. Одно условие на счётчик и на пересбор,
+   * иначе кнопка и число рядом с ней говорили бы о разном.
+   */
+  private missingWhere(tree: string[]): Prisma.AssetWhereInput {
+    return {
+      entries: { some: { folderId: { in: tree }, deletedAt: null } },
+      OR: [
+        { masterReadyAt: null },
+        // PDF мог отрисоваться частично (страницы добираются задачами): догоняем остаток
+        { mime: { in: PDF_MIMES }, pageCount: null },
+      ],
+    };
+  }
+
+  /** Сколько файлов осталось без превью — число для кнопки пересбора (без походов в S3). */
+  @Get('missing')
+  async missing(@CurrentUser() user: RequestUser) {
+    const tree = await this.auth.subtreeIds(user.id);
+    const groups = await this.prisma.asset.groupBy({
+      by: ['mime'],
+      _count: true,
+      where: this.missingWhere(tree),
+    });
+    const byKind: Record<string, number> = { photo: 0, video: 0, pdf: 0 };
+    let total = 0;
+    for (const g of groups) {
+      const kind = mediaKindOf(g.mime);
+      if (!kind) continue; // типы, для которых превью не собираются вообще
+      byKind[kind] += g._count;
+      total += g._count;
+    }
+    return { total, byKind };
+  }
+
+  /**
    * Пересобрать превью у уже загруженных файлов: очередь ставит задачи тем ассетам своего
    * дерева, у которых превью так и не собрались (в т.ч. всем PDF — до появления их рендера
    * они лежали без превью). Дальше это видно в /queue/status.
@@ -74,14 +111,7 @@ export class QueueController {
   async rebuild(@CurrentUser() user: RequestUser) {
     const tree = await this.auth.subtreeIds(user.id);
     const assets = await this.prisma.asset.findMany({
-      where: {
-        entries: { some: { folderId: { in: tree }, deletedAt: null } },
-        OR: [
-          { masterReadyAt: null },
-          // PDF мог отрисоваться частично (страницы добираются задачами): догоняем остаток
-          { mime: { in: PDF_MIMES }, pageCount: null },
-        ],
-      },
+      where: this.missingWhere(tree),
       select: { id: true, sha256: true, mime: true },
     });
     let queued = 0;

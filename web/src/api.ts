@@ -485,6 +485,9 @@ export const retryPreview = (entryId: string) =>
 /** Пересобрать превью у уже загруженных файлов, у которых их нет (в т.ч. у всех PDF). */
 export const rebuildPreviews = () =>
   request<{ queued: number; skipped: number; total: number }>('/queue/rebuild', { method: 'POST', body: JSON.stringify({}) });
+/** Сколько файлов осталось без превью — для кнопки пересбора. */
+export interface MissingPreviews { total: number; byKind: Record<string, number> }
+export const missingPreviews = () => request<MissingPreviews>('/queue/missing');
 export const timeline = () => request<TimelineItem[]>('/timeline');
 export const trips = () => request<Trip[]>('/trips');
 export const listAlbums = () => request<AlbumInfo[]>('/albums');

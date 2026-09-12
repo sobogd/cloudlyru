@@ -725,11 +725,21 @@ function FilePreview({ meta }: { meta: api.FileMeta }) {
   );
 }
 
-/** Нечем показать — говорим об этом прямо и оставляем кнопку скачивания. */
-function PreviewNote({ text, url }: { text: string; url: string }) {
+/** Нечем показать — говорим об этом прямо: кнопка ставит превью в очередь, рядом скачивание. */
+function PreviewNote({ text, url, entryId }: { text: string; url: string; entryId: string }) {
+  const [sent, setSent] = useState(false);
+  const rebuild = async () => {
+    try {
+      await api.retryPreview(entryId);
+      setSent(true);
+    } catch (e) { alert((e as Error).message); }
+  };
   return (
     <div className="pnote">
       <span className="copy">{text}</span>
+      <button className="btn ghost" disabled={sent} onClick={rebuild}>
+        {sent ? '✓ задача поставлена' : '⟳ Пересобрать'}
+      </button>
       <a className="btn ghost" href={url} download>⬇️ Скачать</a>
     </div>
   );
@@ -740,7 +750,7 @@ function ImagePreview({ meta }: { meta: api.FileMeta }) {
   // (превью ещё не готово, а формат браузер не рисует — например RAW или SVG)
   const [stage, setStage] = useState(0);
   if (stage > 1) {
-    return <PreviewNote text="Превью ещё не собрано, а этот формат браузер не показывает" url={api.fileUrl(meta.id)} />;
+    return <PreviewNote text="Превью ещё не собрано, а этот формат браузер не показывает" url={api.fileUrl(meta.id)} entryId={meta.id} />;
   }
   const src = stage === 0 ? api.previewUrl(meta.sha256, 2048) : api.fileInlineUrl(meta.id);
   return (
@@ -753,7 +763,7 @@ function ImagePreview({ meta }: { meta: api.FileMeta }) {
 function VideoPreview({ meta }: { meta: api.FileMeta }) {
   // 0 — превью 1080 (AV1), 1 — оригинал: AV1 умеют не все браузеры (Safari/iOS — частично)
   const [stage, setStage] = useState(0);
-  if (stage > 1) return <PreviewNote text="Видео не проигрывается в этом браузере" url={api.fileUrl(meta.id)} />;
+  if (stage > 1) return <PreviewNote text="Видео не проигрывается в этом браузере" url={api.fileUrl(meta.id)} entryId={meta.id} />;
   return (
     <div className="pmedia">
       <video
@@ -790,7 +800,7 @@ function PdfPreview({ meta }: { meta: api.FileMeta }) {
     );
   }
   if (failed) {
-    return <PreviewNote text="Превью этой страницы не собралось — посмотрите очередь конвертации в настройках" url={api.fileUrl(meta.id)} />;
+    return <PreviewNote text="Превью этой страницы не собралось — посмотрите очередь конвертации в настройках" url={api.fileUrl(meta.id)} entryId={meta.id} />;
   }
   return (
     <>
@@ -1454,11 +1464,18 @@ const JOB_STATE: Record<string, string> = { pending: 'в очереди', proces
 
 function QueuePanel() {
   const [q, setQ] = useState<api.QueueStatus | null>(null);
+  const [missing, setMissing] = useState<api.MissingPreviews | null>(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
 
-  const load = () => api.queueStatus().then(setQ).catch((e) => setErr((e as Error).message));
+  const load = async () => {
+    try {
+      const [status, miss] = await Promise.all([api.queueStatus(), api.missingPreviews()]);
+      setQ(status);
+      setMissing(miss);
+    } catch (e) { setErr((e as Error).message); }
+  };
   // пока очередь не пуста — обновляем чаще, чтобы был виден прогресс
   useEffect(() => {
     void load();
@@ -1471,19 +1488,27 @@ function QueuePanel() {
     setNotice('');
     try {
       const r = await api.rebuildPreviews();
-      setNotice(`Задачи поставлены: ${r.queued}${r.skipped ? `, пропущено ${r.skipped}` : ''}`);
+      setNotice(`Задачи поставлены: ${r.queued}${r.skipped ? `, пропущено ${r.skipped} (нет оригинала)` : ''}`);
       await load();
     } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
   };
 
   const by = q?.byState ?? {};
+  const left = missing?.total ?? 0;
+  const kinds = missing?.byKind ?? {};
+  const leftText = [
+    kinds.photo ? `фото ${kinds.photo}` : '',
+    kinds.video ? `видео ${kinds.video}` : '',
+    kinds.pdf ? `PDF ${kinds.pdf}` : '',
+  ].filter(Boolean).join(' · ');
+
   return (
     <div className="panel">
       <div className="row">
         <strong>Очередь превью</strong>
         <span style={{ flex: 1 }} />
-        <button className="btn ghost" disabled={busy} onClick={rebuild}>
-          {busy ? '…' : '⟳ Пересобрать у существующих'}
+        <button className="btn" disabled={busy || !left} onClick={rebuild}>
+          {busy ? '…' : left ? `⟳ Пересобрать там, где нет (${left})` : '⟳ Всё собрано'}
         </button>
       </div>
       {err && <div className="err">{err}</div>}
@@ -1492,7 +1517,7 @@ function QueuePanel() {
       {q && (
         <>
           <div className="copy">
-            в очереди {by.pending ?? 0} · в работе {by.processing ?? 0} · готово {by.done ?? 0} · ошибок {by.failed ?? 0}
+            без превью {left}{leftText ? ` (${leftText})` : ''} · в очереди {by.pending ?? 0} · в работе {by.processing ?? 0} · готово {by.done ?? 0} · ошибок {by.failed ?? 0}
           </div>
           {q.processing && (
             <div className="panel" style={{ background: '#1c2430' }}>
@@ -1518,8 +1543,8 @@ function QueuePanel() {
           ))}
           {!q.recent.length && <div className="copy">Задач не было — превью собираются автоматически при загрузке</div>}
           <div className="copy">
-            «Пересобрать у существующих» ставит задачи тем файлам, у которых превью так и не собрались:
-            фото и видео из старых загрузок, а также всем PDF (их страницы рисуются заново).
+            Кнопка ставит задачи только тем файлам, у которых превью нет: фото и видео из старых
+            загрузок, а также всем PDF — их страницы рисуются заново.
           </div>
         </>
       )}
