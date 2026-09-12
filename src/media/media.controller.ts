@@ -1,12 +1,13 @@
-import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { FULL_SIZE, MediaService } from './media.service';
 import { AlbumsService } from './albums.service';
 import { S3Service } from '../s3/s3.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from '../auth/auth.service';
-import { CurrentUser, RequestUser } from '../common/decorators';
-import { sendObjectOr404 } from '../common/http-object';
+import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
+import { RateLimitGuard } from '../common/guards/rate-limit.guard';
+import { sendObjectOr404, sendFirstExisting } from '../common/http-object';
 import { asString, isPlainObject } from '../common/utils';
 import { badRequest, notFound } from '../common/errors';
 
@@ -34,8 +35,15 @@ export class MediaController {
     return (await this.auth.ownsAsset(user.id, asset.id)) ? asset : null;
   }
 
-  /** Превью для списка: ?w=512 (фото — квадрат 50×50, видео — постер 50×50); PDF — ?page=N. */
+  /**
+   * Превью для списка: ?w=512 (фото — квадрат 50×50, видео — постер 50×50); PDF — ?page=N.
+   *
+   * Лимит щедрый (3000/мин), но он есть: галерея законно просит сотни превью подряд, а
+   * зацикленный клиент или украденная сессия без лимита выедали бы и БД, и S3.
+   */
   @Get('previews/:sha')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(3000, 60_000)
   async preview(
     @Param('sha') sha: string,
     @Query('w') wRaw: string | undefined,
@@ -59,41 +67,43 @@ export class MediaController {
     }
     const isVideo = String(asset.mime).startsWith('video/') || asset.masterMime === 'video/mp4';
     if (isVideo) {
-      const poster = MediaService.videoPosterKey(sha);
-      if (!(await this.s3.headObject(poster).catch(() => false))) return res.status(404).end();
-      return sendObjectOr404(req, res, this.s3, poster, {
-        mime: 'image/webp',
-        disposition: 'inline',
-        cache: PREVIEW_CACHE,
-      });
+      const sent = await sendFirstExisting(
+        req,
+        res,
+        this.s3,
+        [{ key: MediaService.videoPosterKey(sha), mime: 'image/webp' }],
+        { disposition: 'inline', cache: PREVIEW_CACHE },
+      );
+      return sent ? undefined : res.status(404).end();
     }
     // Фото: сетка (квадрат 50×50) — по умолчанию, полный экран — 1080.
     // Всё, что клиент просит от 1080 и выше, отдаём одним и тем же превью 1080: 2048
     // больше не собирается (это лишний вес на телефоне), а старые клиенты и ассеты
     // со старым превью продолжают работать через легаси-ключи.
+    // Кандидаты перебираются во время отдачи (sendFirstExisting): headObject на каждый
+    // ключ — это лишний поход в S3 на каждую миниатюру в галерее.
     const wantFull = Number(wRaw ?? 512) >= FULL_SIZE;
-    const candidates = wantFull
+    const keys = wantFull
       ? [
           MediaService.photoFullKey(sha),
           MediaService.legacyPhotoFull2048Key(sha),
           MediaService.legacyPhotoFullWebpKey(sha),
         ]
       : [MediaService.gridKey(sha)];
-    for (const key of candidates) {
-      if (await this.s3.headObject(key).catch(() => false)) {
-        const mime = key.endsWith('.avif') ? 'image/avif' : 'image/webp';
-        return sendObjectOr404(req, res, this.s3, key, {
-          mime,
-          disposition: 'inline',
-          cache: PREVIEW_CACHE,
-        });
-      }
-    }
-    return res.status(404).end();
+    const sent = await sendFirstExisting(
+      req,
+      res,
+      this.s3,
+      keys.map((key) => ({ key, mime: key.endsWith('.avif') ? 'image/avif' : 'image/webp' })),
+      { disposition: 'inline', cache: PREVIEW_CACHE },
+    );
+    return sent ? undefined : res.status(404).end();
   }
 
   /** Превью видео для полного экрана: 1080 (AV1), фолбэк — легаси 720 или сам оригинал. */
   @Get('video-preview/:sha')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(600, 60_000)
   async videoPreview(
     @Param('sha') sha: string,
     @Query('src') srcRaw: string | undefined,
@@ -114,15 +124,19 @@ export class MediaController {
         cache: 'private, no-store',
       });
     }
-    for (const key of [MediaService.video1080Key(sha), MediaService.legacyVideo720Key(sha)]) {
-      if (await this.s3.headObject(key).catch(() => false)) {
-        return sendObjectOr404(req, res, this.s3, key, {
-          mime: 'video/mp4',
-          disposition: 'inline',
-          cache: PREVIEW_CACHE,
-        });
-      }
-    }
+    // Кандидаты перебираем самой отдачей: headObject на каждый ключ — лишний поход в S3,
+    // а миниатюр на страницу сотни.
+    const sent1080 = await sendFirstExisting(
+      req,
+      res,
+      this.s3,
+      [
+        { key: MediaService.video1080Key(sha), mime: 'video/mp4' },
+        { key: MediaService.legacyVideo720Key(sha), mime: 'video/mp4' },
+      ],
+      { disposition: 'inline', cache: PREVIEW_CACHE },
+    );
+    if (sent1080) return undefined;
     // превью ещё не собрано — играем оригинал (он и есть мастер). Тип не берём из
     // объявленного при загрузке mime: под ним может приехать что угодно, а отдаём
     // мы это со своего домена.
@@ -135,6 +149,8 @@ export class MediaController {
 
   /** «Оригинал»: всегда исходный файл, как он был загружен. Только на скачивание. */
   @Get('originals/:sha')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(300, 60_000)
   async original(
     @Param('sha') sha: string,
     @CurrentUser() user: RequestUser,
@@ -169,8 +185,14 @@ export class MediaController {
     return res.status(404).end();
   }
 
-  /** Лента «Фото»: `limit` — размер страницы, `cursor` — entryId последней показанной записи. */
+  /**
+   * Лента «Фото»: `limit` — размер страницы, `cursor` — entryId последней показанной записи.
+   * Протухший курсор (запись удалили или перенесли из зоны) — 409 `cursor_stale`; клиент по
+   * этому коду откатывается на предыдущую запись, а не считает, что лента кончилась.
+   */
   @Get('timeline')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(600, 60_000)
   timeline(
     @CurrentUser() user: RequestUser,
     @Query('limit') limit?: string,
@@ -182,6 +204,17 @@ export class MediaController {
       Number.isFinite(lim) ? lim : 300,
       typeof cursor === 'string' && cursor ? cursor : undefined,
     );
+  }
+
+  /**
+   * Статусы сборки превью по списку записей: клиент спрашивает только про те снимки, которые
+   * ещё собираются, и не перечитывает из-за них всю ленту.
+   */
+  @Post('timeline/status')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(1200, 60_000)
+  timelineStatus(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
+    return this.media.timelineStatus(user.id, isPlainObject(body) ? body.entryIds : undefined);
   }
 
   @Get('albums')

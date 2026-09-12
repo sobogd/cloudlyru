@@ -88,6 +88,17 @@ export async function sendObject(
   }
 }
 
+/** Код S3 «объекта нет» и «диапазон неудовлетворим» — их превращаем в 404 и 416, а не в 500. */
+function s3ErrorStatus(e: unknown): number | null {
+  const name = (e as { name?: string; Code?: string; code?: string }).name
+    ?? (e as { Code?: string }).Code
+    ?? (e as { code?: string }).code
+    ?? '';
+  if (name === 'NoSuchKey' || name === 'NotFound' || name === 'NoSuchBucket') return 404;
+  if (name === 'InvalidRange' || name === 'RequestedRangeNotSatisfiable') return 416;
+  return null;
+}
+
 /**
  * То же, но отсутствие объекта в S3 превращаем в 404, а не в 500: у части старых
  * ассетов производных нет, и это нормальная ситуация (код ответа уже не отправить
@@ -104,8 +115,35 @@ export async function sendObjectOr404(
     await sendObject(req, res, s3, key, opts);
   } catch (e) {
     if (res.headersSent) return;
-    const name = (e as { name?: string }).name ?? '';
-    const status = name === 'NoSuchKey' || name === 'NotFound' ? 404 : 500;
-    res.status(status).end();
+    res.status(s3ErrorStatus(e) ?? 500).end();
   }
+}
+
+/**
+ * Отдать первый существующий объект из списка ключей-кандидатов (текущий ключ и легаси).
+ *
+ * Раньше такой выбор делался через headObject — то есть лишний round-trip к S3 на каждую
+ * миниатюру галереи (на страницу в 500 снимков это 500 лишних обращений). Здесь пробуем
+ * сразу стримить и на «объекта нет» переходим к следующему ключу: заголовки ещё не
+ * отправлены, поэтому подмена ответа безопасна.
+ *
+ * Возвращает false, если ни одного ключа нет — вызывающий сам решает, что ответить.
+ */
+export async function sendFirstExisting(
+  req: Request,
+  res: Response,
+  s3: S3Service,
+  candidates: Array<{ key: string; mime: string }>,
+  opts: Omit<SendObjectOptions, 'mime'>,
+): Promise<boolean> {
+  for (const candidate of candidates) {
+    try {
+      await sendObject(req, res, s3, candidate.key, { ...opts, mime: candidate.mime });
+      return true;
+    } catch (e) {
+      if (res.headersSent) return true; // отдача уже началась — подменять нечем
+      if (s3ErrorStatus(e) !== 404) throw e;
+    }
+  }
+  return false;
 }

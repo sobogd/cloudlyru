@@ -176,6 +176,12 @@ export class SharesService {
     const share = await this.resolve(token);
     await this.checkPassword(share, ip, password);
 
+    // Право на чтение проверяем до веток, а не только внутри папки: у файла ветка отдавала
+    // имя, размер, mime и sha256 вообще без проверки, хотя ссылку могли выдать с capability
+    // UPLOAD — держатель получал метаданные файла вопреки выданному разрешению.
+    const canRead = ['VIEW', 'DOWNLOAD', 'RW'].includes(share.capability);
+    if (!canRead) throw forbidden('share does not allow viewing', 'share_view_forbidden');
+
     if (share.kind === 'FILE') {
       const file = await this.entryMeta(share.targetId);
       return { kind: 'file', capability: share.capability, name: file.name, file };
@@ -195,8 +201,6 @@ export class SharesService {
         select: { id: true, name: true, asset: { select: { size: true, mime: true } } },
       }),
     ]);
-    const canRead = ['VIEW', 'DOWNLOAD', 'RW'].includes(share.capability);
-    if (!canRead) throw forbidden('share does not allow viewing', 'share_view_forbidden');
     return {
       kind: 'folder',
       capability: share.capability,

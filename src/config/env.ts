@@ -45,6 +45,11 @@ const envSchema = z.object({
 
   CONVERT_ENABLED: z.string().default('false'),
   CONVERT_MEM_MB: z.coerce.number().int().positive().default(1536),
+  // Потолок размера файла, для которого вообще ставится задача конвертации. Задача качает
+  // объект из S3 целиком во временный каталог, поэтому один огромный файл (или много
+  // заявленных «картинками» мелочей) выедает диск и очередь. Крупнее — файл остаётся как
+  // есть, без превью: скачать оригинал по-прежнему можно.
+  CONVERT_MAX_MB: z.coerce.number().positive().default(10240),
   // Сколько фото-задач считать одновременно. Фото упираются в ядра (AVIF-энкод, heif-convert),
   // видео и PDF всегда идут по одному. На 2 ядрах смысл есть в 2, на 4 — в 3-4.
   // Пустая строка = «не задано»: dotenv не перезаписывает переменные, уже пришедшие в
@@ -89,6 +94,7 @@ export const CHUNK_MAX_BYTES = Math.floor(env.UPLOAD_CHUNK_MAX_MB * 1024 * 1024)
 export const DIRECT_PART_BYTES = Math.floor(env.UPLOAD_DIRECT_PART_MB * 1024 * 1024);
 export const PART_URL_TTL_SEC = Math.floor(env.UPLOAD_PART_URL_TTL_MIN * 60);
 export const MAX_FILE_BYTES = Math.floor(env.MAX_FILE_SIZE_MB * 1024 * 1024);
+export const CONVERT_MAX_BYTES = Math.floor(env.CONVERT_MAX_MB * 1024 * 1024);
 export const MAX_UPLOAD_SESSIONS_PER_USER = env.MAX_UPLOAD_SESSIONS_PER_USER;
 export const TRASH_RETENTION_MS = env.TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 

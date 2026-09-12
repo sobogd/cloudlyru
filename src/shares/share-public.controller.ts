@@ -1,9 +1,11 @@
-import { Controller, Get, Param, Put, Query, Req, Res } from '@nestjs/common';
+import { Controller, Get, Param, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { SharesService } from './shares.service';
 import { S3Service } from '../s3/s3.service';
-import { Public } from '../common/decorators';
+import { Public, RateLimit } from '../common/decorators';
+import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { sendObjectOr404 } from '../common/http-object';
+import { normalizeMime } from '../common/mime';
 import { CHUNK_MAX_BYTES } from '../config/env';
 import { badRequest, payloadTooLarge } from '../common/errors';
 
@@ -48,8 +50,16 @@ export class SharePublicController {
     });
   }
 
-  /** File-drop: PUT сырого тела (≤20 МБ) в расшаренную папку. */
+  /**
+   * File-drop: PUT сырого тела (≤20 МБ) в расшаренную папку.
+   *
+   * С лимитом частоты: раньше число запросов не ограничивалось ничем, и держатель ссылки
+   * мог закидывать файлы потоком. Каждый попавший в зону «Фото» файл к тому же ставит
+   * задачу конвертации, а она качает объект из S3 целиком — очередь из-за гостя вставала.
+   */
   @Put(':token/upload')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(60, 60_000)
   async upload(
     @Param('token') token: string,
     @Req() req: Request,
@@ -69,7 +79,9 @@ export class SharePublicController {
       if (total > CHUNK_MAX_BYTES) throw payloadTooLarge('file too large');
       chunks.push(b);
     }
-    const mime = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : 'application/octet-stream';
+    // Тип приводим к известному: заголовок Content-Type приходит от гостя, и до нормализации
+    // он попадал в Asset.mime как есть (см. common/mime.ts).
+    const mime = normalizeMime(req.headers['content-type']);
     return this.shares.upload(token, req.ip ?? 'unknown', name, mime, Buffer.concat(chunks), passwordOf(req));
   }
 }

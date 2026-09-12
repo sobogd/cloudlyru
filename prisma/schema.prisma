@@ -108,6 +108,9 @@ model FileEntry {
   @@unique([folderId, name])
   @@index([folderId, deletedAt])
   @@index([zone, deletedAt])
+  // Проверка «это мой файл» (ownsAsset) и соединение в ленте идут по assetId. Парный индекс
+  // с порядком NULLS LAST по MediaMeta.capturedAt живёт в миграции: в схеме он не выражается.
+  @@index([assetId, deletedAt])
 }
 
 // Физический объект в S3 (один на уникальное содержимое)

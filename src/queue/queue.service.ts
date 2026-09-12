@@ -18,7 +18,7 @@ import {
   videoInstant,
 } from '../media/media.service';
 import { ZONE_FILES } from '../common/zones';
-import { env } from '../config/env';
+import { CONVERT_MAX_BYTES, env } from '../config/env';
 
 const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 1 ГБ)
 /**
@@ -34,6 +34,15 @@ const PHOTO_PARALLEL = Math.min(Math.max(Number(env.CONVERT_PHOTO_PARALLEL ?? 1)
  */
 const VIDEO_ALONGSIDE_PHOTOS = (env.CONVERT_VIDEO_ALONGSIDE_PHOTOS ?? 'false') === 'true';
 const MAX_ATTEMPTS = 3;
+/**
+ * Сколько держать историю задач. Для работы она не нужна: «превью готово» — это
+ * Asset.masterReadyAt, а «сколько осталось» считается по библиотеке, поэтому завершённые
+ * задачи старше суток удаляем, а отменённые — через час (иначе таблица растёт вечно:
+ * на этом инстансе накопилось 117 тыс. отменённых строк).
+ */
+const DONE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const CANCELLED_RETENTION_MS = 60 * 60 * 1000;
+const CLEANUP_EVERY_MS = 10 * 60 * 1000;
 /** Задержка перед повтором временно упавшей задачи (умножается на номер попытки). */
 const RETRY_BASE_DELAY_MS = 30_000;
 /**
@@ -107,6 +116,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private readonly active = new Map<string, { assetId: string; group: JobGroup; child: import('child_process').ChildProcess | null }>();
   /** Короткий кэш числа ожидающих фото: по нему решается, брать ли видео. */
   private photoPendingCache: { at: number; value: number } | null = null;
+  private lastCleanupAt = 0;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -119,11 +129,32 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // после рестарта все processing возвращаем в очередь (рестарт = прерванный воркер)
     await this.prisma.job.updateMany({ where: { state: 'processing' }, data: { state: 'pending' } }).catch(() => undefined);
     this.cleanupTmp();
+    void this.cleanupHistory();
     this.timer = setInterval(() => void this.tick(), 2000);
     this.logger.log(
       `конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB, фото параллельно ${PHOTO_PARALLEL}, ` +
         `оригиналы ${env.KEEP_ORIGINALS ? 'храним' : 'удаляем'})`,
     );
+  }
+
+  /**
+   * Убрать историю задач, которая работе не нужна. Готовность файла — это Asset.masterReadyAt,
+   * остаток считается по библиотеке, поэтому завершённые задачи старше суток и отменённые
+   * старше часа можно удалять. Настоящие ошибки (state='failed' без пометки cancelled)
+   * не трогаем: их показывает страница ошибок, пока их не разберут.
+   */
+  async cleanupHistory(): Promise<number> {
+    const [done, cancelled] = await Promise.all([
+      this.prisma.job
+        .deleteMany({ where: { state: 'done', finishedAt: { lt: new Date(Date.now() - DONE_RETENTION_MS) } } })
+        .catch(() => ({ count: 0 })),
+      this.prisma.job
+        .deleteMany({ where: { state: 'failed', error: { startsWith: 'cancelled' }, finishedAt: { lt: new Date(Date.now() - CANCELLED_RETENTION_MS) } } })
+        .catch(() => ({ count: 0 })),
+    ]);
+    const total = done.count + cancelled.count;
+    if (total) this.logger.log(`история задач почищена: ${total} (готовых ${done.count}, отменённых ${cancelled.count})`);
+    return total;
   }
 
   /** Осиротевшие каталоги задач: процесс убит (SIGKILL/pm2 reload), поэтому finally не отработал. */
@@ -184,6 +215,17 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   async enqueue(assetId: string, sha256: string, mime: string): Promise<void> {
     const kind = mediaKindOf(mime);
     if (!kind) return;
+    // Слишком крупное не конвертируем: задача качает объект из S3 целиком во временный каталог,
+    // и один гигабайтный «скриншот» выедает диск и очередь (заявить можно любой тип файла).
+    // Такой файл остаётся как есть — открывается и скачивается, превью просто не будет.
+    const tooBig = await this.prisma.asset
+      .findUnique({ where: { id: assetId }, select: { size: true } })
+      .then((a) => (a ? Number(a.size) > CONVERT_MAX_BYTES : false))
+      .catch(() => false);
+    if (tooBig) {
+      this.logger.warn(`конвертация пропущена: файл больше ${Math.round(CONVERT_MAX_BYTES / 1024 / 1024)} МБ (${sha256.slice(0, 8)})`);
+      return;
+    }
     // Превью уже есть, а оригинала нет (KEEP_ORIGINALS=false) — задача обречена на три
     // падения при скачивании files/<sha>. Ставим её только если превью на самом деле нет.
     // Проверяем весь набор ключей, которые отдаёт UI, а не только текущий: у старых
@@ -235,20 +277,26 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       state: { in: ['pending', 'processing'] },
       asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
     };
-    // id забираем только чтобы понять, наша ли задача сейчас считается: обновляем по тому же
-    // условию, а не списком id. Список id упирался в предел Postgres в 32767 bind-параметров:
-    // на 45 тыс. задач очистка очереди падала с 500 (Assertion violation ... received 45500).
-    const jobs = await this.prisma.job.findMany({ where, select: { id: true } });
-    if (!jobs.length) return 0;
-    const res = await this.prisma.job.updateMany({
-      where,
-      data: { state: 'failed', error: 'cancelled: очередь очищена', finishedAt: new Date() },
-    });
-    // Убиваем только свои активные задачи: чужие процессы отменять не наше дело.
-    const ids = new Set(jobs.map((j) => j.id));
-    this.killChildren((id) => ids.has(id), 'очистка очереди');
-    this.logger.log(`очередь очищена: отменено задач ${res.count}`);
-    return res.count;
+    // Ожидающие задачи удаляем, а не помечаем отменёнными: держать историю отмен незачем,
+    // а кнопка «Очистить очередь» должна реально опустошать список. Так таблица не растёт
+    // (на этом инстансе накопилось 117 тыс. отменённых строк — это был чистый мусор).
+    const pending = await this.prisma.job.count({ where: { ...where, state: 'pending' } });
+    // Активные помечаем отменёнными: их процесс мы убиваем, и строку нельзя удалять —
+    // обработчик задачи пишет в неё итог.
+    const active = await this.prisma.job.findMany({ where: { ...where, state: 'processing' }, select: { id: true } });
+    const total = pending + active.length;
+    if (!total) return 0;
+    // Фильтром, а не списком id: список упирался в предел Postgres по bind-параметрам
+    await this.prisma.job.deleteMany({ where: { ...where, state: 'pending' } }).catch(() => undefined);
+    if (active.length) {
+      await this.prisma.job
+        .updateMany({ where: { id: { in: active.map((j) => j.id) } }, data: { state: 'failed', error: 'cancelled: очередь очищена', finishedAt: new Date() } })
+        .catch(() => undefined);
+    }
+    const ids = new Set(active.map((j) => j.id));
+    this.killChildren((id) => ids.has(id), 'очередь очищена');
+    this.logger.log(`очередь очищена: удалено ожидающих ${pending}, отменено активных ${active.length}`);
+    return total;
   }
 
   /** Вернуть в очередь отменённые задачи (файл восстановлен из корзины). */
@@ -340,6 +388,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     if (this.stopped || this.ticking) return;
     this.ticking = true;
     try {
+      // История не копится: чистим её раз в 10 минут (и на старте).
+      if (Date.now() - this.lastCleanupAt > CLEANUP_EVERY_MS) {
+        this.lastCleanupAt = Date.now();
+        void this.cleanupHistory();
+      }
       // на паузе задачи просто ждут в БД: ничего не теряется, снятие паузы продолжит с места
       if (await this.isPaused()) return;
       // Фото берём пачкой по числу свободных слотов, задачи идут параллельно и не ждут друг друга.

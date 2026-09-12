@@ -1750,6 +1750,10 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
   const p = q?.progress;
   const pct = p && p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
   const missing = p ? p.total - p.done : 0;
+  // Сколько из «без превью» ещё не поставлено в очередь: кнопка должна показывать именно
+  // остаток работы, а не общее число файлов без превью (иначе кажется, что пересбор ничего не делает).
+  const queued = (counts?.pending ?? 0) + (counts?.processing ?? 0);
+  const toQueue = Math.max(0, missing - queued);
   // В шапке — остаток текущей фазы: видео идёт только после фото, и суммарные 59 суток
   // (вместе с ещё не начавшимся видео) только пугали бы.
   const left = q?.etaSec.phase ?? null;
@@ -1812,7 +1816,7 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
 
           <div className="copy">
             готово {counts?.done.toLocaleString('ru-RU')} · в очереди {(counts?.pending ?? 0).toLocaleString('ru-RU')} · в работе {counts?.processing ?? 0}
-            {' · '}без превью {missing.toLocaleString('ru-RU')}
+            {' · '}без превью {missing.toLocaleString('ru-RU')} (в очереди {(counts?.pending ?? 0).toLocaleString('ru-RU')})
             {counts?.cancelled ? ` · отменено вручную ${counts.cancelled.toLocaleString('ru-RU')}` : ''}
             {ago != null ? ` · цифры обновлены ${ago} с назад` : ''}
           </div>
@@ -1824,8 +1828,8 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
           ⚠ Ошибки{q?.errors.total ? `: ${q.errors.total}` : ''}
         </button>
         <span style={{ flex: 1 }} />
-        <button className="btn" disabled={busy || !missing} onClick={rebuild} title="Найти файлы без превью и поставить им задачи">
-          {busy ? '…' : missing ? `⟳ Дособрать превью (${missing.toLocaleString('ru-RU')})` : '⟳ Всё собрано'}
+        <button className="btn" disabled={busy || !toQueue} onClick={rebuild} title="Найти файлы без превью и поставить им задачи">
+          {busy ? '…' : toQueue ? `⟳ Дособрать превью (${toQueue.toLocaleString('ru-RU')})` : missing ? '✓ Остальные уже в очереди' : '✓ Всё собрано'}
         </button>
       </div>
     </div>

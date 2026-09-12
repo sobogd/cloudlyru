@@ -698,6 +698,11 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
 
     // Тяжёлое (превью и конвертация) — по-прежнему только для медиа-зоны «Фото»
     if (entry.zone === ZONE_PHOTOS) {
+      // Файл в медиа-зоне обязан быть виден в ленте. У RAW камер и скриншотов без EXIF даты
+      // съёмки нет, и раньше такая запись просто не появлялась в «Фото». Ставим дату загрузки —
+      // тем же способом, каким её получают видео; настоящая дата съёмки (если разбор её нашёл)
+      // не перетирается.
+      await this.media.fillDateAndGeo(params.assetId, new Date(), null).catch(() => undefined);
       await this.queue.enqueue(params.assetId, params.sha256, params.mime);
     }
 

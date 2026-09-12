@@ -8,6 +8,7 @@ import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { ChangesService } from '../sync/changes.service';
 import { QueueService } from '../queue/queue.service';
 import { safeInlineImageMime, sendObjectOr404 } from '../common/http-object';
+import { normalizeMime } from '../common/mime';
 import { assertSafeName, parseOptionalDate } from '../common/utils';
 import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
@@ -71,13 +72,20 @@ export class FilesService {
     return folder;
   }
 
-  /** Asset по хэшу; если нет — создаёт запись (объект в S3 уже должен лежать под files/<sha256>). */
+  /**
+   * Asset по хэшу; если нет — создаёт запись (объект в S3 уже должен лежать под files/<sha256>).
+   *
+   * Тип здесь же приводим к известному (normalizeMime): это единственная точка, где создаётся
+   * Asset, поэтому объявленный клиентом произвольный mime дальше не проходит — ни в выбор
+   * задачи конвертации, ни в Content-Type при отдаче.
+   */
   async ensureAsset(sha256: string, size: number, mime: string, ext?: string): Promise<string> {
+    const cleanMime = normalizeMime(mime);
     const existing = await this.prisma.asset.findUnique({ where: { sha256 } });
     if (existing) return existing.id;
     try {
       const asset = await this.prisma.asset.create({
-        data: { sha256, size: BigInt(size), mime, ext },
+        data: { sha256, size: BigInt(size), mime: cleanMime, ext },
       });
       return asset.id;
     } catch (e) {

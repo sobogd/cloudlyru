@@ -9,6 +9,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { AuthService } from '../auth/auth.service';
+import { conflict } from '../common/errors';
 import { ZONE_PHOTOS } from '../common/zones';
 
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
@@ -45,6 +46,8 @@ const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 export const FULL_SIZE = 1080;
 /** Потолок одной страницы ленты: клиент листает курсором, но страницу ограничиваем. */
 export const TIMELINE_MAX = 1000;
+/** Сколько записей можно спросить одним запросом статусов превью. */
+export const TIMELINE_STATUS_MAX = 500;
 /** Сколько байт читаем из начала объекта, прежде чем тянуть его целиком. */
 const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 /**
@@ -152,20 +155,46 @@ function asStr(v: unknown): string | undefined {
   return t ? t.slice(0, 300) : undefined;
 }
 
+/**
+ * Строка ленты. Координаты, masterMime и прогресс задачи из ответа убраны: карта снята из
+ * продукта, а состояние задачи клиент узнаёт ручкой статусов только про те снимки, которые
+ * ещё не готовы — тянуть его для каждой записи каждой страницы (LATERAL по Job) значило
+ * платить ~15 мс на страницу в 500 снимков.
+ */
 export interface TimelineItem {
   entryId: string;
   name: string;
   sha256?: string;
   capturedAt: string | null;
-  latitude?: number;
-  longitude?: number;
   mime: string;
-  masterMime?: string | null;
   masterReady: boolean;
-  jobState?: string | null;
-  jobProgress?: number;
-  jobError?: string | null;
   size: number;
+}
+
+/** Статус сборки превью одной записи (см. MediaService.timelineStatus). */
+export interface TimelineStatusItem {
+  entryId: string;
+  masterReady: boolean;
+  jobState: string | null;
+  jobError: string | null;
+}
+
+/** Сырые строки запросов: Postgres отдаёт timestamptz как Date, bigint как BigInt. */
+interface TimelineRow {
+  id: string;
+  name: string;
+  sha256: string | null;
+  mime: string;
+  masterReadyAt: Date | null;
+  size: bigint | number | null;
+  capturedAt: Date | null;
+}
+
+interface TimelineStatusRow {
+  id: string;
+  masterReadyAt: Date | null;
+  jobState: string | null;
+  jobError: string | null;
 }
 
 @Injectable()
@@ -336,11 +365,16 @@ export class MediaService {
    *
    * Фото разбираем на месте (читается только начало объекта). Видео — фоном: ffprobe ходит
    * в хранилище, и заставлять клиента ждать этого на complete незачем.
+   *
+   * Разбираем ЛЮБОЙ image/*, а не только те типы, что умеет sharp: RAW камер (DNG, CR2, NEF,
+   * ARW) не конвертируется, но exifr читает его TIFF-производные теги, а без строки MediaMeta
+   * такой файл вообще не появлялся в ленте «Фото» — владелец видел «часть фото пропала».
    */
   async captureAny(assetId: string, sha256: string, size: number, mime: string): Promise<void> {
     if (size <= 0 || size > MAX_PARSE_BYTES) return;
     const isVideo = VIDEO_MIMES.includes(mime);
-    if (!isVideo && !IMAGE_MIMES.includes(mime)) return;
+    const isImage = mime.startsWith('image/');
+    if (!isVideo && !isImage) return;
     if (await this.hasDetailedMeta(assetId)) return;
     if (isVideo) {
       // дата загрузки сразу: видео должно быть в ленте, даже если ffprobe не ответит
@@ -599,66 +633,109 @@ export class MediaService {
   /**
    * Лента медиа: только зона «Фото», свежие сверху.
    *
+   * Запрос написан на SQL, а не через Prisma. `orderBy` по связи Prisma превращает в LEFT JOIN
+   * с сортировкой по алиасу, и тогда Postgres читает и сортирует все медиа пользователя: на
+   * 100k это ~90 мс на страницу и внешняя сортировка на диск, а индекс по дате в таком плане
+   * не используется вообще. С INNER JOIN и курсором по (capturedAt, id) план идёт по
+   * MediaMeta_capturedAt_idx и останавливается на нужной странице: 2.6 мс (замер на 100k).
+   *
    * `cursorEntryId` — запись, до которой клиент уже долистал: отдаём то, что идёт строго после
    * неё. Курсор — пара «дата съёмки + id», а не одна дата: серия кадров пишется в одну секунду,
    * и по дате часть снимков пропускалась или повторялась. Записи без даты съёмки идут в конце
-   * ленты — так же, как их сортирует `nulls: 'last'`.
+   * ленты — так же, как их сортирует `NULLS LAST`.
+   *
+   * Курсора уже нет (запись удалили или она ушла из зоны «Фото» посреди прокрутки) — отвечаем
+   * 409 `cursor_stale`: пустая страница означала бы «лента кончилась», и клиент перестал бы
+   * догружать то, что осталось.
    */
   async timeline(userId: string, limit = 300, cursorEntryId?: string): Promise<TimelineItem[]> {
     const tree = await this.auth.subtreeIds(userId);
     if (!tree.length) return [];
     const cursor = cursorEntryId ? await this.timelineCursor(tree, cursorEntryId) : null;
-    // Курсора уже нет (запись удалили посреди прокрутки): отдаём пусто, иначе клиент по кругу
-    // получал бы первую страницу и «показать ещё» не двигалось бы с места.
-    if (cursorEntryId && !cursor) return [];
-    const rows = (await this.prisma.fileEntry.findMany({
-      where: {
-        deletedAt: null,
-        zone: ZONE_PHOTOS, // только медиа-зона: системная папка «Фото» и её поддеревья
-        folderId: { in: tree }, // и только дерево этого пользователя
-        asset: { media: { isNot: null } },
-        ...(cursor ? this.afterTimelineCursor(cursor) : {}),
-      },
-      orderBy: [
-        { asset: { media: { capturedAt: { sort: 'desc', nulls: 'last' } } } },
-        { id: 'desc' }, // тай-брейк: без него пагинация по одной дате теряет кадры одной секунды
-      ],
-      take: Math.min(Math.max(limit, 1), TIMELINE_MAX),
-      select: {
-        id: true,
-        name: true,
-        asset: {
-          select: {
-            sha256: true,
-            masterMime: true,
-            masterReadyAt: true,
-            size: true,
-            mime: true,
-            media: { select: { capturedAt: true, latitude: true, longitude: true } },
-            jobs: { orderBy: { createdAt: 'desc' }, take: 1, select: { state: true, progress: true, error: true } },
-          },
-        },
-      },
-    })) as any[];
-    return rows.map((r: any) => ({
+    if (cursorEntryId && !cursor) throw conflict('timeline cursor is gone', 'cursor_stale');
+    const take = Math.min(Math.max(limit, 1), TIMELINE_MAX);
+    // «Строго после курсора» в том же порядке, что и ORDER BY: сначала по дате, внутри одной
+    // секунды — по id, а хвост без даты (он в самом конце) — тоже по id.
+    const after = !cursor
+      ? Prisma.empty
+      : cursor.capturedAt
+        ? Prisma.sql`AND (mm."capturedAt" < ${MediaService.sqlTimestamp(cursor.capturedAt)}::timestamp
+             OR (mm."capturedAt" = ${MediaService.sqlTimestamp(cursor.capturedAt)}::timestamp AND f."id" < ${cursor.id})
+             OR mm."capturedAt" IS NULL)`
+        : Prisma.sql`AND mm."capturedAt" IS NULL AND f."id" < ${cursor.id}`;
+    const rows = await this.prisma.$queryRaw<TimelineRow[]>(Prisma.sql`
+      SELECT f."id", f."name", a."sha256", a."mime", a."masterReadyAt", a."size", mm."capturedAt"
+      FROM "MediaMeta" mm
+      JOIN "Asset" a ON a."id" = mm."assetId"
+      JOIN "FileEntry" f ON f."assetId" = a."id"
+      WHERE f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+        ${after}
+      ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
+      LIMIT ${take}
+    `);
+    return rows.map((r) => ({
       entryId: r.id,
       name: r.name,
-      sha256: r.asset?.sha256 ?? undefined,
-      capturedAt: r.asset?.media?.capturedAt?.toISOString() ?? null,
-      ...(r.asset?.media?.latitude != null ? { latitude: r.asset.media.latitude } : {}),
-      ...(r.asset?.media?.longitude != null ? { longitude: r.asset.media.longitude } : {}),
-      mime: r.asset?.mime,
-      masterMime: r.asset?.masterMime ?? null,
-      masterReady: Boolean(r.asset?.masterReadyAt),
-      jobState: r.asset?.jobs?.[0]?.state ?? null,
-      jobProgress: r.asset?.jobs?.[0]?.progress ?? 0,
-      jobError: r.asset?.jobs?.[0]?.error ?? null,
-      size: Number(r.asset?.size ?? 0),
+      sha256: r.sha256 ?? undefined,
+      capturedAt: r.capturedAt ? new Date(r.capturedAt).toISOString() : null,
+      mime: r.mime,
+      masterReady: Boolean(r.masterReadyAt),
+      size: Number(r.size ?? 0),
     }));
   }
 
-  /** Дата и id записи, от которой продолжать ленту. Чужая/вне зоны «Фото» — не курсор. */
-  private async timelineCursor(
+  /**
+   * Статусы сборки превью по списку записей. Нужны, чтобы клиент обновлял именно те снимки,
+   * которые ещё собираются, а не перечитывал из-за них всю ленту (на страницу в 1000 записей
+   * это сотни килобайт каждые несколько секунд).
+   *
+   * Чужие и удалённые записи молча отбрасываем: ответ не должен подтверждать их существование.
+   */
+  async timelineStatus(userId: string, entryIds: unknown): Promise<TimelineStatusItem[]> {
+    const ids = [...new Set(Array.isArray(entryIds) ? entryIds : [])]
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
+      .slice(0, TIMELINE_STATUS_MAX);
+    if (!ids.length) return [];
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return [];
+    const rows = await this.prisma.$queryRaw<TimelineStatusRow[]>(Prisma.sql`
+      SELECT f."id", a."masterReadyAt", j."state" AS "jobState", j."error" AS "jobError"
+      FROM "FileEntry" f
+      JOIN "Asset" a ON a."id" = f."assetId"
+      LEFT JOIN LATERAL (
+        SELECT "state", "error" FROM "Job"
+        WHERE "assetId" = a."id"
+        ORDER BY "createdAt" DESC
+        LIMIT 1
+      ) j ON TRUE
+      WHERE f."id" = ANY(${ids})
+        AND f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+    `);
+    return rows.map((r) => ({
+      entryId: r.id,
+      masterReady: Boolean(r.masterReadyAt),
+      jobState: r.jobState ?? null,
+      jobError: r.jobError ?? null,
+    }));
+  }
+
+  /**
+   * Колонки `capturedAt` у нас — `timestamp without time zone`, и Prisma пишет в них UTC-время
+   * «как есть» (Date 2024-01-08T00:00Z остаётся 2024-01-08 00:00). А вот параметром Prisma
+   * передаёт Date как timestamptz, и Postgres, сравнивая naive-колонку с timestamptz,
+   * пересчитывает её в часовой пояс сессии: на сервере с Europe/Madrid граница уезжала на час,
+   * и запись-курсор попадала в следующую страницу (проверено scripts/timeline-check.mjs).
+   * Поэтому дату передаём строкой и приводим к timestamp явно — без часового пояса.
+   */
+  private static sqlTimestamp(value: Date): string {
+    return value.toISOString().slice(0, 23).replace('T', ' ');
+  }
+
+  /** Дата и id записи, от которой продолжать ленту. Чужая/вне зоны «Фото» — не курсор. */  private async timelineCursor(
     tree: string[],
     entryId: string,
   ): Promise<{ capturedAt: Date | null; id: string } | null> {
@@ -674,24 +751,5 @@ export class MediaService {
     })) as any;
     if (!row) return null;
     return { capturedAt: row.asset?.media?.capturedAt ?? null, id: String(row.id) };
-  }
-
-  /** Условие «строго после курсора» в том же порядке, что и orderBy таймлайна. */
-  private afterTimelineCursor(cursor: { capturedAt: Date | null; id: string }): Prisma.FileEntryWhereInput {
-    // Записи без даты — хвост ленты: после них остаются только они же, тоже по id.
-    if (!cursor.capturedAt) {
-      return {
-        OR: [{ AND: [{ asset: { media: { capturedAt: null } } }, { id: { lt: cursor.id } }] }],
-      };
-    }
-    return {
-      OR: [
-        { asset: { media: { capturedAt: { lt: cursor.capturedAt } } } },
-        // та же секунда съёмки — дальше по id, ровно как в orderBy
-        { AND: [{ asset: { media: { capturedAt: cursor.capturedAt } } }, { id: { lt: cursor.id } }] },
-        // и весь хвост без даты: он идёт после любой датированной записи
-        { asset: { media: { capturedAt: null } } },
-      ],
-    };
   }
 }
