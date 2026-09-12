@@ -5,6 +5,7 @@ import { readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import * as exifr from 'exifr';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { AuthService } from '../auth/auth.service';
@@ -42,6 +43,8 @@ export const GRID_SIZE = 50;
 const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 /** Ширина полноэкранного превью фото (и превью страницы PDF — та же величина). */
 export const FULL_SIZE = 1080;
+/** Потолок одной страницы ленты: клиент листает курсором, но страницу ограничиваем. */
+export const TIMELINE_MAX = 1000;
 /** Сколько байт читаем из начала объекта, прежде чем тянуть его целиком. */
 const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 /**
@@ -165,19 +168,9 @@ export interface TimelineItem {
   size: number;
 }
 
-export interface Trip {
-  id: string;
-  start: string;
-  end: string;
-  title: string;
-  count: number;
-  points: Array<{ capturedAt: string; latitude: number; longitude: number; entryId: string }>;
-}
-
 @Injectable()
 export class MediaService {
   private readonly logger = new Logger(MediaService.name);
-  private static gapMs = 36 * 60 * 60 * 1000;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -603,18 +596,34 @@ export class MediaService {
 
   // ============ Таймлайн ============
 
-  async timeline(userId: string, limit = 300, before?: string): Promise<TimelineItem[]> {
+  /**
+   * Лента медиа: только зона «Фото», свежие сверху.
+   *
+   * `cursorEntryId` — запись, до которой клиент уже долистал: отдаём то, что идёт строго после
+   * неё. Курсор — пара «дата съёмки + id», а не одна дата: серия кадров пишется в одну секунду,
+   * и по дате часть снимков пропускалась или повторялась. Записи без даты съёмки идут в конце
+   * ленты — так же, как их сортирует `nulls: 'last'`.
+   */
+  async timeline(userId: string, limit = 300, cursorEntryId?: string): Promise<TimelineItem[]> {
     const tree = await this.auth.subtreeIds(userId);
     if (!tree.length) return [];
+    const cursor = cursorEntryId ? await this.timelineCursor(tree, cursorEntryId) : null;
+    // Курсора уже нет (запись удалили посреди прокрутки): отдаём пусто, иначе клиент по кругу
+    // получал бы первую страницу и «показать ещё» не двигалось бы с места.
+    if (cursorEntryId && !cursor) return [];
     const rows = (await this.prisma.fileEntry.findMany({
       where: {
         deletedAt: null,
         zone: ZONE_PHOTOS, // только медиа-зона: системная папка «Фото» и её поддеревья
         folderId: { in: tree }, // и только дерево этого пользователя
-        asset: { media: before ? { capturedAt: { lt: new Date(before) } } : { isNot: null } },
+        asset: { media: { isNot: null } },
+        ...(cursor ? this.afterTimelineCursor(cursor) : {}),
       },
-      orderBy: { asset: { media: { capturedAt: 'desc' } } },
-      take: Math.min(Math.max(limit, 1), 1000),
+      orderBy: [
+        { asset: { media: { capturedAt: { sort: 'desc', nulls: 'last' } } } },
+        { id: 'desc' }, // тай-брейк: без него пагинация по одной дате теряет кадры одной секунды
+      ],
+      take: Math.min(Math.max(limit, 1), TIMELINE_MAX),
       select: {
         id: true,
         name: true,
@@ -648,51 +657,41 @@ export class MediaService {
     }));
   }
 
-  async trips(userId: string): Promise<Trip[]> {
-    const tree = await this.auth.subtreeIds(userId);
-    if (!tree.length) return [];
-    const rows = (await this.prisma.fileEntry.findMany({
-      where: { deletedAt: null, zone: ZONE_PHOTOS, folderId: { in: tree }, asset: { media: { isNot: null } } },
-      orderBy: { asset: { media: { capturedAt: 'asc' } } },
-      select: {
-        id: true,
-        asset: {
-          select: {
-            media: { select: { capturedAt: true, latitude: true, longitude: true } },
-            jobs: { orderBy: { createdAt: 'desc' }, take: 1, select: { state: true, progress: true, error: true } },
-          },
-        },
+  /** Дата и id записи, от которой продолжать ленту. Чужая/вне зоны «Фото» — не курсор. */
+  private async timelineCursor(
+    tree: string[],
+    entryId: string,
+  ): Promise<{ capturedAt: Date | null; id: string } | null> {
+    const row = (await this.prisma.fileEntry.findFirst({
+      where: {
+        id: entryId,
+        deletedAt: null,
+        zone: ZONE_PHOTOS,
+        folderId: { in: tree },
+        asset: { media: { isNot: null } },
       },
-    })) as any[];
-    const trips: Trip[] = [];
-    let current: Trip['points'] = [];
-    let prevTs: number | null = null;
-    for (const r of rows) {
-      const m = r.asset?.media;
-      if (!m || m.capturedAt == null || m.latitude == null || m.longitude == null) continue;
-      const t = new Date(m.capturedAt).getTime();
-      if (prevTs !== null && t - prevTs > MediaService.gapMs && current.length) {
-        trips.push(this.finishTrip(trips.length, current));
-        current = [];
-      }
-      current.push({ capturedAt: new Date(t).toISOString(), latitude: Number(m.latitude), longitude: Number(m.longitude), entryId: String(r.id) });
-      prevTs = t;
-    }
-    if (current.length) trips.push(this.finishTrip(trips.length, current));
-    return trips;
+      select: { id: true, asset: { select: { media: { select: { capturedAt: true } } } } },
+    })) as any;
+    if (!row) return null;
+    return { capturedAt: row.asset?.media?.capturedAt ?? null, id: String(row.id) };
   }
 
-  private finishTrip(index: number, points: Trip['points']): Trip {
-    const start = new Date(points[0].capturedAt);
-    const end = new Date(points[points.length - 1].capturedAt);
-    const title = `${start.toISOString().slice(0, 10)} — ${end.toISOString().slice(0, 10)}`;
+  /** Условие «строго после курсора» в том же порядке, что и orderBy таймлайна. */
+  private afterTimelineCursor(cursor: { capturedAt: Date | null; id: string }): Prisma.FileEntryWhereInput {
+    // Записи без даты — хвост ленты: после них остаются только они же, тоже по id.
+    if (!cursor.capturedAt) {
+      return {
+        OR: [{ AND: [{ asset: { media: { capturedAt: null } } }, { id: { lt: cursor.id } }] }],
+      };
+    }
     return {
-      id: `trip-${index + 1}-${start.getTime()}`,
-      start: start.toISOString(),
-      end: end.toISOString(),
-      title,
-      count: points.length,
-      points,
+      OR: [
+        { asset: { media: { capturedAt: { lt: cursor.capturedAt } } } },
+        // та же секунда съёмки — дальше по id, ровно как в orderBy
+        { AND: [{ asset: { media: { capturedAt: cursor.capturedAt } } }, { id: { lt: cursor.id } }] },
+        // и весь хвост без даты: он идёт после любой датированной записи
+        { asset: { media: { capturedAt: null } } },
+      ],
     };
   }
 }

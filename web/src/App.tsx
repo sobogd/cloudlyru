@@ -1,6 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
-import L from 'leaflet';
-import 'leaflet/dist/leaflet.css';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as api from './api';
 import './styles.css';
 
@@ -945,12 +943,38 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
 
 // ================= Фото (медиатека: таймлайн + поездки + карта) =================
 // Показывает только содержимое системной папки «Фото» (зона PHOTOS); сама папка скрыта из
-// «Файлы» и WebDAV. Загрузка — иконки 📷/🎬 в шапке (только фото/видео), прогресс — панелью
-// над галереей, UI блокируется на время загрузки; удаление — из деталки в корзину.
+// «Файлы» и WebDAV. Лента листается курсором (страница = 25 рядов), сгруппирована по месяцам
+// съёмки, свежие сверху. Загрузка — плавающей кнопкой «+» внизу (фото и видео), прогресс —
+// панелью над галереей; удаление — из деталки в корзину.
 
 /** Превью в списке — квадрат 50×50 px (столько же отдаёт сервер); шире 50 px ячейку не делаем. */
 const GRID_CELL = 50;
-const GRID_GAP = 4;
+/** Плитка вплотную: между превью нет отступов — снимки читаются одним массивом. */
+const GRID_GAP = 0;
+/** Скругление ячейки: при отступах оно нужно, у плотной плитки — нет. */
+const CELL_RADIUS = GRID_GAP ? 6 : 0;
+/** Сколько рядов догружаем за одну прокрутку: страница = колонки × это число. */
+const GRID_ROWS_PER_PAGE = 25;
+/** За сколько пикселей до конца ленты начинаем тянуть следующую страницу. */
+const SCROLL_PREFETCH_PX = 300;
+/** Потолок страницы на сервере (TIMELINE_MAX): больше за раз не просим. */
+const TIMELINE_PAGE_MAX = 1000;
+
+const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+
+/**
+ * Ключ месяца по дате съёмки. EXIF-даты показываем «как в файле» (см. fmtExifDate) — без
+ * пересчёта в местное время, поэтому берём компоненты строки, а не Date с таймзоной браузера.
+ * Пустой ключ — снимки без даты: они идут в конце ленты отдельной группой.
+ */
+function monthKeyOf(capturedAt: string | null): string {
+  return capturedAt && /^\d{4}-\d{2}/.test(capturedAt) ? capturedAt.slice(0, 7) : '';
+}
+function monthTitleOf(key: string): string {
+  if (!key) return 'Без даты';
+  const [year, month] = key.split('-');
+  return `${MONTHS[Number(month) - 1] ?? key} ${year}`;
+}
 
 /**
  * Сколько превью в ряд: колонок ровно столько, чтобы ячейка не стала шире GRID_CELL.
@@ -975,64 +999,185 @@ function useGridCols(ref: React.RefObject<HTMLDivElement | null>) {
 }
 
 function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null; up: Uploader; uploadedAt: number }) {
-  type Screen = { kind: 'grid' } | { kind: 'view'; idx: number };
   const [saved] = useState(() => readUi().photos);
   const [items, setItems] = useState<api.TimelineItem[]>([]);
-  const [trips, setTrips] = useState<api.Trip[]>([]);
-  const [activeTrip, setActiveTrip] = useState<string | null>(null);
-  const [screen, setScreen] = useState<Screen>({ kind: 'grid' });
+  /** Открытый снимок — по entryId, а не по индексу: лента догружается и список под просмотром меняется. */
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [firstLoad, setFirstLoad] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
   const cols = useGridCols(gridRef);
   // полноценная деталка (как в «Файлах»): открывается кнопкой ℹ️ из просмотра
   const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
-  // открытый файл после F5 восстанавливаем по entryId (индекс в таймлайне мог сдвинуться)
-  const restoreOpen = useRef<string | null>(saved?.viewEntryId ?? null);
+  // открытый файл после F5 восстанавливаем по entryId (индекс в ленте мог сдвинуться)
+  const [restoreId, setRestoreId] = useState<string | null>(saved?.viewEntryId ?? null);
   const isImg = (m: string) => /^image\//.test(m || '');
   const isVid = (m: string) => /^video\//.test(m || '');
 
-  const load = async () => {
-    try { setItems(await api.timeline()); } catch { /* keep old */ }
-  };
+  // Размер страницы считаем по живому размеру плитки: `cols` из состояния на первом кадре
+  // ещё равен догадке по ширине окна (она шире колонки контента), а запрос уходит сразу.
+  const pageLimit = useCallback(() => {
+    const width = gridRef.current?.clientWidth || window.innerWidth;
+    const columns = Math.max(1, Math.ceil(width / GRID_CELL));
+    return Math.min(Math.max(columns * GRID_ROWS_PER_PAGE, 60), TIMELINE_PAGE_MAX);
+  }, []);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const hasMoreRef = useRef(hasMore);
+  hasMoreRef.current = hasMore;
+  const loadingRef = useRef(false);
+  // Опрос статусов сборки: когда очередь опустела, ходим за обновлением редко.
+  const queueLeftRef = useRef<number | null>(null);
+  const lastRefreshRef = useRef(0);
+
+  /** Страница ленты: первая — с начала, следующая — по курсору (entryId последней записи). */
+  const load = useCallback(async (mode: 'reset' | 'more') => {
+    if (loadingRef.current) return;
+    if (mode === 'more' && (!hasMoreRef.current || !itemsRef.current.length)) return;
+    const limit = pageLimit();
+    const cursor = mode === 'more' ? itemsRef.current[itemsRef.current.length - 1]?.entryId : undefined;
+    loadingRef.current = true;
+    if (mode === 'more') setLoadingMore(true);
+    try {
+      const page = await api.timeline({ limit, cursor });
+      setItems((prev) => {
+        if (mode === 'reset') return page;
+        const known = new Set(prev.map((p) => p.entryId)); // дубликаты не копим: курсор мог сдвинуться
+        return [...prev, ...page.filter((p) => !known.has(p.entryId))];
+      });
+      setHasMore(page.length >= limit);
+      setLoadErr(null);
+    } catch (e) {
+      setLoadErr((e as Error).message);
+    } finally {
+      loadingRef.current = false;
+      setLoadingMore(false);
+      setFirstLoad(false);
+    }
+  }, [pageLimit]);
+
+  /**
+   * Обновить статусы сборки превью и подхватить снимки, появившиеся сверху. Список не
+   * заменяем, а сливаем по entryId: иначе после каждого опроса терялась бы прокрутка.
+   */
+  const refreshHead = useCallback(async () => {
+    if (loadingRef.current || !itemsRef.current.length) return;
+    const limit = Math.min(Math.max(itemsRef.current.length, pageLimit()), TIMELINE_PAGE_MAX);
+    lastRefreshRef.current = Date.now();
+    try {
+      const page = await api.timeline({ limit });
+      setItems((prev) => {
+        const byId = new Map(page.map((p) => [p.entryId, p]));
+        const known = new Set(prev.map((p) => p.entryId));
+        return [...page.filter((p) => !known.has(p.entryId)), ...prev.map((p) => byId.get(p.entryId) ?? p)];
+      });
+    } catch { /* статусы не критичны: следующая попытка позже */ }
+  }, [pageLimit]);
+
   /** Пересобрать превью упавшего файла: сервер сбрасывает задачу в очередь. */
   const retryPreview = async (entryId: string) => {
-    try { await api.retryPreview(entryId); await load(); } catch (e) { alert((e as Error).message); }
+    try { await api.retryPreview(entryId); await refreshHead(); } catch (e) { alert((e as Error).message); }
   };
-  useEffect(() => { void load(); api.trips().then(setTrips).catch(() => undefined); }, []);
-  // автообновление статусов сборки превью
-  useEffect(() => {
-    const t = setInterval(() => { void load(); }, 3000);
-    return () => clearInterval(t);
-  }, []);
+
+  useEffect(() => { void load('reset'); }, [load]);
+
+  // Файл догрузился — сразу показываем его в ленте (опрос раз в 3 с для этого не нужен).
+  useEffect(() => { if (uploadedAt) void refreshHead(); }, [uploadedAt, refreshHead]);
 
   const busy = up.busy;
-  // файл догрузился — сразу показываем его в таймлайне (опрос раз в 3 с для этого не нужен)
-  useEffect(() => { if (uploadedAt) void load(); }, [uploadedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+  const media = useMemo(() => items.filter((it) => isImg(it.mime) || isVid(it.mime)), [items]);
+  const openIdx = openId ? media.findIndex((it) => it.entryId === openId) : -1;
+  const current = openIdx >= 0 ? media[openIdx] : null;
 
-  const media = items.filter((it) => isImg(it.mime) || isVid(it.mime));
-  const current = screen.kind === 'view' ? media[screen.idx] : null;
-
-  // восстановление открытого файла после F5: ждём таймлайн и находим его позицию
+  // Пока что-то ещё собирается — следим за очередью. Спрашиваем лёгкий /queue/status, а ленту
+  // перечитываем только когда что-то дособралось: иначе каждые 3 с летела бы вся страница.
+  const pending = items.some((it) => !it.masterReady && it.jobState !== 'failed');
   useEffect(() => {
-    const id = restoreOpen.current;
-    if (!id || !items.length) return;
-    const idx = media.findIndex((it) => it.entryId === id);
-    restoreOpen.current = null;
-    if (idx >= 0) setScreen({ kind: 'view', idx });
-    else setDetailId(null); // файла больше нет — и деталка не нужна
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items]);
+    if (!pending) { queueLeftRef.current = null; return; }
+    const t = setInterval(async () => {
+      let left: number;
+      try {
+        const status = await api.queueStatus();
+        left = status.counts.pending + status.counts.processing;
+      } catch { return; }
+      const prev = queueLeftRef.current;
+      queueLeftRef.current = left;
+      // Хвост: очередь пуста, а в списке ещё плейсхолдеры — значит статусы надо перечитать
+      // (задача могла быть снята), но не чаще, чем раз в 10 секунд.
+      const stalled = left === 0 && Date.now() - lastRefreshRef.current > 10_000;
+      if ((prev !== null && left < prev) || stalled) void refreshHead();
+    }, 3000);
+    return () => clearInterval(t);
+  }, [pending, refreshHead]);
+
+  // Бесконечная прокрутка: маркер внизу списка попал в зону видимости — тянем следующую страницу.
+  // Пересоздаём наблюдатель при выходе из полноэкранного просмотра: пока он открыт, маркера в
+  // DOM нет, и старый наблюдатель следил бы за оторванным узлом.
+  const viewerOpen = Boolean(current);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => { if (entries.some((e) => e.isIntersecting)) void load('more'); },
+      { rootMargin: `${SCROLL_PREFETCH_PX}px 0px` },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [load, viewerOpen]);
+
+  // Догрузка не должна ждать прокрутки: если маркер всё ещё на экране (высокий монитор),
+  // событие пересечения не придёт — проверяем позицию сами после каждого пополнения ленты.
+  useEffect(() => {
+    if (firstLoad || loadingMore || !hasMore || !items.length) return;
+    const el = sentinelRef.current;
+    if (el && el.getBoundingClientRect().top <= window.innerHeight + SCROLL_PREFETCH_PX) void load('more');
+  }, [items.length, firstLoad, loadingMore, hasMore, load, viewerOpen]);
+
+  // Лента по месяцам: порядок берём из порядка записей (свежие сверху), «Без даты» — последняя.
+  const sections = useMemo(() => {
+    type Section = { key: string; title: string; cells: Array<{ it: api.TimelineItem; idx: number }> };
+    const out: Section[] = [];
+    const byKey = new Map<string, Section>();
+    media.forEach((it, idx) => {
+      const key = monthKeyOf(it.capturedAt);
+      let section = byKey.get(key);
+      if (!section) {
+        section = { key, title: monthTitleOf(key), cells: [] };
+        byKey.set(key, section);
+        out.push(section);
+      }
+      section.cells.push({ it, idx });
+    });
+    return out;
+  }, [media]);
+
+  // восстановление открытого файла после F5: ждём ленту и находим его по entryId
+  useEffect(() => {
+    if (!restoreId || !items.length) return;
+    if (items.some((it) => it.entryId === restoreId)) {
+      setOpenId(restoreId);
+      setRestoreId(null);
+      return;
+    }
+    // первой страницы не хватило или файла больше нет — деталку не восстанавливаем
+    if (!firstLoad) { setRestoreId(null); setDetailId(null); }
+  }, [items, restoreId, firstLoad]);
 
   // запоминаем открытый файл/деталку для F5
   useEffect(() => {
-    if (restoreOpen.current) return; // пока не восстановили — не затираем сохранённое
-    patchUi({ photos: { viewEntryId: current?.entryId ?? null, detailId } });
-  }, [current?.entryId, detailId]);
+    if (restoreId) return; // пока не восстановили — не затираем сохранённое
+    patchUi({ photos: { viewEntryId: openId, detailId } });
+  }, [openId, detailId, restoreId]);
 
   // ===== Экран деталки (#1-4) =====
-  if (screen.kind === 'view' && current) {
+  if (current) {
     const it = current;
     // полноценная деталка: те же метаданные и кнопки, что в «Файлах»
     if (detailId) return <FileDetail entryId={detailId} onBack={() => setDetailId(null)} />;
+    const goto = (i: number) => setOpenId(media[i]?.entryId ?? null);
     return (
       <div className="full">
         {/* медиа занимает весь канвас (верх экрана → нав-бар); шапка/инфо — поверх */}
@@ -1065,7 +1210,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           )}
         </div>
         <div className="tbar">
-          <button className="iconbtn" title="Назад в галерею" onClick={() => setScreen({ kind: 'grid' })}>◀️</button>
+          <button className="iconbtn" title="Назад в галерею" onClick={() => setOpenId(null)}>◀️</button>
           <span style={{ flex: 1 }} />
           <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(it.entryId)}>ℹ️</button>
           {/* Скачивание живёт только в деталке (ℹ️) — из превью его убрали */}
@@ -1076,117 +1221,123 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
               if (!confirm(`Удалить «${it.name}» в корзину?`)) return;
               try {
                 await api.deleteFile(it.entryId);
-                setScreen({ kind: 'grid' });
-                void load();
+                // Из ленты убираем сразу и локально: слияние статусов удалённую запись не выкинет.
+                setItems((prev) => prev.filter((p) => p.entryId !== it.entryId));
+                setOpenId(null);
+                await refreshHead();
               } catch (e) {
                 alert((e as Error).message);
               }
             }}
           >🗑</button>
-          <button className="iconbtn" disabled={screen.idx === 0} title="Назад" onClick={() => setScreen({ kind: 'view', idx: screen.idx - 1 })}>⬅️</button>
-          <button className="iconbtn" disabled={screen.idx >= media.length - 1} title="Вперёд" onClick={() => setScreen({ kind: 'view', idx: screen.idx + 1 })}>➡️</button>
+          <button className="iconbtn" disabled={openIdx === 0} title="Назад" onClick={() => goto(openIdx - 1)}>⬅️</button>
+          <button className="iconbtn" disabled={openIdx >= media.length - 1} title="Вперёд" onClick={() => goto(openIdx + 1)}>➡️</button>
         </div>
       </div>
     );
   }
 
+  const gridStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+    gap: GRID_GAP,
+  };
+
+  /** Ячейка плитки: превью, плейсхолдер сборки или ошибка конвертации. */
+  const renderCell = (it: api.TimelineItem, idx: number) => (
+    <div key={it.entryId} style={{ cursor: 'pointer' }} onClick={() => setOpenId(it.entryId)}>
+      {!it.masterReady ? (
+        <div
+          title={it.jobError || 'превью'}
+          className="cellph"
+          style={{ color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 8, textAlign: 'center', padding: 2, cursor: 'pointer' }}
+        >
+          {it.jobState === 'failed' ? (
+            <>
+              <span style={{ overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflowWrap: 'anywhere' }}>❌ {shortErr(it.jobError, 70)}</span>
+              <span style={{ display: 'flex', gap: 2 }}>
+                <button
+                  className="iconbtn"
+                  title="Пересобрать превью"
+                  style={{ fontSize: 12, padding: '0 3px' }}
+                  onClick={(e) => { e.stopPropagation(); void retryPreview(it.entryId); }}
+                >⟳</button>
+                <a
+                  className="iconbtn"
+                  title="Скачать оригинал"
+                  href={api.fileUrl(it.entryId)}
+                  download
+                  style={{ fontSize: 12, padding: '0 3px' }}
+                  onClick={(e) => e.stopPropagation()}
+                >⬇️</a>
+              </span>
+            </>
+          ) : <span className="spin" />}
+        </div>
+      ) : it.sha256 ? (
+        <div style={{ position: 'relative', cursor: 'pointer' }}>
+          <LoadImg src={api.previewUrl(it.sha256, 512)} radius={CELL_RADIUS} />
+          {isVid(it.mime) && <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 14, textShadow: '0 0 12px #000' }}>▶</span>}
+        </div>
+      ) : (
+        <div className="cellph" style={{ display: 'grid', placeItems: 'center' }}>📄</div>
+      )}
+    </div>
+  );
+
   // ===== Экран-сетка =====
   return (
-    <div>
-      <div className="filehead">
-        <span style={{ flex: 1 }} />
-        {photoFolderId && (
-          <>
-            <label className="iconbtn" title="Загрузить фото (из галереи)">
-              📷
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                style={{ display: 'none' }}
-                disabled={busy}
-                onChange={(e) => {
-                  if (e.target.files?.length) up.addFiles(Array.from(e.target.files), photoFolderId ?? undefined);
-                  e.target.value = '';
-                }}
-              />
-            </label>
-            <label className="iconbtn" title="Загрузить видео">
-              🎬
-              <input
-                type="file"
-                accept="video/*"
-                multiple
-                style={{ display: 'none' }}
-                disabled={busy}
-                onChange={(e) => {
-                  if (e.target.files?.length) up.addFiles(Array.from(e.target.files), photoFolderId ?? undefined);
-                  e.target.value = '';
-                }}
-              />
-            </label>
-          </>
-        )}
-      </div>
-
-      {trips.length > 0 && (
-        <div className="panel">
-          <div className="meta">Поездки — нажми, чтобы увидеть маршрут</div>
-          {trips.map((t) => (
-            <div className="item" key={t.id} onClick={() => setActiveTrip(t.id === activeTrip ? null : t.id)} style={{ cursor: 'pointer' }}>
-              <span className="icon">✈️</span>
-              <span className="fname">{t.title}</span>
-              <span className="meta">{t.count}</span>
-            </div>
-          ))}
+    <div ref={gridRef}>
+      {/* Первая загрузка: место под ленту уже занято плейсхолдерами — экран не «прыгает» */}
+      {firstLoad && !items.length && (
+        <div style={gridStyle}>
+          {Array.from({ length: cols * 4 }, (_, i) => <div key={i} className="cellph" />)}
         </div>
       )}
-      {activeTrip && <TripMap trip={trips.find((t) => t.id === activeTrip)!} />}
-      <div
-        ref={gridRef}
-        style={{ display: 'grid', gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, gap: GRID_GAP }}
-      >
-        {media.map((it, idx) => (
-          <div key={it.entryId} style={{ cursor: 'pointer' }} onClick={() => setScreen({ kind: 'view', idx })}>
-            {!it.masterReady ? (
-              <div
-                title={it.jobError || 'превью'}
-                style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#14181f', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2, color: it.jobState === 'failed' ? '#ff8a8a' : '#8a95a6', fontSize: 8, textAlign: 'center', padding: 2, overflow: 'hidden', cursor: 'pointer' }}
-              >
-                {it.jobState === 'failed' ? (
-                  <>
-                    <span style={{ overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflowWrap: 'anywhere' }}>❌ {shortErr(it.jobError, 70)}</span>
-                    <span style={{ display: 'flex', gap: 2 }}>
-                      <button
-                        className="iconbtn"
-                        title="Пересобрать превью"
-                        style={{ fontSize: 12, padding: '0 3px' }}
-                        onClick={(e) => { e.stopPropagation(); void retryPreview(it.entryId); }}
-                      >⟳</button>
-                      <a
-                        className="iconbtn"
-                        title="Скачать оригинал"
-                        href={api.fileUrl(it.entryId)}
-                        download
-                        style={{ fontSize: 12, padding: '0 3px' }}
-                        onClick={(e) => e.stopPropagation()}
-                      >⬇️</a>
-                    </span>
-                  </>
-                ) : <span className="spin" />}
-              </div>
-            ) : it.sha256 ? (
-              <div style={{ position: 'relative', cursor: 'pointer' }}>
-                <LoadImg src={api.previewUrl(it.sha256, 512)} style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
-                {isVid(it.mime) && <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 14, textShadow: '0 0 12px #000' }}>▶</span>}
-              </div>
-            ) : (
-              <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center' }}>📄</div>
-            )}
+
+      {sections.map((s) => (
+        <section key={s.key || 'nodate'}>
+          <div className="monthhead">
+            <span>{s.title}</span>
+            <span className="meta">{s.cells.length}</span>
           </div>
-        ))}
-        {!media.length && <div className="copy" style={{ gridColumn: '1 / -1' }}>Нет фото и видео. Нажмите 📷 или 🎬 — медиа оптимизируется и появится здесь автоматически.</div>}
-      </div>
+          <div style={gridStyle}>{s.cells.map(({ it, idx }) => renderCell(it, idx))}</div>
+        </section>
+      ))}
+
+      {!firstLoad && !media.length && (
+        <div className="copy" style={{ padding: '12px 2px' }}>
+          {loadErr ? `Не удалось загрузить ленту: ${loadErr}` : 'Нет фото и видео. Нажмите «+» — медиа оптимизируется и появится здесь автоматически.'}
+        </div>
+      )}
+
+      <div ref={sentinelRef} style={{ height: 1 }} />
+      {loadingMore && <div className="copy" style={{ textAlign: 'center', padding: '12px 0' }}>Загружаю…</div>}
+      {loadErr && !!items.length && (
+        <div className="row" style={{ justifyContent: 'center' }}>
+          <button className="btn ghost" onClick={() => void load('more')}>Повторить</button>
+        </div>
+      )}
+      {!!items.length && !hasMore && !loadingMore && (
+        <div className="copy" style={{ textAlign: 'center', padding: '8px 0 0' }}>Это всё — {media.length}</div>
+      )}
+
+      {/* Плавающая кнопка загрузки: одна на фото и видео, тип сервер определяет по формату */}
+      {photoFolderId && (
+        <label className={busy ? 'fab off' : 'fab'} title={busy ? 'Загрузка уже идёт' : 'Добавить фото или видео'}>
+          +
+          <input
+            type="file"
+            accept="image/*,video/*"
+            multiple
+            disabled={busy}
+            onChange={(e) => {
+              if (e.target.files?.length) up.addFiles(Array.from(e.target.files), photoFolderId);
+              e.target.value = '';
+            }}
+          />
+        </label>
+      )}
     </div>
   );
 }
@@ -1348,39 +1499,30 @@ function PhotoZoom({ src }: { src: string }) {
   );
 }
 
-// #4: лоадер для изображений (высоту даёт сам <img> со своим aspectRatio: 1, поэтому
-// фиксированный minHeight не нужен — в списке ячейка всего до 50 px)
-function LoadImg({ src, style }: { src: string; style?: React.CSSProperties }) {
+// #4: лоадер для изображений. Плейсхолдер — часть ячейки: пока превью не пришло, на его месте
+// уже стоит серый квадрат со спиннером, поэтому сетка не «прыгает» при подгрузке.
+function LoadImg({ src, radius = 0 }: { src: string; radius?: number }) {
   const [ok, setOk] = useState(false);
   return (
-    <div style={{ position: 'relative' }}>
+    <div style={{ position: 'relative', width: '100%', aspectRatio: '1', borderRadius: radius, background: '#1b212b', overflow: 'hidden' }}>
       {!ok && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
           <span className="spin" />
         </div>
       )}
-      <img src={src} alt="" style={{ ...style, visibility: ok ? 'visible' : 'hidden' }} onLoad={() => setOk(true)} onError={() => setOk(true)} loading="lazy" />
+      <img
+        src={src}
+        alt=""
+        loading="lazy"
+        onLoad={() => setOk(true)}
+        onError={() => setOk(true)}
+        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: ok ? 1 : 0, transition: 'opacity .15s' }}
+      />
     </div>
   );
 }
 
 
-
-function TripMap({ trip }: { trip: api.Trip }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!ref.current || !trip.points.length) return;
-    const pts = trip.points.map((p) => [p.latitude, p.longitude] as [number, number]);
-    const map = L.map(ref.current, { scrollWheelZoom: false });
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
-    L.polyline(pts, { color: '#2b6cff', weight: 3 }).addTo(map);
-    L.marker(pts[0]).addTo(map).bindPopup('старт');
-    if (pts.length > 1) L.marker(pts[pts.length - 1]).addTo(map).bindPopup('финиш');
-    map.fitBounds(L.latLngBounds(pts).pad(0.25), { maxZoom: 13 });
-    return () => { map.remove(); };
-  }, [trip]);
-  return <div className="panel" style={{ padding: 0 }}><div ref={ref} style={{ height: 320, borderRadius: 8 }} /></div>;
-}
 
 // ================= Шаринг =================
 
@@ -1608,7 +1750,9 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
   const p = q?.progress;
   const pct = p && p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
   const missing = p ? p.total - p.done : 0;
-  const left = q?.etaSec.total ?? null;
+  // В шапке — остаток текущей фазы: видео идёт только после фото, и суммарные 59 суток
+  // (вместе с ещё не начавшимся видео) только пугали бы.
+  const left = q?.etaSec.phase ?? null;
   const ago = updatedAt ? Math.max(0, Math.round((Date.now() - updatedAt) / 1000)) : null;
 
   return (
@@ -1649,7 +1793,10 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
           )}
 
           {!q.parallelism.videoAlongsidePhotos && (q.byKind.video?.pending ?? 0) > 0 && (q.byKind.photo?.pending ?? 0) > 0 && (
-            <div className="copy">видео начнётся, когда фото-очередь разберётся: AV1-энкод занимает все ядра, и вместе с ним фото идут в разы медленнее</div>
+            <div className="copy">
+              видео начнётся, когда фото-очередь разберётся{q.etaSec.video != null ? ` (≈ ${humanLeft(q.etaSec.video)})` : ''}:
+              AV1-энкод занимает все ядра, и вместе с ним фото идут в разы медленнее
+            </div>
           )}
           {QUEUE_KINDS.map((k) => {
             const pend = q.byKind[k]?.pending ?? 0;
@@ -1657,7 +1804,7 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
             if (!pend && !sp) return null;
             return (
               <div className="copy" key={k}>
-                {JOB_KIND[k]}: {sp ? `${humanTaskSec(sp.avgSec)} на задачу, ${sp.perMin} в минуту` : 'скорость считается…'}
+                {JOB_KIND[k]}: {sp ? `${humanTaskSec(sp.avgSec)} на задачу${sp.perMin >= 1 ? `, ${sp.perMin} в минуту` : ''}` : 'скорость считается…'}
                 {pend ? ` · в очереди ${pend.toLocaleString('ru-RU')} · осталось ≈ ${humanLeft(q.etaSec[k])}` : ' · очередь пуста'}
               </div>
             );

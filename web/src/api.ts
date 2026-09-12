@@ -476,10 +476,8 @@ export const listTokens = () => request<ApiTokenRow[]>('/auth/tokens');
 export const createToken = (label: string) => request<{ id: string; token: string; label: string }>('/auth/tokens', { method: 'POST', body: JSON.stringify({ label }) });
 export const revokeToken = (id: string) => request<{ ok: boolean }>(`/auth/tokens/${id}`, { method: 'DELETE' });
 
-// ===== M2: timeline / trips / albums =====
+// ===== M2: timeline / albums =====
 export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; latitude?: number; longitude?: number; mime: string; sha256?: string; masterMime?: string | null; masterReady: boolean; jobState?: string | null; jobProgress?: number; jobError?: string | null; size: number }
-export interface TripPoint { capturedAt: string; latitude: number; longitude: number; entryId: string }
-export interface Trip { id: string; start: string; end: string; title: string; count: number; points: TripPoint[] }
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
@@ -501,8 +499,8 @@ export interface QueueStatus {
   byKind: Record<string, { pending: number }>;
   /** Средняя длительность задачи по видам (по завершённым за последние 15 минут). */
   speed: Record<string, { avgSec: number; perMin: number } | undefined>;
-  /** Остаток в секундах: total — максимум по видам (они идут одновременно). */
-  etaSec: { photo: number | null; video: number | null; pdf: number | null; total: number | null };
+  /** Остаток в секундах: phase — по текущей фазе (пока идут фото, это фото), total — по всей очереди. */
+  etaSec: { photo: number | null; video: number | null; pdf: number | null; total: number | null; phase: number | null };
   parallelism: { photo: number; pdf: number; video: number; videoAlongsidePhotos: boolean };
   /** Задачи в работе прямо сейчас: фото могут идти параллельно, поэтому это список. */
   processing: Array<{ id: string; kind: string; progress: number; startedSecAgo: number; entryId: string | null; name: string | null }>;
@@ -540,8 +538,15 @@ export const queueErrors = (opts: { limit?: number; offset?: number; includeCanc
 /** Вернуть в очередь все настоящие ошибки (отменённые не трогаем). */
 export const retryQueueErrors = () =>
   request<{ retried: number; skipped: number }>('/queue/errors/retry', { method: 'POST', body: JSON.stringify({}) });
-export const timeline = () => request<TimelineItem[]>('/timeline');
-export const trips = () => request<Trip[]>('/trips');
+/** Лента «Фото» постранично: `limit` — размер страницы, `cursor` — entryId последней показанной
+ *  записи (сервер сам знает её дату и отдаёт то, что идёт дальше). */
+export const timeline = (opts: { limit?: number; cursor?: string } = {}) => {
+  const q = new URLSearchParams();
+  if (opts.limit) q.set('limit', String(opts.limit));
+  if (opts.cursor) q.set('cursor', opts.cursor);
+  const qs = q.toString();
+  return request<TimelineItem[]>(`/timeline${qs ? `?${qs}` : ''}`);
+};
 export const listAlbums = () => request<AlbumInfo[]>('/albums');
 export const getAlbum = (id: string) => request<AlbumView>(`/albums/${id}`);
 export const createAlbum = (name: string) => request<AlbumInfo>('/albums', { method: 'POST', body: JSON.stringify({ name }) });

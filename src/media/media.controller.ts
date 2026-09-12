@@ -169,23 +169,19 @@ export class MediaController {
     return res.status(404).end();
   }
 
+  /** Лента «Фото»: `limit` — размер страницы, `cursor` — entryId последней показанной записи. */
   @Get('timeline')
   timeline(
     @CurrentUser() user: RequestUser,
     @Query('limit') limit?: string,
-    @Query('before') before?: string,
+    @Query('cursor') cursor?: string,
   ) {
     const lim = limit ? Number(limit) : 300;
     return this.media.timeline(
       user.id,
       Number.isFinite(lim) ? lim : 300,
-      typeof before === 'string' ? before : undefined,
+      typeof cursor === 'string' && cursor ? cursor : undefined,
     );
-  }
-
-  @Get('trips')
-  trips(@CurrentUser() user: RequestUser) {
-    return this.media.trips(user.id);
   }
 
   @Get('albums')

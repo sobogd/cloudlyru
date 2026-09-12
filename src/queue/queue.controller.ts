@@ -94,6 +94,9 @@ export class QueueController {
     etaSec.total = par.videoAlongsidePhotos
       ? maxAlong || null
       : ((etaSec.photo ?? 0) + (etaSec.video ?? 0)) || maxAlong || null;
+    // Остаток «сейчас»: пока в очереди есть фото, идёт фото-фаза, и показывать в шапке
+    // суммарные 59 суток (вместе с видео, которое ещё даже не началось) бессмысленно.
+    etaSec.phase = (byKind.photo.pending ? etaSec.photo : Math.max(etaSec.video ?? 0, etaSec.pdf ?? 0)) || null;
 
     return {
       paused: await this.queue.isPaused(),

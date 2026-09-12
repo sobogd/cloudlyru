@@ -145,3 +145,22 @@ html, body { overscroll-behavior: none; }
 /* Дамп тегов из файла: строк бывает несколько десятков, по умолчанию свёрнут */
 .tags { margin: 10px 0 0; }
 .tags > summary { cursor: pointer; padding: 10px 2px; border-top: 1px solid #1f242c; }
+
+/* Фото: плотная плитка по месяцам, плейсхолдер ячейки и плавающая кнопка загрузки */
+.cellph { aspect-ratio: 1; background: #171c24; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 2px; overflow: hidden;
+  animation: ph 1.4s ease-in-out infinite alternate; }
+@keyframes ph { from { background: #141922; } to { background: #1d2431; } }
+.monthhead { position: sticky; top: 0; z-index: 4; display: flex; align-items: baseline; gap: 8px;
+  margin: 0 0 4px; padding: 7px 2px 6px; font-size: 14px; color: #cfd6e0;
+  background: rgba(15, 17, 21, .94); backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }
+.monthhead .meta { font-size: 11px; }
+
+/* Кнопка «+»: одна на фото и видео, всегда под большим пальцем — над нижним нав-баром */
+.fab { position: fixed; right: 18px; bottom: calc(70px + env(safe-area-inset-bottom)); z-index: 20;
+  width: 54px; height: 54px; border-radius: 50%; background: #2b6cff; color: #fff;
+  display: grid; place-items: center; font-size: 30px; line-height: 1; cursor: pointer;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .45); user-select: none; }
+.fab:active { background: #245ee0; }
+.fab.off { opacity: .45; }
+.fab input { display: none; }
