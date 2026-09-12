@@ -21,6 +21,12 @@ import { ZONE_FILES } from '../common/zones';
 import { env } from '../config/env';
 
 const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 1 ГБ)
+/**
+ * Сколько ФОТО-задач считать одновременно. Фото упираются в ядра (AVIF-энкод и heif-convert),
+ * поэтому на 2 ядрах смысл есть в 2 потоках, на 4 — в 3-4. Видео и PDF всегда идут по одному:
+ * AV1-энкод забирает все ядра, и второй такой процесс лишь замедлил бы оба.
+ */
+const PHOTO_PARALLEL = Math.min(Math.max(Number(env.CONVERT_PHOTO_PARALLEL ?? 1) || 1, 1), 8);
 const MAX_ATTEMPTS = 3;
 /** Задержка перед повтором временно упавшей задачи (умножается на номер попытки). */
 const RETRY_BASE_DELAY_MS = 30_000;
@@ -79,9 +85,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('Queue');
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
-  private running = false;
-  private activeJob: { id: string; assetId: string } | null = null;
-  private activeChild: import('child_process').ChildProcess | null = null;
+  /** Тик не перекрывается сам с собой (задачи внутри тика запускаются параллельно). */
+  private ticking = false;
+  /**
+   * Задачи в работе сейчас: id → { assetId, group, child }. Одна карта вместо прежних
+   * одиночных полей: при параллельных фото в ней живёт несколько задач, и отмена
+   * (удаление файла, очистка очереди) должна убивать процесс именно своей задачи.
+   */
+  private readonly active = new Map<string, { assetId: string; group: 'photo' | 'heavy'; child: import('child_process').ChildProcess | null }>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -95,7 +106,10 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     await this.prisma.job.updateMany({ where: { state: 'processing' }, data: { state: 'pending' } }).catch(() => undefined);
     this.cleanupTmp();
     this.timer = setInterval(() => void this.tick(), 2000);
-    this.logger.log(`конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB, оригиналы ${env.KEEP_ORIGINALS ? 'храним' : 'удаляем'})`);
+    this.logger.log(
+      `конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB, фото параллельно ${PHOTO_PARALLEL}, ` +
+        `оригиналы ${env.KEEP_ORIGINALS ? 'храним' : 'удаляем'})`,
+    );
   }
 
   /** Осиротевшие каталоги задач: процесс убит (SIGKILL/pm2 reload), поэтому finally не отработал. */
@@ -192,11 +206,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     await this.prisma.job
       .updateMany({ where: { assetId: { in: assetIds }, state: { in: ['pending', 'processing'] } }, data: { state: 'failed', error: 'cancelled: файл удалён', finishedAt: new Date() } })
       .catch(() => undefined);
-    // если удалённый файл прямо сейчас кодируется — убиваем ffmpeg
-    if (this.activeJob && assetIds.includes(this.activeJob.assetId) && this.activeChild) {
-      this.logger.warn(`отмена активной задачи ${this.activeJob.id} (файл удалён) — убиваю ffmpeg`);
-      try { this.activeChild.kill('SIGKILL'); } catch { /* ignore */ }
-    }
+    // если удалённый файл прямо сейчас кодируется — убиваем его процесс
+    this.killChildren((_, assetId) => assetIds.includes(assetId), 'отмена активной задачи (файл удалён)');
   }
 
   /**
@@ -219,11 +230,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       where,
       data: { state: 'failed', error: 'cancelled: очередь очищена', finishedAt: new Date() },
     });
-    // Убиваем только свою активную задачу: чужие процессы отменять не наше дело.
-    if (this.activeJob && jobs.some((j) => j.id === this.activeJob!.id) && this.activeChild) {
-      this.logger.warn(`очистка очереди: убиваю активную задачу ${this.activeJob.id}`);
-      try { this.activeChild.kill('SIGKILL'); } catch { /* ignore */ }
-    }
+    // Убиваем только свои активные задачи: чужие процессы отменять не наше дело.
+    const ids = new Set(jobs.map((j) => j.id));
+    this.killChildren((id) => ids.has(id), 'очистка очереди');
     this.logger.log(`очередь очищена: отменено задач ${res.count}`);
     return res.count;
   }
@@ -314,21 +323,55 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async tick() {
-    if (this.stopped || this.running) return;
-    this.running = true;
+    if (this.stopped || this.ticking) return;
+    this.ticking = true;
     try {
       // на паузе задачи просто ждут в БД: ничего не теряется, снятие паузы продолжит с места
       if (await this.isPaused()) return;
-      const job = await this.next();
-      if (job) await this.process(job);
+      // Фото берём пачкой по числу свободных слотов, задачи идут параллельно и не ждут друг друга.
+      const free = PHOTO_PARALLEL - this.countActive('photo');
+      for (let i = 0; i < free; i++) {
+        const job = await this.next('photo');
+        if (!job) break;
+        void this.process(job).catch((e) => this.logger.error(`process ${job.id}: ${(e as Error).message}`));
+      }
+      // Тяжёлое (видео, PDF) — только по одному: оно и так занимает все ядра.
+      if (this.countActive('heavy') === 0) {
+        const heavy = await this.next('heavy');
+        if (heavy) void this.process(heavy).catch((e) => this.logger.error(`process ${heavy.id}: ${(e as Error).message}`));
+      }
     } catch (e) {
       this.logger.error(`tick: ${(e as Error).message}`);
     } finally {
-      this.running = false;
+      this.ticking = false;
     }
   }
 
-  private async next(): Promise<JobRow | null> {
+  /** Сколько задач группы сейчас в работе — по этому числу считаются свободные слоты. */
+  private countActive(group: 'photo' | 'heavy'): number {
+    let n = 0;
+    for (const a of this.active.values()) if (a.group === group) n++;
+    return n;
+  }
+
+  /** Процесс конкретной задачи (ffmpeg/pdftoppm/heif-convert) — чтобы отмена убивала нужный. */
+  private setChild(jobId: string, child: import('child_process').ChildProcess): void {
+    const a = this.active.get(jobId);
+    if (a) a.child = child;
+  }
+
+  /** Убить процессы активных задач, подходящих под условие. Возвращает число убитых. */
+  private killChildren(match: (jobId: string, assetId: string) => boolean, why: string): number {
+    let killed = 0;
+    for (const [id, a] of this.active) {
+      if (!a.child || !match(id, a.assetId)) continue;
+      this.logger.warn(`${why}: убиваю процесс задачи ${id}`);
+      try { a.child.kill('SIGKILL'); killed += 1; } catch { /* процесс уже умер */ }
+    }
+    return killed;
+  }
+
+  private async next(group: 'photo' | 'heavy'): Promise<JobRow | null> {
     return this.prisma.$transaction(async (tx) => {
       const now = Date.now();
       // отложенные повторы пропускаем: пока их пауза не вышла, берём следующую задачу
@@ -340,25 +383,25 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       // Приоритет по виду задачи: фото (секунды на кадр) обгоняют видео (часы AV1), иначе одно
       // длинное видео держало бы превью всех фото, залитых после него, — а их ждёт телефон.
       const baseWhere = { state: 'pending', ...(delayed.length ? { id: { notIn: delayed } } : {}) };
-      const row =
-        (await tx.job.findFirst({
-          where: { ...baseWhere, kind: 'photo' },
-          orderBy: { createdAt: 'asc' },
-          include: { asset: true },
-        })) ??
-        (await tx.job.findFirst({
-          where: baseWhere,
-          orderBy: { createdAt: 'asc' },
-          include: { asset: true },
-        }));
+      const row = await tx.job.findFirst({
+        where: group === 'photo' ? { ...baseWhere, kind: 'photo' } : { ...baseWhere, kind: { not: 'photo' } },
+        orderBy: { createdAt: 'asc' },
+        include: { asset: true },
+      });
       if (!row) return null;
-      await tx.job.update({ where: { id: row.id }, data: { state: 'processing', startedAt: new Date(), attempts: { increment: 1 }, error: null } });
+      // Захват атомарный: условие по state перепроверяется после блокировки строки, поэтому
+      // при параллельных тиках (и даже при нескольких процессах) задачу получит ровно один.
+      const claim = await tx.job.updateMany({
+        where: { id: row.id, state: 'pending' },
+        data: { state: 'processing', startedAt: new Date(), attempts: { increment: 1 }, error: null },
+      });
+      if (claim.count === 0) return null;
       return { id: row.id, assetId: row.assetId, kind: row.kind, sha256: row.asset.sha256, mime: row.asset.mime };
     });
   }
 
   private async process(job: JobRow) {
-    this.activeJob = { id: job.id, assetId: job.assetId };
+    this.active.set(job.id, { assetId: job.assetId, group: job.kind === 'photo' ? 'photo' : 'heavy', child: null });
     const dir = join(tmpdir(), `clq-${job.id}`);
     mkdirSync(dir, { recursive: true });
     const rawPath = join(dir, 'raw');
@@ -433,8 +476,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } });
       }
     } finally {
-      this.activeJob = null;
-      this.activeChild = null;
+      this.active.delete(job.id);
       rmSync(dir, { recursive: true, force: true });
     }
   }
@@ -454,12 +496,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       // поэтому превью из 10-битных HDR-HEIC получаются SDR — оригинал при этом цел.
       const png = join(tmpdir(), `clq-${job.id}.png`);
       try {
-        await this.run(['heif-convert', rawPath, png], 120000);
+        await this.run(job.id, ['heif-convert', rawPath, png], 120000);
       } catch {
         // повтор: возможно файл был недокачан — перекачиваем и пробуем ещё раз
         rmSync(rawPath, { force: true });
         await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
-        await this.run(['heif-convert', rawPath, png], 120000);
+        await this.run(job.id, ['heif-convert', rawPath, png], 120000);
       }
       base = sharp(png, { animated: true }).rotate();
       decodedPath = png;
@@ -537,9 +579,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // центральный кроп — иначе постер 16:9 растянулся бы в квадратной ячейке сетки.
     const seek = src.duration > 1.5 ? '1' : '0';
     const posterVf = `scale=${GRID_SIZE}:${GRID_SIZE}:force_original_aspect_ratio=increase,crop=${GRID_SIZE}:${GRID_SIZE}`;
-    await this.run(['ffmpeg', '-y', '-ss', seek, '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
+    await this.run(job.id, ['ffmpeg', '-y', '-ss', seek, '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     if (!existsSync(posterRaw)) {
-      await this.run(['ffmpeg', '-y', '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
+      await this.run(job.id, ['ffmpeg', '-y', '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     }
     await this.setProgress(job.id, 5, true);
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
@@ -622,6 +664,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       try {
         // -scale-to-x/-scale-to-y -1: ширина ровно PDF_PAGE_WIDTH, высота по пропорциям
         await this.run(
+          job.id,
           ['pdftoppm', '-png', '-f', String(page), '-l', String(page), '-scale-to-x', String(PDF_PAGE_WIDTH), '-scale-to-y', '-1', '-singlefile', rawPath, png.replace(/\.png$/, '')],
           180000,
         );
@@ -805,7 +848,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return new Promise((resolve, reject) => {
       const script = `ulimit -v ${WORKER_MEM_KB} 2>/dev/null; exec -- "$@"`;
       const child = spawn('bash', ['-c', script, 'clq-worker', ...args, '-progress', 'pipe:1', '-nostats'], { stdio: ['ignore', 'pipe', 'pipe'] });
-      this.activeChild = child;
+      this.setChild(jobId, child);
       let errTail = '';
       let lastPct = -1;
       let outUs = 0;
@@ -850,11 +893,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Запуск бинаря под ограничением виртуальной памяти (ulimit -v). */
-  private run(args: string[], timeoutMs: number): Promise<void> {
+  private run(jobId: string, args: string[], timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const script = `ulimit -v ${WORKER_MEM_KB} 2>/dev/null; exec -- "$@"`;
       const child = spawn('bash', ['-c', script, 'clq-worker', ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
-      this.activeChild = child;
+      this.setChild(jobId, child);
       let errTail = '';
       (child.stderr || ({} as NodeJS.ReadableStream)).on('data', (chunk: Buffer) => {
         errTail = (errTail + chunk.toString()).slice(-2000);

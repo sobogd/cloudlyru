@@ -78,11 +78,13 @@ jobs:
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
           S3_FILES_SECRET_KEY: ${{ secrets.S3_FILES_SECRET_KEY }}
+          # Необязательный секрет: сколько фото конвертировать параллельно (пусто → 2)
+          CONVERT_PHOTO_PARALLEL: ${{ secrets.CONVERT_PHOTO_PARALLEL }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY
+          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -135,6 +137,10 @@ jobs:
             # Оригинал — мастер: выключение молча удаляло бы сырьё после конвертации
             KEEP_ORIGINALS=true
             CONVERT_MEM_MB=1536
+            # Сколько фото конвертировать параллельно: фото упираются в ядра (AVIF-энкод и
+            # heif-convert), видео и PDF идут по одному независимо от значения. Значение —
+            # из секрета репозитория, если он задан, иначе 2 (сервер двухъядерный).
+            CONVERT_PHOTO_PARALLEL=${CONVERT_PHOTO_PARALLEL:-2}
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

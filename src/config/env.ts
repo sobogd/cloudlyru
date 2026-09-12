@@ -45,6 +45,9 @@ const envSchema = z.object({
 
   CONVERT_ENABLED: z.string().default('false'),
   CONVERT_MEM_MB: z.coerce.number().int().positive().default(1536),
+  // Сколько фото-задач считать одновременно. Фото упираются в ядра (AVIF-энкод, heif-convert),
+  // видео и PDF всегда идут по одному. На 2 ядрах смысл есть в 2, на 4 — в 3-4.
+  CONVERT_PHOTO_PARALLEL: z.coerce.number().int().min(1).max(8).default(1),
   // Хранить оригинал в S3 после успешной конвертации (по умолчанию — да).
   // Оригинал нужен, чтобы пересобрать мастер с лучшими параметрами/метаданными:
   // сами метаданные (ICC, gain map, MPF, MakerNotes) после конвертации невосстановимы.
