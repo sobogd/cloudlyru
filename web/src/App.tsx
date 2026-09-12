@@ -1648,6 +1648,9 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
             <div className="copy">{q.paused ? '⏸ пауза — задачи ждут в очереди' : counts?.pending ? 'беру следующую задачу…' : 'очередь пуста'}</div>
           )}
 
+          {!q.parallelism.videoAlongsidePhotos && (q.byKind.video?.pending ?? 0) > 0 && (q.byKind.photo?.pending ?? 0) > 0 && (
+            <div className="copy">видео начнётся, когда фото-очередь разберётся: AV1-энкод занимает все ядра, и вместе с ним фото идут в разы медленнее</div>
+          )}
           {QUEUE_KINDS.map((k) => {
             const pend = q.byKind[k]?.pending ?? 0;
             const sp = q.speed[k];

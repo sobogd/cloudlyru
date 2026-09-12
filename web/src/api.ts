@@ -503,7 +503,7 @@ export interface QueueStatus {
   speed: Record<string, { avgSec: number; perMin: number } | undefined>;
   /** Остаток в секундах: total — максимум по видам (они идут одновременно). */
   etaSec: { photo: number | null; video: number | null; pdf: number | null; total: number | null };
-  parallelism: { photo: number; pdf: number; video: number };
+  parallelism: { photo: number; pdf: number; video: number; videoAlongsidePhotos: boolean };
   /** Задачи в работе прямо сейчас: фото могут идти параллельно, поэтому это список. */
   processing: Array<{ id: string; kind: string; progress: number; startedSecAgo: number; entryId: string | null; name: string | null }>;
   /** Настоящие ошибки (без отменённых вручную) — число для кнопки. */

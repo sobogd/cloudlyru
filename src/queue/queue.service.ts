@@ -368,8 +368,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Сколько задач идёт одновременно: нужно API, чтобы честно считать остаток по времени. */
-  get parallelism(): { photo: number; pdf: number; video: number } {
-    return { photo: PHOTO_PARALLEL, pdf: 1, video: 1 };
+  get parallelism(): { photo: number; pdf: number; video: number; videoAlongsidePhotos: boolean } {
+    return { photo: PHOTO_PARALLEL, pdf: 1, video: 1, videoAlongsidePhotos: VIDEO_ALONGSIDE_PHOTOS };
   }
 
   /** Сколько задач группы сейчас в работе — по этому числу считаются свободные слоты. */

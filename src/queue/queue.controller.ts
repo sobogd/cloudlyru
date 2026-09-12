@@ -87,8 +87,13 @@ export class QueueController {
       const slots = kind === 'photo' ? Math.max(1, par.photo) : 1;
       etaSec[kind] = Math.round((sp.avgSec * pend) / slots);
     }
-    const etas = [etaSec.photo, etaSec.video, etaSec.pdf].filter((v): v is number => typeof v === 'number');
-    etaSec.total = etas.length ? Math.max(...etas) : null;
+    // Как складывать общий остаток, зависит от порядка работ: PDF идёт вместе с фото,
+    // а видео — только после фото (если не разрешено параллельно). Поэтому либо максимум
+    // по видам (они идут одновременно), либо сумма фото и видео.
+    const maxAlong = Math.max(etaSec.photo ?? 0, etaSec.video ?? 0, etaSec.pdf ?? 0);
+    etaSec.total = par.videoAlongsidePhotos
+      ? maxAlong || null
+      : ((etaSec.photo ?? 0) + (etaSec.video ?? 0)) || maxAlong || null;
 
     return {
       paused: await this.queue.isPaused(),
