@@ -100,4 +100,6 @@ DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-sec
   node scripts/m3-sync-check.mjs
 DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
   node scripts/media-meta-check.mjs
+DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
+  node scripts/timeline-check.mjs
 ```

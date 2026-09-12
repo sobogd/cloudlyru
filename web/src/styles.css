@@ -147,10 +147,15 @@ html, body { overscroll-behavior: none; }
 .tags > summary { cursor: pointer; padding: 10px 2px; border-top: 1px solid #1f242c; }
 
 /* Фото: плотная плитка по месяцам, плейсхолдер ячейки и плавающая кнопка загрузки */
+/* Плейсхолдер ячейки. Анимацию фона убрали: при массовом импорте таких ячеек тысячи, и
+   перерисовка цвета в каждой была заметной нагрузкой на главный поток. Спиннер внутри
+   крутится на transform — он дешёвый. */
 .cellph { aspect-ratio: 1; background: #171c24; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 2px; overflow: hidden;
-  animation: ph 1.4s ease-in-out infinite alternate; }
-@keyframes ph { from { background: #141922; } to { background: #1d2431; } }
+  align-items: center; justify-content: center; gap: 2px; overflow: hidden; }
+/* Месяц целиком можно не раскладывать и не рисовать, пока он за экраном: лента листается
+   до десятков тысяч снимков, и без этого браузер держит в расчёте все загруженные строки.
+   contain-intrinsic-size с auto помнит последнюю высоту, поэтому полоса прокрутки не скачет. */
+.monthblock { content-visibility: auto; contain-intrinsic-size: auto 1200px; }
 .monthhead { position: sticky; top: 0; z-index: 4; display: flex; align-items: baseline; gap: 8px;
   margin: 0 0 4px; padding: 7px 2px 6px; font-size: 14px; color: #cfd6e0;
   background: rgba(15, 17, 21, .94); backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }

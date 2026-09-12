@@ -13,8 +13,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!res.ok) {
     const msg = data && typeof data === 'object' && 'message' in data ? String((data as { message: unknown }).message) : `HTTP ${res.status}`;
-    const err = new Error(msg) as Error & { status?: number };
+    const err = new Error(msg) as Error & { status?: number; code?: string };
     err.status = res.status;
+    // Код нужен вызывающему: по `cursor_stale` лента понимает, что запись-курсор исчезла,
+    // и откатывается на предыдущую запись вместо «лента кончилась».
+    if (data && typeof data === 'object' && 'code' in data) err.code = String((data as { code: unknown }).code);
     throw err;
   }
   return data as T;
@@ -477,11 +480,21 @@ export const createToken = (label: string) => request<{ id: string; token: strin
 export const revokeToken = (id: string) => request<{ ok: boolean }>(`/auth/tokens/${id}`, { method: 'DELETE' });
 
 // ===== M2: timeline / albums =====
-export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; latitude?: number; longitude?: number; mime: string; sha256?: string; masterMime?: string | null; masterReady: boolean; jobState?: string | null; jobProgress?: number; jobError?: string | null; size: number }
+/**
+ * Строка ленты. Состояния задачи сборки здесь нет намеренно: сервер отдаёт его отдельной
+ * ручкой (timelineStatus) только про незавершённые снимки — тянуть его для каждой записи
+ * каждой страницы значит платить лишним запросом на строку.
+ */
+export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; masterReady: boolean; size: number }
+/** Статус сборки превью (POST /timeline/status): отвечаем только про свои записи. */
+export interface TimelineStatus { entryId: string; masterReady: boolean; jobState: string | null; jobError: string | null }
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
-/** Превью: w=512 — миниатюра для списка (квадрат 50×50), w=1080 — полный экран. */
+/**
+ * Превью: любое `w` меньше 1080 — это миниатюра списка (квадрат 50×50), 1080 и выше — полный
+ * экран. Отдельного превью на 512 px на сервере нет, поэтому значение по умолчанию — как у сетки.
+ */
 export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
 /** Страница PDF: превью, отрисованное сервером (нумерация с единицы). */
 export const pdfPageUrl = (sha: string, page: number) => `/api/v1/previews/${sha}?page=${page}`;
@@ -547,6 +560,9 @@ export const timeline = (opts: { limit?: number; cursor?: string } = {}) => {
   const qs = q.toString();
   return request<TimelineItem[]>(`/timeline${qs ? `?${qs}` : ''}`);
 };
+/** Статусы сборки превью по списку записей: спрашиваем только про незавершённые снимки. */
+export const timelineStatus = (entryIds: string[]) =>
+  request<TimelineStatus[]>('/timeline/status', { method: 'POST', body: JSON.stringify({ entryIds }) });
 export const listAlbums = () => request<AlbumInfo[]>('/albums');
 export const getAlbum = (id: string) => request<AlbumView>(`/albums/${id}`);
 export const createAlbum = (name: string) => request<AlbumInfo>('/albums', { method: 'POST', body: JSON.stringify({ name }) });
