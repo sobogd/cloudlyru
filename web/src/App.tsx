@@ -1478,6 +1478,9 @@ function Albums() {
 // ================= Настройки =================
 
 function Settings({ login, onLogout }: { login: string; onLogout: () => void }) {
+  // Ошибки очереди — отдельная страница настроек: список упавших задач не должен мешать
+  // основному экрану очереди, где только цифры.
+  const [view, setView] = useState<'main' | 'queue-errors'>('main');
   const [tokens, setTokens] = useState<api.ApiTokenRow[]>([]);
   const [fresh, setFresh] = useState<string | null>(null);
   const [err, setErr] = useState('');
@@ -1491,6 +1494,7 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
       await loadTokens();
     } catch (e) { setErr((e as Error).message); }
   };
+  if (view === 'queue-errors') return <QueueErrorsPanel onBack={() => setView('main')} />;
   return (
     <div>
       <div className="panel">
@@ -1519,7 +1523,7 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
         ))}
         {!tokens.length && <div className="copy">Токенов нет — нужен для Finder/WebDAV</div>}
       </div>
-      <QueuePanel />
+      <QueuePanel onErrors={() => setView('queue-errors')} />
     </div>
   );
 }
@@ -1527,28 +1531,51 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
 // ================= Очередь конвертации (превью фото/видео/PDF) =================
 
 const JOB_KIND: Record<string, string> = { photo: '🖼️ фото', video: '🎬 видео', pdf: '📄 PDF' };
-const JOB_STATE: Record<string, string> = { pending: 'в очереди', processing: 'в работе', done: 'готово', failed: 'ошибка' };
 
-function QueuePanel() {
+/** «3 ч 20 мин», «2 сут 4 ч» — остаток времени читается лучше, чем секунды. */
+function humanLeft(sec: number | null | undefined): string {
+  if (sec == null) return '—';
+  if (sec < 60) return `${Math.max(1, Math.round(sec))} с`;
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m} мин`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h} ч ${String(m % 60).padStart(2, '0')} мин`;
+  return `${Math.floor(h / 24)} сут ${h % 24} ч`;
+}
+
+/** «3,4 с» — средняя длительность одной задачи. */
+function humanTaskSec(sec: number): string {
+  return sec < 60 ? `${sec.toFixed(1).replace('.', ',')} с` : humanLeft(sec);
+}
+
+const QUEUE_KINDS = ['photo', 'video', 'pdf'] as const;
+
+/**
+ * Экран очереди: только цифры. Список файлов убран намеренно — задачи идут десятками тысяч,
+ * и по префиксу sha из него всё равно ничего не понять. Что упало — на отдельной странице
+ * ошибок.
+ */
+function QueuePanel({ onErrors }: { onErrors: () => void }) {
   const [q, setQ] = useState<api.QueueStatus | null>(null);
-  const [missing, setMissing] = useState<api.MissingPreviews | null>(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [updatedAt, setUpdatedAt] = useState(0);
 
   const load = async () => {
     try {
-      const [status, miss] = await Promise.all([api.queueStatus(), api.missingPreviews()]);
-      setQ(status);
-      setMissing(miss);
+      const s = await api.queueStatus();
+      setQ(s);
+      setUpdatedAt(Date.now());
     } catch (e) { setErr((e as Error).message); }
   };
-  // пока очередь не пуста — обновляем чаще, чтобы был виден прогресс
+  // Цифры должны быть живыми: пока что-то идёт — раз в 2 с, на простое — раз в 10 с.
+  const working = Boolean(q?.counts.processing);
   useEffect(() => {
     void load();
-    const t = setInterval(() => { void load(); }, 5000);
+    const t = setInterval(() => { void load(); }, working ? 2000 : 10000);
     return () => clearInterval(t);
-  }, []);
+  }, [working]);
 
   const rebuild = async () => {
     setBusy(true);
@@ -1560,50 +1587,43 @@ function QueuePanel() {
     } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
   };
 
-  const by = q?.byState ?? {};
-  const left = missing?.total ?? 0;
-  const kinds = missing?.byKind ?? {};
-  const leftText = [
-    kinds.photo ? `фото ${kinds.photo}` : '',
-    kinds.video ? `видео ${kinds.video}` : '',
-    kinds.pdf ? `PDF ${kinds.pdf}` : '',
-  ].filter(Boolean).join(' · ');
-
   // Пауза мягкая: новые задачи не берутся, текущая докачивается (для видео это важно —
   // прерванный AV1-энкод означает часы работы заново), PDF встаёт между страницами.
   const togglePause = async () => {
+    try { await api.setQueuePaused(!q?.paused); await load(); } catch (e) { setErr((e as Error).message); }
+  };
+
+  // Очистка, в отличие от паузы, жёсткая: текущая задача обрывается. Собранные превью
+  // остаются, а отменённое возвращается кнопкой «дособрать».
+  const cancelAll = async () => {
+    if (!confirm('Очистить очередь?\n\nОтличия от паузы: пауза просто перестаёт брать новые задачи и даёт текущей закончиться, а очистка обрывает её сейчас же, а все ожидающие задачи помечаются отменёнными.\n\nСобранные превью останутся, отменённые файлы вернёт кнопка «Дособрать превью».')) return;
     try {
-      await api.setQueuePaused(!q?.paused);
+      const r = await api.cancelQueue();
+      setNotice(`Очередь очищена: отменено задач ${r.cancelled}. Вернуть их — кнопкой «Дособрать превью».`);
       await load();
     } catch (e) { setErr((e as Error).message); }
   };
 
-  // Отмена, в отличие от паузы, жёсткая: текущая задача обрывается. Уже собранные
-  // превью не трогаются — отменённое возвращается кнопкой пересбора.
-  const cancelAll = async () => {
-    if (!confirm('Отменить все задачи очереди? Текущая конвертация прервётся, собранные превью останутся.')) return;
-    try {
-      const r = await api.cancelQueue();
-      setNotice(`Отменено задач: ${r.cancelled}`);
-      await load();
-    } catch (e) { setErr((e as Error).message); }
-  };
+  const counts = q?.counts;
+  const p = q?.progress;
+  const pct = p && p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
+  const missing = p ? p.total - p.done : 0;
+  const left = q?.etaSec.total ?? null;
+  const ago = updatedAt ? Math.max(0, Math.round((Date.now() - updatedAt) / 1000)) : null;
 
   return (
     <div className="panel">
       <div className="row">
         <strong>Очередь превью</strong>
         <span style={{ flex: 1 }} />
-        <button className={q?.paused ? 'btn' : 'btn ghost'} disabled={!q} onClick={togglePause}>
+        <button className={q?.paused ? 'btn' : 'btn ghost'} disabled={!q} onClick={togglePause} title="Пауза мягкая: текущая задача докачивается, новые не берутся">
           {q?.paused ? '▶️ Продолжить' : '⏸ Пауза'}
         </button>
-        <button
-          className="btn ghost"
-          disabled={!q || !(by.pending || by.processing)}
-          onClick={cancelAll}
-        >✕ Отменить все</button>
-        <button className="btn" disabled={busy || !left} onClick={rebuild}>
-          {busy ? '…' : left ? `⟳ Пересобрать там, где нет (${left})` : '⟳ Всё собрано'}
+        <button className="btn ghost" disabled={!q || !(counts?.pending || counts?.processing)} onClick={cancelAll} title="Очистка жёсткая: текущая задача обрывается, ожидающие помечаются отменёнными">
+          ✕ Очистить очередь
+        </button>
+        <button className="btn ghost" disabled={!q} onClick={() => void load()} title="Перечитать цифры сейчас, не меняя ничего">
+          ⟳ Обновить
         </button>
       </div>
       {err && <div className="err">{err}</div>}
@@ -1611,46 +1631,139 @@ function QueuePanel() {
       {!q && !err && <div className="copy">Загрузка…</div>}
       {q && (
         <>
-          <div className="copy">
-            {q.paused ? '⏸ конвертация на паузе — задачи ждут в очереди · ' : ''}
-            без превью {left}{leftText ? ` (${leftText})` : ''} · в очереди {by.pending ?? 0} · в работе {by.processing ?? 0} · готово {by.done ?? 0} · ошибок {by.failed ?? 0}
+          <div className="row" style={{ alignItems: 'baseline' }}>
+            <span className="fname">{p?.done.toLocaleString('ru-RU')} из {p?.total.toLocaleString('ru-RU')}</span>
+            <span className="meta">{pct}%{left != null ? ` · осталось ≈ ${humanLeft(left)}` : ''}</span>
           </div>
-          {q.processing && (
-            <div className="panel" style={{ background: '#1c2430' }}>
-              <div className="row">
-                <span className="icon">{JOB_KIND[q.processing.kind] ?? q.processing.kind}</span>
-                <span className="fname">{q.processing.sha256}…</span>
-                <span className="meta">{q.processing.progress}% · идёт {q.processing.startedMinAgo} мин</span>
-              </div>
-              <div className="ubar"><i style={{ width: `${q.processing.progress}%` }} /></div>
+          <div className="ubar"><i style={{ width: `${pct}%` }} /></div>
+
+          {q.processing.length > 0 ? (
+            <div className="copy">
+              сейчас в работе: {q.processing.length}
+              {q.processing.every((j) => j.kind === 'photo') && q.parallelism.photo > 1 ? ` (фото параллельно, до ${q.parallelism.photo})` : ''}
+              {' · '}
+              {q.processing.map((j, i) => `${JOB_KIND[j.kind] ?? j.kind} ${j.progress}%`).join(' · ')}
             </div>
+          ) : (
+            <div className="copy">{q.paused ? '⏸ пауза — задачи ждут в очереди' : counts?.pending ? 'беру следующую задачу…' : 'очередь пуста'}</div>
           )}
-          {q.recent.map((j) => (
-            <div className="item" key={j.id} style={{ alignItems: 'flex-start' }}>
-              <span className="icon">{JOB_KIND[j.kind] ?? j.kind}</span>
-              <span className="fname" style={{ whiteSpace: 'normal' }}>
-                {j.sha256}… — {JOB_STATE[j.state] ?? j.state}
-                {j.state === 'failed' && j.error && (
-                  <div className="err" style={{ fontWeight: 400 }}>
-                    {j.error.startsWith('cancelled') ? 'отменено' : j.error}
-                  </div>
-                )}
-              </span>
-              <span className="meta">{new Date(j.updatedAt).toLocaleString()}</span>
-            </div>
-          ))}
-          {!q.recent.length && <div className="copy">Задач не было — превью собираются автоматически при загрузке</div>}
+
+          {QUEUE_KINDS.map((k) => {
+            const pend = q.byKind[k]?.pending ?? 0;
+            const sp = q.speed[k];
+            if (!pend && !sp) return null;
+            return (
+              <div className="copy" key={k}>
+                {JOB_KIND[k]}: {sp ? `${humanTaskSec(sp.avgSec)} на задачу, ${sp.perMin} в минуту` : 'скорость считается…'}
+                {pend ? ` · в очереди ${pend.toLocaleString('ru-RU')} · осталось ≈ ${humanLeft(q.etaSec[k])}` : ' · очередь пуста'}
+              </div>
+            );
+          })}
+
           <div className="copy">
-            Кнопка ставит задачи только тем файлам, у которых превью нет: фото и видео из старых
-            загрузок, а также всем PDF — их страницы рисуются заново.
+            готово {counts?.done.toLocaleString('ru-RU')} · в очереди {(counts?.pending ?? 0).toLocaleString('ru-RU')} · в работе {counts?.processing ?? 0}
+            {' · '}без превью {missing.toLocaleString('ru-RU')}
+            {counts?.cancelled ? ` · отменено вручную ${counts.cancelled.toLocaleString('ru-RU')}` : ''}
+            {ago != null ? ` · цифры обновлены ${ago} с назад` : ''}
           </div>
         </>
       )}
+
+      <div className="row">
+        <button className="btn ghost" disabled={!q} onClick={onErrors} title="Задачи, которые упали при конвертации">
+          ⚠ Ошибки{q?.errors.total ? `: ${q.errors.total}` : ''}
+        </button>
+        <span style={{ flex: 1 }} />
+        <button className="btn" disabled={busy || !missing} onClick={rebuild} title="Найти файлы без превью и поставить им задачи">
+          {busy ? '…' : missing ? `⟳ Дособрать превью (${missing.toLocaleString('ru-RU')})` : '⟳ Всё собрано'}
+        </button>
+      </div>
     </div>
   );
 }
 
-// ================= Корзина =================
+/** Ошибки очереди отдельной страницей: файл, текст ошибки, попытки и «повторить». */
+function QueueErrorsPanel({ onBack }: { onBack: () => void }) {
+  const LIMIT = 50;
+  const [data, setData] = useState<{ total: number; items: api.QueueErrorRow[] } | null>(null);
+  const [offset, setOffset] = useState(0);
+  const [withCancelled, setWithCancelled] = useState(false);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    try {
+      setData(await api.queueErrors({ limit: LIMIT, offset, includeCancelled: withCancelled }));
+      setErr('');
+    } catch (e) { setErr((e as Error).message); }
+  };
+  useEffect(() => { void load(); }, [offset, withCancelled]);
+
+  const retryOne = async (entryId: string | null) => {
+    if (!entryId) return;
+    try {
+      await api.retryPreview(entryId);
+      setNotice('Файл снова в очереди');
+      await load();
+    } catch (e) { setErr((e as Error).message); }
+  };
+
+  const retryAll = async () => {
+    setBusy(true);
+    setNotice('');
+    try {
+      const r = await api.retryQueueErrors();
+      setNotice(`Возвращено в очередь: ${r.retried}${r.skipped ? `, пропущено ${r.skipped} (оригинала нет в хранилище)` : ''}`);
+      setOffset(0);
+      await load();
+    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+
+  const total = data?.total ?? 0;
+  const shown = data?.items.length ?? 0;
+
+  return (
+    <div className="panel">
+      <div className="row">
+        <button className="iconbtn" onClick={onBack} title="Назад к очереди">◀️</button>
+        <strong>Ошибки очереди</strong>
+        <span className="meta">{total.toLocaleString('ru-RU')}</span>
+        <span style={{ flex: 1 }} />
+        <button className="btn" disabled={busy || !total || withCancelled} onClick={retryAll}>⟳ Повторить все</button>
+      </div>
+      <label className="copy" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <input type="checkbox" checked={withCancelled} onChange={(e) => { setOffset(0); setWithCancelled(e.target.checked); }} />
+        показывать отменённые вручную (очистка очереди, удаление файла — это не ошибки конвертации)
+      </label>
+      {err && <div className="err">{err}</div>}
+      {notice && <div className="notice">{notice}</div>}
+      {!data && !err && <div className="copy">Загрузка…</div>}
+      {data && !shown && <div className="copy">Ошибок нет{withCancelled ? '' : ' — все задачи либо собраны, либо отменены вручную'}</div>}
+      {data?.items.map((j) => (
+        <div className="item" key={j.id} style={{ alignItems: 'flex-start' }}>
+          <span className="icon">{JOB_KIND[j.kind] ?? j.kind}</span>
+          <span className="fname" style={{ whiteSpace: 'normal' }}>
+            {j.entryId ? <a href={api.fileUrl(j.entryId)}>{j.name ?? 'файл'}</a> : (j.name ?? 'файл удалён')}
+            <div className="err" style={{ fontWeight: 400 }}>{j.error.replace(/^cancelled:\s*/, 'отменено: ')}</div>
+            <div className="meta">
+              попыток: {j.attempts}
+              {j.finishedAt ? ` · ${new Date(j.finishedAt).toLocaleString()}` : ''}
+            </div>
+          </span>
+          <button className="btn ghost" disabled={!j.entryId || withCancelled} onClick={() => void retryOne(j.entryId)} title="Поставить задачу в очередь заново">⟳</button>
+        </div>
+      ))}
+      {total > LIMIT && (
+        <div className="row">
+          <button className="btn ghost" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - LIMIT))}>← назад</button>
+          <span className="meta">{offset + 1}–{offset + shown} из {total.toLocaleString('ru-RU')}</span>
+          <button className="btn ghost" disabled={offset + shown >= total} onClick={() => setOffset(offset + LIMIT)}>вперёд →</button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function TrashPage() {
   const [view, setView] = useState<api.TrashView | null>(null);

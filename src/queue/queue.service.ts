@@ -347,6 +347,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Сколько задач идёт одновременно: нужно API, чтобы честно считать остаток по времени. */
+  get parallelism(): { photo: number; heavy: number } {
+    return { photo: PHOTO_PARALLEL, heavy: 1 };
+  }
+
   /** Сколько задач группы сейчас в работе — по этому числу считаются свободные слоты. */
   private countActive(group: 'photo' | 'heavy'): number {
     let n = 0;

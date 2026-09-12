@@ -1,16 +1,18 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
+import { Body, Controller, Get, Logger, Post, Query } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from '../auth/auth.service';
 import { S3Service } from '../s3/s3.service';
 import { QueueService } from './queue.service';
-import { PDF_MIMES, mediaKindOf } from '../media/media.service';
+import { IMAGE_MIMES, VIDEO_MIMES, PDF_MIMES, mediaKindOf } from '../media/media.service';
 import { CurrentUser, RequestUser } from '../common/decorators';
 import { asString, isPlainObject } from '../common/utils';
 import { badRequest, notFound } from '../common/errors';
 
 @Controller('queue')
 export class QueueController {
+  private readonly logger = new Logger('QueueApi');
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly auth: AuthService,
@@ -18,53 +20,242 @@ export class QueueController {
     private readonly s3: S3Service,
   ) {}
 
-  /** Статус очереди конвертации (для UI-монитора) — только по своим файлам. */
+  /**
+   * Статус очереди: цифры, скорость и остаток. Список файлов здесь не отдаём — для ошибок
+   * есть отдельная ручка /queue/errors, а прогресс считается как «собрано из всего, что
+   * требует превью».
+   */
   @Get('status')
   async status(@CurrentUser() user: RequestUser) {
     const tree = await this.auth.subtreeIds(user.id);
     // job'ы привязаны к ассету, а ассеты дедуплицируются между всеми: показываем те,
     // на которые у пользователя есть живая запись в его дереве
     const mine = { entries: { some: { folderId: { in: tree }, deletedAt: null } } };
-    const [groups, processing, recent] = await Promise.all([
-      this.prisma.job.groupBy({ by: ['state'], _count: true, where: { asset: mine } }),
-      this.prisma.job.findFirst({
+    const [groups, processingRows, doneCount, missingGroups, errorCount, speed] = await Promise.all([
+      this.prisma.job.groupBy({ by: ['state', 'kind'], _count: true, where: { asset: mine } }),
+      this.prisma.job.findMany({
         where: { state: 'processing', asset: mine },
         orderBy: { startedAt: 'asc' },
-        include: { asset: true },
+        select: {
+          id: true,
+          kind: true,
+          progress: true,
+          startedAt: true,
+          asset: {
+            select: {
+              entries: {
+                where: { folderId: { in: tree }, deletedAt: null },
+                take: 1,
+                select: { id: true, name: true },
+              },
+            },
+          },
+        },
       }),
-      this.prisma.job.findMany({
-        where: { asset: mine },
-        orderBy: { updatedAt: 'desc' },
-        take: 15,
-        include: { asset: { select: { sha256: true, masterReadyAt: true } } },
-      }),
+      this.prisma.asset.count({ where: { ...this.mediaWhere(tree), masterReadyAt: { not: null } } }),
+      this.prisma.asset.groupBy({ by: ['mime'], _count: true, where: this.missingWhere(tree) }),
+      this.prisma.job.count({ where: { state: 'failed', asset: mine, ...this.realErrorWhere() } }),
+      this.speedByKind(tree),
     ]);
-    const byState: Record<string, number> = { pending: 0, processing: 0, done: 0, failed: 0 };
-    for (const g of groups) byState[g.state] = g._count;
+
+    const counts = { pending: 0, processing: 0, done: 0, failed: 0, cancelled: 0 };
+    const byKind: Record<string, { pending: number }> = { photo: { pending: 0 }, video: { pending: 0 }, pdf: { pending: 0 } };
+    let failedTotal = 0;
+    for (const g of groups) {
+      if (!(g.state in counts)) continue;
+      counts[g.state as keyof typeof counts] += g._count;
+      if (g.state === 'pending' && byKind[g.kind]) byKind[g.kind].pending += g._count;
+      if (g.state === 'failed') failedTotal += g._count;
+    }
+    // «отменённые» — это не ошибки: их снял пользователь (очистка очереди, удаление файла)
+    counts.cancelled = Math.max(0, failedTotal - errorCount);
+    counts.failed = errorCount;
+
+    // сколько всего требует превью = уже собранные + те, у кого превью нет
+    let missing = 0;
+    for (const g of missingGroups) if (mediaKindOf(g.mime)) missing += g._count;
+
+    // Остаток по видам. Фото идут параллельно, видео и PDF — по одному, поэтому время
+    // фото делится на число слотов; суммарный остаток — максимум, а не сумма: виды
+    // считаются одновременно и не ждут друг друга.
+    const par = this.queue.parallelism;
+    const etaSec: Record<string, number | null> = { photo: null, video: null, pdf: null, total: null };
+    for (const kind of ['photo', 'video', 'pdf'] as const) {
+      const sp = speed[kind];
+      const pend = byKind[kind].pending;
+      if (!sp || !pend) continue;
+      const slots = kind === 'photo' ? Math.max(1, par.photo) : 1;
+      etaSec[kind] = Math.round((sp.avgSec * pend) / slots);
+    }
+    const etas = [etaSec.photo, etaSec.video, etaSec.pdf].filter((v): v is number => typeof v === 'number');
+    etaSec.total = etas.length ? Math.max(...etas) : null;
 
     return {
       paused: await this.queue.isPaused(),
-      byState,
-      processing: processing
-        ? {
-            id: processing.id,
-            kind: processing.kind,
-            sha256: processing.asset.sha256.slice(0, 10),
-            startedMinAgo: Math.max(0, Math.round((Date.now() - (processing.startedAt?.getTime() ?? Date.now())) / 60000)),
-            progress: processing.progress,
-          }
-        : null,
-      recent: recent.map((j) => ({
+      counts,
+      progress: { done: doneCount, total: doneCount + missing },
+      byKind,
+      speed,
+      etaSec,
+      parallelism: par,
+      processing: processingRows.map((j) => ({
         id: j.id,
         kind: j.kind,
-        state: j.state,
-        error: j.state === 'failed' ? (j.error || '').slice(0, 220) : null,
-        updatedAt: j.updatedAt,
-        sha256: j.asset.sha256.slice(0, 10),
         progress: j.progress,
-        masterReady: Boolean(j.asset.masterReadyAt),
+        startedSecAgo: Math.max(0, Math.round((Date.now() - (j.startedAt?.getTime() ?? Date.now())) / 1000)),
+        entryId: j.asset.entries[0]?.id ?? null,
+        name: j.asset.entries[0]?.name ?? null,
+      })),
+      errors: { total: errorCount },
+    };
+  }
+
+  /** Ошибка конвертации — всё, кроме отменённых вручную задач. */
+  private realErrorWhere(): Prisma.JobWhereInput {
+    return { OR: [{ error: null }, { error: { not: { startsWith: 'cancelled' } } }] };
+  }
+
+  /** Ассеты под превью: картинки, видео и PDF. */
+  private mediaWhere(tree: string[]): Prisma.AssetWhereInput {
+    return {
+      entries: { some: { folderId: { in: tree }, deletedAt: null } },
+      OR: [
+        { mime: { in: IMAGE_MIMES } },
+        { mime: { in: VIDEO_MIMES } },
+        { mime: { in: PDF_MIMES } },
+      ],
+    };
+  }
+
+  /**
+   * Средняя длительность задачи по видам за последние 15 минут. Считается по завершённым
+   * задачам, поэтому честно работает и для фото (секунды), и для видео (часы AV1).
+   * Результат кэшируется на 10 секунд: статус спрашивают каждые пару секунд.
+   */
+  private speedCache: { at: number; value: Record<string, { avgSec: number; perMin: number }> } | null = null;
+
+  private async speedByKind(tree: string[]): Promise<Record<string, { avgSec: number; perMin: number }>> {
+    if (this.speedCache && Date.now() - this.speedCache.at < 10_000) return this.speedCache.value;
+    const rows = await this.prisma.job.findMany({
+      where: {
+        state: 'done',
+        finishedAt: { gt: new Date(Date.now() - 15 * 60 * 1000) },
+        startedAt: { not: null },
+        asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
+      },
+      orderBy: { finishedAt: 'desc' },
+      take: 500,
+      select: { kind: true, startedAt: true, finishedAt: true },
+    });
+    const acc: Record<string, { n: number; sec: number }> = {};
+    for (const r of rows) {
+      if (!r.startedAt || !r.finishedAt) continue;
+      const sec = (r.finishedAt.getTime() - r.startedAt.getTime()) / 1000;
+      if (!Number.isFinite(sec) || sec < 0) continue;
+      const a = (acc[r.kind] ??= { n: 0, sec: 0 });
+      a.n += 1;
+      a.sec += sec;
+    }
+    const value: Record<string, { avgSec: number; perMin: number }> = {};
+    // окно 15 минут: сколько задач в минуту получается при текущей скорости
+    const windowMin = 15;
+    for (const [kind, a] of Object.entries(acc)) {
+      if (!a.n) continue;
+      value[kind] = { avgSec: Math.round((a.sec / a.n) * 10) / 10, perMin: Math.round((a.n / windowMin) * 10) / 10 };
+    }
+    this.speedCache = { at: Date.now(), value };
+    return value;
+  }
+
+  /**
+   * Ошибки очереди: постранично, с именем файла. Отменённые задачи (очистка очереди,
+   * удаление файла) по умолчанию не показываем — это не ошибки конвертации.
+   */
+  @Get('errors')
+  async errors(
+    @CurrentUser() user: RequestUser,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+    @Query('include') include?: string,
+  ) {
+    const tree = await this.auth.subtreeIds(user.id);
+    const take = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    const skip = Math.max(Number(offset) || 0, 0);
+    const where: Prisma.JobWhereInput = {
+      state: 'failed',
+      asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
+      ...(include === 'cancelled' ? {} : this.realErrorWhere()),
+    };
+    const [total, rows] = await Promise.all([
+      this.prisma.job.count({ where }),
+      this.prisma.job.findMany({
+        where,
+        orderBy: { finishedAt: 'desc' },
+        skip,
+        take,
+        select: {
+          id: true,
+          kind: true,
+          error: true,
+          attempts: true,
+          finishedAt: true,
+          asset: {
+            select: {
+              entries: {
+                where: { folderId: { in: tree }, deletedAt: null },
+                take: 1,
+                select: { id: true, name: true },
+              },
+            },
+          },
+        },
+      }),
+    ]);
+    return {
+      total,
+      items: rows.map((j) => ({
+        id: j.id,
+        kind: j.kind,
+        error: (j.error ?? '').slice(0, 400),
+        attempts: j.attempts,
+        finishedAt: j.finishedAt,
+        entryId: j.asset.entries[0]?.id ?? null,
+        name: j.asset.entries[0]?.name ?? null,
       })),
     };
+  }
+
+  /** Вернуть в очередь все настоящие ошибки: то же, что «повторить» у файла, но пачкой. */
+  @Post('errors/retry')
+  async retryErrors(@CurrentUser() user: RequestUser) {
+    const tree = await this.auth.subtreeIds(user.id);
+    const rows = await this.prisma.job.findMany({
+      where: {
+        state: 'failed',
+        asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
+        ...this.realErrorWhere(),
+      },
+      select: { id: true, asset: { select: { sha256: true } } },
+    });
+    if (!rows.length) return { retried: 0, skipped: 0 };
+    // Оригинал мог исчезнуть (KEEP_ORIGINALS=false): без него задача снова упадёт три раза.
+    // HEAD-запросы идут пачками, иначе на сотнях задач ручка отвечала бы минутами.
+    const alive: string[] = [];
+    let skipped = 0;
+    for (let i = 0; i < rows.length; i += 8) {
+      const chunk = rows.slice(i, i + 8);
+      const heads = await Promise.all(chunk.map((r) => this.s3.headObject(S3Service.assetKey(r.asset.sha256)).catch(() => false)));
+      chunk.forEach((r, j) => (heads[j] ? alive.push(r.id) : (skipped += 1)));
+    }
+    // Пачками по 5000: список id в одном UPDATE упирается в предел Postgres по bind-параметрам
+    for (let i = 0; i < alive.length; i += 5000) {
+      await this.prisma.job.updateMany({
+        where: { id: { in: alive.slice(i, i + 5000) } },
+        data: { state: 'pending', error: null, attempts: 0, progress: 0, startedAt: null, finishedAt: null },
+      });
+    }
+    this.logger.log(`ошибки очереди возвращены в работу: ${alive.length}${skipped ? `, пропущено ${skipped}` : ''}`);
+    return { retried: alive.length, skipped };
   }
 
   /**

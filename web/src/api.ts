@@ -495,9 +495,19 @@ export const thumbUrl = (entryId: string) => `${BASE}/files/${entryId}/thumb`;
 export interface QueueStatus {
   /** Конвертация на паузе: состояние хранится в БД, живёт до снятия. */
   paused: boolean;
-  byState: Record<string, number>;
-  processing: { id: string; kind: string; sha256: string; startedMinAgo: number; progress: number } | null;
-  recent: Array<{ id: string; kind: string; state: string; error: string | null; updatedAt: string; sha256: string; progress: number; masterReady: boolean }>;
+  counts: { pending: number; processing: number; done: number; failed: number; cancelled: number };
+  /** Прогресс «собрано из всего, что требует превью». */
+  progress: { done: number; total: number };
+  byKind: Record<string, { pending: number }>;
+  /** Средняя длительность задачи по видам (по завершённым за последние 15 минут). */
+  speed: Record<string, { avgSec: number; perMin: number } | undefined>;
+  /** Остаток в секундах: total — максимум по видам (они идут одновременно). */
+  etaSec: { photo: number | null; video: number | null; pdf: number | null; total: number | null };
+  parallelism: { photo: number; heavy: number };
+  /** Задачи в работе прямо сейчас: фото могут идти параллельно, поэтому это список. */
+  processing: Array<{ id: string; kind: string; progress: number; startedSecAgo: number; entryId: string | null; name: string | null }>;
+  /** Настоящие ошибки (без отменённых вручную) — число для кнопки. */
+  errors: { total: number };
 }
 export const queueStatus = () => request<QueueStatus>('/queue/status');
 /** Пересобрать превью упавшего файла: задача конвертации ставится в очередь заново. */
@@ -515,6 +525,21 @@ export const setQueuePaused = (paused: boolean) =>
 /** Очистить очередь: отменить все ожидающие задачи и остановить текущую. */
 export const cancelQueue = () =>
   request<{ cancelled: number }>('/queue/cancel', { method: 'POST', body: JSON.stringify({}) });
+/** Ошибки конвертации: постранично, с именем файла. Отменённые — только по флагу. */
+export interface QueueErrorRow {
+  id: string; kind: string; error: string; attempts: number; finishedAt: string | null;
+  entryId: string | null; name: string | null;
+}
+export const queueErrors = (opts: { limit?: number; offset?: number; includeCancelled?: boolean } = {}) => {
+  const q = new URLSearchParams();
+  q.set('limit', String(opts.limit ?? 50));
+  q.set('offset', String(opts.offset ?? 0));
+  if (opts.includeCancelled) q.set('include', 'cancelled');
+  return request<{ total: number; items: QueueErrorRow[] }>(`/queue/errors?${q}`);
+};
+/** Вернуть в очередь все настоящие ошибки (отменённые не трогаем). */
+export const retryQueueErrors = () =>
+  request<{ retried: number; skipped: number }>('/queue/errors/retry', { method: 'POST', body: JSON.stringify({}) });
 export const timeline = () => request<TimelineItem[]>('/timeline');
 export const trips = () => request<Trip[]>('/trips');
 export const listAlbums = () => request<AlbumInfo[]>('/albums');
