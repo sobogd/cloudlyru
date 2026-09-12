@@ -27,6 +27,12 @@ const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальн
  * AV1-энкод забирает все ядра, и второй такой процесс лишь замедлил бы оба.
  */
 const PHOTO_PARALLEL = Math.min(Math.max(Number(env.CONVERT_PHOTO_PARALLEL ?? 1) || 1, 1), 8);
+/**
+ * Пускать видео параллельно с фото. По умолчанию нет, и вот почему: AV1-энкод занимает все
+ * ядра, и фото рядом с ним идут в разы медленнее (замер на проде: 3,4 с против 19,4 с).
+ * Флаг имеет смысл на машине с большим числом ядер, где фото-слоты не съедают всё.
+ */
+const VIDEO_ALONGSIDE_PHOTOS = (env.CONVERT_VIDEO_ALONGSIDE_PHOTOS ?? 'false') === 'true';
 const MAX_ATTEMPTS = 3;
 /** Задержка перед повтором временно упавшей задачи (умножается на номер попытки). */
 const RETRY_BASE_DELAY_MS = 30_000;
@@ -80,6 +86,12 @@ interface JobRow {
   mime: string;
 }
 
+/**
+ * Группы задач в очереди. Фото и PDF дешёвые (секунды-минуты), видео — часы AV1 на все ядра,
+ * поэтому у него отдельное правило: оно не идёт, пока в очереди есть фото.
+ */
+type JobGroup = 'photo' | 'pdf' | 'video';
+
 @Injectable()
 export class QueueService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('Queue');
@@ -92,7 +104,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
    * одиночных полей: при параллельных фото в ней живёт несколько задач, и отмена
    * (удаление файла, очистка очереди) должна убивать процесс именно своей задачи.
    */
-  private readonly active = new Map<string, { assetId: string; group: 'photo' | 'heavy'; child: import('child_process').ChildProcess | null }>();
+  private readonly active = new Map<string, { assetId: string; group: JobGroup; child: import('child_process').ChildProcess | null }>();
+  /** Короткий кэш числа ожидающих фото: по нему решается, брать ли видео. */
+  private photoPendingCache: { at: number; value: number } | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -335,10 +349,16 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         if (!job) break;
         void this.process(job).catch((e) => this.logger.error(`process ${job.id}: ${(e as Error).message}`));
       }
-      // Тяжёлое (видео, PDF) — только по одному: оно и так занимает все ядра.
-      if (this.countActive('heavy') === 0) {
-        const heavy = await this.next('heavy');
-        if (heavy) void this.process(heavy).catch((e) => this.logger.error(`process ${heavy.id}: ${(e as Error).message}`));
+      // PDF — короткие задачи (постраничный рендер), один слот, идут вместе с фото.
+      if (this.countActive('pdf') === 0) {
+        const pdf = await this.next('pdf');
+        if (pdf) void this.process(pdf).catch((e) => this.logger.error(`process ${pdf.id}: ${(e as Error).message}`));
+      }
+      // Видео — отдельное правило: AV1-энкод занимает все ядра, поэтому оно стартует только
+      // когда фото-очередь разобрана. Иначе одно длинное видео растягивает превью всех фото.
+      if (this.countActive('video') === 0 && (VIDEO_ALONGSIDE_PHOTOS || (await this.pendingPhotos()) === 0)) {
+        const video = await this.next('video');
+        if (video) void this.process(video).catch((e) => this.logger.error(`process ${video.id}: ${(e as Error).message}`));
       }
     } catch (e) {
       this.logger.error(`tick: ${(e as Error).message}`);
@@ -348,15 +368,23 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Сколько задач идёт одновременно: нужно API, чтобы честно считать остаток по времени. */
-  get parallelism(): { photo: number; heavy: number } {
-    return { photo: PHOTO_PARALLEL, heavy: 1 };
+  get parallelism(): { photo: number; pdf: number; video: number } {
+    return { photo: PHOTO_PARALLEL, pdf: 1, video: 1 };
   }
 
   /** Сколько задач группы сейчас в работе — по этому числу считаются свободные слоты. */
-  private countActive(group: 'photo' | 'heavy'): number {
+  private countActive(group: JobGroup): number {
     let n = 0;
     for (const a of this.active.values()) if (a.group === group) n++;
     return n;
+  }
+
+  /** Сколько фото ещё ждёт в очереди: пока хоть одно — видео не берём. Кэш на 5 секунд. */
+  private async pendingPhotos(): Promise<number> {
+    if (this.photoPendingCache && Date.now() - this.photoPendingCache.at < 5000) return this.photoPendingCache.value;
+    const value = await this.prisma.job.count({ where: { state: 'pending', kind: 'photo' } }).catch(() => 0);
+    this.photoPendingCache = { at: Date.now(), value };
+    return value;
   }
 
   /** Процесс конкретной задачи (ffmpeg/pdftoppm/heif-convert) — чтобы отмена убивала нужный. */
@@ -376,7 +404,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return killed;
   }
 
-  private async next(group: 'photo' | 'heavy'): Promise<JobRow | null> {
+  private async next(group: JobGroup): Promise<JobRow | null> {
     return this.prisma.$transaction(async (tx) => {
       const now = Date.now();
       // отложенные повторы пропускаем: пока их пауза не вышла, берём следующую задачу
@@ -389,7 +417,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       // длинное видео держало бы превью всех фото, залитых после него, — а их ждёт телефон.
       const baseWhere = { state: 'pending', ...(delayed.length ? { id: { notIn: delayed } } : {}) };
       const row = await tx.job.findFirst({
-        where: group === 'photo' ? { ...baseWhere, kind: 'photo' } : { ...baseWhere, kind: { not: 'photo' } },
+        where: { ...baseWhere, kind: group },
         orderBy: { createdAt: 'asc' },
         include: { asset: true },
       });
@@ -406,7 +434,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async process(job: JobRow) {
-    this.active.set(job.id, { assetId: job.assetId, group: job.kind === 'photo' ? 'photo' : 'heavy', child: null });
+    const group: JobGroup = job.kind === 'photo' ? 'photo' : job.kind === 'pdf' ? 'pdf' : 'video';
+    this.active.set(job.id, { assetId: job.assetId, group, child: null });
     const dir = join(tmpdir(), `clq-${job.id}`);
     mkdirSync(dir, { recursive: true });
     const rawPath = join(dir, 'raw');
