@@ -599,6 +599,7 @@ function mediaRows(raw: Record<string, unknown> | null): Array<[string, string]>
 function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }) {
   const [meta, setMeta] = useState<api.FileMeta | null>(null);
   const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
   const [job, setJob] = useState<api.UnzipJob | null>(null);
   const isZip = !!meta && (meta.mime === 'application/zip' || /\.zip$/i.test(meta.name));
   const busy = job?.state === 'pending' || job?.state === 'processing';
@@ -663,6 +664,16 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
         : 'Вырезано. Откройте нужную папку и нажмите 📥 в её шапке.');
     } catch (e) { alert((e as Error).message); }
   };
+  // Переименование: имя проверяет сервер (255 байт, без «/», конфликт с тёзкой — 409)
+  const rename = async () => {
+    const next = prompt('Новое имя файла', meta?.name ?? '');
+    if (!next || next === meta?.name) return;
+    try {
+      await api.renameFile(entryId, next);
+      setMeta((m) => (m ? { ...m, name: next } : m));
+      setNotice('Имя изменено');
+    } catch (e) { setErr((e as Error).message); }
+  };
 
   return (
     <div>
@@ -671,6 +682,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
         <span style={{ flex: 1 }} />
         {meta && (
           <>
+            <button className="iconbtn" title="Переименовать" onClick={rename}>✏️</button>
             <button className="iconbtn" title="Копировать в другую папку" onClick={() => toClipboard('copy')}>📋</button>
             <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={() => toClipboard('cut')}>✂️</button>
           </>
@@ -695,6 +707,7 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
+      {notice && <div className="notice" style={{ margin: '10px 2px' }}>{notice}</div>}
       {job && (
         <div className="panel" style={{ margin: '10px 2px' }}>
           <div className="row">
@@ -885,6 +898,7 @@ function PdfPreview({ meta }: { meta: api.FileMeta }) {
 function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBack: () => void; onDeleted: () => void }) {
   const [meta, setMeta] = useState<api.FolderMeta | null>(null);
   const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
   useEffect(() => {
     api.folderMeta(folderId).then(setMeta).catch((e) => setErr((e as Error).message));
   }, [folderId]);
@@ -907,12 +921,23 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
       alert('Папка вырезана. Откройте нужную папку и нажмите 📥 в её шапке.');
     } catch (e) { alert((e as Error).message); }
   };
+  // Переименование: корень и зарезервированное имя сервер не даст переименовать (400/409)
+  const rename = async () => {
+    const next = prompt('Новое имя папки', meta?.name ?? '');
+    if (!next || next === meta?.name) return;
+    try {
+      await api.renameFolder(folderId, next);
+      setMeta((m) => (m ? { ...m, name: next } : m));
+      setNotice('Имя изменено');
+    } catch (e) { setErr((e as Error).message); }
+  };
 
   return (
     <div>
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
         <span style={{ flex: 1 }} />
+        <button className="iconbtn" title="Переименовать" onClick={rename}>✏️</button>
         <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={cutFolder}>✂️</button>
         <button
           className="iconbtn"
@@ -927,6 +952,7 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
+      {notice && <div className="notice" style={{ margin: '10px 2px' }}>{notice}</div>}
       {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
       {meta && (
         <div className="detbody">

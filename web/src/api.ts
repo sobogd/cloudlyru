@@ -50,6 +50,9 @@ export const mkdir = (name: string, parentId?: string) =>
   request<{ id: string }>('/folders', { method: 'POST', body: JSON.stringify({ name, ...(parentId ? { parentId } : {}) }) });
 export const renameFolder = (id: string, name: string) =>
   request<unknown>(`/folders/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+/** Переименование файла: сервер проверит имя (255 байт, без «/») и конфликт с тёзкой (409). */
+export const renameFile = (id: string, name: string) =>
+  request<unknown>(`/files/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
 export const deleteFolder = (id: string) => request<{ ok: boolean }>(`/folders/${id}`, { method: 'DELETE' });
 /** «Держать офлайн»: телефон обязан хранить содержимое и не вытеснять его ради места. */
 export const setFolderKeepOffline = (id: string, keepOffline: boolean) =>
