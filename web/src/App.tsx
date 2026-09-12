@@ -1511,6 +1511,17 @@ function QueuePanel() {
     } catch (e) { setErr((e as Error).message); }
   };
 
+  // Отмена, в отличие от паузы, жёсткая: текущая задача обрывается. Уже собранные
+  // превью не трогаются — отменённое возвращается кнопкой пересбора.
+  const cancelAll = async () => {
+    if (!confirm('Отменить все задачи очереди? Текущая конвертация прервётся, собранные превью останутся.')) return;
+    try {
+      const r = await api.cancelQueue();
+      setNotice(`Отменено задач: ${r.cancelled}`);
+      await load();
+    } catch (e) { setErr((e as Error).message); }
+  };
+
   return (
     <div className="panel">
       <div className="row">
@@ -1519,6 +1530,11 @@ function QueuePanel() {
         <button className={q?.paused ? 'btn' : 'btn ghost'} disabled={!q} onClick={togglePause}>
           {q?.paused ? '▶️ Продолжить' : '⏸ Пауза'}
         </button>
+        <button
+          className="btn ghost"
+          disabled={!q || !(by.pending || by.processing)}
+          onClick={cancelAll}
+        >✕ Отменить все</button>
         <button className="btn" disabled={busy || !left} onClick={rebuild}>
           {busy ? '…' : left ? `⟳ Пересобрать там, где нет (${left})` : '⟳ Всё собрано'}
         </button>
@@ -1548,7 +1564,9 @@ function QueuePanel() {
               <span className="fname" style={{ whiteSpace: 'normal' }}>
                 {j.sha256}… — {JOB_STATE[j.state] ?? j.state}
                 {j.state === 'failed' && j.error && (
-                  <div className="err" style={{ fontWeight: 400 }}>{j.error}</div>
+                  <div className="err" style={{ fontWeight: 400 }}>
+                    {j.error.startsWith('cancelled') ? 'отменено' : j.error}
+                  </div>
                 )}
               </span>
               <span className="meta">{new Date(j.updatedAt).toLocaleString()}</span>

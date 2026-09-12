@@ -191,9 +191,37 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Очистить очередь: отменить всё, что ждёт и что сейчас считается. Отмена жёсткая —
+   * в этом её отличие от паузы: активный процесс (ffmpeg/pdftoppm) убивается, иначе
+   * очередь не опустеет никогда. Уже собранные производные остаются на месте, так что
+   * отменённое можно пересобрать кнопкой пересбора, а не с нуля.
+   */
+  async cancelAll(tree: string[]): Promise<number> {
+    const jobs = await this.prisma.job.findMany({
+      where: {
+        state: { in: ['pending', 'processing'] },
+        asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
+      },
+      select: { id: true },
+    });
+    if (!jobs.length) return 0;
+    const ids = jobs.map((j) => j.id);
+    await this.prisma.job.updateMany({
+      where: { id: { in: ids } },
+      data: { state: 'failed', error: 'cancelled: очередь очищена', finishedAt: new Date() },
+    });
+    // Убиваем только свою активную задачу: чужие процессы отменять не наше дело.
+    if (this.activeJob && ids.includes(this.activeJob.id) && this.activeChild) {
+      this.logger.warn(`очистка очереди: убиваю активную задачу ${this.activeJob.id}`);
+      try { this.activeChild.kill('SIGKILL'); } catch { /* ignore */ }
+    }
+    this.logger.log(`очередь очищена: отменено задач ${ids.length}`);
+    return ids.length;
+  }
+
   /** Вернуть в очередь отменённые задачи (файл восстановлен из корзины). */
-  async requeueForAssets(assetIds: string[]): Promise<void> {
-    if (!assetIds.length) return;
+  async requeueForAssets(assetIds: string[]): Promise<void> {    if (!assetIds.length) return;
     const rows = await this.prisma.job.findMany({
       where: { assetId: { in: assetIds }, state: 'failed', error: { contains: 'cancelled' } },
       select: { id: true, asset: { select: { sha256: true } } },
@@ -565,10 +593,18 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const batch = missing.slice(0, PDF_PAGES_PER_JOB);
 
     let rendered = 0;
+    let cancelled = false;
     for (const page of batch) {
       // Пауза посреди длинного PDF: досчитывать десятки страниц, пока просили остановиться,
       // ни к чему — остаток доедет следующей задачей после снятия паузы.
       if (await this.isPaused()) break;
+      // Очистку очереди видно только по состоянию задачи: активный pdftoppm уже убит,
+      // а между страницами процесса нет — иначе досчитали бы весь батч «в отменённом» виде.
+      const row = await this.prisma.job.findUnique({ where: { id: job.id }, select: { state: true } }).catch(() => null);
+      if (row?.state !== 'processing') {
+        cancelled = true;
+        break;
+      }
       const png = join(tmpdir(), `clq-${job.id}-p${page}.png`);
       try {
         // -scale-to-x/-scale-to-y -1: ширина ровно PDF_PAGE_WIDTH, высота по пропорциям
@@ -596,8 +632,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // деталка показала бы число страниц и битые картинки вместо «превью готовится».
     if (existing.size + rendered > 0) await this.finishPdf(job, total);
     // Остались страницы (упёрлись в лимит задачи или встали на паузу) — дорисуем следующей
-    // задачей: готовые страницы она пропустит по списку ключей.
-    if (missing.length > rendered) {
+    // задачей: готовые страницы она пропустит по списку ключей. После отмены очереди
+    // следующую задачу не ставим — иначе отменённое воскресло бы само.
+    if (!cancelled && missing.length > rendered) {
       await this.prisma.job.create({ data: { assetId: job.assetId, kind: 'pdf', state: 'pending' } }).catch(() => undefined);
       this.logger.log(`△ pdf ${sha.slice(0, 8)}: отрисовано ${rendered} из ${missing.length} оставшихся страниц`);
     }

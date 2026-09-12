@@ -493,6 +493,9 @@ export const missingPreviews = () => request<MissingPreviews>('/queue/missing');
 /** Пауза конвертации (мягкая: текущая задача докачивается, новые не берутся). */
 export const setQueuePaused = (paused: boolean) =>
   request<{ paused: boolean }>('/queue/pause', { method: 'POST', body: JSON.stringify({ paused }) });
+/** Очистить очередь: отменить все ожидающие задачи и остановить текущую. */
+export const cancelQueue = () =>
+  request<{ cancelled: number }>('/queue/cancel', { method: 'POST', body: JSON.stringify({}) });
 export const timeline = () => request<TimelineItem[]>('/timeline');
 export const trips = () => request<Trip[]>('/trips');
 export const listAlbums = () => request<AlbumInfo[]>('/albums');
