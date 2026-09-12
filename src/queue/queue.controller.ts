@@ -133,27 +133,34 @@ export class QueueController {
   }
 
   /**
-   * Средняя длительность задачи по видам за последние 15 минут. Считается по завершённым
-   * задачам, поэтому честно работает и для фото (секунды), и для видео (часы AV1).
-   * Результат кэшируется на 10 секунд: статус спрашивают каждые пару секунд.
+   * Средняя длительность задачи по видам. Окно у видов разное, и это важно: фото считаются
+   * секунды, поэтому за 15 минут данных достаточно; видео идёт часами, и в короткое окно
+   * его задачи просто не попадают — по нему смотрим сутки. Результат кэшируется на 10 секунд:
+   * статус спрашивают каждые пару секунд.
    */
   private speedCache: { at: number; value: Record<string, { avgSec: number; perMin: number }> } | null = null;
 
   private async speedByKind(tree: string[]): Promise<Record<string, { avgSec: number; perMin: number }>> {
     if (this.speedCache && Date.now() - this.speedCache.at < 10_000) return this.speedCache.value;
-    const rows = await this.prisma.job.findMany({
-      where: {
-        state: 'done',
-        finishedAt: { gt: new Date(Date.now() - 15 * 60 * 1000) },
-        startedAt: { not: null },
-        asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
-      },
-      orderBy: { finishedAt: 'desc' },
-      take: 500,
-      select: { kind: true, startedAt: true, finishedAt: true },
-    });
+    const mine = { entries: { some: { folderId: { in: tree }, deletedAt: null } } };
+    const since = (ms: number) => new Date(Date.now() - ms);
+    const [fast, slow] = await Promise.all([
+      this.prisma.job.findMany({
+        where: { state: 'done', startedAt: { not: null }, finishedAt: { gt: since(15 * 60 * 1000) }, kind: { in: ['photo', 'pdf'] }, asset: mine },
+        orderBy: { finishedAt: 'desc' },
+        take: 500,
+        select: { kind: true, startedAt: true, finishedAt: true },
+      }),
+      this.prisma.job.findMany({
+        where: { state: 'done', startedAt: { not: null }, finishedAt: { gt: since(24 * 60 * 60 * 1000) }, kind: 'video', asset: mine },
+        orderBy: { finishedAt: 'desc' },
+        take: 200,
+        select: { kind: true, startedAt: true, finishedAt: true },
+      }),
+    ]);
+    const windowMin: Record<string, number> = { photo: 15, pdf: 15, video: 24 * 60 };
     const acc: Record<string, { n: number; sec: number }> = {};
-    for (const r of rows) {
+    for (const r of [...fast, ...slow]) {
       if (!r.startedAt || !r.finishedAt) continue;
       const sec = (r.finishedAt.getTime() - r.startedAt.getTime()) / 1000;
       if (!Number.isFinite(sec) || sec < 0) continue;
@@ -162,11 +169,12 @@ export class QueueController {
       a.sec += sec;
     }
     const value: Record<string, { avgSec: number; perMin: number }> = {};
-    // окно 15 минут: сколько задач в минуту получается при текущей скорости
-    const windowMin = 15;
     for (const [kind, a] of Object.entries(acc)) {
       if (!a.n) continue;
-      value[kind] = { avgSec: Math.round((a.sec / a.n) * 10) / 10, perMin: Math.round((a.n / windowMin) * 10) / 10 };
+      value[kind] = {
+        avgSec: Math.round((a.sec / a.n) * 10) / 10,
+        perMin: Math.round((a.n / (windowMin[kind] ?? 15)) * 10) / 10,
+      };
     }
     this.speedCache = { at: Date.now(), value };
     return value;
