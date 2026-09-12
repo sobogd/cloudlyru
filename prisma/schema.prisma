@@ -121,13 +121,18 @@ model Asset {
   mime          String
   ext           String?
   createdAt     DateTime    @default(now())
-  masterReadyAt DateTime?
-  masterMime    String?
+  // Состояние превью: 'none' — ещё нет (задача ждёт, упала или её ещё не ставили),
+  // 'done' — собраны, 'impossible' — собрать нельзя (причина в previewError).
+  // Превью строятся из содержимого, поэтому состояние живёт на ассете, а не на записи в дереве.
+  previewState  String      @default("none")
+  previewError  String?
   // Число страниц PDF: по нему перечисляются превью страниц при удалении файла.
   pageCount     Int?
   entries       FileEntry[]
   media         MediaMeta?
   jobs          Job[]
+
+  @@index([previewState])
 }
 
 // Активная загрузка файла: multipart-сессия в S3. Принятые части (partNumber + ETag)
@@ -287,16 +292,17 @@ model ChangeLog {
   @@index([at])
 }
 
-// ===== M2.5: очередь конвертации (оригинал -> AVIF/AV1 + производные) =====
+// ===== Очередь конвертации (оригинал → превью) =====
+// Строка = одна задача на ассет: создаётся сигналом (загрузка в «Фото», пересчёт), живёт до
+// успеха (тогда удаляется) или до ошибки (остаётся, чтобы её можно было повторить).
 
 model Job {
   id         String    @id @default(uuid())
   assetId    String
   kind       String // 'photo' | 'video' | 'pdf'
-  state      String    @default("pending") // pending|processing|done|failed
+  state      String    @default("pending") // pending | processing | failed
   error      String?
   attempts   Int       @default(0)
-  progress   Int       @default(0)
   createdAt  DateTime  @default(now())
   startedAt  DateTime?
   finishedAt DateTime?

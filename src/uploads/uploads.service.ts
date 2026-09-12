@@ -364,12 +364,12 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     if (declared) {
       const asset = await this.prisma.asset.findUnique({ where: { sha256: declared } });
       if (asset && Number(asset.size) === size && (await this.auth.ownsAsset(userId, asset.id))) {
-        // Дедуп годится, только если содержимое реально можно отдать: либо оригинал на месте,
-        // либо это легаси-ассет, у которого старый пайплайн удалил оригинал, но превью собраны.
-        // Иначе получилась бы запись, которую нечем показать и нечем пересобрать — такой файл
-        // лучше залить байтами заново (дедуп никуда не девается, просто не в этом случае).
+        // Дедуп годится, только если содержимое реально можно отдать: оригинал на месте или
+        // превью уже собраны (состояние лежит на ассете). Иначе получилась бы запись, которую
+        // нечем показать и нечем пересобрать — такой файл лучше залить байтами заново
+        // (дедуп никуда не девается, просто не в этом случае).
         const rawAlive = await this.s3.headObject(S3Service.assetKey(declared)).catch(() => false);
-        if (rawAlive || (await this.queue.previewsAlive(mime, declared))) {
+        if (rawAlive || asset.previewState === 'done') {
           const done = await this.finish({
             userId,
             folderId,

@@ -53,7 +53,7 @@ const s3 = {
   abortMultipartUpload: async () => {},
 };
 const media = { captureMeta: async () => {}, extractDetail: async () => {}, captureAny: async () => {} };
-const queue = { enqueue: async () => {}, cancelForAssets: async () => {}, requeueForAssets: async () => {}, previewsAlive: async () => false };
+const queue = { enqueue: async () => {} };
 
 const audit = new AuditService(prisma);
 const auth = new AuthService(prisma, audit);

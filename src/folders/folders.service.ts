@@ -384,7 +384,6 @@ export class FoldersService {
       // одно событие на корень поддерева: «папка удалена» означает «всего её содержимого нет»
       await this.changes.recordFolderTreeDeleted(userId, id, tx);
     });
-    await this.cancelAssetsIn(ids);
     return { ok: true, affected: ids.length };
   }
 
@@ -459,7 +458,6 @@ export class FoldersService {
         }
       }
     }, { timeout: 120_000, maxWait: 15_000 });
-    await this.requeueAssetsIn(ids);
     return { ok: true, affected: ids.length };
   }
 
@@ -483,26 +481,12 @@ export class FoldersService {
   }
 
 
-  /** assetId'ы файлов внутри папок (для отмены/возврата конвертации). */
-  private async assetsIn(folderIds: string[]): Promise<string[]> {
-    const rows = await this.prisma.fileEntry.findMany({ where: { folderId: { in: folderIds } }, select: { assetId: true } });
-    return [...new Set(rows.map((r) => r.assetId))];
-  }
-  private async cancelAssetsIn(folderIds: string[]): Promise<void> {
-    const assetIds = await this.assetsIn(folderIds);
-    if (assetIds.length) await this.queue.cancelForAssets(assetIds);
-  }
-  private async requeueAssetsIn(folderIds: string[]): Promise<void> {
-    const assetIds = await this.assetsIn(folderIds);
-    if (assetIds.length) await this.queue.requeueForAssets(assetIds);
-  }
-
   /** Папки переехали в медиа-зону: ставим на обработку их ещё не конвертированные фото/видео (best-effort). */
   private async reprocessAsMedia(folderIds: string[]) {
     try {
       const assets = await this.prisma.asset.findMany({
         where: {
-          masterReadyAt: null,
+          previewState: 'none',
           entries: { some: { folderId: { in: folderIds }, deletedAt: null, zone: ZONE_PHOTOS } },
         },
         select: { id: true, sha256: true, mime: true, size: true },

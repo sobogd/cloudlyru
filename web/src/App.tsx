@@ -726,7 +726,6 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
           <MetaRow k="Размер" v={fmt(meta.size)} />
           <MetaRow k="Расположение" v={meta.path} />
           <MetaRow k="Создан" v={new Date(meta.createdAt).toLocaleString()} />
-          {meta.masterMime && <MetaRow k="Оптимизирован" v={meta.masterMime} />}
           {/* Главное из метаданных — всегда на виду, а не только когда полного дампа нет:
               дата съёмки, камера, кадр и координаты нужны сразу, а остальные теги лежат
               ниже в свёрнутом «Все теги из файла» (он длинный и не должен отодвигать превью). */}
@@ -1002,17 +1001,19 @@ function sortTimeline<T extends { capturedAt: string | null; entryId: string }>(
 }
 
 /** Статус сборки превью: приходит ручкой /timeline/status, а не внутри самой ленты. */
-type PreviewStatus = { masterReady: boolean; jobState: string | null; jobError: string | null };
+type PreviewStatus = { previewState: string; previewError: string | null; jobState: string | null; jobError: string | null };
 
 /** Готов ли снимок к показу и что с задачей сборки: ответ статусов уточняет данные ленты. */
 function previewState(item: api.TimelineItem, status?: PreviewStatus) {
-  const ready = item.masterReady || Boolean(status?.masterReady);
+  const state = status?.previewState ?? item.previewState;
+  const ready = state === 'done';
   const jobState = status?.jobState ?? null;
-  const jobError = status?.jobError ?? null;
-  // Превью не появится само: задача упала или её вообще нет (формат не конвертируется —
-  // например RAW камер, или задачу сняли). Это не «подожди», а «смотреть нечего».
-  const hopeless = !ready && status !== undefined && (jobState === null || jobState === 'failed');
-  return { ready, jobState, jobError, failed: jobState === 'failed', hopeless };
+  // Причина известна серверу: «собрать нельзя» — это состояние ассета, а не догадка клиента
+  // по отсутствию задачи (раньше «превью не будет» выводилось из jobState === null).
+  const jobError = status?.jobError ?? (state === 'impossible' ? status?.previewError ?? null : null);
+  const impossible = state === 'impossible';
+  const hopeless = !ready && (impossible || jobState === 'failed');
+  return { ready, jobState, jobError, failed: jobState === 'failed', impossible, hopeless };
 }
 
 /**
@@ -1069,8 +1070,8 @@ const PhotoCell = memo(function PhotoCell({
     );
   }
 
-  // Идёт сборка — плейсхолдер со спиннером; задача упала — причина и две кнопки; задачи нет
-  // вовсе (RAW, снятая задача) — «превью не будет», чтобы спиннер не висел вечно.
+  // Идёт сборка — плейсхолдер со спиннером; задача упала или превью собрать нельзя (нет
+  // оригинала, слишком большой файл, формат) — причина и две кнопки, чтобы спиннер не висел вечно.
   const showError = failed || hopeless;
   return (
     <div
@@ -1260,7 +1261,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     () =>
       items
         .filter((it) => {
-          if (it.masterReady) return false;
+          if (it.previewState === 'done') return false;
           const st = statuses.get(it.entryId);
           if (!st) return true;
           return st.jobState === 'pending' || st.jobState === 'processing';
@@ -1295,7 +1296,12 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
         setStatuses((prev) => {
           const next = new Map(prev);
           for (const row of rows) {
-            next.set(row.entryId, { masterReady: row.masterReady, jobState: row.jobState, jobError: row.jobError });
+            next.set(row.entryId, {
+              previewState: row.previewState,
+              previewError: row.previewError,
+              jobState: row.jobState,
+              jobError: row.jobError,
+            });
           }
           return next;
         });
@@ -1382,7 +1388,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   // ===== Экран просмотра =====
   if (current) {
     const it = current;
-    const { ready, failed, hopeless, jobError } = previewState(it, statuses.get(it.entryId));
+    const { ready, failed, hopeless, impossible, jobError } = previewState(it, statuses.get(it.entryId));
     // полноценная деталка: те же метаданные и кнопки, что в «Файлах»
     if (detailId) {
       return <FileDetail entryId={detailId} onBack={() => setDetailId(null)} onDeleted={forgetEntry} />;
@@ -1412,9 +1418,12 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                   </div>
                 </>
               ) : hopeless ? (
-                // Задачи сборки нет: формат не конвертируется (RAW камер) или задачу сняли.
+                // Собрать нельзя: сервер знает причину (нет оригинала, слишком большой файл,
+                // формат не конвертируется) и отдаёт её в previewError.
                 <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
-                  <div className="copy">Превью для этого файла нет — формат не конвертируется или задача была снята</div>
+                  <div className="copy">
+                    {impossible && jobError ? `Превью не собрать: ${jobError}` : 'Превью для этого файла собрать нельзя'}
+                  </div>
                   <div className="row" style={{ justifyContent: 'center' }}>
                     <button className="btn ghost" onClick={() => void retryPreview(it.entryId)}>⟳ Поставить задачу</button>
                     <a className="btn ghost" href={api.fileUrl(it.entryId)} download>⬇️ Скачать оригинал</a>
@@ -1876,64 +1885,34 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
   );
 }
 
-// ================= Очередь конвертации (превью фото/видео/PDF) =================
+// ================= Очередь превью =================
 
 const JOB_KIND: Record<string, string> = { photo: '🖼️ фото', video: '🎬 видео', pdf: '📄 PDF' };
 
-/** «3 ч 20 мин», «2 сут 4 ч» — остаток времени читается лучше, чем секунды. */
-function humanLeft(sec: number | null | undefined): string {
-  if (sec == null) return '—';
-  if (sec < 60) return `${Math.max(1, Math.round(sec))} с`;
-  const m = Math.round(sec / 60);
-  if (m < 60) return `${m} мин`;
-  const h = Math.floor(m / 60);
-  if (h < 48) return `${h} ч ${String(m % 60).padStart(2, '0')} мин`;
-  return `${Math.floor(h / 24)} сут ${h % 24} ч`;
-}
-
-/** «3,4 с» — средняя длительность одной задачи. */
-function humanTaskSec(sec: number): string {
-  return sec < 60 ? `${sec.toFixed(1).replace('.', ',')} с` : humanLeft(sec);
-}
-
-const QUEUE_KINDS = ['photo', 'video', 'pdf'] as const;
-
 /**
- * Экран очереди: только цифры. Список файлов убран намеренно — задачи идут десятками тысяч,
- * и по префиксу sha из него всё равно ничего не понять. Что упало — на отдельной странице
- * ошибок.
+ * Очередь превью: сколько осталось, пауза и пересчёт. Больше на этом экране ничего нет —
+ * прогресс, скорости и остаток времени убраны: очередь либо разбирается, либо стоит.
+ * Упавшие задачи живут на отдельной странице (иначе их нечем повторить).
  */
 function QueuePanel({ onErrors }: { onErrors: () => void }) {
   const [q, setQ] = useState<api.QueueStatus | null>(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
-  const [updatedAt, setUpdatedAt] = useState(0);
 
   const load = async () => {
     try {
-      const s = await api.queueStatus();
-      setQ(s);
-      setUpdatedAt(Date.now());
+      setQ(await api.queueStatus());
+      setErr('');
     } catch (e) { setErr((e as Error).message); }
   };
-  // Цифры должны быть живыми: пока что-то идёт — раз в 2 с, на простое — раз в 10 с.
-  const working = Boolean(q?.counts.processing);
+  // Пока очередь разбирается — раз в 2 с, на простое — раз в 10 с.
+  const working = Boolean(q?.processing);
   useEffect(() => {
     void load();
     const t = setInterval(() => { void load(); }, working ? 2000 : 10000);
     return () => clearInterval(t);
   }, [working]);
-
-  const rebuild = async () => {
-    setBusy(true);
-    setNotice('');
-    try {
-      const r = await api.rebuildPreviews();
-      setNotice(`Задачи поставлены: ${r.queued}${r.skipped ? `, пропущено ${r.skipped} (нет оригинала)` : ''}`);
-      await load();
-    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
-  };
 
   // Пауза мягкая: новые задачи не берутся, текущая докачивается (для видео это важно —
   // прерванный AV1-энкод означает часы работы заново), PDF встаёт между страницами.
@@ -1941,29 +1920,23 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
     try { await api.setQueuePaused(!q?.paused); await load(); } catch (e) { setErr((e as Error).message); }
   };
 
-  // Очистка, в отличие от паузы, жёсткая: текущая задача обрывается. Собранные превью
-  // остаются, а отменённое возвращается кнопкой «дособрать».
-  const cancelAll = async () => {
-    if (!confirm('Очистить очередь?\n\nОтличия от паузы: пауза просто перестаёт брать новые задачи и даёт текущей закончиться, а очистка обрывает её сейчас же, а все ожидающие задачи помечаются отменёнными.\n\nСобранные превью останутся, отменённые файлы вернёт кнопка «Дособрать превью».')) return;
+  // Пересчёт: найти файлы без превью и поставить им задачи. Ходит только по БД, ничего
+  // не пересобирает заново, повторное нажатие не создаёт вторых задач.
+  const rebuild = async () => {
+    setBusy(true);
+    setNotice('');
     try {
-      const r = await api.cancelQueue();
-      setNotice(`Очередь очищена: отменено задач ${r.cancelled}. Вернуть их — кнопкой «Дособрать превью».`);
+      const r = await api.rebuildPreviews();
+      setNotice(
+        r.queued
+          ? `Поставлено задач: ${r.queued.toLocaleString('ru-RU')}${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}`
+          : `Новых задач нет — всё, что можно собрать, уже в очереди${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}`,
+      );
       await load();
-    } catch (e) { setErr((e as Error).message); }
+    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
   };
 
-  const counts = q?.counts;
-  const p = q?.progress;
-  const pct = p && p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
-  const missing = p ? p.total - p.done : 0;
-  // Сколько из «без превью» ещё не поставлено в очередь: кнопка должна показывать именно
-  // остаток работы, а не общее число файлов без превью (иначе кажется, что пересбор ничего не делает).
-  const queued = (counts?.pending ?? 0) + (counts?.processing ?? 0);
-  const toQueue = Math.max(0, missing - queued);
-  // В шапке — остаток текущей фазы: видео идёт только после фото, и суммарные 59 суток
-  // (вместе с ещё не начавшимся видео) только пугали бы.
-  const left = q?.etaSec.phase ?? null;
-  const ago = updatedAt ? Math.max(0, Math.round((Date.now() - updatedAt) / 1000)) : null;
+  const remaining = q?.remaining ?? 0;
 
   return (
     <div className="panel">
@@ -1973,11 +1946,8 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
         <button className={q?.paused ? 'btn' : 'btn ghost'} disabled={!q} onClick={togglePause} title="Пауза мягкая: текущая задача докачивается, новые не берутся">
           {q?.paused ? '▶️ Продолжить' : '⏸ Пауза'}
         </button>
-        <button className="btn ghost" disabled={!q || !(counts?.pending || counts?.processing)} onClick={cancelAll} title="Очистка жёсткая: текущая задача обрывается, ожидающие помечаются отменёнными">
-          ✕ Очистить очередь
-        </button>
-        <button className="btn ghost" disabled={!q} onClick={() => void load()} title="Перечитать цифры сейчас, не меняя ничего">
-          ⟳ Обновить
+        <button className="btn ghost" disabled={busy || !q} onClick={rebuild} title="Найти файлы без превью и поставить им задачи">
+          {busy ? '…' : '⟳ Пересчитать'}
         </button>
       </div>
       {err && <div className="err">{err}</div>}
@@ -1986,56 +1956,17 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
       {q && (
         <>
           <div className="row" style={{ alignItems: 'baseline' }}>
-            <span className="fname">{p?.done.toLocaleString('ru-RU')} из {p?.total.toLocaleString('ru-RU')}</span>
-            <span className="meta">{pct}%{left != null ? ` · осталось ≈ ${humanLeft(left)}` : ''}</span>
+            <span className="fname">Осталось: {remaining.toLocaleString('ru-RU')}</span>
+            {q.processing > 0 && <span className="meta">в работе {q.processing}</span>}
           </div>
-          <div className="ubar"><i style={{ width: `${pct}%` }} /></div>
-
-          {q.processing.length > 0 ? (
-            <div className="copy">
-              сейчас в работе: {q.processing.length}
-              {q.processing.every((j) => j.kind === 'photo') && q.parallelism.photo > 1 ? ` (фото параллельно, до ${q.parallelism.photo})` : ''}
-              {' · '}
-              {q.processing.map((j, i) => `${JOB_KIND[j.kind] ?? j.kind} ${j.progress}%`).join(' · ')}
-            </div>
-          ) : (
-            <div className="copy">{q.paused ? '⏸ пауза — задачи ждут в очереди' : counts?.pending ? 'беру следующую задачу…' : 'очередь пуста'}</div>
-          )}
-
-          {!q.parallelism.videoAlongsidePhotos && (q.byKind.video?.pending ?? 0) > 0 && (q.byKind.photo?.pending ?? 0) > 0 && (
-            <div className="copy">
-              видео начнётся, когда фото-очередь разберётся{q.etaSec.video != null ? ` (≈ ${humanLeft(q.etaSec.video)})` : ''}:
-              AV1-энкод занимает все ядра, и вместе с ним фото идут в разы медленнее
-            </div>
-          )}
-          {QUEUE_KINDS.map((k) => {
-            const pend = q.byKind[k]?.pending ?? 0;
-            const sp = q.speed[k];
-            if (!pend && !sp) return null;
-            return (
-              <div className="copy" key={k}>
-                {JOB_KIND[k]}: {sp ? `${humanTaskSec(sp.avgSec)} на задачу${sp.perMin >= 1 ? `, ${sp.perMin} в минуту` : ''}` : 'скорость считается…'}
-                {pend ? ` · в очереди ${pend.toLocaleString('ru-RU')} · осталось ≈ ${humanLeft(q.etaSec[k])}` : ' · очередь пуста'}
-              </div>
-            );
-          })}
-
           <div className="copy">
-            готово {counts?.done.toLocaleString('ru-RU')} · в очереди {(counts?.pending ?? 0).toLocaleString('ru-RU')} · в работе {counts?.processing ?? 0}
-            {' · '}без превью {missing.toLocaleString('ru-RU')} (в очереди {(counts?.pending ?? 0).toLocaleString('ru-RU')})
-            {counts?.cancelled ? ` · отменено вручную ${counts.cancelled.toLocaleString('ru-RU')}` : ''}
-            {ago != null ? ` · цифры обновлены ${ago} с назад` : ''}
+            {q.paused ? '⏸ пауза — задачи ждут в очереди' : remaining ? 'очередь разбирается' : 'очередь пуста'}
           </div>
         </>
       )}
-
       <div className="row">
         <button className="btn ghost" disabled={!q} onClick={onErrors} title="Задачи, которые упали при конвертации">
-          ⚠ Ошибки{q?.errors.total ? `: ${q.errors.total}` : ''}
-        </button>
-        <span style={{ flex: 1 }} />
-        <button className="btn" disabled={busy || !toQueue} onClick={rebuild} title="Найти файлы без превью и поставить им задачи">
-          {busy ? '…' : toQueue ? `⟳ Дособрать превью (${toQueue.toLocaleString('ru-RU')})` : missing ? '✓ Остальные уже в очереди' : '✓ Всё собрано'}
+          ⚠ Ошибки{q?.errors ? `: ${q.errors.toLocaleString('ru-RU')}` : ''}
         </button>
       </div>
     </div>
@@ -2047,18 +1978,17 @@ function QueueErrorsPanel({ onBack }: { onBack: () => void }) {
   const LIMIT = 50;
   const [data, setData] = useState<{ total: number; items: api.QueueErrorRow[] } | null>(null);
   const [offset, setOffset] = useState(0);
-  const [withCancelled, setWithCancelled] = useState(false);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
 
   const load = async () => {
     try {
-      setData(await api.queueErrors({ limit: LIMIT, offset, includeCancelled: withCancelled }));
+      setData(await api.queueErrors({ limit: LIMIT, offset }));
       setErr('');
     } catch (e) { setErr((e as Error).message); }
   };
-  useEffect(() => { void load(); }, [offset, withCancelled]);
+  useEffect(() => { void load(); }, [offset]);
 
   const retryOne = async (entryId: string | null) => {
     if (!entryId) return;
@@ -2074,7 +2004,7 @@ function QueueErrorsPanel({ onBack }: { onBack: () => void }) {
     setNotice('');
     try {
       const r = await api.retryQueueErrors();
-      setNotice(`Возвращено в очередь: ${r.retried}${r.skipped ? `, пропущено ${r.skipped} (оригинала нет в хранилище)` : ''}`);
+      setNotice(`Возвращено в очередь: ${r.retried}`);
       setOffset(0);
       await load();
     } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
@@ -2090,28 +2020,24 @@ function QueueErrorsPanel({ onBack }: { onBack: () => void }) {
         <strong>Ошибки очереди</strong>
         <span className="meta">{total.toLocaleString('ru-RU')}</span>
         <span style={{ flex: 1 }} />
-        <button className="btn" disabled={busy || !total || withCancelled} onClick={retryAll}>⟳ Повторить все</button>
+        <button className="btn" disabled={busy || !total} onClick={retryAll}>⟳ Повторить все</button>
       </div>
-      <label className="copy" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <input type="checkbox" checked={withCancelled} onChange={(e) => { setOffset(0); setWithCancelled(e.target.checked); }} />
-        показывать отменённые вручную (очистка очереди, удаление файла — это не ошибки конвертации)
-      </label>
       {err && <div className="err">{err}</div>}
       {notice && <div className="notice">{notice}</div>}
       {!data && !err && <div className="copy">Загрузка…</div>}
-      {data && !shown && <div className="copy">Ошибок нет{withCancelled ? '' : ' — все задачи либо собраны, либо отменены вручную'}</div>}
+      {data && !shown && <div className="copy">Ошибок нет — очередь разбирается без падений</div>}
       {data?.items.map((j) => (
         <div className="item" key={j.id} style={{ alignItems: 'flex-start' }}>
           <span className="icon">{JOB_KIND[j.kind] ?? j.kind}</span>
           <span className="fname" style={{ whiteSpace: 'normal' }}>
             {j.entryId ? <a href={api.fileUrl(j.entryId)}>{j.name ?? 'файл'}</a> : (j.name ?? 'файл удалён')}
-            <div className="err" style={{ fontWeight: 400 }}>{j.error.replace(/^cancelled:\s*/, 'отменено: ')}</div>
+            <div className="err" style={{ fontWeight: 400 }}>{j.error}</div>
             <div className="meta">
               попыток: {j.attempts}
               {j.finishedAt ? ` · ${new Date(j.finishedAt).toLocaleString()}` : ''}
             </div>
           </span>
-          <button className="btn ghost" disabled={!j.entryId || withCancelled} onClick={() => void retryOne(j.entryId)} title="Поставить задачу в очередь заново">⟳</button>
+          <button className="btn ghost" disabled={!j.entryId} onClick={() => void retryOne(j.entryId)} title="Поставить задачу в очередь заново">⟳</button>
         </div>
       ))}
       {total > LIMIT && (

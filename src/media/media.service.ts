@@ -156,10 +156,10 @@ function asStr(v: unknown): string | undefined {
 }
 
 /**
- * Строка ленты. Координаты, masterMime и прогресс задачи из ответа убраны: карта снята из
- * продукта, а состояние задачи клиент узнаёт ручкой статусов только про те снимки, которые
- * ещё не готовы — тянуть его для каждой записи каждой страницы (LATERAL по Job) значило
- * платить ~15 мс на страницу в 500 снимков.
+ * Строка ленты. Координаты и прогресс задачи из ответа убраны: карта снята из продукта,
+ * а состояние задачи клиент узнаёт ручкой статусов только про те снимки, которые ещё не
+ * готовы — тянуть его для каждой записи каждой страницы (LATERAL по Job) значило платить
+ * ~15 мс на страницу в 500 снимков. previewState — состояние превью (см. Asset).
  */
 export interface TimelineItem {
   entryId: string;
@@ -167,14 +167,16 @@ export interface TimelineItem {
   sha256?: string;
   capturedAt: string | null;
   mime: string;
-  masterReady: boolean;
+  previewState: string;
   size: number;
 }
 
 /** Статус сборки превью одной записи (см. MediaService.timelineStatus). */
 export interface TimelineStatusItem {
   entryId: string;
-  masterReady: boolean;
+  previewState: string;
+  /** Причина, по которой превью собрать нельзя (previewState='impossible'). */
+  previewError: string | null;
   jobState: string | null;
   jobError: string | null;
 }
@@ -185,14 +187,15 @@ interface TimelineRow {
   name: string;
   sha256: string | null;
   mime: string;
-  masterReadyAt: Date | null;
+  previewState: string;
   size: bigint | number | null;
   capturedAt: Date | null;
 }
 
 interface TimelineStatusRow {
   id: string;
-  masterReadyAt: Date | null;
+  previewState: string;
+  previewError: string | null;
   jobState: string | null;
   jobError: string | null;
 }
@@ -664,7 +667,7 @@ export class MediaService {
              OR mm."capturedAt" IS NULL)`
         : Prisma.sql`AND mm."capturedAt" IS NULL AND f."id" < ${cursor.id}`;
     const rows = await this.prisma.$queryRaw<TimelineRow[]>(Prisma.sql`
-      SELECT f."id", f."name", a."sha256", a."mime", a."masterReadyAt", a."size", mm."capturedAt"
+      SELECT f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt"
       FROM "MediaMeta" mm
       JOIN "Asset" a ON a."id" = mm."assetId"
       JOIN "FileEntry" f ON f."assetId" = a."id"
@@ -681,7 +684,7 @@ export class MediaService {
       sha256: r.sha256 ?? undefined,
       capturedAt: r.capturedAt ? new Date(r.capturedAt).toISOString() : null,
       mime: r.mime,
-      masterReady: Boolean(r.masterReadyAt),
+      previewState: r.previewState,
       size: Number(r.size ?? 0),
     }));
   }
@@ -701,7 +704,7 @@ export class MediaService {
     const tree = await this.auth.subtreeIds(userId);
     if (!tree.length) return [];
     const rows = await this.prisma.$queryRaw<TimelineStatusRow[]>(Prisma.sql`
-      SELECT f."id", a."masterReadyAt", j."state" AS "jobState", j."error" AS "jobError"
+      SELECT f."id", a."previewState", a."previewError", j."state" AS "jobState", j."error" AS "jobError"
       FROM "FileEntry" f
       JOIN "Asset" a ON a."id" = f."assetId"
       LEFT JOIN LATERAL (
@@ -717,7 +720,8 @@ export class MediaService {
     `);
     return rows.map((r) => ({
       entryId: r.id,
-      masterReady: Boolean(r.masterReadyAt),
+      previewState: r.previewState,
+      previewError: r.previewError ?? null,
       jobState: r.jobState ?? null,
       jobError: r.jobError ?? null,
     }));

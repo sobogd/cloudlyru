@@ -152,14 +152,14 @@ async function processAsset(asset) {
 
 const where = {
   mime: { startsWith: 'image/' },
-  masterReadyAt: { not: null },
+  previewState: 'done',
   entries: { some: { zone: 'PHOTOS', deletedAt: null } },
   ...(shaPrefix ? { sha256: { startsWith: shaPrefix } } : {}),
 };
 const assets = await prisma.asset.findMany({
   where,
-  select: { sha256: true, mime: true, size: true, masterReadyAt: true },
-  orderBy: { masterReadyAt: 'asc' },
+  select: { sha256: true, mime: true, size: true },
+  orderBy: { createdAt: 'asc' },
   take: limit || undefined,
 });
 

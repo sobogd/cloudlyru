@@ -450,7 +450,6 @@ export class FilesService {
       mime: entry.asset.mime,
       ext: entry.asset.ext ?? undefined,
       sha256: entry.asset.sha256,
-      masterMime: entry.asset.masterMime && entry.asset.masterReadyAt ? entry.asset.masterMime : null,
       pageCount: entry.asset.pageCount ?? undefined,
       media: m
         ? {
@@ -592,9 +591,9 @@ export class FilesService {
    */
   async thumb(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
     const entry = await this.requireOwnEntry(entryId, userId);
-    // Превью нет и не будет (задача не дошла до конца) — отвечаем сразу, без похода в S3:
+    // Превью нет (задача ещё идёт, упала или собрать нечего) — отвечаем сразу, без похода в S3:
     // список файлов запрашивает миниатюру на каждую строку.
-    if (!entry.asset.masterReadyAt) {
+    if (entry.asset.previewState !== 'done') {
       res.status(404).end();
       return;
     }
@@ -624,12 +623,6 @@ export class FilesService {
       await tx.fileEntry.update({ where: { id: entryId }, data: { deletedAt: new Date() } });
       await this.changes.recordEntry(userId, entryId, 'delete', tx);
     });
-    // удалённый файл не должен доехать до конца конвертации: ffmpeg по 4K-видео держит оба ядра
-    const asset = await this.prisma.fileEntry.findUnique({
-      where: { id: entryId },
-      select: { assetId: true },
-    });
-    if (asset) await this.queue.cancelForAssets([asset.assetId]).catch(() => undefined);
     return { ok: true };
   }
 

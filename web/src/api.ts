@@ -77,7 +77,7 @@ export interface FileMedia {
 }
 export interface FileMeta {
   id: string; name: string; createdAt: string; folderId: string; zone: string; path: string;
-  size: number; mime: string; ext?: string; sha256: string; masterMime?: string | null;
+  size: number; mime: string; ext?: string; sha256: string;
   /** Число страниц PDF (есть после того, как очередь отрисовала превью страниц). */
   pageCount?: number;
   media?: FileMedia | null;
@@ -485,9 +485,16 @@ export const revokeToken = (id: string) => request<{ ok: boolean }>(`/auth/token
  * ручкой (timelineStatus) только про незавершённые снимки — тянуть его для каждой записи
  * каждой страницы значит платить лишним запросом на строку.
  */
-export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; masterReady: boolean; size: number }
+export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; previewState: string; size: number }
 /** Статус сборки превью (POST /timeline/status): отвечаем только про свои записи. */
-export interface TimelineStatus { entryId: string; masterReady: boolean; jobState: string | null; jobError: string | null }
+export interface TimelineStatus {
+  entryId: string;
+  /** 'none' — превью ещё нет, 'done' — собраны, 'impossible' — собрать нельзя (см. previewError). */
+  previewState: string;
+  previewError: string | null;
+  jobState: string | null;
+  jobError: string | null;
+}
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
@@ -506,51 +513,36 @@ export const thumbUrl = (entryId: string) => `${BASE}/files/${entryId}/thumb`;
 export interface QueueStatus {
   /** Конвертация на паузе: состояние хранится в БД, живёт до снятия. */
   paused: boolean;
-  counts: { pending: number; processing: number; done: number; failed: number; cancelled: number };
-  /** Прогресс «собрано из всего, что требует превью». */
-  progress: { done: number; total: number };
-  byKind: Record<string, { pending: number }>;
-  /** Средняя длительность задачи по видам (по завершённым за последние 15 минут). */
-  speed: Record<string, { avgSec: number; perMin: number } | undefined>;
-  /** Остаток в секундах: phase — по текущей фазе (пока идут фото, это фото), total — по всей очереди. */
-  etaSec: { photo: number | null; video: number | null; pdf: number | null; total: number | null; phase: number | null };
-  parallelism: { photo: number; pdf: number; video: number; videoAlongsidePhotos: boolean };
-  /** Задачи в работе прямо сейчас: фото могут идти параллельно, поэтому это список. */
-  processing: Array<{ id: string; kind: string; progress: number; startedSecAgo: number; entryId: string | null; name: string | null }>;
-  /** Настоящие ошибки (без отменённых вручную) — число для кнопки. */
-  errors: { total: number };
+  /** Сколько задач осталось: ожидают и считаются сейчас. Готовая задачу строку не оставляет. */
+  remaining: number;
+  processing: number;
+  /** Упавшие задачи: строка остаётся, пока её не разберут. */
+  errors: number;
 }
 export const queueStatus = () => request<QueueStatus>('/queue/status');
 /** Пересобрать превью упавшего файла: задача конвертации ставится в очередь заново. */
 export const retryPreview = (entryId: string) =>
   request<{ ok: boolean }>('/queue/retry', { method: 'POST', body: JSON.stringify({ entryId }) });
-/** Пересобрать превью у уже загруженных файлов, у которых их нет (в т.ч. у всех PDF). */
+/** Пересчёт: найти файлы, у которых превью нет, и поставить им задачи. */
 export const rebuildPreviews = () =>
-  request<{ queued: number; skipped: number; total: number }>('/queue/rebuild', { method: 'POST', body: JSON.stringify({}) });
-/** Сколько файлов осталось без превью — для кнопки пересбора. */
-export interface MissingPreviews { total: number; byKind: Record<string, number> }
-export const missingPreviews = () => request<MissingPreviews>('/queue/missing');
+  request<{ queued: number; impossible: number }>('/queue/rebuild', { method: 'POST', body: JSON.stringify({}) });
 /** Пауза конвертации (мягкая: текущая задача докачивается, новые не берутся). */
 export const setQueuePaused = (paused: boolean) =>
   request<{ paused: boolean }>('/queue/pause', { method: 'POST', body: JSON.stringify({ paused }) });
-/** Очистить очередь: отменить все ожидающие задачи и остановить текущую. */
-export const cancelQueue = () =>
-  request<{ cancelled: number }>('/queue/cancel', { method: 'POST', body: JSON.stringify({}) });
-/** Ошибки конвертации: постранично, с именем файла. Отменённые — только по флагу. */
+/** Ошибки конвертации: постранично, с именем файла. */
 export interface QueueErrorRow {
   id: string; kind: string; error: string; attempts: number; finishedAt: string | null;
   entryId: string | null; name: string | null;
 }
-export const queueErrors = (opts: { limit?: number; offset?: number; includeCancelled?: boolean } = {}) => {
+export const queueErrors = (opts: { limit?: number; offset?: number } = {}) => {
   const q = new URLSearchParams();
   q.set('limit', String(opts.limit ?? 50));
   q.set('offset', String(opts.offset ?? 0));
-  if (opts.includeCancelled) q.set('include', 'cancelled');
   return request<{ total: number; items: QueueErrorRow[] }>(`/queue/errors?${q}`);
 };
-/** Вернуть в очередь все настоящие ошибки (отменённые не трогаем). */
+/** Вернуть в очередь все упавшие задачи. */
 export const retryQueueErrors = () =>
-  request<{ retried: number; skipped: number }>('/queue/errors/retry', { method: 'POST', body: JSON.stringify({}) });
+  request<{ retried: number }>('/queue/errors/retry', { method: 'POST', body: JSON.stringify({}) });
 /** Лента «Фото» постранично: `limit` — размер страницы, `cursor` — entryId последней показанной
  *  записи (сервер сам знает её дату и отдаёт то, что идёт дальше). */
 export const timeline = (opts: { limit?: number; cursor?: string } = {}) => {

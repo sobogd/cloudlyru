@@ -65,7 +65,7 @@ export class MediaController {
         cache: PREVIEW_CACHE,
       });
     }
-    const isVideo = String(asset.mime).startsWith('video/') || asset.masterMime === 'video/mp4';
+    const isVideo = String(asset.mime).startsWith('video/');
     if (isVideo) {
       const sent = await sendFirstExisting(
         req,

@@ -4,7 +4,6 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import sharp from 'sharp';
-import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import {
@@ -35,14 +34,11 @@ const PHOTO_PARALLEL = Math.min(Math.max(Number(env.CONVERT_PHOTO_PARALLEL ?? 1)
 const VIDEO_ALONGSIDE_PHOTOS = (env.CONVERT_VIDEO_ALONGSIDE_PHOTOS ?? 'false') === 'true';
 const MAX_ATTEMPTS = 3;
 /**
- * Сколько держать историю задач. Для работы она не нужна: «превью готово» — это
- * Asset.masterReadyAt, а «сколько осталось» считается по библиотеке, поэтому завершённые
- * задачи старше суток удаляем, а отменённые — через час (иначе таблица растёт вечно:
- * на этом инстансе накопилось 117 тыс. отменённых строк).
+ * Причина, по которой превью не собрать: оригинала нет в хранилище. Единственная из причин,
+ * которая может перестать быть верной (файл залили снова), поэтому её и только её `enqueue`
+ * умеет снимать; «слишком большой» и «тип не конвертируется» — свойства содержимого.
  */
-const DONE_RETENTION_MS = 24 * 60 * 60 * 1000;
-const CANCELLED_RETENTION_MS = 60 * 60 * 1000;
-const CLEANUP_EVERY_MS = 10 * 60 * 1000;
+const NO_ORIGINAL = 'оригинала нет в хранилище';
 /** Задержка перед повтором временно упавшей задачи (умножается на номер попытки). */
 const RETRY_BASE_DELAY_MS = 30_000;
 /**
@@ -109,14 +105,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   /** Тик не перекрывается сам с собой (задачи внутри тика запускаются параллельно). */
   private ticking = false;
   /**
-   * Задачи в работе сейчас: id → { assetId, group, child }. Одна карта вместо прежних
-   * одиночных полей: при параллельных фото в ней живёт несколько задач, и отмена
-   * (удаление файла, очистка очереди) должна убивать процесс именно своей задачи.
+   * Задачи в работе сейчас: id → { assetId, group, child } — по нему считаются свободные слоты
+   * (фото идут параллельно) и убивается процесс задачи по таймауту.
    */
   private readonly active = new Map<string, { assetId: string; group: JobGroup; child: import('child_process').ChildProcess | null }>();
   /** Короткий кэш числа ожидающих фото: по нему решается, брать ли видео. */
   private photoPendingCache: { at: number; value: number } | null = null;
-  private lastCleanupAt = 0;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -129,32 +123,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // после рестарта все processing возвращаем в очередь (рестарт = прерванный воркер)
     await this.prisma.job.updateMany({ where: { state: 'processing' }, data: { state: 'pending' } }).catch(() => undefined);
     this.cleanupTmp();
-    void this.cleanupHistory();
     this.timer = setInterval(() => void this.tick(), 2000);
     this.logger.log(
       `конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB, фото параллельно ${PHOTO_PARALLEL}, ` +
         `оригиналы ${env.KEEP_ORIGINALS ? 'храним' : 'удаляем'})`,
     );
-  }
-
-  /**
-   * Убрать историю задач, которая работе не нужна. Готовность файла — это Asset.masterReadyAt,
-   * остаток считается по библиотеке, поэтому завершённые задачи старше суток и отменённые
-   * старше часа можно удалять. Настоящие ошибки (state='failed' без пометки cancelled)
-   * не трогаем: их показывает страница ошибок, пока их не разберут.
-   */
-  async cleanupHistory(): Promise<number> {
-    const [done, cancelled] = await Promise.all([
-      this.prisma.job
-        .deleteMany({ where: { state: 'done', finishedAt: { lt: new Date(Date.now() - DONE_RETENTION_MS) } } })
-        .catch(() => ({ count: 0 })),
-      this.prisma.job
-        .deleteMany({ where: { state: 'failed', error: { startsWith: 'cancelled' }, finishedAt: { lt: new Date(Date.now() - CANCELLED_RETENTION_MS) } } })
-        .catch(() => ({ count: 0 })),
-    ]);
-    const total = done.count + cancelled.count;
-    if (total) this.logger.log(`история задач почищена: ${total} (готовых ${done.count}, отменённых ${cancelled.count})`);
-    return total;
   }
 
   /** Осиротевшие каталоги задач: процесс убит (SIGKILL/pm2 reload), поэтому finally не отработал. */
@@ -186,60 +159,33 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Ключи «полного» превью, которые реально умеет отдавать `/previews` и `/video-preview`
-   * (включая легаси-ключи старого пайплайна: у части ассетов оригинал был удалён).
+   * Поставить задачу конвертации: файл попал в медиа-зону или его просит пересчёт.
+   * Идемпотентно: строка одна на ассет, поэтому повторный вызов ничего не создаёт.
    */
-  private fullPreviewKeys(kind: string, sha256: string): string[] {
-    if (kind === 'photo') {
-      return [
-        MediaService.photoFullKey(sha256),
-        MediaService.legacyPhotoFull2048Key(sha256),
-        MediaService.legacyPhotoFullWebpKey(sha256),
-      ];
-    }
-    if (kind === 'pdf') return [MediaService.pdfPageKey(sha256, 1)];
-    return [MediaService.video1080Key(sha256), MediaService.legacyVideo720Key(sha256)];
-  }
-
-  /** Есть ли чем показать содержимое, кроме оригинала. */
-  async previewsAlive(mime: string, sha256: string): Promise<boolean> {
-    const kind = mediaKindOf(mime);
-    if (!kind) return false;
-    for (const key of this.fullPreviewKeys(kind, sha256)) {
-      if (await this.s3.headObject(key).catch(() => false)) return true;
-    }
-    return false;
-  }
-
-  /** Ставит задачу, если для ассета ещё нет активной. */
   async enqueue(assetId: string, sha256: string, mime: string): Promise<void> {
     const kind = mediaKindOf(mime);
-    if (!kind) return;
-    // Слишком крупное не конвертируем: задача качает объект из S3 целиком во временный каталог,
-    // и один гигабайтный «скриншот» выедает диск и очередь (заявить можно любой тип файла).
-    // Такой файл остаётся как есть — открывается и скачивается, превью просто не будет.
-    const tooBig = await this.prisma.asset
-      .findUnique({ where: { id: assetId }, select: { size: true } })
-      .then((a) => (a ? Number(a.size) > CONVERT_MAX_BYTES : false))
-      .catch(() => false);
-    if (tooBig) {
-      this.logger.warn(`конвертация пропущена: файл больше ${Math.round(CONVERT_MAX_BYTES / 1024 / 1024)} МБ (${sha256.slice(0, 8)})`);
+    const asset = await this.prisma.asset
+      .findUnique({ where: { id: assetId }, select: { size: true, previewState: true, previewError: true } })
+      .catch(() => null);
+    // Превью для такого типа не собираются: помечаем, чтобы файл не числился в остатке.
+    if (!kind) {
+      await this.markImpossible(assetId, 'превью для такого типа файла не собираются');
       return;
     }
-    // Превью уже есть, а оригинала нет (KEEP_ORIGINALS=false) — задача обречена на три
-    // падения при скачивании files/<sha>. Ставим её только если превью на самом деле нет.
-    // Проверяем весь набор ключей, которые отдаёт UI, а не только текущий: у старых
-    // ассетов полное превью лежит под легаси-ключом `-2048.avif`/`-2048.webp`/`-720.mp4`.
-    const asset = await this.prisma.asset
-      .findUnique({ where: { id: assetId }, select: { masterReadyAt: true } })
-      .catch(() => null);
-    if (asset?.masterReadyAt) {
-      const rawAlive = await this.s3.headObject(S3Service.assetKey(sha256)).catch(() => false);
-      if (!rawAlive) {
-        for (const key of this.fullPreviewKeys(kind, sha256)) {
-          if (await this.s3.headObject(key).catch(() => false)) return;
-        }
-      }
+    if (asset?.previewState === 'done') return;
+    // Слишком крупное не конвертируем: задача качает объект из S3 целиком во временный каталог,
+    // и один огромный «скриншот» выедает диск и очередь (заявить можно любой тип файла).
+    // Это свойство содержимого и оно не изменится — помечаем и больше не трогаем.
+    if (asset && Number(asset.size) > CONVERT_MAX_BYTES) {
+      this.logger.warn(`конвертация пропущена: файл больше ${Math.round(CONVERT_MAX_BYTES / 1024 / 1024)} МБ (${sha256.slice(0, 8)})`);
+      await this.markImpossible(assetId, `файл больше ${Math.round(CONVERT_MAX_BYTES / 1024 / 1024)} МБ`);
+      return;
+    }
+    // «Оригинала нет» — единственная причина, которая может перестать быть верной: файл залили
+    // снова. Такой ассет возвращаем в работу, воркер проверит оригинал ещё раз.
+    if (asset?.previewState === 'impossible') {
+      if (asset.previewError !== NO_ORIGINAL) return;
+      await this.setPreviewState(assetId, 'none', null);
     }
     if (kind === 'video') {
       // без MediaMeta видео не попадает в таймлайн — создаём сразу (дата = загрузка)
@@ -247,74 +193,22 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         .upsert({ where: { assetId }, create: { assetId, capturedAt: new Date() }, update: {} })
         .catch(() => undefined);
     }
-    const exists = await this.prisma.job.findFirst({
-      where: { assetId, state: { in: ['pending', 'processing'] } },
-      select: { id: true },
-    });
+    // Строка задачи одна на ассет: есть в любом состоянии (ждёт, идёт, упала) — второй не будет.
+    // Упавшую возвращает в работу «повторить», а не новый сигнал: иначе ошибка терялась бы молча.
+    const exists = await this.prisma.job.findFirst({ where: { assetId }, select: { id: true } });
     if (!exists) {
       await this.prisma.job.create({ data: { assetId, kind, state: 'pending' } }).catch(() => undefined);
     }
   }
 
-  /** Отменить задачи ассетов (файл удалён) и вернуть из корзины при восстановлении. */
-  async cancelForAssets(assetIds: string[]): Promise<void> {
-    if (!assetIds.length) return;
-    await this.prisma.job
-      .updateMany({ where: { assetId: { in: assetIds }, state: { in: ['pending', 'processing'] } }, data: { state: 'failed', error: 'cancelled: файл удалён', finishedAt: new Date() } })
-      .catch(() => undefined);
-    // если удалённый файл прямо сейчас кодируется — убиваем его процесс
-    this.killChildren((_, assetId) => assetIds.includes(assetId), 'отмена активной задачи (файл удалён)');
+  /** Превью собрать нельзя: причина видна в деталке, из остатка файл выходит. */
+  private async markImpossible(assetId: string, reason: string): Promise<void> {
+    await this.setPreviewState(assetId, 'impossible', reason);
   }
 
-  /**
-   * Очистить очередь: отменить всё, что ждёт и что сейчас считается. Отмена жёсткая —
-   * в этом её отличие от паузы: активный процесс (ffmpeg/pdftoppm) убивается, иначе
-   * очередь не опустеет никогда. Уже собранные производные остаются на месте, так что
-   * отменённое можно пересобрать кнопкой пересбора, а не с нуля.
-   */
-  async cancelAll(tree: string[]): Promise<number> {
-    const where: Prisma.JobWhereInput = {
-      state: { in: ['pending', 'processing'] },
-      asset: { entries: { some: { folderId: { in: tree }, deletedAt: null } } },
-    };
-    // Ожидающие задачи удаляем, а не помечаем отменёнными: держать историю отмен незачем,
-    // а кнопка «Очистить очередь» должна реально опустошать список. Так таблица не растёт
-    // (на этом инстансе накопилось 117 тыс. отменённых строк — это был чистый мусор).
-    const pending = await this.prisma.job.count({ where: { ...where, state: 'pending' } });
-    // Активные помечаем отменёнными: их процесс мы убиваем, и строку нельзя удалять —
-    // обработчик задачи пишет в неё итог.
-    const active = await this.prisma.job.findMany({ where: { ...where, state: 'processing' }, select: { id: true } });
-    const total = pending + active.length;
-    if (!total) return 0;
-    // Фильтром, а не списком id: список упирался в предел Postgres по bind-параметрам
-    await this.prisma.job.deleteMany({ where: { ...where, state: 'pending' } }).catch(() => undefined);
-    if (active.length) {
-      await this.prisma.job
-        .updateMany({ where: { id: { in: active.map((j) => j.id) } }, data: { state: 'failed', error: 'cancelled: очередь очищена', finishedAt: new Date() } })
-        .catch(() => undefined);
-    }
-    const ids = new Set(active.map((j) => j.id));
-    this.killChildren((id) => ids.has(id), 'очередь очищена');
-    this.logger.log(`очередь очищена: удалено ожидающих ${pending}, отменено активных ${active.length}`);
-    return total;
-  }
-
-  /** Вернуть в очередь отменённые задачи (файл восстановлен из корзины). */
-  async requeueForAssets(assetIds: string[]): Promise<void> {
-    if (!assetIds.length) return;
-    const rows = await this.prisma.job.findMany({
-      where: { assetId: { in: assetIds }, state: 'failed', error: { contains: 'cancelled' } },
-      select: { id: true, asset: { select: { sha256: true } } },
-    });
-    // Возвращаем только те, для которых сырьё действительно на месте: иначе задача
-    // просто трижды упадёт на downloadToFile (оригинал мог быть удалён после конвертации).
-    const alive: string[] = [];
-    for (const r of rows) {
-      if (await this.s3.headObject(S3Service.assetKey(r.asset.sha256)).catch(() => false)) alive.push(r.id);
-    }
-    if (!alive.length) return;
-    await this.prisma.job
-      .updateMany({ where: { id: { in: alive } }, data: { state: 'pending', error: null, attempts: 0 } })
+  private async setPreviewState(assetId: string, state: 'none' | 'done' | 'impossible', error: string | null): Promise<void> {
+    await this.prisma.asset
+      .update({ where: { id: assetId }, data: { previewState: state, previewError: error } })
       .catch(() => undefined);
   }
 
@@ -323,28 +217,44 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return TRANSIENT_ERR.test(msg);
   }
 
+  /** Оригинала нет именно в этом объекте (а не S3 не ответил): NoSuchKey/404. */
+  private isMissingObject(e: unknown): boolean {
+    const err = e as { name?: string; message?: string; $metadata?: { httpStatusCode?: number } };
+    if (err?.name === 'NoSuchKey' || err?.name === 'NotFound') return true;
+    if (err?.$metadata?.httpStatusCode === 404) return true;
+    return /NoSuchKey|does not exist/i.test(String(err?.message ?? ''));
+  }
+
   /**
    * Пересобрать превью вручную: упавшую задачу сбрасываем в очередь с нуля.
-   * Оригинала нет — собирать нечего, говорим об этом честно (обычно он удалён
-   * после успешной конвертации, а падение было уже на превью).
+   * Оригинала нет — собирать нечего, говорим об этом честно и помечаем ассет.
    */
   async retryPreview(assetId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const asset = await this.prisma.asset
-      .findUnique({ where: { id: assetId }, select: { sha256: true, mime: true } })
+      .findUnique({ where: { id: assetId }, select: { sha256: true, mime: true, size: true } })
       .catch(() => null);
     if (!asset) return { ok: false, reason: 'файл не найден' };
     const kind = mediaKindOf(asset.mime);
     if (!kind) return { ok: false, reason: 'превью для такого типа файла не собираются' };
+    if (Number(asset.size) > CONVERT_MAX_BYTES) {
+      const maxMb = Math.round(CONVERT_MAX_BYTES / 1024 / 1024);
+      await this.markImpossible(assetId, `файл больше ${maxMb} МБ`);
+      return { ok: false, reason: `файл больше ${maxMb} МБ — конвертация пропускается` };
+    }
     const rawAlive = await this.s3.headObject(S3Service.assetKey(asset.sha256)).catch(() => false);
-    if (!rawAlive) return { ok: false, reason: 'оригинала больше нет в хранилище — залейте файл заново' };
-
+    if (!rawAlive) {
+      await this.markImpossible(assetId, NO_ORIGINAL);
+      return { ok: false, reason: 'оригинала больше нет в хранилище — залейте файл заново' };
+    }
+    // Задачу возвращаем в работу, а прошлую ошибку снимаем: иначе строка осталась бы упавшей.
+    await this.setPreviewState(assetId, 'none', null);
     const last = await this.prisma.job.findFirst({ where: { assetId }, orderBy: { createdAt: 'desc' } });
     if (last && (last.state === 'pending' || last.state === 'processing')) return { ok: true }; // уже собирается
     if (last) {
       this.retryAfter.delete(last.id);
       await this.prisma.job.update({
         where: { id: last.id },
-        data: { state: 'pending', error: null, attempts: 0, progress: 0, startedAt: null, finishedAt: null },
+        data: { state: 'pending', error: null, attempts: 0, startedAt: null, finishedAt: null },
       });
     } else {
       await this.prisma.job.create({ data: { assetId, kind, state: 'pending' } });
@@ -353,16 +263,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return { ok: true };
   }
 
-  private lastProgressUpdate = 0;
   /** Отложенные повторы временно упавших задач: id → время, раньше которого не брать. */
   private readonly retryAfter = new Map<string, number>();
-
-  private async setProgress(jobId: string, value: number, force = false): Promise<void> {
-    const now = Date.now();
-    if (!force && now - this.lastProgressUpdate < 2000) return;
-    this.lastProgressUpdate = now;
-    await this.prisma.job.update({ where: { id: jobId }, data: { progress: Math.max(0, Math.min(100, Math.round(value))) } }).catch(() => undefined);
-  }
 
   /**
    * Пауза конвертации. Мягкая: новые задачи не берутся, текущая докачивается —
@@ -388,11 +290,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     if (this.stopped || this.ticking) return;
     this.ticking = true;
     try {
-      // История не копится: чистим её раз в 10 минут (и на старте).
-      if (Date.now() - this.lastCleanupAt > CLEANUP_EVERY_MS) {
-        this.lastCleanupAt = Date.now();
-        void this.cleanupHistory();
-      }
       // на паузе задачи просто ждут в БД: ничего не теряется, снятие паузы продолжит с места
       if (await this.isPaused()) return;
       // Фото берём пачкой по числу свободных слотов, задачи идут параллельно и не ждут друг друга.
@@ -420,11 +317,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Сколько задач идёт одновременно: нужно API, чтобы честно считать остаток по времени. */
-  get parallelism(): { photo: number; pdf: number; video: number; videoAlongsidePhotos: boolean } {
-    return { photo: PHOTO_PARALLEL, pdf: 1, video: 1, videoAlongsidePhotos: VIDEO_ALONGSIDE_PHOTOS };
-  }
-
   /** Сколько задач группы сейчас в работе — по этому числу считаются свободные слоты. */
   private countActive(group: JobGroup): number {
     let n = 0;
@@ -440,21 +332,10 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return value;
   }
 
-  /** Процесс конкретной задачи (ffmpeg/pdftoppm/heif-convert) — чтобы отмена убивала нужный. */
+  /** Процесс конкретной задачи (ffmpeg/pdftoppm/heif-convert) — чтобы убить его по таймауту. */
   private setChild(jobId: string, child: import('child_process').ChildProcess): void {
     const a = this.active.get(jobId);
     if (a) a.child = child;
-  }
-
-  /** Убить процессы активных задач, подходящих под условие. Возвращает число убитых. */
-  private killChildren(match: (jobId: string, assetId: string) => boolean, why: string): number {
-    let killed = 0;
-    for (const [id, a] of this.active) {
-      if (!a.child || !match(id, a.assetId)) continue;
-      this.logger.warn(`${why}: убиваю процесс задачи ${id}`);
-      try { a.child.kill('SIGKILL'); killed += 1; } catch { /* процесс уже умер */ }
-    }
-    return killed;
   }
 
   private async next(group: JobGroup): Promise<JobRow | null> {
@@ -494,7 +375,18 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const rawPath = join(dir, 'raw');
     const tag = `${job.kind} ${job.sha256.slice(0, 8)}`;
     try {
-      await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
+      try {
+        await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
+      } catch (e) {
+        // Оригинала нет — это не сбой задачи, а свойство содержимого (раньше сырьё удаляли
+        // после конвертации): помечаем и убираем строку, иначе файл вечно висел бы в остатке
+        // и возвращался кнопкой пересчёта. Всё остальное (сеть, S3, 5xx) идёт обычным путём с повторами.
+        if (!this.isMissingObject(e)) throw e;
+        await this.markImpossible(job.assetId, NO_ORIGINAL);
+        await this.prisma.job.delete({ where: { id: job.id } }).catch(() => undefined);
+        this.logger.warn(`✗ ${tag}: ${NO_ORIGINAL} — превью не собрать`);
+        return;
+      }
       // EXIF из локального файла, если MediaMeta ещё нет: так помечаются фото из архивов
       // (при распаковке captureMeta не вызывается) и не тратится повторный трафик S3.
       const hasMeta = await this.prisma.mediaMeta
@@ -518,7 +410,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
       // Сырьё из S3 удаляем, только если это разрешено конфигом и ни одна живая копия
       // не лежит в зоне «Файлы» — там файл должен оставаться оригиналом как есть.
-      // keepRaw: мастер не создан (анимация/несжатый вариант) — оригинал обязан остаться.
+      // keepRaw: производные не заменяют оригинал (анимация/PDF) — он обязан остаться.
       if (env.KEEP_ORIGINALS || res.keepRaw) {
         this.logger.log(`оригинал сохранён: ${tag}${res.keepRaw && !env.KEEP_ORIGINALS ? ' (нужен как есть)' : ''}`);
       } else {
@@ -529,26 +421,20 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
           await this.s3.deleteObject(S3Service.assetKey(job.sha256)).catch(() => undefined);
         }
       }
-      // res.warn = мастер-версия не собрана, но производные готовы: задача не «failed»,
-      // иначе UI показывал бы ошибку конвертации, хотя медиа доступно для просмотра.
+      // res.warn = производные собраны не полностью (например у видео есть только постер):
+      // задача не «failed», иначе UI показывал бы ошибку, хотя медиа доступно для просмотра.
       this.retryAfter.delete(job.id);
-      await this.prisma.job.update({
-        where: { id: job.id },
-        data: { state: 'done', error: res.warn ? truncErr(res.warn) : null, progress: 100, finishedAt: new Date() },
-      });
+      // Успех — это Asset.previewState = 'done' (его выставил convert*), а не строка задачи.
+      // Строку удаляем: очередь = список того, что осталось, готовое в ней не живёт.
+      await this.prisma.job.delete({ where: { id: job.id } }).catch(() => undefined);
       if (res.warn) this.logger.warn(`△ ${tag}: ${res.warn}`);
       else this.logger.log(`✓ ${tag}`);
     } catch (e) {
       const msg = (e as Error).message || 'error';
       const row = await this.prisma.job.findUnique({ where: { id: job.id } });
-      const cancelled = row?.state === 'failed' && row?.error?.startsWith('cancelled');
       const attempts = row?.attempts ?? 1;
       const transient = this.isTransient(msg);
-      if (cancelled) {
-        // задачу сняли снаружи (файл удалён) — это не падение конвертации
-        this.retryAfter.delete(job.id);
-        this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)}`);
-      } else if (transient && attempts < MAX_ATTEMPTS) {
+      if (transient && attempts < MAX_ATTEMPTS) {
         const delay = RETRY_BASE_DELAY_MS * attempts;
         this.retryAfter.set(job.id, Date.now() + delay);
         this.logger.warn(
@@ -556,7 +442,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         );
         await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: truncErr(msg) } });
       } else {
-        // постоянная ошибка: три попытки подряд дают тот же результат, а очередь занята
+        // постоянная ошибка: три попытки подряд дают тот же результат, а очередь занята.
+        // Строка остаётся со статусом ошибки — её видно на странице ошибок и можно повторить.
         const why = transient ? `попытки исчерпаны (${attempts})` : 'ошибка не временная — повтор не поможет';
         this.retryAfter.delete(job.id);
         this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)} — ${why}`);
@@ -604,7 +491,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // в браузере, а ICC в AVIF нельзя добавить постфактум (exiftool умеет только
     // заменять уже существующий блок). EXIF в превью не нужен — метаданные живут
     // в оригинале; ориентация уже запечена в пиксели через rotate().
-    await this.setProgress(job.id, 40, true);
     // Превью для списка — квадрат GRID_SIZE×GRID_SIZE: в сетке оно показывается
     // не крупнее 50 px, поэтому кадрируем по центру (fit: cover) вместо «ширины 512».
     const grid = await base
@@ -633,14 +519,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
           .avif({ quality: 60 })
           .toBuffer();
 
-    await this.setProgress(job.id, 85, true);
     await Promise.all([
       this.s3.putObject(MediaService.gridKey(sha), grid, 'image/webp'),
       this.s3.putObject(MediaService.photoFullKey(sha), full, animated ? 'image/webp' : 'image/avif'),
     ]);
 
-    // masterMime не выставляем: оптимизированного мастера нет, исходник — он и есть.
-    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: null, masterReadyAt: new Date() } });
+    // Превью собраны: и превью списка (50×50), и полноэкранное (1080). Оптимизированного
+    // мастера нет — оригинал и есть мастер, он отдаётся как есть.
+    await this.setPreviewState(job.assetId, 'done', null);
     return animated ? { keepRaw: true } : {};
   }
 
@@ -670,7 +556,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     if (!existsSync(posterRaw)) {
       await this.run(job.id, ['ffmpeg', '-y', '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     }
-    await this.setProgress(job.id, 5, true);
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
@@ -681,7 +566,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // -map_metadata 0 + use_metadata_tags: без них у превью creation_time = 0, а Apple
     // Keys (GPS, Make/Model, ContentIdentifier) не переносятся вообще — проверено на проде.
     try {
-      await this.runProgress(job.id, src.duration, 5, 94, [
+      await this.run(job.id, [
         'ffmpeg', '-y', '-i', rawPath,
         '-map_metadata', '0',
         '-map', '0:v:0', ...vf,
@@ -693,13 +578,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       await this.s3.putFile(MediaService.video1080Key(sha), previewPath, 'video/mp4');
     } catch (e) {
       // Постер уже опубликован — ролик виден в ленте, это не повод валить задачу.
-      await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: null, masterReadyAt: new Date() } });
+      await this.setPreviewState(job.assetId, 'done', null);
       return { warn: `превью 1080 не собрано (${(e as Error).message}); есть только постер` };
     }
 
-    // masterReadyAt = «превью готовы, есть чем показать» (оптимизированного мастера нет).
-    await this.prisma.asset.update({ where: { id: job.assetId }, data: { masterMime: null, masterReadyAt: new Date() } });
-    await this.setProgress(job.id, 100, true);
+    await this.setPreviewState(job.assetId, 'done', null);
     return {};
   }
 
@@ -735,16 +618,16 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const batch = missing.slice(0, PDF_PAGES_PER_JOB);
 
     let rendered = 0;
-    let cancelled = false;
+    let stopped = false;
     for (const page of batch) {
       // Пауза посреди длинного PDF: досчитывать десятки страниц, пока просили остановиться,
       // ни к чему — остаток доедет следующей задачей после снятия паузы.
       if (await this.isPaused()) break;
-      // Очистку очереди видно только по состоянию задачи: активный pdftoppm уже убит,
-      // а между страницами процесса нет — иначе досчитали бы весь батч «в отменённом» виде.
+      // Строки задачи нет — ассет вычистили из корзины прямо сейчас (строки задач уходят
+      // каскадом). Тогда остаток страниц рисовать некуда, и продолжение ставить не нужно.
       const row = await this.prisma.job.findUnique({ where: { id: job.id }, select: { state: true } }).catch(() => null);
-      if (row?.state !== 'processing') {
-        cancelled = true;
+      if (!row) {
+        stopped = true;
         break;
       }
       const png = join(tmpdir(), `clq-${job.id}-p${page}.png`);
@@ -768,16 +651,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       rmSync(png, { force: true });
       rendered++;
       const doneCount = total - missing.length + batch.indexOf(page) + 1;
-      await this.setProgress(job.id, Math.round((doneCount / total) * 100));
     }
 
     // «Есть чем показать» — только если хотя бы одна страница реально лежит в S3: иначе
     // деталка показала бы число страниц и битые картинки вместо «превью готовится».
     if (existing.size + rendered > 0) await this.finishPdf(job, total);
     // Остались страницы (упёрлись в лимит задачи или встали на паузу) — дорисуем следующей
-    // задачей: готовые страницы она пропустит по списку ключей. После отмены очереди
-    // следующую задачу не ставим — иначе отменённое воскресло бы само.
-    if (!cancelled && missing.length > rendered) {
+    // задачей: готовые страницы она пропустит по списку ключей. Если ассет вычистили — не ставим.
+    if (!stopped && missing.length > rendered) {
       await this.prisma.job.create({ data: { assetId: job.assetId, kind: 'pdf', state: 'pending' } }).catch(() => undefined);
       this.logger.log(`△ pdf ${sha.slice(0, 8)}: отрисовано ${rendered} из ${missing.length} оставшихся страниц`);
     }
@@ -805,7 +686,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private async finishPdf(job: JobRow, total: number): Promise<void> {
     await this.prisma.asset.update({
       where: { id: job.assetId },
-      data: { masterMime: null, masterReadyAt: new Date(), pageCount: total },
+      data: { previewState: 'done', previewError: null, pageCount: total },
     });
   }
 
@@ -921,62 +802,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         },
       })
       .catch(() => undefined);
-  }
-
-  /** ffmpeg с прогрессом: out_time делится на длительность, пишется в Job.progress. */
-  private runProgress(
-    jobId: string,
-    durationSec: number,
-    base: number,
-    span: number,
-    args: string[],
-    timeoutMs: number,
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const script = `ulimit -v ${WORKER_MEM_KB} 2>/dev/null; exec -- "$@"`;
-      const child = spawn('bash', ['-c', script, 'clq-worker', ...args, '-progress', 'pipe:1', '-nostats'], { stdio: ['ignore', 'pipe', 'pipe'] });
-      this.setChild(jobId, child);
-      let errTail = '';
-      let lastPct = -1;
-      let outUs = 0;
-      let acc = '';
-      const onData = (d: Buffer) => {
-        acc += d.toString();
-        let nl: number;
-        while ((nl = acc.indexOf('\n')) >= 0) {
-          const line = acc.slice(0, nl);
-          acc = acc.slice(nl + 1);
-          if (line.startsWith('out_time_us=')) outUs = parseInt(line.slice(12), 10) || 0;
-        }
-        if (durationSec > 0) {
-          const t = outUs / 1e6;
-          const pct = base + span * Math.min(1, t / durationSec);
-          if (Math.floor(pct) !== lastPct) {
-            lastPct = Math.floor(pct);
-            void this.setProgress(jobId, pct);
-          }
-        }
-      };
-      (child.stdout as NodeJS.ReadableStream).on('data', onData);
-      (child.stderr as NodeJS.ReadableStream).on('data', (c: Buffer) => {
-        errTail = (errTail + c.toString()).slice(-2000);
-      });
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error('timeout'));
-      }, timeoutMs);
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        reject(e);
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        if (code === 0) resolve();
-        else {
-          reject(new Error(`exit ${code}; ${errTail.slice(0, 1500)}`));
-        }
-      });
-    });
   }
 
   /** Запуск бинаря под ограничением виртуальной памяти (ulimit -v). */

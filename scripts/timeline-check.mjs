@@ -132,7 +132,7 @@ try {
   for (const [i, r] of rows.entries()) {
     const assetId = randomUUID();
     await prisma.asset.create({
-      data: { id: assetId, sha256: createHash('sha256').update(`${LOGIN_PREFIX}${stamp}-${i}`).digest('hex'), size: 1n, mime: 'image/jpeg', masterReadyAt: new Date() },
+      data: { id: assetId, sha256: createHash('sha256').update(`${LOGIN_PREFIX}${stamp}-${i}`).digest('hex'), size: 1n, mime: 'image/jpeg', previewState: 'done' },
     });
     await prisma.mediaMeta.create({ data: { assetId, capturedAt: r.capturedAt } });
     await prisma.fileEntry.create({
@@ -197,7 +197,7 @@ try {
   const statuses = await media.timelineStatus(userId, [own, randomUUID(), foreign.id]);
   check('статусы: своя запись пришла', statuses.length === 1 && statuses[0].entryId === own, `записей ${statuses.length}`);
   check('статусы: чужая и несуществующая отброшены', !statuses.some((s) => s.entryId !== own), '');
-  check('статусы: превью считается готовым', statuses.length === 1 && statuses[0].masterReady === true, JSON.stringify(statuses[0] ?? null));
+  check('статусы: превью считается готовым', statuses.length === 1 && statuses[0].previewState === 'done', JSON.stringify(statuses[0] ?? null));
 } finally {
   await cleanup();
   await prisma.$disconnect();
