@@ -78,8 +78,10 @@ jobs:
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
           S3_FILES_SECRET_KEY: ${{ secrets.S3_FILES_SECRET_KEY }}
-          # Необязательный секрет: сколько фото конвертировать параллельно (пусто → 2)
-          CONVERT_PHOTO_PARALLEL: ${{ secrets.CONVERT_PHOTO_PARALLEL }}
+          # Необязательный секрет: сколько фото конвертировать параллельно. `|| '2'` важен:
+          # без него отсутствующий секрет экспортировал пустое значение, и оно перебивало
+          # то, что записано в .env (dotenv не перезаписывает уже заданные переменные).
+          CONVERT_PHOTO_PARALLEL: ${{ secrets.CONVERT_PHOTO_PARALLEL || '2' }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
