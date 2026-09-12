@@ -4,6 +4,11 @@
 // координат и параметров кадра — на проде это была треть библиотеки. Здесь проверяется
 // сам разбор (без S3: объект подставляется локальным файлом) и что он не зависит от зоны.
 //
+// Отдельно проверяются два дефекта разбора, из-за которых деталка оставалась пустой:
+//   1) EXIF дальше начала файла (HEIC/HEIF телефонов, файлы из архивов): обрезанная голова
+//      даёт пустой разбор, и он считался готовым — запасное чтение файла целиком не запускалось;
+//   2) видео: ffprobe по presigned-ссылке на сервере не работает, теги читаются с локального файла.
+//
 // Запуск (нужны ffmpeg и собранный dist):
 //   DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
 //     node scripts/media-meta-check.mjs
@@ -81,6 +86,29 @@ function jpegWithExif({ make, model, dateTimeOriginal }) {
 const dir = mkdtempSync(join(tmpdir(), 'clq-meta-'));
 const made = [];
 
+/**
+ * Тот же JPEG, но с EXIF дальше 512 КБ: перед APP1(Exif) идут сегменты APP2 (ICC) — ровно то,
+ * что даёт HEIC/HEIF современных телефонов, где метаданные лежат не в начале файла. Проверка
+ * ловит регрессию «разбор обрезанной головы счёл себя успешным и не прочитал файл целиком».
+ */
+function jpegWithDeepExif(exif) {
+  const APP_MAX = 65533; // предел полезной нагрузки одного APPn-сегмента JPEG
+  const padding = [];
+  const seg = (marker, size) => Buffer.concat([
+    Buffer.from([0xff, marker]),
+    Buffer.from([(size + 2) >> 8, (size + 2) & 0xff]),
+    Buffer.alloc(size, 0x20),
+  ]);
+  // 10 сегментов по ~64 КБ = 640 КБ: EXIF оказывается дальше и 512 КБ, и половины мегабайта
+  for (let i = 0; i < 10; i++) padding.push(seg(0xe2, APP_MAX));
+  const base = jpegWithExif(exif);
+  return Buffer.concat([
+    base.subarray(0, 2), // SOI
+    ...padding,
+    base.subarray(2), // APP1(Exif) + EOI
+  ]);
+}
+
 /** Куда подставляем локальный файл вместо объекта в S3. */
 const objects = new Map();
 
@@ -90,10 +118,16 @@ const s3 = {
     if (!buf) throw new Error(`нет объекта ${key}`);
     return buf.subarray(start, end + 1);
   },
-  // ffprobe умеет читать локальный путь — этого достаточно, чтобы проверить разбор видео
-  presignedGet: async (key) => {
-    if (!objects.has(key)) throw new Error(`нет объекта ${key}`);
-    return objects.get(key + ':path');
+  getObjectBytes: async (key, maxBytes) => {
+    const buf = objects.get(key);
+    if (!buf) throw new Error(`нет объекта ${key}`);
+    return buf.subarray(0, maxBytes ?? buf.length);
+  },
+  /** ffprobe читает локальный файл — так же, как это делает сервис вместо presigned-ссылки. */
+  downloadToFile: async (key, dest) => {
+    const buf = objects.get(key);
+    if (!buf) throw new Error(`нет объекта ${key}`);
+    writeFileSync(dest, buf);
   },
 };
 
@@ -104,7 +138,6 @@ async function seed(name, mime, path, zone) {
     data: { sha256, size: BigInt(buf.length), mime, ext: name.split('.').pop() },
   });
   objects.set(`files/${sha256}`, buf);
-  objects.set(`files/${sha256}:path`, path);
   made.push({ assetId: asset.id, sha256, zone });
   return { assetId: asset.id, sha256, size: buf.length };
 }
@@ -125,6 +158,13 @@ try {
 
   const media = new MediaService(prisma, s3, { rootFolderId: async () => null });
 
+  // === «разбор ничего не нашёл» — это не готовые метаданные ==============================
+  // Ровно так выглядит результат разбора обрезанного начала HEIC: {kind:'image'} и всё.
+  const { hasUsefulRaw } = dist('media/media.service.js');
+  check('raw только с kind разбором не считается', !hasUsefulRaw({ kind: 'image' }));
+  check('raw с полями разбором считается', hasUsefulRaw({ kind: 'image', make: 'TestCam' }));
+  check('отсутствующий raw разбором не считается', !hasUsefulRaw(null) && !hasUsefulRaw(undefined));
+
   // === фото в зоне «Файлы»: метаданные всё равно разбираются ============================
   const image = await seed('photo.jpg', 'image/jpeg', photo, 'FILES');
   await media.captureAny(image.assetId, image.sha256, image.size, 'image/jpeg');
@@ -135,11 +175,24 @@ try {
   check('фото: камера из EXIF', imageMeta?.make === 'TestCam', String(imageMeta?.make));
   check('фото: модель из EXIF', imageMeta?.model === 'Model-X', String(imageMeta?.model));
   check('фото: полный набор тегов сохранён', raw.kind === 'image' && raw.model === 'Model-X', String(raw.kind));
-  check('фото: повторный разбор не ходит в S3', await media['metaAlreadyParsed'](image.assetId));
+  check('фото: повторный разбор не ходит в S3', await media.hasDetailedMeta(image.assetId));
   const before = imageMeta?.createdAt?.getTime();
   await media.captureAny(image.assetId, image.sha256, image.size, 'image/jpeg');
   const again = await prisma.mediaMeta.findUnique({ where: { assetId: image.assetId } });
   check('фото: повторный вызов ничего не переписывает', again?.createdAt?.getTime() === before);
+
+  // === EXIF дальше начала файла: разбор обязан прочитать файл целиком ===================
+  const deep = join(dir, 'deep.jpg');
+  writeFileSync(deep, jpegWithDeepExif({ make: 'DeepCam', model: 'D-900', dateTimeOriginal: '2024:02:03 04:05:06' }));
+  const deepBytes = readFileSync(deep);
+  check('EXIF за 512 КБ: в первых 512 КБ тегов камеры нет', !deepBytes.subarray(0, 512 * 1024).includes('DeepCam'), `${deepBytes.length} байт`);
+  check('EXIF за 512 КБ: теги лежат дальше в файле', deepBytes.includes('DeepCam'));
+  const deepAsset = await seed('deep.jpg', 'image/jpeg', deep, 'FILES');
+  await media.captureAny(deepAsset.assetId, deepAsset.sha256, deepAsset.size, 'image/jpeg');
+  const deepMeta = await prisma.mediaMeta.findUnique({ where: { assetId: deepAsset.assetId } });
+  check('EXIF за 512 КБ: камера всё равно найдена', deepMeta?.make === 'DeepCam', String(deepMeta?.make));
+  check('EXIF за 512 КБ: дата съёмки найдена', deepMeta?.capturedAt?.toISOString().startsWith('2024-02-03') === true, String(deepMeta?.capturedAt));
+  check('EXIF за 512 КБ: разбор засчитан как полноценный', await media.hasDetailedMeta(deepAsset.assetId));
 
   // === видео в зоне «Файлы»: ffprobe сохраняет длительность, кодек и дату ===============
   const clip = await seed('video.mp4', 'video/mp4', video, 'FILES');
@@ -154,6 +207,24 @@ try {
   check('видео: ffprobe добрал длительность', Number(vraw.durationSec) > 1.5 && Number(vraw.durationSec) < 2.5, String(vraw.durationSec));
   check('видео: кодек и разрешение', vraw.videoCodec === 'h264' && vraw.width === 64 && vraw.height === 48, `${vraw.videoCodec} ${vraw.width}x${vraw.height}`);
   check('видео: дата из контейнера', String(vraw.createdAt ?? '').startsWith('2022-05-06'), String(vraw.createdAt));
+
+  // === видео из очереди: сырьё уже скачано, теги берём с локального файла ================
+  const video2 = join(dir, 'video2.mp4');
+  execFileSync('ffmpeg', [
+    '-v', 'quiet',
+    '-f', 'lavfi', '-i', 'testsrc=size=32x32:rate=10:duration=3',
+    '-metadata', 'creation_time=2023-04-05T06:07:08.000000Z',
+    '-y', video2,
+  ]);
+  const clip2 = await seed('video2.mp4', 'video/mp4', video2, 'PHOTOS');
+  // как это делает queue.enqueue(): строка есть, подробностей в ней нет
+  await prisma.mediaMeta.create({ data: { assetId: clip2.assetId, capturedAt: new Date() } });
+  check('видео из очереди: до разбора подробностей нет', !(await media.hasDetailedMeta(clip2.assetId)));
+  await media.captureVideoFromFile(clip2.assetId, video2);
+  const vraw2 = (await prisma.mediaMeta.findUnique({ where: { assetId: clip2.assetId } }))?.raw ?? {};
+  check('видео из очереди: длительность и кодек с локального файла', Number(vraw2.durationSec) > 2.5 && vraw2.videoCodec === 'h264', `${vraw2.durationSec}s ${vraw2.videoCodec}`);
+  check('видео из очереди: дата из контейнера', String(vraw2.createdAt ?? '').startsWith('2023-04-05'), String(vraw2.createdAt));
+  check('видео из очереди: повторный разбор не нужен', await media.hasDetailedMeta(clip2.assetId));
 
   // === сайдкары и даты архивов =========================================================
   // Настоящие архивы Takeout: даты файлов внутри — время упаковки, поэтому дата съёмки
@@ -192,6 +263,8 @@ try {
   await media.captureAny(shotAsset.assetId, shotAsset.sha256, shotAsset.size, 'image/png');
   const beforeFill = await prisma.mediaMeta.findUnique({ where: { assetId: shotAsset.assetId } });
   check('скриншот: EXIF нет — даты нет', !beforeFill?.capturedAt);
+  // PNG: exifr читает заголовок (1×1), то есть разбор не пустой — но ни даты, ни камеры в нём нет
+  check('скриншот: разбор дал только размеры кадра', beforeFill?.raw?.kind === 'image' && beforeFill?.width === 1 && beforeFill?.height === 1, JSON.stringify(beforeFill?.raw));
   const takenDate = new Date(Number(sidecarJson.photoTakenTime.timestamp) * 1000);
   await media.fillDateAndGeo(shotAsset.assetId, takenDate, {
     latitude: sidecarJson.geoData.latitude,

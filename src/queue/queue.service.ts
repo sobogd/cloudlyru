@@ -374,6 +374,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         await this.media
           .captureMetaFromFile(job.assetId, rawPath, statSync(rawPath).size, job.mime)
           .catch(() => undefined);
+      } else if (job.kind === 'video') {
+        // У видео строка MediaMeta уже есть (её создал enqueue с датой загрузки), поэтому разбор
+        // по локальному файлу раньше пропускался: в деталке не было ни длительности, ни кодеков.
+        // Файл под конвертацию уже скачан — теги читаем с него, без второго похода в S3.
+        await this.media.captureVideoFromFile(job.assetId, rawPath).catch(() => undefined);
       }
       let res: ConvertResult = {};
       if (job.kind === 'photo') res = await this.convertPhoto(job, rawPath);

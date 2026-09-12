@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import type { Request, Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
-import { MediaService } from '../media/media.service';
+import { hasUsefulRaw, MediaService } from '../media/media.service';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { ChangesService } from '../sync/changes.service';
 import { QueueService } from '../queue/queue.service';
@@ -420,7 +420,9 @@ export class FilesService {
 
     // Подробные метаданные извлекаем лениво при первом открытии деталки и кэшируем в БД.
     // Раньше EXIF парсился только для зоны «Фото», поэтому у файлов в «Файлах» деталка была пустой.
-    if (!entry.asset.media?.raw) {
+    // Пустой raw (например, `{"kind":"image"}` из разбора обрезанного начала HEIC) за разбор
+    // не считаем: иначе деталка навсегда оставалась без даты, камеры и кадра.
+    if (!hasUsefulRaw(entry.asset.media?.raw)) {
       await this.media.extractDetail(
         entry.assetId,
         entry.asset.sha256,

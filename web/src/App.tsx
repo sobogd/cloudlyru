@@ -743,7 +743,10 @@ function FileDetail({ entryId, onBack }: { entryId: string; onBack: () => void }
           <MetaRow k="Расположение" v={meta.path} />
           <MetaRow k="Создан" v={new Date(meta.createdAt).toLocaleString()} />
           {meta.masterMime && <MetaRow k="Оптимизирован" v={meta.masterMime} />}
-          {rows.length === 0 && meta.media && (
+          {/* Главное из метаданных — всегда на виду, а не только когда полного дампа нет:
+              дата съёмки, камера, кадр и координаты нужны сразу, а остальные теги лежат
+              ниже в свёрнутом «Все теги из файла» (он длинный и не должен отодвигать превью). */}
+          {meta.media && (
             <>
               {meta.media.capturedAt && <MetaRow k="Дата съёмки" v={new Date(meta.media.capturedAt).toLocaleString()} />}
               {meta.media.make || meta.media.model ? <MetaRow k="Камера" v={[meta.media.make, meta.media.model].filter(Boolean).join(' ')} /> : null}

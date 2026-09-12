@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { execFileSync } from 'child_process';
+import { mkdtempSync, rmSync } from 'fs';
 import { readFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import * as exifr from 'exifr';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
@@ -31,11 +34,15 @@ export function mediaKindOf(mime: unknown): 'photo' | 'video' | 'pdf' | null {
  * старое превью 512 px, и оно продолжает отдаваться без пересборки.
  */
 export const GRID_SIZE = 50;
-/** Сколько байт читать из начала файла для EXIF. */
+/**
+ * Начало файла для EXIF. Для JPEG этого всегда хватает, а у HEIC/HEIF новых телефонов и у
+ * файлов из архивов Takeout теги лежат глубже — тогда читаем объект целиком (см.
+ * storeImageMetaFromObject): обрезанное начало exifr разбирает в пустой результат.
+ */
 const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 /** Ширина полноэкранного превью фото (и превью страницы PDF — та же величина). */
 export const FULL_SIZE = 1080;
-/** Сколько байт читаем из начала файла, прежде чем тянуть объект целиком. */
+/** Сколько байт читаем из начала объекта, прежде чем тянуть его целиком. */
 const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 /**
  * Голова объекта для быстрого разбора метаданных: EXIF и GPS лежат в начале JPEG/HEIC/MP4.
@@ -44,7 +51,27 @@ const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
  */
 const META_HEAD_BYTES = 512 * 1024;
 const MAX_PARSE_BYTES = 150 * 1024 * 1024;
-/** Сколько байт читать из начала файла для EXIF (метаданные лежат в начале JPEG/HEIC). */
+/**
+ * Сколько готовы скачать из S3 ради тегов видео. Файл скачивается целиком: ffprobe по
+ * presigned-ссылке на этом сервере не работает (внешний хост не резолвится), а метаданные
+ * контейнера лежат и в конце файла. Разбор идёт один раз на ассет и кэшируется в БД.
+ */
+const VIDEO_META_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+/**
+ * Разбор дал что-то полезное? В `raw` есть служебный `kind` и поля; если кроме `kind` ничего
+ * нет — это не метаданные, а след неудачного разбора. Так выглядит обрезанное начало файла:
+ * exifr на неполном HEIC/HEIF возвращает объект с одной ошибкой (`{errors:[…]}`), из которого
+ * не извлекается ни одного поля. Раньше такой `raw` считался готовыми метаданными, и фото
+ * навсегда оставалось без даты, камеры и кадра — ни запасной полный разбор, ни ленивый
+ * разбор при открытии деталки больше не запускались.
+ */
+export function hasUsefulRaw(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  return Object.entries(raw as Record<string, unknown>).some(
+    ([k, v]) => k !== 'kind' && v !== undefined && v !== null && v !== '',
+  );
+}
 
 const MS_PER_MIN = 60_000;
 
@@ -321,7 +348,7 @@ export class MediaService {
     if (size <= 0 || size > MAX_PARSE_BYTES) return;
     const isVideo = VIDEO_MIMES.includes(mime);
     if (!isVideo && !IMAGE_MIMES.includes(mime)) return;
-    if (await this.metaAlreadyParsed(assetId)) return;
+    if (await this.hasDetailedMeta(assetId)) return;
     if (isVideo) {
       // дата загрузки сразу: видео должно быть в ленте, даже если ffprobe не ответит
       await this.prisma.mediaMeta
@@ -364,38 +391,80 @@ export class MediaService {
       .catch(() => undefined);
   }
 
-  /** Уже разбирали этот ассет: второй раз в S3 за тем же не ходим. */
-  private async metaAlreadyParsed(assetId: string): Promise<boolean> {
+  /**
+   * Разбор уже дал подробности: `raw` есть и в нём есть поля, кроме `kind`.
+   *
+   * Проверять только `raw != null` нельзя: пустой `raw` остаётся после неудачного разбора
+   * обрезанного начала файла, и тогда и повторная загрузка того же содержимого, и ленивый
+   * разбор при открытии деталки решали, что ходить в хранилище незачем.
+   */
+  async hasDetailedMeta(assetId: string): Promise<boolean> {
     const known = await this.prisma.mediaMeta
       .findUnique({ where: { assetId }, select: { raw: true } })
       .catch(() => null);
-    return Boolean(known?.raw);
+    return hasUsefulRaw(known?.raw);
   }
 
   /**
-   * Подробные метаданные для деталки файла: EXIF фото или ffprobe видео.
-   * Читается только начало объекта (EXIF лежит в начале JPEG/HEIC), видео
-   * пробуется по presigned-ссылке — без скачивания. Результат кэшируется в MediaMeta.
+   * Подробные метаданные для деталки файла: EXIF фото или ffprobe видео. Результат
+   * кэшируется в MediaMeta, поэтому в хранилище ходим только пока разбор не удался.
    */
   async extractDetail(assetId: string, sha256: string, size: number, mime: string): Promise<void> {
     try {
       if (IMAGE_MIMES.includes(mime)) {
-        const head = await this.s3.readRange(
-          S3Service.assetKey(sha256),
-          0,
-          Math.min(size, MediaService.EXIF_HEAD_BYTES) - 1,
-        );
-        await this.storeImageMeta(assetId, head);
+        await this.storeImageMetaFromObject(assetId, sha256, size);
         return;
       }
 
       if (VIDEO_MIMES.includes(mime)) {
-        const url = await this.s3.presignedGet(S3Service.assetKey(sha256), mime);
-        await this.storeVideoMeta(assetId, url);
+        await this.captureVideoFromObject(assetId, sha256, size);
       }
     } catch (e) {
       this.logger.debug(`extractDetail skip: ${(e as Error).message}`);
     }
+  }
+
+  /**
+   * EXIF фото из объекта. Сначала читаем начало файла, а если его не хватило — объект целиком.
+   *
+   * Одной головы мало: у HEIC/HEIF новых телефонов (проверено на Samsung S25 Ultra) EXIF лежит
+   * глубже 512 КБ, а у файлов из архивов Takeout — и глубже 4 МБ. На обрезанном начале exifr
+   * не находит ни одного поля, и фото остаётся без даты, камеры и кадра.
+   */
+  private async storeImageMetaFromObject(assetId: string, sha256: string, size: number): Promise<void> {
+    const key = S3Service.assetKey(sha256);
+    const head = await this.s3.readRange(key, 0, Math.min(size, MediaService.EXIF_HEAD_BYTES) - 1);
+    if (await this.storeImageMeta(assetId, head)) return;
+    if (size <= head.length) return; // голова была всем файлом — читать больше нечего
+    const whole = await this.s3.getObjectBytes(key, MAX_PARSE_BYTES);
+    if (whole.length > head.length) await this.storeImageMeta(assetId, whole);
+  }
+
+  /**
+   * Видео: ffprobe по ЛОКАЛЬНОМУ файлу. По presigned-ссылке он на этом сервере не работает
+   * (внешний хост S3 не резолвится), из-за чего видео оставалось без длительности и кодеков
+   * в деталке. Уже скачанное сырьё воркер отдаёт через captureVideoFromFile — без второго
+   * скачивания из S3.
+   */
+  private async captureVideoFromObject(assetId: string, sha256: string, size: number): Promise<void> {
+    if (size <= 0 || size > VIDEO_META_MAX_BYTES) {
+      this.logger.debug(`видео ${sha256.slice(0, 8)}: ${size} байт — теги не читаем, слишком большой файл`);
+      return;
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'clq-vmeta-'));
+    const path = join(dir, 'raw');
+    try {
+      await this.s3.downloadToFile(S3Service.assetKey(sha256), path);
+      await this.storeVideoMeta(assetId, path);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  /** Теги видео из уже скачанного файла (воркер очереди качает сырьё под конвертацию). */
+  async captureVideoFromFile(assetId: string, filePath: string): Promise<void> {
+    if (await this.hasDetailedMeta(assetId)) return;
+    await this.storeVideoMeta(assetId, filePath);
   }
 
   /**
@@ -465,14 +534,16 @@ export class MediaService {
       // без GPS), и тогда таймлайн оставался с неверным моментом съёмки навсегда.
       update: { raw: raw as never, capturedAt, latitude, longitude, make, model, width, height },
     });
-    return true;
+    // Нашли ли что-то по-настоящему: пустой raw вызывающему нужно трактовать как «не разобрали»
+    // и читать файл дальше или целиком (см. hasUsefulRaw).
+    return hasUsefulRaw(raw);
   }
 
-  /** ffprobe — по ссылке на объект или по локальному файлу: длительность, кодек, GPS, дата. */
-  private async storeVideoMeta(assetId: string, source: string): Promise<void> {
+  /** ffprobe по локальному файлу: длительность, кодек, GPS, дата съёмки. */
+  private async storeVideoMeta(assetId: string, filePath: string): Promise<void> {
     const out = execFileSync(
       'ffprobe',
-      ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', source],
+      ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath],
       { encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
     const parsed = JSON.parse(out) as {
