@@ -33,7 +33,8 @@ export function mediaKindOf(mime: unknown): 'photo' | 'video' | 'pdf' | null {
 export const GRID_SIZE = 50;
 /** Сколько байт читать из начала файла для EXIF. */
 const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
-export const FULL_SIZE = 2048;
+/** Ширина полноэкранного превью фото (и превью страницы PDF — та же величина). */
+export const FULL_SIZE = 1080;
 /** Сколько байт читаем из начала файла, прежде чем тянуть объект целиком. */
 const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 /**
@@ -164,9 +165,9 @@ export class MediaService {
   static gridKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-512.webp');
   }
-  /** Полноэкранное превью фото (2048, AVIF). */
+  /** Полноэкранное превью фото (1080, AVIF; у анимированных источников — WebP). */
   static photoFullKey(sha256: string): string {
-    return MediaService.viewKey(sha256, '-2048.avif');
+    return MediaService.viewKey(sha256, `-${FULL_SIZE}.avif`);
   }
   /** Постер видео для списка (тот же квадрат 50×50). */
   static videoPosterKey(sha256: string): string {
@@ -197,6 +198,10 @@ export class MediaService {
   static legacyPhotoFullWebpKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-2048.webp');
   }
+  /** Прежний размер полноэкранного превью фото: у части ассетов оно ещё лежит под этим ключом. */
+  static legacyPhotoFull2048Key(sha256: string): string {
+    return MediaService.viewKey(sha256, '-2048.avif');
+  }
 
   /**
    * Все производные ассета — актуальные и устаревшие. Нужно для полного удаления:
@@ -220,6 +225,7 @@ export class MediaService {
       MediaService.legacyVideoMasterKey(sha256),
       MediaService.legacyVideo720Key(sha256),
       MediaService.legacyPhotoFullWebpKey(sha256),
+      MediaService.legacyPhotoFull2048Key(sha256),
     ];
   }
 

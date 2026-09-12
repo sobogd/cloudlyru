@@ -506,6 +506,7 @@ export class FilesService {
       : [
           MediaService.legacyPhotoMasterKey(sha),
           MediaService.photoFullKey(sha),
+          MediaService.legacyPhotoFull2048Key(sha),
           MediaService.legacyPhotoFullWebpKey(sha),
           MediaService.gridKey(sha),
         ];

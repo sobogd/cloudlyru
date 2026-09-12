@@ -7,6 +7,7 @@ import sharp from 'sharp';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import {
+  FULL_SIZE,
   GRID_SIZE,
   MediaService,
   PDF_PAGES_PER_JOB,
@@ -129,7 +130,13 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
    * (включая легаси-ключи старого пайплайна: у части ассетов оригинал был удалён).
    */
   private fullPreviewKeys(kind: string, sha256: string): string[] {
-    if (kind === 'photo') return [MediaService.photoFullKey(sha256), MediaService.legacyPhotoFullWebpKey(sha256)];
+    if (kind === 'photo') {
+      return [
+        MediaService.photoFullKey(sha256),
+        MediaService.legacyPhotoFull2048Key(sha256),
+        MediaService.legacyPhotoFullWebpKey(sha256),
+      ];
+    }
     if (kind === 'pdf') return [MediaService.pdfPageKey(sha256, 1)];
     return [MediaService.video1080Key(sha256), MediaService.legacyVideo720Key(sha256)];
   }
@@ -151,7 +158,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // Превью уже есть, а оригинала нет (KEEP_ORIGINALS=false) — задача обречена на три
     // падения при скачивании files/<sha>. Ставим её только если превью на самом деле нет.
     // Проверяем весь набор ключей, которые отдаёт UI, а не только текущий: у старых
-    // ассетов полное превью лежит под легаси-ключом `-2048.webp`/`-720.mp4`.
+    // ассетов полное превью лежит под легаси-ключом `-2048.avif`/`-2048.webp`/`-720.mp4`.
     const asset = await this.prisma.asset
       .findUnique({ where: { id: assetId }, select: { masterReadyAt: true } })
       .catch(() => null);
@@ -425,7 +432,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ============ Фото → превью 50×50 (список) + 2048 (полный экран) ============
+  // ============ Фото → превью 50×50 (список) + 1080 (полный экран) ============
   // Мастер-версия не создаётся: оригинал и есть мастер и отдаётся как есть
   // (при KEEP_ORIGINALS=true он не удаляется), поэтому метаданные исходника
   // (EXIF, GPS, ICC, MakerNotes, MPF/depth, gain map) не теряются вообще.
@@ -473,21 +480,20 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
     // Анимированный источник (GIF/WebP): полноэкранное превью оставляем анимированным
     // WebP — AVIF-мастер в старом пайплайне отдавал только первый кадр.
-    // Качество полного превью — q60: у AVIF шкала не как у JPEG, q60 ≈ JPEG 85–90 на глаз,
-    // а вес на 4000×3000 выходит ~400 КБ против ~940 КБ при q85 (замеры на реальных файлах).
-    // Полный экран открывают по одному фото, поэтому каждый лишний мегабайт — это трафик
-    // мобильного клиента, а не «запас качества».
+    // Ширина полного превью — FULL_SIZE (1080): столько же, сколько у превью страницы PDF
+    // и превью видео. 2048 давал заметно более тяжёлый файл, а на телефоне разницы не видно;
+    // качество AVIF q60 (шкала не как у JPEG: на глаз ≈ JPEG 85–90) оставлено прежним.
     const full = animated
       ? await base
           .clone()
           .keepIccProfile()
-          .resize({ width: 2048, withoutEnlargement: true })
+          .resize({ width: FULL_SIZE, withoutEnlargement: true })
           .webp({ quality: 80 })
           .toBuffer()
       : await base
           .clone()
           .keepIccProfile()
-          .resize({ width: 2048, withoutEnlargement: true })
+          .resize({ width: FULL_SIZE, withoutEnlargement: true })
           .avif({ quality: 60 })
           .toBuffer();
 

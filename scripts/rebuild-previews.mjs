@@ -1,12 +1,13 @@
-// Пересборка полных превью фото под актуальные настройки энкодера.
+// Пересборка полных превью фото под актуальный размер (1080) и настройки энкодера.
 //
-// Зачем: ключ `view/<sha>-2048.avif` — это то, что открывается в полноэкранном просмотре.
-// После смены параметров энкодера (2048 px, AVIF q60 вместо q85) старые превью остаются
-// тяжёлыми (~940 КБ на кадр 4000×3000), пока их не пересоберут из оригиналов.
+// Зачем: полноэкранное превью лежит по ключу `view/<sha>-1080.avif`. У ассетов, собранных
+// прежним пайплайном, там пусто, а под легаси-ключом `-2048.avif` (или `-2048.webp`) лежит
+// превью прежнего размера — вдвое тяжелее. Сервер отдаёт его как фолбэк, поэтому старые
+// фото не ломаются, но место в S3 и трафик на телефоне оно всё ещё занимает: этот скрипт
+// пересобирает такие ассеты из оригинала под 1080.
 //
 // Оригиналы на месте (KEEP_ORIGINALS=true), поэтому пересборка идёт из исходника, а не
-// из старого превью — второго поколения потерь нет. Ассеты, у которых оригинал удалён
-// старым пайплайном, пропускаются: их полное превью лежит под легаси-ключом `-2048.webp`.
+// из старого превью — второго поколения потерь нет. Ассеты без оригинала пропускаются.
 //
 // Запуск на сервере (там же, где БД и S3; параметры — из .env приложения):
 //   node --env-file=.env scripts/rebuild-previews.mjs                     # dry-run: что и насколько
@@ -15,8 +16,7 @@
 //   node --env-file=.env scripts/rebuild-previews.mjs --apply             # вся медиатека
 //
 // Флаги: --apply (без него ничего не пишем), --limit N, --sha <префикс sha256>,
-//        --min-kb N (порог: превью легче — не трогаем, по умолчанию 450),
-//        --width N (2048), --quality N (60 — те же значения, что в src/queue/queue.service.ts).
+//        --width N (1080), --quality N (60 — те же значения, что в src/queue/queue.service.ts).
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -30,7 +30,9 @@ const run = promisify(execFile);
 const env = process.env;
 
 // ===== ключи производных: те же, что в MediaService (viewKey(sha, suffix)) =====
-const photoFullKey = (sha) => `view/${sha}-2048.avif`;
+const width = Number(arg('width', 1080));
+const photoFullKey = (sha) => `view/${sha}-${width}.avif`;
+const legacyPhotoFull2048Key = (sha) => `view/${sha}-2048.avif`;
 const legacyPhotoFullWebpKey = (sha) => `view/${sha}-2048.webp`;
 
 function arg(name, def) {
@@ -42,8 +44,6 @@ function arg(name, def) {
 const apply = !!arg('apply', false);
 const limit = Number(arg('limit', 0)) || 0;
 const shaPrefix = typeof arg('sha', '') === 'string' ? arg('sha', '') : '';
-const minKb = Number(arg('min-kb', 450));
-const width = Number(arg('width', 2048));
 const quality = Number(arg('quality', 60));
 
 const bucket = env.S3_FILES_BUCKET;
@@ -71,30 +71,34 @@ const head = async (key) => {
 
 const kb = (bytes) => `${Math.round(bytes / 1024)}К`;
 
-/** Полное превью как в queue.service.convertPhoto: 2048 px, AVIF q60 (анимация — WebP). */
+/** Полное превью как в queue.service.convertPhoto: FULL_SIZE px, AVIF q60 (анимация — WebP). */
 async function encodeFull(srcPath, animated) {
   const pipe = sharp(srcPath, { animated }).rotate().resize({ width, withoutEnlargement: true }).keepIccProfile();
   if (animated) return { body: await pipe.webp({ quality: 80 }).toBuffer(), mime: 'image/webp' };
   return { body: await pipe.avif({ quality }).toBuffer(), mime: 'image/avif' };
 }
 
-const stats = { total: 0, rebuilt: 0, skippedSmall: 0, skippedNoRaw: 0, skippedBigger: 0, savedBytes: 0 };
+const stats = { total: 0, rebuilt: 0, skippedCurrent: 0, skippedNoRaw: 0, skippedBigger: 0, savedBytes: 0 };
 
 async function processAsset(asset) {
   const sha = asset.sha256;
   const fullKey = photoFullKey(sha);
   const current = await head(fullKey);
-  const legacy = current ? 0 : await head(legacyPhotoFullWebpKey(sha));
+  // Прежние размеры: 2048 (AVIF — прошлый пайплайн, WebP — ещё более старый)
+  const legacy = current
+    ? 0
+    : (await head(legacyPhotoFull2048Key(sha))) || (await head(legacyPhotoFullWebpKey(sha)));
 
-  if (current && current <= minKb * 1024) {
-    stats.skippedSmall++;
+  // Превью уже нужного размера — не трогаем: скрипт пересобирает только отставшие
+  if (current) {
+    stats.skippedCurrent++;
     return;
   }
   const rawKey = `files/${sha}`;
   const rawSize = await head(rawKey);
   if (!rawSize) {
     stats.skippedNoRaw++;
-    console.log(`— ${sha.slice(0, 10)} нет оригинала (легаси-ассет), пропуск${legacy ? ' (превью — старый WebP)' : ''}`);
+    console.log(`— ${sha.slice(0, 10)} нет оригинала (легаси-ассет), пропуск${legacy ? ' (превью — старый размер)' : ''}`);
     return;
   }
 
@@ -120,7 +124,7 @@ async function processAsset(asset) {
     const meta = await sharp(decodedPath, { animated: true }).metadata().catch(() => null);
     const animated = (meta?.pages ?? 1) > 1;
     const { body, mime } = await encodeFull(decodedPath, animated);
-    const before = current || legacy; // 0 — превью ещё нет (или есть только легаси-WebP)
+    const before = current || legacy; // 0 — превью нет вовсе (обычно так у новых 1080-ассетов)
 
     if (before && body.length >= before) {
       stats.skippedBigger++;
@@ -140,7 +144,7 @@ async function processAsset(asset) {
     }
     if (before) stats.savedBytes += before - body.length;
     stats.rebuilt++;
-    if (!current && legacy) console.log('   (ляжет по ключу -2048.avif, легаси-WebP останется как есть)');
+    if (legacy) console.log(`   (легаси-превью прежнего размера останется — его подберёт trash purge)`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -162,7 +166,7 @@ const assets = await prisma.asset.findMany({
 stats.total = assets.length;
 console.log(
   `${apply ? 'ПЕРЕСБОРКА' : 'DRY-RUN'}: фото-ассетов ${assets.length} ` +
-  `(ширина ${width}, AVIF q${quality}, порог ${minKb} КБ${limit ? `, лимит ${limit}` : ''})`,
+  `(ширина ${width}, AVIF q${quality}${limit ? `, лимит ${limit}` : ''})`,
 );
 
 let i = 0;
@@ -180,7 +184,7 @@ const saved = stats.savedBytes >= 1024 * 1024
   ? `${(stats.savedBytes / 1024 / 1024).toFixed(1)} МБ`
   : `${Math.round(stats.savedBytes / 1024)} КБ`;
 console.log(
-  `\nИтого: пересобрано ${stats.rebuilt}, уже лёгких ${stats.skippedSmall}, ` +
+  `\nИтого: пересобрано ${stats.rebuilt}, уже нужного размера ${stats.skippedCurrent}, ` +
   `без оригинала ${stats.skippedNoRaw}, не выиграли ${stats.skippedBigger}; ` +
   `экономия ~${saved}${apply ? '' : ' (в dry-run — оценочно)'}`,
 );

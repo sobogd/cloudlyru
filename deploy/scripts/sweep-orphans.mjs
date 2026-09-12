@@ -56,6 +56,7 @@ const s3 = new S3Client({
 // Плюс превью страниц PDF: view/<sha>-p<N>-1080.webp — их число переменно, поэтому шаблон.
 const SUFFIXES = [
   '-512.webp',
+  '-1080.avif',
   '-2048.avif',
   '-poster.webp',
   '-1080.mp4',

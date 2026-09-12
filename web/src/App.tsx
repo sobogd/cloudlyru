@@ -812,7 +812,7 @@ function ImagePreview({ meta }: { meta: api.FileMeta }) {
   if (stage > 1) {
     return <PreviewNote text="Превью ещё не собрано, а этот формат браузер не показывает" url={api.fileUrl(meta.id)} entryId={meta.id} />;
   }
-  const src = stage === 0 ? api.previewUrl(meta.sha256, 2048) : api.fileInlineUrl(meta.id);
+  const src = stage === 0 ? api.previewUrl(meta.sha256, 1080) : api.fileInlineUrl(meta.id);
   return (
     <div className="pmedia">
       <img src={src} alt={meta.name} onError={() => setStage((s) => s + 1)} />
@@ -1062,7 +1062,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           ) : isVid(it.mime) ? (
             <video src={api.videoPreviewUrl(it.sha256!)} controls autoPlay style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />
           ) : (
-            <PhotoZoom src={api.previewUrl(it.sha256!, 2048)} />
+            <PhotoZoom src={api.previewUrl(it.sha256!, 1080)} />
           )}
         </div>
         <div className="tbar">

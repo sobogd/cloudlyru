@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { MediaService } from './media.service';
+import { FULL_SIZE, MediaService } from './media.service';
 import { AlbumsService } from './albums.service';
 import { S3Service } from '../s3/s3.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -67,11 +67,17 @@ export class MediaController {
         cache: PREVIEW_CACHE,
       });
     }
-    // Фото: сетка (квадрат 50×50) — по умолчанию, 2048 — полный экран
-    // (AVIF; у анимированных источников WebP).
-    const wantFull = Number(wRaw ?? 512) === 2048;
+    // Фото: сетка (квадрат 50×50) — по умолчанию, полный экран — 1080.
+    // Всё, что клиент просит от 1080 и выше, отдаём одним и тем же превью 1080: 2048
+    // больше не собирается (это лишний вес на телефоне), а старые клиенты и ассеты
+    // со старым превью продолжают работать через легаси-ключи.
+    const wantFull = Number(wRaw ?? 512) >= FULL_SIZE;
     const candidates = wantFull
-      ? [MediaService.photoFullKey(sha), MediaService.legacyPhotoFullWebpKey(sha)]
+      ? [
+          MediaService.photoFullKey(sha),
+          MediaService.legacyPhotoFull2048Key(sha),
+          MediaService.legacyPhotoFullWebpKey(sha),
+        ]
       : [MediaService.gridKey(sha)];
     for (const key of candidates) {
       if (await this.s3.headObject(key).catch(() => false)) {

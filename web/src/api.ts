@@ -486,6 +486,7 @@ export interface Trip { id: string; start: string; end: string; title: string; c
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 
+/** Превью: w=512 — миниатюра для списка (квадрат 50×50), w=1080 — полный экран. */
 export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
 /** Страница PDF: превью, отрисованное сервером (нумерация с единицы). */
 export const pdfPageUrl = (sha: string, page: number) => `/api/v1/previews/${sha}?page=${page}`;
