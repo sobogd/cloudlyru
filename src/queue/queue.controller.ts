@@ -47,6 +47,10 @@ export class QueueController {
       remaining: pending + processing,
       processing,
       errors: failed,
+      // Место на диске сервера: когда его мало, конвертация встаёт — и это должно быть видно
+      // в настройках, а не только в логах на сервере (13.09.2026 диск кончился и уронил всё).
+      diskFree: this.queue.freeBytes(),
+      diskLow: this.queue.diskLow(),
     };
   }
 

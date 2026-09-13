@@ -518,6 +518,10 @@ export interface QueueStatus {
   processing: number;
   /** Упавшие задачи: строка остаётся, пока её не разберут. */
   errors: number;
+  /** Свободно байт на диске сервера (null — сервер не смог посчитать). */
+  diskFree: number | null;
+  /** Места мало — конвертация стоит, пока не освободится. */
+  diskLow: boolean | null;
 }
 export const queueStatus = () => request<QueueStatus>('/queue/status');
 /** Пересобрать превью упавшего файла: задача конвертации ставится в очередь заново. */

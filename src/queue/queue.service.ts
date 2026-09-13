@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { execFileSync, spawn } from 'child_process';
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, statfsSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import sharp from 'sharp';
@@ -56,6 +56,12 @@ const TMP_PREFIX = 'clq-';
 const TMP_STALE_MS = 12 * 60 * 60 * 1000;
 /** Как часто подчищать осиротевшее, пока конвертер работает не перезапускаясь. */
 const TMP_CLEAN_EVERY_MS = 10 * 60 * 1000;
+/**
+ * Меньше этого запаса на разделе с /tmp — новые задачи не берём. Диск на VPS общий: место
+ * занимают и БД, и nginx, и другие сервисы, а «диск кончился» роняет всё сразу — API отвечает
+ * 500, деплой падает на scp, Postgres не может писать. Превью не стоят такого риска.
+ */
+const MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024;
 
 /** Параметры источника, влияющие на команду ffmpeg (HDR/10 бит/каналы/длительность). */
 interface SourceProbe {
@@ -108,6 +114,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private ticking = false;
   /** Когда последний раз подчищали /tmp (см. TMP_CLEAN_EVERY_MS). */
   private tmpCleanedAt = Date.now();
+  /** Когда последний раз жаловались на кончающееся место: в лог, а не в спам каждые 2 секунды. */
+  private lowDiskWarnedAt = 0;
   /**
    * Задачи в работе сейчас: id → { assetId, group, child } — по нему считаются свободные слоты
    * (фото идут параллельно) и убивается процесс задачи по таймауту.
@@ -179,6 +187,37 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     } catch {
       /* нет доступа к /tmp — не повод ронять задачу */
     }
+  }
+
+  /**
+   * Свободное место на разделе с временными файлами (байт); null — посчитать не вышло.
+   * Показывается в статусе очереди, чтобы место было видно до того, как кончится.
+   */
+  freeBytes(): number | null {
+    try {
+      const st = statfsSync(tmpdir());
+      return st.bavail * st.bsize;
+    } catch {
+      // нет statfs или нет доступа — не повод останавливать очередь
+      return null;
+    }
+  }
+
+  /** Место кончается — конвертация стоит (см. MIN_FREE_BYTES); null — посчитать не вышло. */
+  diskLow(): boolean | null {
+    const free = this.freeBytes();
+    return free === null ? null : free < MIN_FREE_BYTES;
+  }
+
+  /** Места мало: очередь стоит, пока не освободится. В лог — не чаще раза в 10 минут. */
+  private warnLowDisk(free: number): void {
+    const now = Date.now();
+    if (now - this.lowDiskWarnedAt < TMP_CLEAN_EVERY_MS) return;
+    this.lowDiskWarnedAt = now;
+    this.logger.warn(
+      `на диске мало места: свободно ${Math.round(free / 1024 ** 2)} МБ — новые задачи не беру, ` +
+        `пока не освободится (порог ${Math.round(MIN_FREE_BYTES / 1024 ** 3)} ГБ)`,
+    );
   }
 
   onModuleDestroy() {
@@ -320,6 +359,13 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     try {
       // на паузе задачи просто ждут в БД: ничего не теряется, снятие паузы продолжит с места
       if (await this.isPaused()) return;
+      // Кончается место — новые задачи не берём: незабранная задача ничего не стоит, а
+      // добитый диск кладёт весь сервис. Уже начатые задачи досчитываются до конца.
+      const diskFree = this.freeBytes();
+      if (diskFree !== null && diskFree < MIN_FREE_BYTES) {
+        this.warnLowDisk(diskFree);
+        return;
+      }
       // Фото берём пачкой по числу свободных слотов, задачи идут параллельно и не ждут друг друга.
       const free = PHOTO_PARALLEL - this.countActive('photo');
       for (let i = 0; i < free; i++) {
