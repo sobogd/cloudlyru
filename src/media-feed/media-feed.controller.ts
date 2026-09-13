@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { MediaFeedService } from './media-feed.service';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
@@ -41,6 +41,15 @@ export class MediaFeedController {
   @RateLimit(600, 60_000)
   months(@CurrentUser() user: RequestUser) {
     return this.feed.months(user.id);
+  }
+
+  /** Статусы превью по списку записей: клиент переспрашивает только неготовые снимки. */
+  @Post('status')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(1200, 60_000)
+  status(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
+    const ids = body && typeof body === 'object' ? (body as { entryIds?: unknown }).entryIds : undefined;
+    return this.feed.status(user.id, ids);
   }
 
   /** Метаданные кадра для панели «Инфо»: своя ручка, а не общий /files/:id. */

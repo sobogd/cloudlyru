@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownToLine, ArrowLeft, ArrowRight, Info, Trash, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowLeft, ArrowRight, ImageOff, Info, LoaderCircle, Trash, X } from 'lucide-react';
 import * as api from './api';
 
 /**
@@ -28,6 +28,8 @@ const OVERSCAN = 3;
 const FETCH_DEBOUNCE_MS = 500;
 /** Сколько элементов просим одним запросом range. */
 const FETCH_CHUNK = 500;
+/** Как часто переспрашиваем статусы неготовых превью. */
+const STATUS_POLL_MS = 4000;
 
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
@@ -199,6 +201,46 @@ export default function MediaSection({ onOverlayChange }: {
       }
     }
   }, []);
+
+  // Статусы неготовых снимков: переспрашиваем, чтобы «в обработке» со временем становилось фото.
+  useEffect(() => {
+    const map = itemsRef.current;
+    const notReady: Array<{ idx: number; id: string }> = [];
+    for (const [idx, it] of map) {
+      if (it.previewState !== 'done') notReady.push({ idx, id: it.entryId });
+    }
+    if (!notReady.length) return;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const rows = await api.mediaStatus(notReady.map((n) => n.id));
+        if (stopped || !rows.length) return;
+        const byId = new Map(rows.map((r) => [r.entryId, r]));
+        setItems((prev) => {
+          let changed = false;
+          const next = new Map(prev);
+          for (const { idx, id } of notReady) {
+            const row = byId.get(id);
+            if (!row) continue;
+            const cur = next.get(idx);
+            if (cur && (cur.previewState !== row.previewState || cur.jobState !== row.jobState)) {
+              next.set(idx, { ...cur, previewState: row.previewState, jobState: row.jobState });
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+      } catch {
+        /* следующий тик попробует снова */
+      }
+    };
+    void tick();
+    const t = window.setInterval(() => void tick(), STATUS_POLL_MS);
+    return () => {
+      stopped = true;
+      window.clearInterval(t);
+    };
+  }, [items]);
 
   const updateRange = useCallback(
     (top: number) => {
@@ -469,19 +511,50 @@ export default function MediaSection({ onOverlayChange }: {
 }
 
 function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => void }) {
-  if (!item) return <div className="mcell off" />;
+  const [failed, setFailed] = useState(false);
+  if (!item) {
+    // ещё не загруженный элемент — просто мерцающий скелетон
+    return (
+      <div className="mcell">
+        <span className="mcell-skel" />
+      </div>
+    );
+  }
   const ready = item.previewState === 'done' && !!item.sha256;
   const video = /^video\//.test(item.mime);
+  const processing = !ready && (item.jobState === 'pending' || item.jobState === 'processing');
+
+  if (!ready) {
+    return (
+      <button
+        type="button"
+        className="mcell off"
+        disabled
+        onClick={onClick}
+        title={processing ? 'Превью обрабатывается' : 'Превью не собрано'}
+        aria-label={processing ? 'Превью обрабатывается' : 'Превью не собрано'}
+      >
+        <span className={'mcell-ico' + (processing ? ' spin' : '')}>
+          {processing ? <LoaderCircle size={16} /> : <ImageOff size={16} />}
+        </span>
+      </button>
+    );
+  }
+
   return (
     <button
       type="button"
-      className={'mcell' + (ready ? (video ? ' video' : '') : ' off')}
-      disabled={!ready}
+      className={'mcell' + (video ? ' video' : '')}
       onClick={onClick}
       title={item.name}
       aria-label={item.name}
     >
-      {ready && <img src={api.previewUrl(item.sha256!)} alt="" loading="lazy" decoding="async" draggable={false} />}
+      {!failed && <span className="mcell-skel" />}
+      {failed ? (
+        <span className="mcell-ico"><ImageOff size={16} /></span>
+      ) : (
+        <img src={api.previewUrl(item.sha256!)} alt="" loading="lazy" decoding="async" draggable={false} onError={() => setFailed(true)} />
+      )}
     </button>
   );
 }

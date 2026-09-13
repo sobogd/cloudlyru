@@ -497,7 +497,7 @@ export interface TimelineStatus {
 }
 // ===== Раздел «Медиа» (изолированные ручки /media/*) =====
 /** Строка ленты «Медиа»: тот же контракт, что у TimelineItem, но из своего модуля. */
-export interface MediaItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; previewState: string; size: number }
+export interface MediaItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; previewState: string; jobState: string | null; size: number }
 /** Общее число медиа — по нему клиент считает полную высоту скролла. */
 export const mediaCount = () => request<number>('/media/count');
 /** Срез ленты по смещению: элементы [offset, offset+limit) в порядке ленты. */
@@ -506,6 +506,10 @@ export const mediaRange = (offset: number, limit: number) =>
 /** Индекс по месяцам для подписи у ползунка: строка на месяц, month=null — «без даты». */
 export interface MediaMonthBucket { month: string | null; count: number }
 export const mediaMonths = () => request<MediaMonthBucket[]>('/media/months');
+/** Статусы превью по списку записей (только неготовые снимки). */
+export interface MediaStatusItem { entryId: string; previewState: string; jobState: string | null }
+export const mediaStatus = (entryIds: string[]) =>
+  request<MediaStatusItem[]>('/media/status', { method: 'POST', body: JSON.stringify({ entryIds }) });
 /** Метаданные кадра для панели «Инфо» в модалке. */
 export interface MediaInfo {
   entryId: string;

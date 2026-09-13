@@ -15,6 +15,8 @@ import { ZONE_PHOTOS } from '../common/zones';
 
 /** Потолок одного запроса range. */
 export const MEDIA_RANGE_MAX = 1000;
+/** Потолок одного запроса статусов превью. */
+export const MEDIA_STATUS_MAX = 500;
 
 /** Строка ленты «Медиа». */
 export interface MediaItem {
@@ -24,6 +26,8 @@ export interface MediaItem {
   capturedAt: string | null;
   mime: string;
   previewState: string;
+  /** Состояние задачи конвертации (pending/processing/failed/null) — для иконки «в обработке». */
+  jobState: string | null;
   size: number;
 }
 
@@ -50,6 +54,7 @@ interface MediaRow {
   sha256: string | null;
   mime: string;
   previewState: string;
+  jobState: string | null;
   size: bigint | number | null;
   capturedAt: Date | null;
 }
@@ -88,10 +93,14 @@ export class MediaFeedService {
     const take = Math.min(Math.max(limit, 1), MEDIA_RANGE_MAX);
     const skip = Math.max(0, Math.floor(offset));
     const rows = await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
-      SELECT f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt"
+      SELECT f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt",
+             j."state" AS "jobState"
       FROM "MediaMeta" mm
       JOIN "Asset" a ON a."id" = mm."assetId"
       JOIN "FileEntry" f ON f."assetId" = a."id"
+      LEFT JOIN LATERAL (
+        SELECT "state" FROM "Job" WHERE "assetId" = a."id" ORDER BY "createdAt" DESC LIMIT 1
+      ) j ON TRUE
       WHERE f."deletedAt" IS NULL
         AND f."zone" = ${ZONE_PHOTOS}
         AND f."folderId" = ANY(${tree})
@@ -179,7 +188,31 @@ export class MediaFeedService {
       capturedAt: r.capturedAt ? new Date(r.capturedAt).toISOString() : null,
       mime: r.mime,
       previewState: r.previewState,
+      jobState: r.jobState ?? null,
       size: Number(r.size ?? 0),
     };
+  }
+
+  /** Статусы превью по списку записей — клиент переспрашивает только неготовые снимки. */
+  async status(userId: string, entryIds: unknown): Promise<Array<{ entryId: string; previewState: string; jobState: string | null }>> {
+    const ids = [...new Set(Array.isArray(entryIds) ? entryIds : [])]
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
+      .slice(0, MEDIA_STATUS_MAX);
+    if (!ids.length) return [];
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return [];
+    const rows = await this.prisma.$queryRaw<Array<{ id: string; previewState: string; jobState: string | null }>>(Prisma.sql`
+      SELECT f."id", a."previewState", j."state" AS "jobState"
+      FROM "FileEntry" f
+      JOIN "Asset" a ON a."id" = f."assetId"
+      LEFT JOIN LATERAL (
+        SELECT "state" FROM "Job" WHERE "assetId" = a."id" ORDER BY "createdAt" DESC LIMIT 1
+      ) j ON TRUE
+      WHERE f."id" = ANY(${ids})
+        AND f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+    `);
+    return rows.map((r) => ({ entryId: r.id, previewState: r.previewState, jobState: r.jobState ?? null }));
   }
 }
