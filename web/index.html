@@ -7,12 +7,17 @@
     <!-- Установка как отдельного приложения: Chrome (Android/desktop) ставит по манифесту,
          Safari — «Поделиться → На экран «Домой»» по apple-touch-icon. -->
     <link rel="manifest" href="/manifest.webmanifest" />
-    <meta name="theme-color" content="#0f1115" />
+    <!-- Фон страницы — системный (Canvas): острова интерфейса полупрозрачные, между ними
+         просвечивает фон браузера. Обе схемы разрешены, тему выбирает система.
+         theme-color красит статус-бар/адресную строку под текущую схему. -->
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)" />
     <link rel="icon" href="/icons/icon-192.png" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="CloudlyRu" />
   </head>
   <body>

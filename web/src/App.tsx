@@ -1,16 +1,34 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { LucideIcon } from 'lucide-react';
+import {
+  ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, Ban, Check, ChevronLeft, ChevronRight,
+  CircleAlert, CircleCheck, CircleX, Clock, Cloud, Copy, Eraser, FileText, Film, Folder,
+  FolderOpen, Image as ImageIcon, Images, Info, KeyRound, Link2, LoaderCircle, Lock, Package,
+  Pause, Pencil, Play, Plus, RefreshCw, Scissors, Settings as SettingsIcon, Trash, Upload,
+  UserRound, X,
+} from 'lucide-react';
 import * as api from './api';
 import './styles.css';
 
 type Tab = 'files' | 'photos' | 'shares' | 'albums' | 'trash' | 'settings';
-const NAV: Array<{ id: Tab; icon: string; label: string }> = [
-  { id: 'files', icon: '📁', label: 'Файлы' },
-  { id: 'photos', icon: '🖼️', label: 'Фото' },
-  { id: 'shares', icon: '🔗', label: 'Шаринг' },
-  { id: 'albums', icon: '🗂️', label: 'Альбомы' },
-  { id: 'trash', icon: '🗑️', label: 'Корзина' },
-  { id: 'settings', icon: '⚙️', label: 'Настройки' },
+/** Иконки навигации — компоненты lucide, а не эмодзи: они наследуют цвет и размер от кнопки.
+    Settings импортируется как SettingsIcon: имя Settings занято локальным компонентом-экраном. */
+const NAV: Array<{ id: Tab; Icon: LucideIcon; label: string }> = [
+  { id: 'files', Icon: Folder, label: 'Файлы' },
+  { id: 'photos', Icon: ImageIcon, label: 'Фото' },
+  { id: 'shares', Icon: Link2, label: 'Шаринг' },
+  { id: 'albums', Icon: Images, label: 'Альбомы' },
+  { id: 'trash', Icon: Trash, label: 'Корзина' },
+  { id: 'settings', Icon: SettingsIcon, label: 'Настройки' },
 ];
+
+/** Иконка файла по MIME — одна на все списки: строка, деталка, аплоадер. */
+function FileIcon({ mime, className }: { mime?: string; className?: string }) {
+  const cls = className ?? 'icon';
+  if (mime?.startsWith('image/')) return <span className={cls}><ImageIcon /></span>;
+  if (mime?.startsWith('video/')) return <span className={cls}><Film /></span>;
+  return <span className={cls}><FileText /></span>;
+}
 
 // ===== Восстановление экрана после перезагрузки (F5) =====
 // Открытая вкладка, путь в «Файлах», открытый файл/папка и альбом живут в sessionStorage:
@@ -60,8 +78,8 @@ function Login({ onLogin }: { onLogin: (u: api.UserInfo) => void }) {
   };
   return (
     <div className="loginbox">
-      <div style={{ fontSize: 34 }}>☁️</div>
-      <h2 style={{ margin: '0 0 4px' }}>CloudlyRu</h2>
+      <div className="brand"><Cloud size={40} strokeWidth={1.5} /></div>
+      <h2>CloudlyRu</h2>
       <input placeholder="логин" value={login} onChange={(e) => setLogin(e.target.value)} />
       <input placeholder="пароль" type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && submit()} />
       {err && <div className="err">{err}</div>}
@@ -106,6 +124,10 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
 
   return (
     <div className="app">
+      {/* Шапка-остров: плавающая плашка сверху, контент прокручивается под ней */}
+      <header className="island island-top">
+        <h1>CloudlyRu</h1>
+      </header>
       <main className="content">
         {up.rows.length > 0 && (
           <UploadPanel
@@ -129,10 +151,19 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
         {tab === 'trash' && <TrashPage />}
         {tab === 'settings' && <Settings login={user.login} onLogout={onLogout} />}
       </main>
-      <nav className="nav">
-        {NAV.map((n) => (
-          <button key={n.id} className={tab === n.id ? 'navbtn active' : 'navbtn'} onClick={() => setTab(n.id)} title={n.label} aria-label={n.label}>
-            <span className="navico">{n.icon}</span>
+      {/* Нижний остров-навигация: иконка + подпись, активная вкладка подсвечена */}
+      <nav className="island island-bottom">
+        {NAV.map(({ id, Icon, label }) => (
+          <button
+            key={id}
+            className={tab === id ? 'navbtn active' : 'navbtn'}
+            onClick={() => setTab(id)}
+            title={label}
+            aria-label={label}
+            aria-current={tab === id ? 'page' : undefined}
+          >
+            <span className="navico"><Icon /></span>
+            <span className="navlbl">{label}</span>
           </button>
         ))}
       </nav>
@@ -142,11 +173,11 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
 
 // ================= Файлы =================
 
-function fileIcon(mime?: string): string {
-  if (!mime) return '📄';
-  if (mime.startsWith('image/')) return '🖼️';
-  if (mime.startsWith('video/')) return '🎬';
-  return '📄';
+function fileIcon(mime?: string): JSX.Element {
+  if (!mime) return <FileText />;
+  if (mime.startsWith('image/')) return <ImageIcon />;
+  if (mime.startsWith('video/')) return <Film />;
+  return <FileText />;
 }
 
 // ================= Общая инлайн-загрузка (без отдельной страницы) =================
@@ -288,17 +319,17 @@ function UploadPanel({ rows, busy, onCancel, onRetryFailed, onDismissFailed }: {
         <span className="upcount">{label}</span>
         <span style={{ flex: 1 }} />
         {busy ? (
-          <button className="iconbtn" title="Отменить — убрать незагруженное" onClick={onCancel}>✕</button>
+          <button className="iconbtn" title="Отменить — убрать незагруженное" onClick={onCancel}><X /></button>
         ) : failN > 0 ? (
           <>
-            <button className="btn ghost" onClick={onRetryFailed}>⟳ повторить</button>
-            <button className="iconbtn" title="Убрать ошибки" onClick={onDismissFailed}>✕</button>
+            <button className="btn ghost" onClick={onRetryFailed}><RefreshCw size={14} /> повторить</button>
+            <button className="iconbtn" title="Убрать ошибки" onClick={onDismissFailed}><X /></button>
           </>
         ) : null}
       </div>
       {rows.map((r) => (
         <div className="uprow" key={r.key}>
-          <span className="icon">{r.state === 'done' ? '✅' : r.state === 'failed' ? '❌' : r.state === 'uploading' ? '⏳' : '🕒'}</span>
+          <span className="icon">{r.state === 'done' ? <CircleCheck /> : r.state === 'failed' ? <CircleX /> : r.state === 'uploading' ? <LoaderCircle /> : <Clock />}</span>
           <div className="upmain">
             <div className="upname">{r.file.name} <span className="meta">{fmt(r.file.size)}</span></div>
             {r.state === 'failed' ? (
@@ -306,7 +337,7 @@ function UploadPanel({ rows, busy, onCancel, onRetryFailed, onDismissFailed }: {
             ) : (
               <>
                 <div className="ubar">
-                  <i style={{ width: `${r.state === 'done' ? 100 : r.pct}%`, background: r.state === 'done' ? '#2fae5f' : undefined }} />
+                  <i style={{ width: `${r.state === 'done' ? 100 : r.pct}%`, background: r.state === 'done' ? 'var(--ok)' : undefined }} />
                 </div>
                 {r.state === 'uploading' && (
                   <div className="upmeta">
@@ -404,9 +435,9 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
   return (
     <div>
       <div className="filehead">
-        <button className="iconbtn" title="На уровень выше" onClick={goUp} disabled={stack.length === 1}>⬆️</button>
+        <button className="iconbtn" title="На уровень выше" onClick={goUp} disabled={stack.length === 1}><ArrowUp /></button>
         {stack.length > 1 && (
-          <button className="iconbtn" title="Инфо о папке" onClick={() => setFolderMeta(true)} disabled={busy}>ℹ️</button>
+          <button className="iconbtn" title="Инфо о папке" onClick={() => setFolderMeta(true)} disabled={busy}><Info /></button>
         )}
         <span style={{ flex: 1 }} />
         {/* «Вставить» живёт в шапке любой папки: буфер серверный, поэтому он одинаков
@@ -419,16 +450,16 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
                 ? `Вставить сюда: ${clip.mode === 'cut' ? 'перенести' : 'скопировать'} «${clip.name}»`
                 : `Источник «${clip.name}» больше недоступен`}
               onClick={pasteHere}
-            >📥</button>
+            ><Upload /></button>
             <span className="clipnote" title={`${clip.mode === 'cut' ? 'вырезано' : 'скопировано'}: ${clip.name}`}>
-              {clip.mode === 'cut' ? '✂️' : '📋'} {clip.name}
-              <button className="iconbtn" title="Очистить буфер" onClick={clearClip}>✕</button>
+              {clip.mode === 'cut' ? <Scissors size={12} /> : <Copy size={12} />} {clip.name}
+              <button className="iconbtn" title="Очистить буфер" onClick={clearClip}><X /></button>
             </span>
           </>
         )}
-        <button className="iconbtn" title="Новая папка" onClick={mkdir} disabled={busy}>📂</button>
+        <button className="iconbtn" title="Новая папка" onClick={mkdir} disabled={busy}><FolderOpen /></button>
         <label className="iconbtn" title="Загрузить файлы (любого типа)">
-          📄
+          <FileText />
           <input
             type="file"
             multiple
@@ -447,7 +478,7 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
       <div className="fileslist">
         {(view?.folders || []).filter((f) => f.id !== photoFolderId).map((f) => (
           <div className="item" key={f.id} onClick={() => setStack((s) => [...s, { id: f.id, name: f.name }])}>
-            <span className="icon">📁</span>
+            <span className="icon"><Folder /></span>
             <span className="fname">{f.name}</span>
           </div>
         ))}
@@ -458,7 +489,7 @@ function Files({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null
           </div>
         ))}
         {!view?.folders.length && !view?.entries.length && (
-          <div className="copy" style={{ padding: '14px 6px' }}>Пусто — нажмите 📄, чтобы загрузить файлы в эту папку</div>
+          <div className="copy empty" style={{ padding: '14px 6px' }}><FileText size={14} /> <span>Пусто — нажмите «Загрузить» в шапке, чтобы добавить файлы в эту папку</span></div>
         )}
       </div>
     </div>
@@ -661,8 +692,8 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
     try {
       await api.setClipboard('file', entryId, mode);
       alert(mode === 'copy'
-        ? 'Скопировано. Откройте нужную папку и нажмите 📥 в её шапке.'
-        : 'Вырезано. Откройте нужную папку и нажмите 📥 в её шапке.');
+        ? 'Скопировано. Откройте нужную папку и нажмите «Вставить сюда» в её шапке.'
+        : 'Вырезано. Откройте нужную папку и нажмите «Вставить сюда» в её шапке.');
     } catch (e) { alert((e as Error).message); }
   };
   // Переименование: имя проверяет сервер (255 байт, без «/», конфликт с тёзкой — 409)
@@ -679,13 +710,13 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
   return (
     <div>
       <div className="filehead">
-        <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
+        <button className="iconbtn" title="Назад" onClick={onBack}><ArrowLeft /></button>
         <span style={{ flex: 1 }} />
         {ready && (
           <>
-            <button className="iconbtn" title="Переименовать" onClick={rename}>✏️</button>
-            <button className="iconbtn" title="Копировать в другую папку" onClick={() => toClipboard('copy')}>📋</button>
-            <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={() => toClipboard('cut')}>✂️</button>
+            <button className="iconbtn" title="Переименовать" onClick={rename}><Pencil /></button>
+            <button className="iconbtn" title="Копировать в другую папку" onClick={() => toClipboard('copy')}><Copy /></button>
+            <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={() => toClipboard('cut')}><Scissors /></button>
           </>
         )}
         {isZip && (
@@ -694,19 +725,19 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
             title="Разархивировать рядом с архивом"
             disabled={busy}
             onClick={startUnzip}
-          >📦</button>
+          ><Package /></button>
         )}
         {ready && (
-          <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} download>⬇️</a>
+          <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} download><ArrowDownToLine /></a>
         )}
-        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}><Trash /></button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       {notice && <div className="notice" style={{ margin: '10px 2px' }}>{notice}</div>}
       {job && (
         <div className="panel" style={{ margin: '10px 2px' }}>
           <div className="row">
-            <span className="icon">📦</span>
+            <span className="icon"><Package /></span>
             <strong>Распаковка</strong>
             <span style={{ flex: 1 }} />
             <span className="meta">
@@ -715,9 +746,9 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
                 : job.state === 'cancelled' ? 'отменено'
                 : `${job.percent}%`}
             </span>
-            {busy && <button className="btn ghost" onClick={cancelUnzip}>✕</button>}
+            {busy && <button className="btn ghost" onClick={cancelUnzip}><X size={16} /></button>}
           </div>
-          <div className="ubar"><i style={{ width: `${job.percent}%`, background: job.state === 'done' ? '#2fae5f' : undefined }} /></div>
+          <div className="ubar"><i style={{ width: `${job.percent}%`, background: job.state === 'done' ? 'var(--ok)' : undefined }} /></div>
           <div className="copy">
             файлов: {job.doneEntries} из {job.totalEntries || '…'} · {fmt(job.doneBytes)} из {fmt(job.totalBytes)}
             {job.skippedEntries ? ` · уже было: ${job.skippedEntries}` : ''}
@@ -812,9 +843,9 @@ function PreviewNote({ text, url, entryId }: { text: string; url: string; entryI
     <div className="pnote">
       <span className="copy">{text}</span>
       <button className="btn ghost" disabled={sent} onClick={rebuild}>
-        {sent ? '✓ задача поставлена' : '⟳ Пересобрать'}
+        {sent ? <><Check size={16} /> задача поставлена</> : <><RefreshCw size={16} /> Пересобрать</>}
       </button>
-      <a className="btn ghost" href={url} download>⬇️ Скачать</a>
+      <a className="btn ghost" href={url} download><ArrowDownToLine size={16} /> Скачать</a>
     </div>
   );
 }
@@ -868,7 +899,7 @@ function PdfPreview({ meta }: { meta: api.FileMeta }) {
       <div className="pmedia">
         <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
           <span className="spin" />
-          <span className="copy">⏳ Готовлю превью страниц…</span>
+          <span className="copy empty"><LoaderCircle size={14} /> <span>Готовлю превью страниц…</span></span>
         </div>
       </div>
     );
@@ -886,9 +917,9 @@ function PdfPreview({ meta }: { meta: api.FileMeta }) {
         />
       </div>
       <div className="pbar">
-        <button className="iconbtn" title="Предыдущая страница" disabled={page <= 1} onClick={() => { setFailed(false); setPage(page - 1); }}>◀️</button>
+        <button className="iconbtn" title="Предыдущая страница" disabled={page <= 1} onClick={() => { setFailed(false); setPage(page - 1); }}><ChevronLeft /></button>
         <span className="meta">{page} / {pages}</span>
-        <button className="iconbtn" title="Следующая страница" disabled={page >= pages} onClick={() => { setFailed(false); setPage(page + 1); }}>▶️</button>
+        <button className="iconbtn" title="Следующая страница" disabled={page >= pages} onClick={() => { setFailed(false); setPage(page + 1); }}><ChevronRight /></button>
       </div>
     </>
   );
@@ -912,7 +943,7 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
   const cutFolder = async () => {
     try {
       await api.setClipboard('folder', folderId, 'cut');
-      alert('Папка вырезана. Откройте нужную папку и нажмите 📥 в её шапке.');
+      alert('Папка вырезана. Откройте нужную папку и нажмите «Вставить сюда» в её шапке.');
     } catch (e) { alert((e as Error).message); }
   };
   // Переименование: корень и зарезервированное имя сервер не даст переименовать (400/409)
@@ -929,13 +960,13 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
   return (
     <div>
       <div className="filehead">
-        <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
+        <button className="iconbtn" title="Назад" onClick={onBack}><ArrowLeft /></button>
         <span style={{ flex: 1 }} />
-        <button className="iconbtn" title="Переименовать" onClick={rename}>✏️</button>
-        <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={cutFolder}>✂️</button>
+        <button className="iconbtn" title="Переименовать" onClick={rename}><Pencil /></button>
+        <button className="iconbtn" title="Вырезать (перенести) в другую папку" onClick={cutFolder}><Scissors /></button>
         {/* защищать от удаления в этом разделе больше нечего: корень зеркала у каждого
             устройства свой и лежит в корне облака, а папка «Телефон» — легаси */}
-        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
+        <button className="iconbtn" title="Удалить (в корзину)" onClick={del}><Trash /></button>
       </div>
       {err && <div className="err" style={{ margin: '10px 2px' }}>{err}</div>}
       {notice && <div className="notice" style={{ margin: '10px 2px' }}>{notice}</div>}
@@ -1107,7 +1138,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const [win, setWin] = useState<{ items: api.TimelineItem[]; idx: number }>(() => (
     saved?.photo ? { items: [saved.photo], idx: 0 } : { items: [], idx: -1 }
   ));
-  /** Полноценная деталка (как в «Файлах») — открывается кнопкой ℹ️ из просмотра. */
+  /** Полноценная деталка (как в «Файлах») — открывается кнопкой «Инфо» из просмотра. */
   const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
   /** Статусы сборки превью: спрашиваем только про те снимки, что видит пользователь. */
   const [statuses, setStatuses] = useState<Map<string, PreviewStatus>>(() => new Map());
@@ -1424,7 +1455,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           onPointerLeave={holdPrev.stop}
           onPointerCancel={holdPrev.stop}
           onClick={(e) => { if (e.detail === 0) gotoMonth(-1); }}
-        >◀️</button>
+        ><ChevronLeft /></button>
         {/* Название месяца во время загрузки живёт в центре экрана: в шапке его не дублируем. */}
         <button className="caltitle" title="К последнему месяцу со снимками" onClick={gotoNewest}>
           {phase === 'ready' ? monthTitleOf(month) : ''}
@@ -1437,7 +1468,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           onPointerLeave={holdNext.stop}
           onPointerCancel={holdNext.stop}
           onClick={(e) => { if (e.detail === 0) gotoMonth(1); }}
-        >▶️</button>
+        ><ChevronRight /></button>
       </div>
 
       {loadErr && <div className="err" style={{ margin: '8px 2px' }}>Не удалось загрузить месяц: {loadErr}</div>}
@@ -1480,7 +1511,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
             }
           }}
         >
-          +
+          <Plus size={26} />
           <input
             type="file"
             accept="image/*,video/*"
@@ -1505,19 +1536,19 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
               <VideoPreview key={photo.entryId} meta={{ id: photo.entryId, sha256: photo.sha256, name: photo.name }} />
             ) : view2.ready && photo.sha256 ? (
               // key по снимку: у каждого своя геометрия и свой зум. Лоадер кадра крутится не
-              // меньше секунды — переключение ⬅️/➡️ не мигает, даже если картинка уже в памяти.
+              // меньше секунды — переключение стрелками не мигает, даже если картинка уже в памяти.
               <PhotoZoom key={photo.entryId} src={api.previewUrl(photo.sha256, 1080)} />
             ) : (
               <div className="panel">
                 {view2.failed ? (
                   <>
-                    <div className="copy">❌ Не удалось собрать превью</div>
+                    <div className="copy empty"><CircleX size={14} /> <span>Не удалось собрать превью</span></div>
                     {view2.jobError && (
-                      <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c', maxHeight: 180, overflow: 'auto' }}>{view2.jobError}</pre>
+                      <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: 'var(--danger)', maxHeight: 180, overflow: 'auto' }}>{view2.jobError}</pre>
                     )}
                     <div className="row" style={{ justifyContent: 'center' }}>
-                      <button className="btn ghost" onClick={() => void retryPreview(photo.entryId)}>⟳ Пересобрать</button>
-                      <a className="btn ghost" href={api.fileUrl(photo.entryId)} download>⬇️ Скачать оригинал</a>
+                      <button className="btn ghost" onClick={() => void retryPreview(photo.entryId)}><RefreshCw size={16} /> Пересобрать</button>
+                      <a className="btn ghost" href={api.fileUrl(photo.entryId)} download><ArrowDownToLine size={16} /> Скачать оригинал</a>
                     </div>
                   </>
                 ) : view2.hopeless ? (
@@ -1526,28 +1557,28 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                       {view2.impossible && view2.jobError ? `Превью не собрать: ${view2.jobError}` : 'Превью для этого файла собрать нельзя'}
                     </div>
                     <div className="row" style={{ justifyContent: 'center' }}>
-                      <button className="btn ghost" onClick={() => void retryPreview(photo.entryId)}>⟳ Поставить задачу</button>
-                      <a className="btn ghost" href={api.fileUrl(photo.entryId)} download>⬇️ Скачать оригинал</a>
+                      <button className="btn ghost" onClick={() => void retryPreview(photo.entryId)}><RefreshCw size={16} /> Поставить задачу</button>
+                      <a className="btn ghost" href={api.fileUrl(photo.entryId)} download><ArrowDownToLine size={16} /> Скачать оригинал</a>
                     </div>
                   </div>
                 ) : (
                   <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
                     <span className="spin" />
-                    <div className="copy">⏳ Готовлю превью…</div>
+                    <div className="copy empty"><LoaderCircle size={14} /> <span>Готовлю превью…</span></div>
                   </div>
                 )}
               </div>
             )}
           </div>
           <div className="tbar">
-            <button className="iconbtn" title="Назад в календарь" onClick={() => setWin({ items: [], idx: -1 })}>◀️</button>
+            <button className="iconbtn" title="Назад в календарь" onClick={() => setWin({ items: [], idx: -1 })}><ChevronLeft /></button>
             {/* Просмотр держит один кадр — в шапке его дата съёмки (та самая «деталка»), а если
                 даты нет, имя файла */}
             <span className="calday">
               {photo.capturedAt ? fmtExifDate(photo.capturedAt) ?? dayTitle(photo.capturedAt.slice(0, 10)) : photo.name}
             </span>
-            <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(photo.entryId)}>ℹ️</button>
-            {/* Скачивание живёт только в деталке (ℹ️) — из превью его убрали */}
+            <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(photo.entryId)}><Info /></button>
+            {/* Скачивание живёт только в деталке («Инфо») — из превью его убрали */}
             <button
               className="iconbtn"
               title="Удалить (в корзину)"
@@ -1562,10 +1593,10 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                   alert((e as Error).message);
                 }
               }}
-            >🗑</button>
+            ><Trash /></button>
             {/* Стрелки не гаснут: кадр берётся из уже загруженного окна, ждать сеть не нужно. */}
-            <button className="iconbtn" title="Предыдущий снимок" onClick={() => stepPhoto('prev')}>⬅️</button>
-            <button className="iconbtn" title="Следующий снимок" onClick={() => stepPhoto('next')}>➡️</button>
+            <button className="iconbtn" title="Предыдущий снимок" onClick={() => stepPhoto('prev')}><ArrowLeft /></button>
+            <button className="iconbtn" title="Следующий снимок" onClick={() => stepPhoto('next')}><ArrowRight /></button>
           </div>
         </div>
       )}
@@ -1706,13 +1737,13 @@ function PhotoZoom({ src }: { src: string }) {
   return (
     <div
       ref={box}
-      style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', touchAction: 'none', background: '#000' }}
+      style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', touchAction: 'none', background: 'var(--media)' }}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
     >
       {/* Миниатюра из сетки под кадром: пока 1080 грузится, видно хоть что-то осмысленное —
-          переключение ⬅️/➡️ не выглядит пустым экраном. */}
+          переключение стрелками не выглядит пустым экраном. */}
       {state === 'loading' && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
           <span className="spin" />
@@ -1770,15 +1801,15 @@ function Shares() {
   };
   return (
     <div>
-      <div className="row"><span style={{ flex: 1 }} /><button className="btn" title="Создать ссылку" onClick={create}>🔗</button></div>
+      <div className="row"><span style={{ flex: 1 }} /><button className="btn" title="Создать ссылку" onClick={create}><Link2 size={16} /></button></div>
       {notice && <div className="notice">{notice}</div>}
       {err && <div className="err">{err}</div>}
       {items.map((s) => (
         <div className="item" key={s.token}>
-          <span className="icon">🔗</span>
-          <span className="fname">{s.kind} · {s.capability}{s.hasPassword ? ' · 🔒' : ''}{s.expiresAt ? ` · до ${new Date(s.expiresAt).toLocaleDateString()}` : ''}</span>
-          <button className="btn ghost" onClick={() => { navigator.clipboard.writeText(s.url); setNotice('Скопировано'); }}>📋</button>
-          <button className="btn ghost" onClick={async () => { await api.revokeShare(s.token); await load(); }}>🚫</button>
+          <span className="icon"><Link2 /></span>
+          <span className="fname">{s.kind} · {s.capability}{s.hasPassword ? <> · <Lock size={13} /></> : ''}{s.expiresAt ? ` · до ${new Date(s.expiresAt).toLocaleDateString()}` : ''}</span>
+          <button className="btn ghost" onClick={() => { navigator.clipboard.writeText(s.url); setNotice('Скопировано'); }}><Copy size={16} /></button>
+          <button className="btn ghost" onClick={async () => { await api.revokeShare(s.token); await load(); }}><Ban size={16} /></button>
         </div>
       ))}
       {!items.length && <div className="copy">Активных шарингов нет</div>}
@@ -1808,14 +1839,14 @@ function Albums() {
   };
   return (
     <div>
-      <div className="row"><span style={{ flex: 1 }} /><button className="btn" title="Новый альбом" onClick={create}>🗂️</button></div>
+      <div className="row"><span style={{ flex: 1 }} /><button className="btn" title="Новый альбом" onClick={create}><Images size={16} /></button></div>
       {err && <div className="err">{err}</div>}
       {albums.map((a) => (
         <div className="item" key={a.id}>
-          <span className="icon">🗂️</span>
+          <span className="icon"><Images /></span>
           <span className="fname" onClick={() => setOpenId(a.id)}>{a.name}</span>
           <span className="meta">{a.count}</span>
-          <button className="btn ghost" onClick={async () => { if (confirm('Удалить альбом?')) { await api.deleteAlbum(a.id); if (openId === a.id) setOpenId(null); await load(); } }}>🗑</button>
+          <button className="btn ghost" onClick={async () => { if (confirm('Удалить альбом?')) { await api.deleteAlbum(a.id); if (openId === a.id) setOpenId(null); await load(); } }}><Trash size={16} /></button>
         </div>
       ))}
       {!albums.length && <div className="copy">Альбомов нет</div>}
@@ -1827,9 +1858,9 @@ function Albums() {
             {open.items.map((it) => (
               <div key={it.entryId} style={{ width: '31.5%' }}>
                 {/^image\//.test(it.mime) ? (
-                  <img src={api.fileInlineUrl(it.entryId)} alt={it.name} loading="lazy" style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: '#1b212b' }} />
+                  <img src={api.fileInlineUrl(it.entryId)} alt={it.name} loading="lazy" style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 6, background: 'var(--surface-3)' }} />
                 ) : (
-                  <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: '#1b212b', display: 'grid', placeItems: 'center' }}>📄</div>
+                  <div style={{ width: '100%', aspectRatio: '1', borderRadius: 6, background: 'var(--surface-3)', color: 'var(--fg-3)', display: 'grid', placeItems: 'center' }}><FileText size={28} /></div>
                 )}
               </div>
             ))}
@@ -1863,16 +1894,16 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
   return (
     <div>
       <div className="panel">
-        <div className="row"><span className="icon">👤</span><strong>{login}</strong></div>
+        <div className="row"><span className="icon"><UserRound /></span><strong>{login}</strong></div>
         <div className="row">
           <a className="fname" href={location.origin}>{location.origin}</a>
           <button className="btn danger" onClick={async () => { await api.logout().catch(() => undefined); onLogout(); }}>Выйти</button>
         </div>
       </div>
       <div className="panel">
-        <div className="row"><strong>Приложения (WebDAV/Finder)</strong><button className="btn" onClick={addToken}>🔑 токен</button></div>
+        <div className="row"><strong>Приложения (WebDAV/Finder)</strong><button className="btn" onClick={addToken}><KeyRound size={16} /> токен</button></div>
         {fresh && (
-          <div className="panel" style={{ background: '#1c2430' }}>
+          <div className="panel" style={{ background: 'var(--accent-soft)' }}>
             <div className="copy">Токен (один раз): <b>{fresh}</b></div>
             <div className="copy">WebDAV: https://files.iq-factura.com/api/v1/dav · логин: {login}</div>
           </div>
@@ -1880,10 +1911,10 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
         {err && <div className="err">{err}</div>}
         {tokens.map((t) => (
           <div className="item" key={t.id}>
-            <span className="icon">🔑</span>
+            <span className="icon"><KeyRound /></span>
             <span className="fname">{t.label}</span>
             <span className="meta">{t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString() : 'не использовался'}</span>
-            <button className="btn ghost" onClick={async () => { await api.revokeToken(t.id); await loadTokens(); }}>🚫</button>
+            <button className="btn ghost" onClick={async () => { await api.revokeToken(t.id); await loadTokens(); }}><Ban size={16} /></button>
           </div>
         ))}
         {!tokens.length && <div className="copy">Токенов нет — нужен для Finder/WebDAV</div>}
@@ -1895,7 +1926,13 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
 
 // ================= Очередь превью =================
 
-const JOB_KIND: Record<string, string> = { photo: '🖼️ фото', video: '🎬 видео', pdf: '📄 PDF' };
+const JOB_KIND: Record<string, LucideIcon> = { photo: ImageIcon, video: Film, pdf: FileText };
+
+/** Значок типа задачи в списке ошибок: у неизвестного типа — общий знак предупреждения. */
+function JobKindIcon({ kind }: { kind: string }) {
+  const Icon = JOB_KIND[kind] ?? CircleAlert;
+  return <Icon />;
+}
 
 /**
  * Очередь превью: сколько осталось, пауза и пересчёт. Больше на этом экране ничего нет —
@@ -1979,13 +2016,13 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
         <strong>Очередь превью</strong>
         <span style={{ flex: 1 }} />
         <button className={q?.paused ? 'btn' : 'btn ghost'} disabled={!q} onClick={togglePause} title="Пауза мягкая: текущая задача докачивается, новые не берутся">
-          {q?.paused ? '▶️ Продолжить' : '⏸ Пауза'}
+          {q?.paused ? <><Play size={16} /> Продолжить</> : <><Pause size={16} /> Пауза</>}
         </button>
         <button className="btn ghost" disabled={busy || !q} onClick={clear} title="Удалить все строки очереди. Собранные превью остаются — вернуть недостающие можно кнопкой «Пересчитать»">
-          🧹 Очистить
+          <Eraser size={16} /> Очистить
         </button>
         <button className="btn ghost" disabled={busy || !q} onClick={rebuild} title="Найти файлы без превью и поставить им задачи">
-          {busy ? '…' : '⟳ Пересчитать'}
+          {busy ? '…' : <><RefreshCw size={16} /> Пересчитать</>}
         </button>
       </div>
       {err && <div className="err">{err}</div>}
@@ -2007,15 +2044,15 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
               {q.remainingByKind?.pdf ? ` · PDF: ${q.remainingByKind.pdf.toLocaleString('ru-RU')}` : ''}
             </div>
           )}
-          <div className="copy">
-            {q.paused ? '⏸ пауза — задачи ждут в очереди' : remaining ? 'очередь разбирается' : 'очередь пуста'}
+          <div className={q.paused ? 'copy empty' : 'copy'}>
+            {q.paused ? <><Pause size={14} /> <span>пауза — задачи ждут в очереди</span></> : remaining ? 'очередь разбирается' : 'очередь пуста'}
           </div>
           {/* Место на диске сервера: если оно кончится, ляжет весь сервис, поэтому показываем
               его всегда — и отдельно предупреждаем, когда конвертация из-за него встала. */}
           {q.diskFree != null && (
             <div className={q.diskLow ? 'err' : 'copy'}>
               {q.diskLow
-                ? `⚠ на диске сервера мало места (${fmt(q.diskFree)} свободно) — конвертация стоит, пока не освободится`
+                ? <><CircleAlert size={13} /> <span>{`на диске сервера мало места (${fmt(q.diskFree)} свободно) — конвертация стоит, пока не освободится`}</span></>
                 : `диск сервера: ${fmt(q.diskFree)} свободно`}
             </div>
           )}
@@ -2023,7 +2060,7 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
       )}
       <div className="row">
         <button className="btn ghost" disabled={!q} onClick={onErrors} title="Задачи, которые упали при конвертации">
-          ⚠ Ошибки{q?.errors ? `: ${q.errors.toLocaleString('ru-RU')}` : ''}
+          <CircleAlert size={16} /> Ошибки{q?.errors ? `: ${q.errors.toLocaleString('ru-RU')}` : ''}
         </button>
       </div>
     </div>
@@ -2073,11 +2110,11 @@ function QueueErrorsPanel({ onBack }: { onBack: () => void }) {
   return (
     <div className="panel">
       <div className="row">
-        <button className="iconbtn" onClick={onBack} title="Назад к очереди">◀️</button>
+        <button className="iconbtn" onClick={onBack} title="Назад к очереди"><ChevronLeft /></button>
         <strong>Ошибки очереди</strong>
         <span className="meta">{total.toLocaleString('ru-RU')}</span>
         <span style={{ flex: 1 }} />
-        <button className="btn" disabled={busy || !total} onClick={retryAll}>⟳ Повторить все</button>
+        <button className="btn" disabled={busy || !total} onClick={retryAll}><RefreshCw size={16} /> Повторить все</button>
       </div>
       {err && <div className="err">{err}</div>}
       {notice && <div className="notice">{notice}</div>}
@@ -2085,7 +2122,7 @@ function QueueErrorsPanel({ onBack }: { onBack: () => void }) {
       {data && !shown && <div className="copy">Ошибок нет — очередь разбирается без падений</div>}
       {data?.items.map((j) => (
         <div className="item" key={j.id} style={{ alignItems: 'flex-start' }}>
-          <span className="icon">{JOB_KIND[j.kind] ?? j.kind}</span>
+          <span className="icon" title={j.kind}><JobKindIcon kind={j.kind} /></span>
           <span className="fname" style={{ whiteSpace: 'normal' }}>
             {j.entryId ? <a href={api.fileUrl(j.entryId)}>{j.name ?? 'файл'}</a> : (j.name ?? 'файл удалён')}
             <div className="err" style={{ fontWeight: 400 }}>{j.error}</div>
@@ -2094,14 +2131,14 @@ function QueueErrorsPanel({ onBack }: { onBack: () => void }) {
               {j.finishedAt ? ` · ${new Date(j.finishedAt).toLocaleString()}` : ''}
             </div>
           </span>
-          <button className="btn ghost" disabled={!j.entryId} onClick={() => void retryOne(j.entryId)} title="Поставить задачу в очередь заново">⟳</button>
+          <button className="btn ghost" disabled={!j.entryId} onClick={() => void retryOne(j.entryId)} title="Поставить задачу в очередь заново"><RefreshCw size={16} /></button>
         </div>
       ))}
       {total > LIMIT && (
         <div className="row">
-          <button className="btn ghost" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - LIMIT))}>← назад</button>
+          <button className="btn ghost" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - LIMIT))}><ChevronLeft size={16} /> назад</button>
           <span className="meta">{offset + 1}–{offset + shown} из {total.toLocaleString('ru-RU')}</span>
-          <button className="btn ghost" disabled={offset + shown >= total} onClick={() => setOffset(offset + LIMIT)}>вперёд →</button>
+          <button className="btn ghost" disabled={offset + shown >= total} onClick={() => setOffset(offset + LIMIT)}>вперёд <ChevronRight size={16} /></button>
         </div>
       )}
     </div>
@@ -2128,13 +2165,13 @@ function TrashPage() {
     <div>
       <div className="row">
         <span style={{ flex: 1 }} />
-        <button className="btn danger" title="Очистить корзину" onClick={purge}>🧹</button>
+        <button className="btn danger" title="Очистить корзину" onClick={purge}><Eraser size={16} /></button>
       </div>
       {err && <div className="err">{err}</div>}
       <div className="panel">
         {items.map((t) => (
           <div className="item" key={t.kind + t.id}>
-            <span className="icon">{t.kind === 'folder' ? '📁' : '📄'}</span>
+            <span className="icon">{t.kind === 'folder' ? <Folder /> : <FileText />}</span>
             <span className="fname">{t.name}</span>
             <span className="meta">{new Date(t.deletedAt).toLocaleString()}</span>
             <button className="btn ghost" onClick={() => restore(t.kind, t.id)}>восстановить</button>

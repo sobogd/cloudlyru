@@ -1,212 +1,581 @@
-body { margin: 0; font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background: #0f1115; color: #e6e8eb; }
-.app { max-width: 980px; margin: 0 auto; padding: 18px; }
-.topbar { display: flex; align-items: center; gap: 12px; padding: 8px 0 16px; border-bottom: 1px solid #262b33; }
-.topbar h1 { font-size: 18px; margin: 0 auto 0 0; }
-.tab { background: none; border: 1px solid #3a4250; color: #cfd6e0; padding: 6px 14px; border-radius: 8px; cursor: pointer; }
-.tab.active { background: #2b6cff; border-color: #2b6cff; color: #fff; }
-.btn { background: #2b6cff; border: 0; color: #fff; padding: 7px 14px; border-radius: 8px; cursor: pointer; }
-.btn.ghost { background: none; border: 1px solid #3a4250; color: #cfd6e0; }
-.btn.danger { background: #d33; }
-input, select { background: #171b22; border: 1px solid #343b46; color: #e6e8eb; padding: 7px 10px; border-radius: 8px; }
-.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
-.panel { background: #14181f; border: 1px solid #262b33; border-radius: 12px; padding: 14px; margin: 12px 0; }
-.item { display: flex; align-items: center; gap: 10px; padding: 8px 6px; border-bottom: 1px solid #1f242c; }
-.item:hover { background: #191e27; }
-.icon { width: 20px; text-align: center; color: #8fa3bd; }
-.fname { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.meta { color: #6d7889; font-size: 12px; }
-.crumb { background: none; border: 0; color: #7ab0ff; cursor: pointer; padding: 0 4px; }
-.notice { color: #9fe6a0; font-size: 13px; }
-.err { color: #ff8a8a; font-size: 13px; }
-.loginbox { max-width: 340px; margin: 10vh auto; display: grid; gap: 10px; }
-.copy { font-size: 12px; color: #9aa7b8; word-break: break-all; }
-progress { width: 100%; }
+@import 'tailwindcss';
 
-/* Mobile-first: нижний бар */
-body { background: #0f1115; }
-.app { max-width: none; padding: 0; }
-.head { position: sticky; top: 0; z-index: 5; background: #0f1115ee; backdrop-filter: blur(6px);
-  display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #262b33; }
-.content { max-width: 1000px; margin: 0 auto; padding: 12px 12px 92px; }
-.nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
-  display: flex; justify-content: space-around; align-items: stretch;
-  background: #10141bee; backdrop-filter: blur(8px); border-top: 1px solid #262b33;
-  padding-bottom: env(safe-area-inset-bottom); }
-.navbtn { flex: 1; background: none; border: 0; color: #8a95a6; display: grid; justify-items: center;
-  gap: 2px; padding: 8px 2px 10px; font-size: 10px; cursor: pointer; }
-.navbtn.active { color: #6ea8ff; }
-.navico { font-size: 20px; line-height: 1; }
-.panel { margin: 8px 0; }
-.row { gap: 6px; }
-@media (min-width: 900px) {
-  .content { max-width: 1000px; }
+/* Явный источник сканирования: утилиты собираются из классов в исходниках web/src. */
+@source './**/*.{tsx,ts,html}';
+
+/* ============================================================================
+   CloudlyRu — оформление интерфейса.
+
+   Две темы: система решает — светлая или тёмная (prefers-color-scheme), приложение
+   подстраивается токенами ниже. Своего фона у страницы нет: body прозрачный, фон
+   рисует сам браузер (Canvas — системный цвет), а полупрозрачные «острова»
+   интерфейса пропускают его сквозь себя.
+
+   Правило для новых мест: цвета берём только из токенов (var(--...)) или утилитами
+   Tailwind (bg-surface, text-muted, rounded-2xl…). Хардкод hex в JSX означает, что
+   место не переживёт переключение темы.
+   ========================================================================== */
+
+/* --- Токены: светлая тема (по умолчанию) ---------------------------------- */
+:root {
+  color-scheme: light dark;
+
+  --side: 10px;                       /* отступ островов от краёв экрана */
+  --island-radius: 1rem;              /* скругление островов */
+  --col: 1000px;                      /* ширина колонки контента */
+
+  /* Фон: страница прозрачная, острова — полупрозрачная «плёнка» поверх системного фона */
+  --canvas: transparent;
+  --island: rgb(255 255 255 / .78);
+  --island-solid: #ffffff;
+  --island-brd: rgb(0 0 0 / .07);
+  --island-shadow: 0 6px 24px rgb(0 0 0 / .10), 0 1px 2px rgb(0 0 0 / .06);
+  --scrim: rgb(255 255 255 / .72);    /* плёнка стики-панелей внутри контента */
+
+  --surface: #ffffff;                 /* карточки и панели */
+  --surface-2: #f4f4f7;               /* вложенные блоки, строки */
+  --surface-3: #e9e9ef;               /* поля ввода, «утопленные» площадки */
+
+  --fg: #12141a;
+  --fg-2: #4d5566;                    /* второстепенный текст */
+  --fg-3: #7a8291;                    /* подписи, метрики */
+
+  --brd: #e2e3e9;
+  --brd-2: #d3d5dd;
+
+  --accent: #2b6cff;
+  --accent-fg: #ffffff;
+  --accent-2: #245ee0;                /* нажатое состояние */
+  --accent-soft: #eaf1ff;             /* подложка ссылок, «пустых» кружков */
+
+  --ok: #1f9d55;
+  --warn: #b7791f;
+  --danger: #de3b3b;
+
+  --media: #000;                      /* подложка фото и видео — всегда тёмная */
+  --overlay-fg: #f5f6f8;              /* текст поверх медиа */
 }
 
-.viewer { position: fixed; inset: 0; background: #000c; z-index: 40; display: grid; place-items: center; }
-.viewer-inner { max-width: 96vw; }
-.spin { width: 26px; height: 26px; border: 3px solid #2b4256; border-top-color: #6ea8ff; border-radius: 50%; animation: sp 0.8s linear infinite; }
-@keyframes sp { to { transform: rotate(360deg); } }
-.navbtn { font-size: 20px; }
-html, body { overscroll-behavior: none; }
-/* Просмотр фото — оверлей поверх галереи, а не отдельный экран вместо неё: сетка остаётся
-   смонтированной (превью не перезагружаются), прокрутка страницы под оверлеем заперта, поэтому
-   двойного скролла нет. Высота та же, что была: до нижнего нав-бара. */
-.full { position: fixed; left: 0; right: 0; top: 0; z-index: 8; max-width: 1000px; margin: 0 auto;
-  overflow: hidden; background: #000;
-  display: flex; flex-direction: column;
-  height: calc(100dvh - 39px);
-  height: calc(100dvh - 39px - env(safe-area-inset-bottom)); }
+/* --- Токены: тёмная тема --------------------------------------------------- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: transparent;
+    --island: rgb(22 26 34 / .74);
+    --island-solid: #161a22;
+    --island-brd: rgb(255 255 255 / .09);
+    --island-shadow: 0 8px 28px rgb(0 0 0 / .5), 0 1px 2px rgb(0 0 0 / .4);
+    --scrim: rgb(15 17 21 / .78);
 
-/* Деталка фото — вторым оверлеем, поверх просмотра: свой единственный скролл, страница заперта.
-   max-width здесь по content-box: 1000 + padding 24 = ровно ширина колонки .content. */
-.ovl { position: fixed; left: 0; right: 0; top: 0; z-index: 9; max-width: 1000px; margin: 0 auto;
-  bottom: calc(39px + env(safe-area-inset-bottom));
-  overflow-y: auto; overscroll-behavior: contain; background: #0f1115; padding: 0 12px 24px; }
-.ovl .filehead { margin: 0 -12px 10px; }
-.mediaarea { flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden;
-  touch-action: none; background: #000; }
-.zoomed { transform-origin: 0 0; will-change: transform; max-width: none; max-height: none; }
-/* шапка поверх медиа (прозрачная, тач сквозь неё проходит к зуму) */
-.tbar { position: absolute; top: 0; left: 0; right: 0; z-index: 5;
-  display: flex; align-items: center; gap: 2px; padding: 8px 10px;
-  background: linear-gradient(to bottom, rgba(0,0,0,.6), rgba(0,0,0,0));
-  pointer-events: none; }
-.tbar button, .tbar a { pointer-events: auto; }
-.iconbtn { border: 0; background: none; color: #fff; font-size: 20px; line-height: 1;
-  padding: 6px 8px; cursor: pointer; border-radius: 8px; text-decoration: none;
-  /* удержание стрелок календаря: без выделения, без зума по двойному тапу и без меню */
-  touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-.iconbtn:disabled { opacity: 0.3; }
-.iconbtn:active { background: rgba(255,255,255,.18); }
-.det-info { position: absolute; top: 50px; left: 12px; z-index: 5; pointer-events: none;
-  max-width: calc(100% - 24px); font-size: 13px; color: #e6e8eb; word-break: break-all;
-  background: rgba(0,0,0,.55); border-radius: 8px; padding: 6px 10px; }
+    --surface: #161a22;
+    --surface-2: #1c212b;
+    --surface-3: #232936;
 
-/* Шапка разделов (Файлы / Фото / страница загрузки) — действия-иконки здесь */
-.filehead { position: sticky; top: 0; z-index: 6; display: flex; align-items: center; gap: 6px;
-  margin: -12px -12px 10px; padding: 9px 8px 9px 10px; background: rgba(15,17,21,.94);
-  backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }
-.filehead strong { font-size: 16px; white-space: nowrap; }
-.crumbs { display: flex; align-items: center; gap: 3px; overflow-x: auto; scrollbar-width: none;
-  flex: 1; min-width: 0; }
-.crumbs::-webkit-scrollbar { display: none; }
-.crumbs .crumb { white-space: nowrap; }
+    --fg: #e6e8eb;
+    --fg-2: #aab3c0;
+    --fg-3: #7b8494;
 
-/* Страница загрузки */
-.updrop { border: 1px dashed #333c49; border-radius: 12px; padding: 18px 10px; text-align: center;
-  background: #12161d; margin: 0 0 10px; }
-.upgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 12px; }
-.upbtn { border: 1px solid #2a313c; background: #14181f; border-radius: 12px; padding: 14px 6px 10px;
-  text-align: center; cursor: pointer; display: block; }
-.upbtn:active { background: #1a202b; border-color: #3a4250; }
-.upbtn input { display: none; }
-.upbtn-ico { font-size: 26px; line-height: 1.2; }
-.upbtn-label { font-size: 14px; color: #e6e8eb; margin-top: 4px; }
-.upbtn .meta { font-size: 11px; margin-top: 2px; }
-.uprow { display: flex; align-items: flex-start; gap: 10px; padding: 9px 2px; border-bottom: 1px solid #1f242c; }
-.uprow:last-child { border-bottom: 0; }
-.uprow .icon { line-height: 1.6; }
-.upmain { flex: 1; min-width: 0; }
-.upname { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.upname .meta { margin-left: 8px; }
-.upmeta { font-size: 12px; color: #6d7889; margin: 2px 0 4px; word-break: break-word; }
-.uprow progress { height: 6px; }
-.ubar { height: 5px; background: #262c37; border-radius: 3px; overflow: hidden; margin: 3px 0; }
-.ubar i { display: block; height: 100%; background: #2b6cff; border-radius: 3px; }
+    --brd: #262b33;
+    --brd-2: #3a4250;
 
-/* Инлайн-загрузка: панель прогресса над содержимым (очередь живёт в Shell, UI не блокируется) */
-.uppanel { position: relative; z-index: 91; background: #10141b; border: 1px solid #2a313c;
-  border-radius: 12px; padding: 10px 12px; margin: 0 0 10px; }
-.uphead { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
-.upcount { font-size: 13px; color: #cfd6e0; }
-.uppanel .uprow { padding: 6px 2px; }
+    --accent: #2b6cff;
+    --accent-fg: #ffffff;
+    --accent-2: #245ee0;
+    --accent-soft: #1b2637;
 
-/* Буфер копирования/вырезания в шапке папки: что лежит и кнопка очистки */
-.clipnote { display: inline-flex; align-items: center; gap: 2px; max-width: 140px;
-  font-size: 11px; color: #cfd6e0; background: #1c2430; border-radius: 8px; padding: 2px 2px 2px 8px;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.clipnote .iconbtn { font-size: 13px; padding: 2px 5px; }
+    --ok: #2fae5f;
+    --warn: #d9a343;
+    --danger: #ff6b6b;
 
-/* Файлы: плоский список на фоне, без «карточки»; строка = только иконка + имя */
-.fileslist { margin: 0; }
-.fileslist .item { padding: 13px 6px; cursor: pointer; }
-.fileslist .icon { width: 30px; font-size: 22px; }
-.fileslist .fname { font-size: 15px; }
-/* Миниатюра строки: сервер отдаёт квадрат 50×50, показываем меньше — строка не «толстеет» */
-.fileslist .thumb { width: 36px; height: 36px; object-fit: cover; border-radius: 6px;
-  background: #1b212b; flex: none; }
+    --media: #000;
+    --overlay-fg: #f5f6f8;
+  }
+}
 
-/* Деталка файла/папки */
-.filehead strong.detname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.detbody { margin: 6px 0 0; padding: 0 2px; }
-.metarow { display: grid; grid-template-columns: 118px 1fr; gap: 10px; align-items: baseline;
-  padding: 9px 2px; border-bottom: 1px solid #1f242c; }
-.metarow:last-child { border-bottom: 0; }
-.metak { color: #6d7889; font-size: 13px; }
-.metav { font-size: 13px; color: #e6e8eb; word-break: break-all; white-space: pre-wrap; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+/* --- Токены для утилит Tailwind -------------------------------------------
+   Цвета объявлены как `inline`: утилита подставляет var(--...) на месте и потому
+   сама переключается вместе с темой (значение @theme статично и не умеет в медиазапрос).
+   Плюс регистрируем радиус острова, чтобы работало rounded-island. */
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-island: var(--island);
+  --color-island-solid: var(--island-solid);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --color-brd: var(--brd);
+  --color-brd-2: var(--brd-2);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-media: var(--media);
 
-/* Превью содержимого в деталке файла (фото / видео / PDF).
-   Внутренней прокрутки у превью нет: медиа вписано в блок, скролл один — у самой деталки. */
-.preview { margin: 10px 0 0; border: 1px solid #262b33; border-radius: 12px; background: #0d1016; overflow: hidden; }
-.pmedia { display: grid; place-items: center; max-height: 60vh; overflow: hidden; background: #000; padding: 2px; }
-.pmedia img, .pmedia video { max-width: 100%; max-height: 60vh; display: block; }
-.pmedia canvas { display: block; max-width: 100%; max-height: 60vh; }
-.pbar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-top: 1px solid #262b33; background: #10141b; }
-.pnote { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px; }
-/* Дамп тегов из файла: строк бывает несколько десятков, по умолчанию свёрнут */
-.tags { margin: 10px 0 0; }
-.tags > summary { cursor: pointer; padding: 10px 2px; border-top: 1px solid #1f242c; }
+  --radius-island: var(--island-radius);
+}
 
-/* ---- Фото: календарь по месяцам ---- */
-/* Шапка календаря: ◀️ месяц ▶️. Липнет к верху, чтобы листать месяцы можно было из любого места. */
-.calnav { position: sticky; top: 0; z-index: 6; display: flex; align-items: center; gap: 4px;
-  height: 44px; box-sizing: border-box; margin: 0 -12px 6px; padding: 0 8px;
-  background: rgba(15, 17, 21, .94); backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }
-.caltitle { flex: 1; min-width: 0; background: none; border: 0; color: #e6e8eb; font-size: 15px;
-  font-weight: 600; padding: 6px 4px; border-radius: 8px; cursor: pointer; }
-.caltitle:active { background: rgba(255, 255, 255, .08); }
+/* --- База ------------------------------------------------------------------ */
+@layer base {
+  html, body {
+    /* Прокрутка сама страница, без «резинки» и без pull-to-refresh */
+    overscroll-behavior: none;
+  }
 
-/* Сетка дней: всегда 7 колонок; шире 380 px календарь не растёт и стоит по центру.
-   Размер клетки считает сам CSS (fr внутри min(100%, 380px)) — JS его не меряет.
-   На мобиле ширина ограничена экраном: 7 клеток делят доступную ширину, сетка не вылезает. */
-.calgrid { display: grid; width: min(100%, 380px); margin: 0 auto; }
-.calcell { position: relative; aspect-ratio: 1; display: grid; place-items: center; }
-.calcell.blank { visibility: hidden; }
-.calcell.off { cursor: default; }
-.calcell:not(.off):not(.blank) { cursor: pointer; }
-/* Превью дня ещё собирается: кружок тёмный, но число на месте — день видно и можно открыть */
-.calcell.wait::before { content: ''; position: absolute; inset: 1px; border-radius: 50%; background: #171c24; }
-/* Фото дня — кружок под числом: притемнено и под затемняющей вуалью, чтобы число читалось
-   на любом снимке (даже на белом небе контраст числа с фоном остаётся не ниже ~4:1).
-   Ширину и высоту задаём явно (calc(100% - 2px)): у картинки с width:auto размер берётся из её
-   собственных пикселей, и тогда фото вылезает за пределы кружка. */
-.calphoto { position: absolute; top: 1px; left: 1px; width: calc(100% - 2px); height: calc(100% - 2px);
-  border-radius: 50%; object-fit: cover; overflow: hidden; filter: brightness(.5) saturate(.85); }
-.calcell:not(.off):not(.wait)::after { content: ''; position: absolute; inset: 1px; border-radius: 50%;
-  background: radial-gradient(circle at 50% 50%, rgba(0, 0, 0, .15), rgba(0, 0, 0, .45)); }
-.calnum { position: relative; z-index: 1; font-size: 13px; font-weight: 600; color: #e6e8eb;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, .95), 0 0 5px rgba(0, 0, 0, .85); }
-.calcell.off .calnum { color: #5c6779; font-weight: 400; text-shadow: none; }
-.calmeta { width: min(100%, 380px); margin: 10px auto 0; font-size: 12px; color: #6d7889; text-align: center; }
-/* Месяц стоит по центру экрана и по вертикали, и по горизонтали: высота области — всё, что
-   осталось от экрана после шапки календаря и нижнего нав-бара (его отступ даёт .content). */
-.calwrap { display: grid; place-items: center; min-height: calc(100dvh - 44px - 92px); }
-.calcenter { display: grid; justify-items: center; width: 100%; }
-/* Ожидание месяца: пока данных нет, на экране только месяц с годом и лоадер — ни сетки, ни счётчиков. */
-.calload { display: grid; justify-items: center; gap: 16px; }
-.calloadmonth { font-size: 20px; font-weight: 600; color: #e6e8eb; text-align: center; }
-/* Деталка файла до готовности данных: в теле только лоадер. */
-.detload { display: grid; place-items: center; padding: 48px 0; }
-/* Открытый день в шапке просмотра: вместо имени файла — дата и место снимка среди снимков дня. */
-.calday { flex: 1; min-width: 0; padding: 0 6px; font-size: 13px; color: #e6e8eb; text-align: center;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body {
+    margin: 0;
+    /* Своего фона у страницы нет — фон даёт браузер (Canvas по color-scheme) */
+    background: var(--canvas);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
 
-/* Кнопка «+»: одна на фото и видео, всегда под большим пальцем — над нижним нав-баром */
-.fab { position: fixed; right: 18px; bottom: calc(70px + env(safe-area-inset-bottom)); z-index: 20;
-  width: 54px; height: 54px; border-radius: 50%; background: #2b6cff; color: #fff;
-  display: grid; place-items: center; font-size: 30px; line-height: 1; cursor: pointer;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, .45); user-select: none; }
-.fab:active { background: #245ee0; }
-.fab.off { opacity: .45; }
-.fab input { display: none; }
+  /* Иконки — SVG: размер задаёт шрифтовой кегль родителя, толщина штриха общая.
+     currentColor наследуется от кнопки, поэтому цвета иконок те же, что у текста. */
+  .icon svg,
+  .iconbtn svg,
+  .navbtn svg {
+    display: block;
+    width: 1em;
+    height: 1em;
+    stroke-width: 1.75;
+  }
+
+  button { font: inherit; color: inherit; }
+  img, video { max-width: 100%; }
+}
+
+@layer components {
+  /* ===== Каркас ===== */
+  .app { max-width: none; }
+
+  /* Колонка контента. Отступы сверху/снизу — чтобы содержимое не заезжало под острова
+     (высота острова + его отступ от края + воздух). */
+  .content {
+    max-width: var(--col);
+    margin: 0 auto;
+    padding: calc(56px + var(--side)) 12px
+             calc(72px + var(--side) + env(safe-area-inset-bottom));
+  }
+
+  /* ===== Острова: шапка сверху, навигация снизу =====
+     Оба плавающие, с зазором от краёв экрана и от краёв колонки. Фон — полупрозрачный,
+     с blur: сквозь остров видно системный фон. */
+  .island {
+    position: fixed;
+    left: calc(var(--side) + env(safe-area-inset-left));
+    right: calc(var(--side) + env(safe-area-inset-right));
+    z-index: 30;
+    max-width: min(var(--col), calc(100% - 2 * var(--side)));
+    margin: 0 auto;
+    background: var(--island);
+    border: 1px solid var(--island-brd);
+    border-radius: var(--island-radius);
+    box-shadow: var(--island-shadow);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
+  }
+
+  .island-top {
+    top: calc(var(--side) + env(safe-area-inset-top));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 46px;
+    padding: 6px 8px 6px 14px;
+  }
+  .island-top h1 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 650; }
+
+  /* Нижний остров — навигация; место под жест «домой» учтено отступом снизу */
+  .island-bottom {
+    bottom: calc(var(--side) + env(safe-area-inset-bottom));
+    display: flex;
+    align-items: stretch;
+    justify-content: space-around;
+    padding: 4px;
+  }
+  .navbtn {
+    flex: 1;
+    display: grid;
+    justify-items: center;
+    gap: 3px;
+    padding: 7px 2px 6px;
+    font-size: 10px;
+    color: var(--fg-3);
+    background: none;
+    border: 0;
+    border-radius: calc(var(--island-radius) - 6px);
+    cursor: pointer;
+    transition: color .15s, background-color .15s;
+  }
+  .navbtn.active { color: var(--accent); background: var(--accent-soft); }
+  .navico { font-size: 20px; line-height: 1; }
+  /* Подписи в нижнем баре: на узком экране под шесть колонок текста не хватает — там остаются
+     только иконки, на широком показываем и слово. Доступность держит aria-label кнопки. */
+  .navlbl { font-size: 10px; line-height: 1.1; white-space: nowrap; }
+  @media (max-width: 560px) {
+    .navlbl { display: none; }
+    .navbtn { padding: 9px 2px; }
+  }
+
+  /* ===== Формы и кнопки ===== */
+  input, select, textarea {
+    background: var(--surface-3);
+    border: 1px solid var(--brd-2);
+    color: var(--fg);
+    padding: 8px 11px;
+    border-radius: 10px;
+  }
+  input:focus-visible, select:focus-visible, textarea:focus-visible,
+  button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border: 1px solid transparent;
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-size: 14px;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .btn:active { background: var(--accent-2); }
+  .btn.ghost { background: var(--surface-2); border-color: var(--brd-2); color: var(--fg); }
+  .btn.danger { background: var(--danger); color: #fff; }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
+
+  /* Строка действия в шапках: иконка-кнопка без фона, цвет — как у текста */
+  .iconbtn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    background: none;
+    color: var(--fg);
+    font-size: 19px;
+    line-height: 1;
+    padding: 7px;
+    border-radius: 10px;
+    cursor: pointer;
+    text-decoration: none;
+    /* удержание стрелок календаря: без выделения, без зума по двойному тапу и без меню */
+    touch-action: manipulation;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  }
+  .iconbtn:disabled { opacity: .3; }
+  .iconbtn:active { background: color-mix(in srgb, currentColor 14%, transparent); }
+
+  /* ===== Блоки ===== */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--brd);
+    border-radius: 14px;
+    padding: 14px;
+    margin: 10px 0;
+  }
+
+  .item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 6px;
+    border-bottom: 1px solid var(--brd);
+  }
+  .item:hover { background: var(--surface-2); }
+  .icon { width: 20px; text-align: center; color: var(--fg-3); font-size: 18px; line-height: 1; }
+  .fname { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--fg-3); font-size: 12px; }
+  .notice { color: var(--ok); font-size: 13px; }
+  .err { color: var(--danger); font-size: 13px; }
+  .copy { font-size: 12px; color: var(--fg-2); word-break: break-all; }
+  .empty { display: flex; align-items: center; justify-content: center; gap: 6px; }
+  progress { width: 100%; accent-color: var(--accent); }
+
+  /* ===== Вход ===== */
+  .loginbox { max-width: 340px; margin: 12vh auto; display: grid; gap: 10px; padding: 0 16px; }
+  .loginbox .brand { display: grid; justify-items: center; gap: 6px; color: var(--accent); }
+  .loginbox h2 { margin: 0 0 4px; text-align: center; }
+
+  /* ===== Шапки разделов =====
+     Не остров: липкая панель внутри колонки контента, без зазора от её краёв. */
+  .filehead {
+    position: sticky;
+    top: calc(56px + var(--side));
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: -12px -12px 10px;
+    padding: 9px 8px 9px 10px;
+    background: var(--scrim);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--brd);
+  }
+  .filehead strong { font-size: 16px; white-space: nowrap; }
+  .filehead strong.detname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  /* ===== Списки файлов ===== */
+  .fileslist { margin: 0; }
+  .fileslist .item { padding: 13px 6px; cursor: pointer; }
+  .fileslist .icon { width: 30px; font-size: 22px; }
+  .fileslist .fname { font-size: 15px; }
+  /* Миниатюра строки: сервер отдаёт квадрат 50×50, показываем меньше — строка не «толстеет» */
+  .fileslist .thumb {
+    width: 36px; height: 36px;
+    object-fit: cover;
+    border-radius: 8px;
+    background: var(--surface-3);
+    flex: none;
+  }
+
+  /* ===== Загрузка файлов ===== */
+  .uprow { display: flex; align-items: flex-start; gap: 10px; padding: 9px 2px; border-bottom: 1px solid var(--brd); }
+  .uprow:last-child { border-bottom: 0; }
+  .uprow .icon { line-height: 1; }
+  .upmain { flex: 1; min-width: 0; }
+  .upname { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .upname .meta { margin-left: 8px; }
+  .upmeta { font-size: 12px; color: var(--fg-3); margin: 2px 0 4px; word-break: break-word; }
+  .uprow progress { height: 6px; }
+  .ubar { height: 5px; background: var(--surface-3); border-radius: 3px; overflow: hidden; margin: 3px 0; }
+  .ubar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  .ubar i.done { background: var(--ok); }
+
+  /* Панель прогресса над содержимым (очередь живёт в Shell, UI не блокируется) */
+  .uppanel {
+    position: relative;
+    z-index: 91;
+    background: var(--surface);
+    border: 1px solid var(--brd);
+    border-radius: 14px;
+    padding: 10px 12px;
+    margin: 0 0 10px;
+  }
+  .uphead { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
+  .upcount { font-size: 13px; color: var(--fg-2); }
+  .uppanel .uprow { padding: 6px 2px; }
+
+  /* Буфер копирования/вырезания в шапке папки */
+  .clipnote {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    max-width: 140px;
+    font-size: 11px;
+    color: var(--fg-2);
+    background: var(--surface-3);
+    border-radius: 8px;
+    padding: 2px 2px 2px 8px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .clipnote .iconbtn { font-size: 13px; padding: 2px 5px; }
+
+  /* ===== Деталка файла/папки ===== */
+  .detbody { margin: 6px 0 0; padding: 0 2px; }
+  .metarow {
+    display: grid;
+    grid-template-columns: 118px 1fr;
+    gap: 10px;
+    align-items: baseline;
+    padding: 9px 2px;
+    border-bottom: 1px solid var(--brd);
+  }
+  .metarow:last-child { border-bottom: 0; }
+  .metak { color: var(--fg-3); font-size: 13px; }
+  .metav { font-size: 13px; color: var(--fg); word-break: break-all; white-space: pre-wrap; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .detload { display: grid; place-items: center; padding: 48px 0; }
+
+  /* Превью содержимого в деталке файла (фото / видео / PDF).
+     Внутренней прокрутки у превью нет: медиа вписано в блок, скролл один — у самой деталки. */
+  .preview { margin: 10px 0 0; border: 1px solid var(--brd); border-radius: 14px; background: var(--surface-2); overflow: hidden; }
+  .pmedia { display: grid; place-items: center; max-height: 60vh; overflow: hidden; background: var(--media); padding: 2px; }
+  .pmedia img, .pmedia video { max-width: 100%; max-height: 60vh; display: block; }
+  .pmedia canvas { display: block; max-width: 100%; max-height: 60vh; }
+  .pbar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-top: 1px solid var(--brd); background: var(--surface-2); color: var(--fg); }
+  .pnote { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px; }
+  /* Дамп тегов из файла: строк бывает несколько десятков, по умолчанию свёрнут */
+  .tags { margin: 10px 0 0; }
+  .tags > summary { cursor: pointer; padding: 10px 2px; border-top: 1px solid var(--brd); }
+
+  /* ===== Фото: календарь по месяцам ===== */
+  /* Шапка календаря: стрелки + месяц. Липнет под островом-шапкой, чтобы листать месяцы
+     можно было из любого места. */
+  .calnav {
+    position: sticky;
+    top: calc(56px + var(--side));
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 44px;
+    box-sizing: border-box;
+    margin: 0 -12px 6px;
+    padding: 0 8px;
+    background: var(--scrim);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--brd);
+  }
+  .caltitle {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: 0;
+    color: var(--fg);
+    font-size: 15px;
+    font-weight: 600;
+    padding: 6px 4px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .caltitle:active { background: var(--surface-2); }
+
+  /* Сетка дней: всегда 7 колонок; шире 380 px календарь не растёт и стоит по центру.
+     Размер клетки считает сам CSS (fr внутри min(100%, 380px)) — JS его не меряет. */
+  .calgrid { display: grid; width: min(100%, 380px); margin: 0 auto; }
+  .calcell { position: relative; aspect-ratio: 1; display: grid; place-items: center; }
+  .calcell.blank { visibility: hidden; }
+  .calcell.off { cursor: default; }
+  .calcell:not(.off):not(.blank) { cursor: pointer; }
+  /* Превью дня ещё собирается: кружок тёмный, но число на месте — день видно и можно открыть */
+  .calcell.wait::before { content: ''; position: absolute; inset: 1px; border-radius: 50%; background: var(--surface-2); }
+  /* Фото дня — кружок под числом: притемнено и под затемняющей вуалью, чтобы число читалось
+     на любом снимке (даже на белом небе контраст числа с фоном остаётся не ниже ~4:1).
+     Ширину и высоту задаём явно (calc(100% - 2px)): у картинки с width:auto размер берётся из её
+     собственных пикселей, и тогда фото вылезает за пределы кружка. */
+  .calphoto {
+    position: absolute; top: 1px; left: 1px;
+    width: calc(100% - 2px); height: calc(100% - 2px);
+    border-radius: 50%;
+    object-fit: cover;
+    overflow: hidden;
+    filter: brightness(.5) saturate(.85);
+  }
+  .calcell:not(.off):not(.wait)::after {
+    content: ''; position: absolute; inset: 1px; border-radius: 50%;
+    background: radial-gradient(circle at 50% 50%, rgb(0 0 0 / .15), rgb(0 0 0 / .45));
+  }
+  .calnum {
+    position: relative; z-index: 1;
+    font-size: 13px; font-weight: 600; color: #fff;
+    text-shadow: 0 1px 2px rgb(0 0 0 / .95), 0 0 5px rgb(0 0 0 / .85);
+  }
+  /* День без фото — число обычным текстом страницы, а не поверх снимка */
+  .calcell.off .calnum { color: var(--fg-3); font-weight: 400; text-shadow: none; }
+  .calmeta { width: min(100%, 380px); margin: 10px auto 0; font-size: 12px; color: var(--fg-3); text-align: center; }
+  /* Месяц стоит по центру экрана и по вертикали, и по горизонтали: высота области — всё, что
+     осталось от экрана после шапки календаря и нижнего острова-навигации (его отступ даёт .content). */
+  .calwrap { display: grid; place-items: center; min-height: calc(100dvh - 44px - 130px); }
+  .calcenter { display: grid; justify-items: center; width: 100%; }
+  /* Ожидание месяца: пока данных нет, на экране только месяц с годом и лоадер */
+  .calload { display: grid; justify-items: center; gap: 16px; }
+  .calloadmonth { font-size: 20px; font-weight: 600; color: var(--fg); text-align: center; }
+  /* Открытый день в шапке просмотра: вместо имени файла — дата и место снимка среди снимков дня. */
+  .calday {
+    flex: 1; min-width: 0; padding: 0 6px;
+    font-size: 13px; color: var(--overlay-fg); text-align: center;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* ===== Просмотр фото и файлов (полноэкранные слои) ===== */
+  .viewer { position: fixed; inset: 0; background: rgb(0 0 0 / .8); z-index: 40; display: grid; place-items: center; }
+
+  /* Просмотр фото — оверлей поверх галереи, а не отдельный экран вместо неё: сетка остаётся
+     смонтированной (превью не перезагружаются), прокрутка страницы под оверлеем заперта, поэтому
+     двойного скролла нет. Высота — от верха экрана до нижнего острова-навигации. */
+  .full {
+    position: fixed; left: 0; right: 0; top: 0; z-index: 8;
+    max-width: var(--col); margin: 0 auto;
+    overflow: hidden; background: var(--media);
+    display: flex; flex-direction: column;
+    height: calc(100dvh - 72px - var(--side));
+    height: calc(100dvh - 72px - var(--side) - env(safe-area-inset-bottom));
+  }
+
+  .mediaarea {
+    flex: 1; min-height: 0;
+    display: grid; place-items: center;
+    overflow: hidden;
+    touch-action: none;
+    background: var(--media);
+  }
+
+  /* Деталка фото — вторым оверлеем, поверх просмотра: свой единственный скролл, страница заперта.
+     max-width здесь по content-box: 1000 + padding 24 = ровно ширина колонки .content. */
+  .ovl {
+    position: fixed; left: 0; right: 0; top: 0; z-index: 9;
+    max-width: var(--col); margin: 0 auto;
+    bottom: calc(72px + var(--side) + env(safe-area-inset-bottom));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* Непрозрачный фон обязателен: под слоем остаётся смонтированная сетка галереи */
+    background: var(--island-solid);
+    padding: 0 12px 24px;
+  }
+  .ovl .filehead { margin: 0 -12px 10px; top: 0; }
+
+  /* Шапка поверх медиа (прозрачная, тач сквозь неё проходит к зуму) */
+  .tbar {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+    display: flex; align-items: center; gap: 2px;
+    padding: 8px 10px;
+    background: linear-gradient(to bottom, rgb(0 0 0 / .6), rgb(0 0 0 / 0));
+    color: var(--overlay-fg);
+    pointer-events: none;
+  }
+  .tbar button, .tbar a { pointer-events: auto; }
+  /* Поверх медиа иконки всегда светлые — независимо от темы */
+  .tbar .iconbtn { color: var(--overlay-fg); }
+  .det-info {
+    position: absolute; top: 50px; left: 12px; z-index: 5;
+    pointer-events: none;
+    max-width: calc(100% - 24px);
+    font-size: 13px; color: var(--overlay-fg); word-break: break-all;
+    background: rgb(0 0 0 / .55);
+    border-radius: 10px;
+    padding: 6px 10px;
+  }
+
+  /* Кнопка «+»: одна на фото и видео, всегда под большим пальцем — над нижним островом */
+  .fab {
+    position: fixed;
+    right: calc(var(--side) + 8px);
+    bottom: calc(84px + var(--side) + env(safe-area-inset-bottom));
+    z-index: 20;
+    width: 54px; height: 54px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--accent-fg);
+    display: grid; place-items: center;
+    font-size: 26px; line-height: 1;
+    border: 0;
+    cursor: pointer;
+    box-shadow: 0 6px 18px rgb(0 0 0 / .45);
+    user-select: none;
+  }
+  .fab:active { background: var(--accent-2); }
+  .fab.off { opacity: .45; }
+  .fab input { display: none; }
+
+  /* ===== Лоадер ===== */
+  .spin {
+    width: 26px; height: 26px;
+    border: 3px solid var(--brd-2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: sp .8s linear infinite;
+  }
+  @keyframes sp { to { transform: rotate(360deg); } }
+}
