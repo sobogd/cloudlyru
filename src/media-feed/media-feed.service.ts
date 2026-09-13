@@ -134,6 +134,10 @@ export class MediaFeedService {
       WHERE f."deletedAt" IS NULL
         AND f."zone" = ${ZONE_PHOTOS}
         AND f."folderId" = ANY(${tree})
+        -- Только кадры с собранным превью: на карте точка — это миниатюра, а тап открывает
+        -- кадр. Без превью и то и другое мертво (миниатюра 404, просмотрщик — «не открылось»);
+        -- в ленте такие кадры и так помечены как «Превью не собрано».
+        AND a."previewState" = 'done'
         AND mm."latitude" IS NOT NULL
         AND mm."longitude" IS NOT NULL
       ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
