@@ -1599,13 +1599,14 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
             <button className="iconbtn" title="Предыдущий снимок" onClick={() => stepPhoto('prev')}><ArrowLeft /></button>
             <button className="iconbtn" title="Следующий снимок" onClick={() => stepPhoto('next')}><ArrowRight /></button>
           </div>
-        </div>
-      )}
 
-      {/* Полноценная деталка (как в «Файлах») — вторым оверлеем, поверх просмотра. */}
-      {detailId && (
-        <div className="ovl" key={detailId}>
-          <FileDetail entryId={detailId} onBack={() => setDetailId(null)} onDeleted={forgetEntry} inOverlay />
+          {/* Деталка кадра — карточка в потоке просмотра: остров между шапкой и нижним
+              островом-навигацией, теми же зазорами и границами. Свой скролл — у карточки. */}
+          {detailId && (
+            <div className="ovl" key={detailId}>
+              <FileDetail entryId={detailId} onBack={() => setDetailId(null)} onDeleted={forgetEntry} inOverlay />
+            </div>
+          )}
         </div>
       )}
     </div>
