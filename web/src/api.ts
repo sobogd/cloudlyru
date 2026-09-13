@@ -523,6 +523,17 @@ export interface MediaInfo {
 export const mediaInfo = (entryId: string) =>
   request<MediaInfo>(`/media/${encodeURIComponent(entryId)}`);
 
+/** Точка на карте: запись с геометкой. Порядок — как в ленте «Медиа» (от свежих). */
+export interface MapPoint {
+  entryId: string;
+  lat: number;
+  lon: number;
+  capturedAt: string | null;
+}
+/** Все геометки ленты для вкладки «Карта»: total — сколько всего, points — что влезло. */
+export const mediaMap = () =>
+  request<{ total: number; truncated: boolean; points: MapPoint[] }>('/media/map');
+
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 

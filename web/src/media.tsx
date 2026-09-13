@@ -603,7 +603,9 @@ function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => v
 
 type ZoomState = { scale: number; tx: number; ty: number };
 
-function MediaViewer({
+/** Просмотрщик кадра. Живёт вне ленты: карте он нужен с тем же набором пропсов
+    (свой источник кадров, свой порядок), поэтому экспортируется. */
+export function MediaViewer({
   total,
   idx,
   getItem,

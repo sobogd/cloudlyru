@@ -17,6 +17,19 @@ import { ZONE_PHOTOS } from '../common/zones';
 export const MEDIA_RANGE_MAX = 1000;
 /** Потолок одного запроса статусов превью. */
 export const MEDIA_STATUS_MAX = 500;
+/**
+ * Потолок точек карты: это одна точка на кадр со всей библиотеки, и она уходит в браузер
+ * целиком (тепловой слой считает клиент). 20 000 точек — это уже сотни тысяч фото на карте.
+ */
+export const MEDIA_MAP_MAX = 20_000;
+
+/** Точка на карте: запись с геометкой. Минимум полей — карте не нужны имя, тип и размер. */
+export interface MediaMapPoint {
+  entryId: string;
+  lat: number;
+  lon: number;
+  capturedAt: string | null;
+}
 
 /** Строка ленты «Медиа». */
 export interface MediaItem {
@@ -92,6 +105,44 @@ export class MediaFeedService {
     private readonly prisma: PrismaService,
     private readonly auth: AuthService,
   ) {}
+
+  /**
+   * Все геометки ленты для вкладки «Карта»: по точке на кадр, порядок — как в ленте
+   * (от свежих к старым), чтобы индекс точки совпадал с порядком листания в модалке.
+   *
+   * Отдаём минимум полей: имена, размеры и sha256 карте не нужны — миниатюра берётся по
+   * `entryId` (`/files/:id/thumb`), а детали кадра подтягиваются при открытии. Библиотека
+   * целиком в браузер не поедет: потолок MEDIA_MAP_MAX, `total` показывает, сколько всего.
+   */
+  async mapPoints(userId: string): Promise<{ total: number; truncated: boolean; points: MediaMapPoint[] }> {
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return { total: 0, truncated: false, points: [] };
+    const rows = await this.prisma.$queryRaw<Array<{ id: string; lat: number; lon: number; capturedAt: Date | null; n: bigint | number }>>(Prisma.sql`
+      SELECT f."id", mm."latitude" AS lat, mm."longitude" AS lon, mm."capturedAt",
+             count(*) OVER () AS n
+      FROM "MediaMeta" mm
+      JOIN "Asset" a ON a."id" = mm."assetId"
+      JOIN "FileEntry" f ON f."assetId" = a."id"
+      WHERE f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+        AND mm."latitude" IS NOT NULL
+        AND mm."longitude" IS NOT NULL
+      ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
+      LIMIT ${MEDIA_MAP_MAX}
+    `);
+    const total = Number(rows[0]?.n ?? 0);
+    return {
+      total,
+      truncated: total > rows.length,
+      points: rows.map((r) => ({
+        entryId: r.id,
+        lat: Number(r.lat),
+        lon: Number(r.lon),
+        capturedAt: r.capturedAt ? new Date(r.capturedAt).toISOString() : null,
+      })),
+    };
+  }
 
   /** Общее число медиа зоны «Фото» — по нему клиент считает высоту скролла. */
   async count(userId: string): Promise<number> {

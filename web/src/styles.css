@@ -737,6 +737,94 @@
   }
   .mv-err .copy { color: var(--fg-2); }
 
+  /* ===== Карта: все кадры с геометкой на подложке OSM =====
+     Занимает ту же область, что лента «Медиа»: между верхним краем и нижним островом.
+     Внутри — шапка-остров со счётчиком кадров и карточка с тайлами. */
+  .mapwrap {
+    position: fixed;
+    left: calc(var(--side) + env(safe-area-inset-left));
+    right: calc(var(--side) + env(safe-area-inset-right));
+    top: calc(var(--side) + env(safe-area-inset-top));
+    bottom: calc(var(--island-h) + var(--side) * 2 + env(safe-area-inset-bottom));
+    z-index: 5;
+    max-width: min(var(--col), calc(100% - 2 * var(--side)));
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--side);
+  }
+  .mapbox {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    border: 1px solid var(--island-brd);
+    border-radius: var(--island-radius);
+    overflow: hidden;
+    background: var(--surface-2);
+  }
+  .map-host { position: absolute; inset: 0; }
+  /* Тепловой слой: canvas в своей панели Leaflet, едет вместе с тайлами */
+  .map-heat { position: absolute; left: 0; top: 0; }
+  /* Миниатюра-кластер: кадр места и счётчик, если кадров больше одного */
+  .map-cluster {
+    border-radius: 10px;
+    background: var(--surface-3);
+    box-shadow: 0 1px 5px rgb(0 0 0 / .35);
+    cursor: pointer;
+  }
+  .map-cluster img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 10px;
+  }
+  .map-cluster i {
+    position: absolute;
+    right: -5px;
+    bottom: -5px;
+    min-width: 17px;
+    height: 17px;
+    padding: 0 4px;
+    border-radius: 9px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 600;
+    line-height: 17px;
+    text-align: center;
+  }
+  /* Подсказка поверх карты: что это за пятна и что делать дальше */
+  .map-legend {
+    position: absolute;
+    left: 50%;
+    bottom: 10px;
+    z-index: 500;
+    transform: translateX(-50%);
+    padding: 5px 10px;
+    background: var(--island);
+    border: 1px solid var(--island-brd);
+    border-radius: 9px;
+    font-size: 11px;
+    color: var(--fg-2);
+    white-space: nowrap;
+    pointer-events: none;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+  /* Состояния карты: загрузка, пусто, ошибка — по центру карточки */
+  .map-note {
+    position: absolute;
+    inset: 0;
+    z-index: 500;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    text-align: center;
+    background: var(--island);
+  }
+
   /* Футер — та же карточка, что шапка: плашка --island-glass у нижнего края.
      Внутри — прокручиваемая по горизонтали строка метаданных кадра. */
   .mv-foot {

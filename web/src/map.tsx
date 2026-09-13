@@ -1,0 +1,428 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import { LocateFixed } from 'lucide-react';
+import * as api from './api';
+import { MediaViewer } from './media';
+import { patchUi, readUi } from './storage';
+
+/**
+ * Вкладка «Карта» — все кадры с геометкой на подложке OpenStreetMap.
+ *
+ * Вид как в Google Photos: издалека плотность съёмки рисуется тепловым слоем (свой canvas
+ * в отдельной панели Leaflet, поэтому он едет вместе с тайлами без перерисовки), при
+ * приближении вместо тепла появляются миниатюры кадров, сгруппированные по экранным
+ * клеткам: тап открывает кадр в общем просмотрщике «Медиа» — тот же MediaViewer, что и
+ * в ленте, поэтому листание и удаление работают одинаково.
+ *
+ * Точки приходят одним запросом (`/media/map`): имена, типы и размеры карте не нужны —
+ * миниатюра берётся по entryId (`/files/:id/thumb`), а детали кадра подтягиваются только
+ * для открытого и соседних кадров.
+ */
+
+/** С какого зума вместо теплового слоя показываем миниатюры кадров. */
+const MARKER_ZOOM = 13;
+/** Сторона экранной клетки, по которой кадры группируются в одну миниатюру. */
+const CLUSTER_PX = 56;
+/** Потолок одновременных миниатюр: это DOM-узлы с картинками, больше браузер не тянет. */
+const CLUSTER_MAX = 300;
+/** Сторона клетки, в которую складываются точки теплового слоя (меньше — дороже отрисовка). */
+const HEAT_CELL = 8;
+/** Радиус пятна теплового слоя, px. */
+const HEAT_RADIUS = 26;
+/** Размер миниатюры-кластера, px. */
+const CLUSTER_ICON = 46;
+/** Вид по умолчанию, если пользователь ещё не двигал карту. */
+const DEFAULT_VIEW = { lat: 20, lon: 10, zoom: 2 };
+
+/** Палитра теплового слоя: накопленная плотность (0…1) → цвет. */
+const HEAT_STOPS: Array<[number, [number, number, number]]> = [
+  [0, [43, 108, 255]],
+  [0.35, [64, 196, 255]],
+  [0.6, [47, 174, 95]],
+  [0.8, [255, 204, 51]],
+  [1, [255, 77, 79]],
+];
+
+function heatColor(t: number): [number, number, number] {
+  let lo = HEAT_STOPS[0];
+  let hi = HEAT_STOPS[HEAT_STOPS.length - 1];
+  for (let i = 0; i < HEAT_STOPS.length - 1; i++) {
+    if (t >= HEAT_STOPS[i][0] && t <= HEAT_STOPS[i + 1][0]) {
+      lo = HEAT_STOPS[i];
+      hi = HEAT_STOPS[i + 1];
+      break;
+    }
+  }
+  const span = hi[0] - lo[0] || 1;
+  const k = Math.min(1, Math.max(0, (t - lo[0]) / span));
+  return [
+    Math.round(lo[1][0] + (hi[1][0] - lo[1][0]) * k),
+    Math.round(lo[1][1] + (hi[1][1] - lo[1][1]) * k),
+    Math.round(lo[1][2] + (hi[1][2] - lo[1][2]) * k),
+  ];
+}
+
+/** Пятно теплового слоя: рисуется один раз и потом только копируется по точкам. */
+function makeSprite(): HTMLCanvasElement {
+  const size = HEAT_RADIUS * 2;
+  const cv = document.createElement('canvas');
+  cv.width = size;
+  cv.height = size;
+  const ctx = cv.getContext('2d');
+  if (ctx) {
+    const g = ctx.createRadialGradient(HEAT_RADIUS, HEAT_RADIUS, 0, HEAT_RADIUS, HEAT_RADIUS, HEAT_RADIUS);
+    g.addColorStop(0, 'rgba(255,255,255,0.9)');
+    g.addColorStop(0.4, 'rgba(255,255,255,0.35)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+  }
+  return cv;
+}
+
+/** Ключ экранной клетки: координаты клетки в одну сортируемую пару. */
+const cellKey = (gx: number, gy: number) => (gx + 4096) * 16384 + (gy + 4096);
+
+export default function MapSection({ onOverlayChange }: {
+  /** Открыт просмотрщик кадра — Shell прячет нижний остров, чтобы он не наезжал на футер. */
+  onOverlayChange?: (open: boolean) => void;
+}) {
+  const [points, setPoints] = useState<api.MapPoint[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [truncated, setTruncated] = useState(false);
+  const [error, setError] = useState('');
+  const [openIdx, setOpenIdx] = useState<number | null>(null);
+  /** Зум достаточный, чтобы вместо тепла показывать миниатюры. */
+  const [markers, setMarkers] = useState(false);
+
+  const hostRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<L.Map | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const offRef = useRef<HTMLCanvasElement | null>(null);
+  const spriteRef = useRef<HTMLCanvasElement | null>(null);
+  const markerLayerRef = useRef<L.LayerGroup | null>(null);
+  const pointsRef = useRef<api.MapPoint[]>([]);
+  const drawRef = useRef<() => void>(() => {});
+  const markersRef = useRef<() => void>(() => {});
+  /** Вид карты, сохранённый в прошлый раз: восстановим его вместо «показать всё». */
+  const [savedView] = useState(() => readUi().map);
+
+  useEffect(() => {
+    onOverlayChange?.(openIdx != null);
+  }, [openIdx, onOverlayChange]);
+
+  // Точки всей ленты — одним запросом при входе на вкладку.
+  useEffect(() => {
+    let stopped = false;
+    api
+      .mediaMap()
+      .then((r) => {
+        if (stopped) return;
+        pointsRef.current = r.points;
+        setPoints(r.points);
+        setTotal(r.total);
+        setTruncated(r.truncated);
+      })
+      .catch((e) => {
+        if (!stopped) setError((e as Error).message);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, []);
+
+  /** Показать все кадры разом (или вернуть мир, если геометок нет). */
+  const fitAll = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const pts = pointsRef.current;
+    if (!pts.length) {
+      map.setView([DEFAULT_VIEW.lat, DEFAULT_VIEW.lon], DEFAULT_VIEW.zoom);
+      return;
+    }
+    map.fitBounds(L.latLngBounds(pts.map((p) => [p.lat, p.lon] as [number, number])), {
+      padding: [40, 40],
+      maxZoom: 15,
+    });
+  }, []);
+
+  // Карта живёт вне React: Leaflet сам двигает тайлы, мы только рисуем тепло и маркеры.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const map = L.map(host, {
+      center: [savedView?.lat ?? DEFAULT_VIEW.lat, savedView?.lon ?? DEFAULT_VIEW.lon],
+      zoom: savedView?.zoom ?? DEFAULT_VIEW.zoom,
+      minZoom: 2,
+      maxZoom: 19,
+      worldCopyJump: true,
+      zoomControl: true,
+      attributionControl: true,
+    });
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap',
+    }).addTo(map);
+    // Отдельная панель под тепловой слой: canvas лежит среди панелей карты и потому
+    // переезжает вместе с тайлами — во время панорамирования перерисовка не нужна.
+    const pane = map.createPane('heat');
+    pane.style.zIndex = '350';
+    pane.style.pointerEvents = 'none';
+    const canvas = document.createElement('canvas');
+    canvas.className = 'map-heat';
+    pane.appendChild(canvas);
+    canvasRef.current = canvas;
+    markerLayerRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
+    spriteRef.current = makeSprite();
+
+    const draw = () => {
+      const cv = canvasRef.current;
+      if (!cv) return;
+      const bounds = map.getPixelBounds();
+      const size = bounds.getSize();
+      const tl = bounds.min ?? L.point(0, 0);
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const w = Math.max(1, Math.round(size.x * dpr));
+      const h = Math.max(1, Math.round(size.y * dpr));
+      if (cv.width !== w || cv.height !== h) {
+        cv.width = w;
+        cv.height = h;
+      }
+      cv.style.width = `${size.x}px`;
+      cv.style.height = `${size.y}px`;
+      L.DomUtil.setPosition(cv, tl);
+      const ctx = cv.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, size.x, size.y);
+      const pts = pointsRef.current;
+      // Вблизи вместо тепла — миниатюры: два слоя одновременно читались бы плохо.
+      if (!pts.length || map.getZoom() >= MARKER_ZOOM) return;
+
+      // Точки складываются в клетки: 20 000 пятен по одному рисовать нельзя, а клетка
+      // ещё и показывает плотность — чем больше кадров, тем ярче пятно.
+      const buckets = new Map<number, { x: number; y: number; n: number }>();
+      for (const p of pts) {
+        const lp = map.latLngToLayerPoint([p.lat, p.lon]);
+        const x = lp.x - tl.x;
+        const y = lp.y - tl.y;
+        if (x < -HEAT_RADIUS || y < -HEAT_RADIUS || x > size.x + HEAT_RADIUS || y > size.y + HEAT_RADIUS) continue;
+        const key = cellKey(Math.floor(x / HEAT_CELL), Math.floor(y / HEAT_CELL));
+        const b = buckets.get(key);
+        if (b) b.n++;
+        else buckets.set(key, { x, y, n: 1 });
+      }
+      if (!buckets.size) return;
+
+      let off = offRef.current;
+      if (!off) {
+        off = document.createElement('canvas');
+        offRef.current = off;
+      }
+      if (off.width !== w || off.height !== h) {
+        off.width = w;
+        off.height = h;
+      }
+      const octx = off.getContext('2d');
+      const sprite = spriteRef.current;
+      if (!octx || !sprite) return;
+      octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      octx.clearRect(0, 0, size.x, size.y);
+      // 'lighter' складывает альфу пятен — из неё и получается градиент плотности
+      octx.globalCompositeOperation = 'lighter';
+      for (const b of buckets.values()) {
+        octx.globalAlpha = Math.min(1, 0.22 + 0.14 * Math.sqrt(b.n));
+        octx.drawImage(sprite, b.x - HEAT_RADIUS, b.y - HEAT_RADIUS);
+      }
+      octx.globalAlpha = 1;
+      octx.globalCompositeOperation = 'source-over';
+      // Накопленная альфа — это и есть мера плотности: раскрашиваем её палитрой
+      const img = octx.getImageData(0, 0, off.width, off.height);
+      const d = img.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const a = d[i + 3];
+        if (!a) continue;
+        const [r, g, bl] = heatColor(a / 255);
+        d[i] = r;
+        d[i + 1] = g;
+        d[i + 2] = bl;
+      }
+      octx.putImageData(img, 0, 0);
+      ctx.drawImage(off, 0, 0, size.x, size.y);
+    };
+
+    const syncMarkers = () => {
+      const layer = markerLayerRef.current;
+      if (!layer) return;
+      layer.clearLayers();
+      const pts = pointsRef.current;
+      const show = map.getZoom() >= MARKER_ZOOM && pts.length > 0;
+      setMarkers(show);
+      if (!show) return;
+      const tl = map.getPixelBounds().min ?? L.point(0, 0);
+      // Кадры одной экранной клетки — одна миниатюра; points уже идут от свежих,
+      // поэтому первый в клетке и есть самый новый кадр места.
+      const cells = new Map<number, { lat: number; lon: number; n: number; idx: number }>();
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        const lp = map.latLngToLayerPoint([p.lat, p.lon]);
+        const key = cellKey(Math.floor((lp.x - tl.x) / CLUSTER_PX), Math.floor((lp.y - tl.y) / CLUSTER_PX));
+        const c = cells.get(key);
+        if (c) c.n++;
+        else cells.set(key, { lat: p.lat, lon: p.lon, n: 1, idx: i });
+      }
+      const list = [...cells.values()].sort((a, b) => b.n - a.n).slice(0, CLUSTER_MAX);
+      for (const c of list) {
+        const item = pts[c.idx];
+        const icon = L.divIcon({
+          className: 'map-cluster',
+          html:
+            `<img src="${api.thumbUrl(item.entryId)}" alt="" loading="lazy" decoding="async">` +
+            (c.n > 1 ? `<i>${c.n}</i>` : ''),
+          iconSize: [CLUSTER_ICON, CLUSTER_ICON],
+          iconAnchor: [CLUSTER_ICON / 2, CLUSTER_ICON / 2],
+        });
+        const marker = L.marker([c.lat, c.lon], { icon, keyboard: false, riseOnHover: true });
+        marker.on('click', () => setOpenIdx(c.idx));
+        layer.addLayer(marker);
+      }
+    };
+
+    drawRef.current = draw;
+    markersRef.current = syncMarkers;
+
+    let saveTimer: number | null = null;
+    const onViewChange = () => {
+      draw();
+      syncMarkers();
+      if (saveTimer != null) window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(() => {
+        const c = map.getCenter();
+        patchUi({ map: { lat: c.lat, lon: c.lng, zoom: map.getZoom() } });
+      }, 400);
+    };
+    map.on('moveend', onViewChange);
+    map.on('zoomend', onViewChange);
+    map.on('resize', () => draw());
+
+    return () => {
+      if (saveTimer != null) window.clearTimeout(saveTimer);
+      map.off();
+      map.remove();
+      mapRef.current = null;
+      canvasRef.current = null;
+      markerLayerRef.current = null;
+      drawRef.current = () => {};
+      markersRef.current = () => {};
+    };
+    // Карта создаётся один раз: смена вида и точек идёт через refs, а не пересоздание Leaflet.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Точки пришли (или изменились после удаления) — перерисовать слои.
+  const fittedRef = useRef(false);
+  useEffect(() => {
+    if (points == null) return;
+    drawRef.current();
+    markersRef.current();
+    // Вид восстанавливаем только один раз и только если прошлого вида нет: иначе после
+    // каждого удаления кадра карта прыгала бы обратно «показать всё».
+    if (!savedView && !fittedRef.current) {
+      fittedRef.current = true;
+      fitAll();
+    }
+  }, [points, savedView, fitAll]);
+
+  // ---- Источник кадров для просмотрщика: у карты нет ленты, детали берём по entryId ----
+  const itemsRef = useRef(new Map<string, api.MediaItem>());
+  const pendingRef = useRef(new Set<string>());
+  const [, bump] = useState(0);
+
+  const ensure = useCallback((start: number, end: number) => {
+    const pts = pointsRef.current;
+    const from = Math.max(0, start);
+    const to = Math.min(pts.length - 1, end);
+    for (let i = from; i <= to; i++) {
+      const p = pts[i];
+      if (!p || itemsRef.current.has(p.entryId) || pendingRef.current.has(p.entryId)) continue;
+      pendingRef.current.add(p.entryId);
+      void api
+        .mediaInfo(p.entryId)
+        .then((d) => {
+          itemsRef.current.set(p.entryId, {
+            entryId: p.entryId,
+            name: d.name,
+            mime: d.mime,
+            sha256: d.sha256,
+            capturedAt: p.capturedAt,
+            size: d.size,
+            previewState: 'done',
+            jobState: null,
+          });
+          bump((n) => n + 1);
+        })
+        .catch(() => undefined)
+        .finally(() => pendingRef.current.delete(p.entryId));
+    }
+  }, []);
+
+  const getItem = useCallback((i: number) => {
+    const p = pointsRef.current[i];
+    return p ? itemsRef.current.get(p.entryId) : undefined;
+  }, []);
+
+  // Удаление кадра: точка уходит с карты, индексы дальше сдвигаются — как в ленте.
+  const handleDelete = useCallback((index: number) => {
+    const next = pointsRef.current.filter((_, i) => i !== index);
+    pointsRef.current = next;
+    setPoints(next);
+    setOpenIdx(next.length ? Math.min(index, next.length - 1) : null);
+  }, []);
+
+  const count = points?.length ?? 0;
+
+  return (
+    <div className="mapwrap">
+      <div className="mhead">
+        <span className="mmonth">
+          {error
+            ? 'Карта'
+            : points == null
+              ? 'Карта'
+              : count === 0
+                ? 'Нет фото с геоданными'
+                : `${count} фото на карте${truncated ? ` из ${total}` : ''}`}
+        </span>
+        <button className="iconbtn" title="Показать все фото" onClick={fitAll} disabled={!count}>
+          <LocateFixed />
+        </button>
+      </div>
+      <div className="mapbox">
+        <div className="map-host" ref={hostRef} />
+        {error && <div className="err map-note">{error}</div>}
+        {points == null && !error && <div className="map-note"><span className="spin" /></div>}
+        {points != null && count === 0 && !error && (
+          <div className="map-note copy">
+            Здесь появятся кадры с геометкой. Координаты берутся из EXIF фото и видео — у снимков
+            без геоданных их нет.
+          </div>
+        )}
+        {!markers && count > 0 && <div className="map-legend">Плотность съёмки · приблизьте, чтобы увидеть кадры</div>}
+      </div>
+
+      {openIdx != null && points != null && points.length > 0 && (
+        <MediaViewer
+          total={points.length}
+          idx={openIdx}
+          getItem={getItem}
+          ensure={ensure}
+          onNavigate={setOpenIdx}
+          onClose={() => setOpenIdx(null)}
+          onDelete={handleDelete}
+        />
+      )}
+    </div>
+  );
+}

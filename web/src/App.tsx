@@ -3,12 +3,14 @@ import type { LucideIcon } from 'lucide-react';
 import {
   ArrowDownToLine, ArrowLeft, ArrowUp, Ban, Check, ChevronLeft, ChevronRight,
   CircleAlert, CircleCheck, CircleX, Clock, Cloud, Copy, Eraser, FileText, Film, Folder,
-  FolderOpen, Image as ImageIcon, ImagePlay, Images, Info, KeyRound, Link2, LoaderCircle, Lock, Package,
+  FolderOpen, Image as ImageIcon, ImagePlay, Images, Info, KeyRound, Link2, LoaderCircle, Lock,
+  Map as MapIcon, Package,
   Pause, Pencil, Play, RefreshCw, Scissors, Settings as SettingsIcon, Trash, Upload,
   UserRound, X,
 } from 'lucide-react';
 import * as api from './api';
 import MediaSection from './media';
+import MapSection from './map';
 import { clearUi, patchUi, readUi, type Tab } from './storage';
 import './styles.css';
 
@@ -17,7 +19,7 @@ import './styles.css';
 const NAV: Array<{ id: Tab; Icon: LucideIcon; label: string }> = [
   { id: 'files', Icon: Folder, label: 'Файлы' },
   { id: 'media', Icon: ImagePlay, label: 'Медиа' },
-  { id: 'albums', Icon: Images, label: 'Альбомы' },
+  { id: 'map', Icon: MapIcon, label: 'Карта' },
   { id: 'trash', Icon: Trash, label: 'Корзина' },
   { id: 'settings', Icon: SettingsIcon, label: 'Настройки' },
 ];
@@ -121,7 +123,7 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
           />
         )}
         {tab === 'media' && <MediaSection onOverlayChange={setNavHidden} />}
-        {tab === 'albums' && <Albums />}
+        {tab === 'map' && <MapSection onOverlayChange={setNavHidden} />}
         {tab === 'trash' && <TrashPage />}
         {tab === 'settings' && <Settings login={user.login} onLogout={onLogout} />}
       </main>

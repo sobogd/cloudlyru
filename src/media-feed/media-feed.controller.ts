@@ -52,7 +52,15 @@ export class MediaFeedController {
     return this.feed.status(user.id, ids);
   }
 
-  /** Метаданные кадра для панели «Инфо»: своя ручка, а не общий /files/:id. */
+  /** Геометки всей ленты — для вкладки «Карта». Объявлена до `:entryId`, иначе «map» уйдёт в неё. */
+  @Get('map')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(120, 60_000)
+  map(@CurrentUser() user: RequestUser) {
+    return this.feed.mapPoints(user.id);
+  }
+
+  /** Метаданные кадра для футера модалки: своя ручка, а не общий /files/:id. */
   @Get(':entryId')
   async info(@Param('entryId') entryId: string, @CurrentUser() user: RequestUser) {
     const info = await this.feed.info(user.id, entryId);
