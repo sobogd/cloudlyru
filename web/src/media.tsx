@@ -460,13 +460,14 @@ export default function MediaSection({ onOverlayChange }: {
     setScrubVisible(true);
     cancelHold();
     armedRef.current = false;
-    holdStartRef.current = e.clientY;
+    const startY = e.clientY;
+    holdStartRef.current = startY;
     setScrubState('arming');
     holdTimerRef.current = window.setTimeout(() => {
       holdTimerRef.current = null;
       armedRef.current = true;
       setScrubState('armed');
-      scrubTo(e.clientY);
+      scrubTo(startY);
     }, ARM_MS);
   };
   const onRailPointerMove = (e: React.PointerEvent) => {
