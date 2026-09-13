@@ -518,6 +518,8 @@ export interface QueueStatus {
   processing: number;
   /** Упавшие задачи: строка остаётся, пока её не разберут. */
   errors: number;
+  /** Из чего состоит остаток: фото разбираются пачкой и быстро, видео идёт по одному и часами. */
+  remainingByKind: { photo: number; video: number; pdf: number };
   /** Свободно байт на диске сервера (null — сервер не смог посчитать). */
   diskFree: number | null;
   /** Места мало — конвертация стоит, пока не освободится. */

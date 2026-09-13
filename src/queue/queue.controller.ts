@@ -35,17 +35,29 @@ export class QueueController {
     // Задачи привязаны к ассету, а ассеты дедуплицируются между всеми: показываем те,
     // на которые у пользователя есть живая запись в его дереве.
     const mine = { entries: { some: { folderId: { in: tree }, deletedAt: null } } };
-    const [pending, processing, failed] = await Promise.all([
+    const [pending, processing, failed, byKind] = await Promise.all([
       this.prisma.job.count({ where: { state: 'pending', asset: mine } }),
       this.prisma.job.count({ where: { state: 'processing', asset: mine } }),
       this.prisma.job.count({ where: { state: 'failed', asset: mine } }),
+      // Разбивка остатка по типам: фото конвертируются пачкой и разбираются быстро, видео идёт
+      // по одному и часами, поэтому «осталось 500» без разбивки ничего не говорит о сроке.
+      this.prisma.job.groupBy({
+        by: ['kind'],
+        where: { state: { in: ['pending', 'processing'] }, asset: mine },
+        _count: { _all: true },
+      }),
     ]);
+    const remainingByKind: Record<string, number> = { photo: 0, video: 0, pdf: 0 };
+    for (const row of byKind) {
+      if (row.kind in remainingByKind) remainingByKind[row.kind] = row._count._all;
+    }
     return {
       paused: await this.queue.isPaused(),
       // Остаток — это строки очереди: успешная задача строку не оставляет, упавшая остаётся
       // (видно в ошибках, можно повторить), а «собрать нельзя» в очередь вообще не попадает.
       remaining: pending + processing,
       processing,
+      remainingByKind,
       errors: failed,
       // Место на диске сервера: когда его мало, конвертация встаёт — и это должно быть видно
       // в настройках, а не только в логах на сервере (13.09.2026 диск кончился и уронил всё).

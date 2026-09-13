@@ -1891,6 +1891,16 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
             <span className="fname">Осталось: {remaining.toLocaleString('ru-RU')}</span>
             {q.processing > 0 && <span className="meta">в работе {q.processing}</span>}
           </div>
+          {/* Разбивка остатка по типам: фото уходят пачкой, видео идёт по одному и часами —
+              без неё «осталось 500» ничего не говорит о том, сколько это займёт.
+              PDF показываем, только когда они есть: обычно их нет вовсе. */}
+          {!!remaining && (
+            <div className="copy">
+              фото: {(q.remainingByKind?.photo ?? 0).toLocaleString('ru-RU')}
+              {' · '}видео: {(q.remainingByKind?.video ?? 0).toLocaleString('ru-RU')}
+              {q.remainingByKind?.pdf ? ` · PDF: ${q.remainingByKind.pdf.toLocaleString('ru-RU')}` : ''}
+            </div>
+          )}
           <div className="copy">
             {q.paused ? '⏸ пауза — задачи ждут в очереди' : remaining ? 'очередь разбирается' : 'очередь пуста'}
           </div>
