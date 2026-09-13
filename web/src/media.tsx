@@ -56,6 +56,24 @@ function fitGeom(cw: number, ch: number, nw: number, nh: number) {
   return { cw, ch, ox: (cw - bw) / 2, oy: (ch - bh) / 2, bw, bh };
 }
 
+/** Бинарный поиск месяца по абсолютному индексу элемента в ленте (кумулятивные отрезки). */
+function findBucket(
+  cum: Array<{ month: string | null; start: number; end: number }> | null,
+  index: number,
+): { month: string | null } | undefined {
+  if (!cum || !cum.length) return undefined;
+  let lo = 0;
+  let hi = cum.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const b = cum[mid];
+    if (index < b.start) hi = mid - 1;
+    else if (index >= b.end) lo = mid + 1;
+    else return b;
+  }
+  return undefined;
+}
+
 // =============================== Таймлайн ===============================
 
 export default function MediaSection({ onOverlayChange }: {
@@ -63,9 +81,12 @@ export default function MediaSection({ onOverlayChange }: {
   onOverlayChange?: (open: boolean) => void;
 }) {
   const [total, setTotal] = useState<number | null>(null);
+  const [months, setMonths] = useState<Array<{ month: string | null; count: number }> | null>(null);
   const [items, setItems] = useState<Map<number, MediaItem>>(() => new Map());
   const [error, setError] = useState('');
   const [openIdx, setOpenIdx] = useState<number | null>(null);
+  const [scrub, setScrub] = useState<{ top: number; h: number; monthKey: string | null | undefined }>({ top: 0, h: 24, monthKey: undefined });
+  const [scrubVisible, setScrubVisible] = useState(false);
 
   useEffect(() => {
     onOverlayChange?.(openIdx != null);
@@ -79,6 +100,9 @@ export default function MediaSection({ onOverlayChange }: {
   const seqRef = useRef(0);
   const debounceRef = useRef<number | null>(null);
   const rafRef = useRef(0);
+  const hideTimer = useRef<number | null>(null);
+  const dragRef = useRef(false);
+  const railRef = useRef<HTMLDivElement>(null);
 
   const [cols, setCols] = useState(1);
   const colsRef = useRef(1);
@@ -99,6 +123,19 @@ export default function MediaSection({ onOverlayChange }: {
       .catch((e) => {
         if (!stopped) setError((e as Error).message);
       });
+    return () => {
+      stopped = true;
+    };
+  }, []);
+
+  // Индекс по месяцам — для точной подписи у ползунка (грузится параллельно с count).
+  useEffect(() => {
+    let stopped = false;
+    api.mediaMonths()
+      .then((m) => {
+        if (!stopped) setMonths(m);
+      })
+      .catch(() => undefined);
     return () => {
       stopped = true;
     };
@@ -193,16 +230,51 @@ export default function MediaSection({ onOverlayChange }: {
     }, FETCH_DEBOUNCE_MS);
   }, [fetchRange]);
 
+  // Кумулятивные отрезки месяцев в порядке ленты: по индексу элемента — его месяц.
+  const monthCum = useMemo(() => {
+    if (!months) return null;
+    const arr: Array<{ month: string | null; start: number; end: number }> = [];
+    let start = 0;
+    for (const b of months) {
+      if (b.count <= 0) continue;
+      arr.push({ month: b.month, start, end: start + b.count });
+      start += b.count;
+    }
+    return arr;
+  }, [months]);
+  const monthCumRef = useRef(monthCum);
+  monthCumRef.current = monthCum;
+
+  /** Геометрия ползунка и месяц в текущей позиции скролла. */
+  const updateScrub = useCallback((top: number) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const sh = el.scrollHeight;
+    const ch = el.clientHeight;
+    const h = Math.max(24, (ch / Math.max(sh, 1)) * ch);
+    const maxScroll = sh - ch;
+    const t = maxScroll > 0 ? (top / maxScroll) * (ch - h) : 0;
+    const firstRow = Math.max(0, Math.floor(top / ROW));
+    const b = findBucket(monthCumRef.current, firstRow * colsRef.current);
+    const monthKey = b ? b.month : undefined;
+    setScrub((s) => (s.top === t && s.h === h && s.monthKey === monthKey ? s : { top: t, h, monthKey }));
+  }, []);
+
   const onScroll = useCallback(() => {
     if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = 0;
       const el = scrollRef.current;
       if (!el) return;
-      updateRange(el.scrollTop);
+      const top = el.scrollTop;
+      updateRange(top);
       scheduleFetch();
+      updateScrub(top);
+      setScrubVisible(true);
+      if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
+      hideTimer.current = window.setTimeout(() => setScrubVisible(false), 800);
     });
-  }, [updateRange, scheduleFetch]);
+  }, [updateRange, scheduleFetch, updateScrub]);
 
   // Первый экран — сразу после того, как узнали общее число и ширину.
   useLayoutEffect(() => {
@@ -225,6 +297,12 @@ export default function MediaSection({ onOverlayChange }: {
     const key = item?.capturedAt?.slice(0, 7) ?? '';
     setMonth((m) => (m === key ? m : key));
   }, [items, cols]);
+
+  // Подпись у ползунка готова, когда пришёл индекс по месяцам.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el) updateScrub(el.scrollTop);
+  }, [months, updateScrub]);
 
   const rows = useMemo(() => {
     const out: Array<{ y: number; start: number; cells: Array<MediaItem | undefined> }> = [];
@@ -256,32 +334,85 @@ export default function MediaSection({ onOverlayChange }: {
     setOpenIdx(nt <= 0 ? null : Math.min(index, nt - 1));
   }, []);
 
+  // Перетаскивание ползунка: pointer → scrollTop (скраб по всей ленте).
+  const scrubTo = (clientY: number) => {
+    const el = scrollRef.current;
+    const rail = railRef.current;
+    if (!el || !rail) return;
+    const rect = rail.getBoundingClientRect();
+    const y = clientY - rect.top;
+    const sh = el.scrollHeight;
+    const ch = el.clientHeight;
+    const h = Math.max(24, (ch / Math.max(sh, 1)) * ch);
+    const maxTop = ch - h;
+    const maxScroll = sh - ch;
+    const frac = maxTop > 0 ? clamp(y - h / 2, 0, maxTop) / maxTop : 0;
+    el.scrollTop = frac * maxScroll;
+  };
+  const onRailPointerDown = (e: React.PointerEvent) => {
+    dragRef.current = true;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    setScrubVisible(true);
+    scrubTo(e.clientY);
+  };
+  const onRailPointerMove = (e: React.PointerEvent) => {
+    if (!dragRef.current) return;
+    scrubTo(e.clientY);
+  };
+  const onRailPointerUp = () => {
+    dragRef.current = false;
+  };
+
+  const scrubLabel = scrub.monthKey === undefined ? '' : scrub.monthKey === null ? 'Без даты' : monthLabel(scrub.monthKey);
+  const labelTop = clamp(scrub.top + scrub.h / 2, 12, Math.max(12, viewport.h - 12));
+
   return (
     <div className={'media' + (openIdx != null ? ' has-viewer' : '')}>
       <div className="mhead">
         <span className="mmonth">{month ? monthLabel(month) : 'Медиа'}</span>
       </div>
-      <div className="mscroll" ref={scrollRef} onScroll={onScroll}>
-        {error && <div className="err" style={{ padding: '8px 4px' }}>{error}</div>}
-        {total == null && !error && (
-          <div className="mempty">
-            <span className="spin" />
-          </div>
-        )}
-        {total === 0 && !error && (
-          <div className="mempty">
-            <span className="copy">Здесь появятся фото и видео из раздела «Фото»</span>
-          </div>
-        )}
-        {total != null && total > 0 && (
-          <div className="mvirt" style={{ height: totalH }}>
-            {rows.map((row) => (
-              <div className="mrow" key={row.start} style={{ transform: `translateY(${row.y}px)` }}>
-                {row.cells.map((it, ci) => (
-                  <Cell key={row.start + ci} item={it} onClick={() => it && setOpenIdx(row.start + ci)} />
-                ))}
-              </div>
-            ))}
+      <div className="mscroll-wrap">
+        <div className="mscroll" ref={scrollRef} onScroll={onScroll}>
+          {error && <div className="err" style={{ padding: '8px 4px' }}>{error}</div>}
+          {total == null && !error && (
+            <div className="mempty">
+              <span className="spin" />
+            </div>
+          )}
+          {total === 0 && !error && (
+            <div className="mempty">
+              <span className="copy">Здесь появятся фото и видео из раздела «Фото»</span>
+            </div>
+          )}
+          {total != null && total > 0 && (
+            <div className="mvirt" style={{ height: totalH }}>
+              {rows.map((row) => (
+                <div className="mrow" key={row.start} style={{ transform: `translateY(${row.y}px)` }}>
+                  {row.cells.map((it, ci) => (
+                    <Cell key={row.start + ci} item={it} onClick={() => it && setOpenIdx(row.start + ci)} />
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        {openIdx == null && total != null && total > 0 && (
+          <div
+            className={'mrail' + (scrubVisible ? ' visible' : '')}
+            ref={railRef}
+            onPointerDown={onRailPointerDown}
+            onPointerMove={onRailPointerMove}
+            onPointerUp={onRailPointerUp}
+            onPointerCancel={onRailPointerUp}
+          >
+            <div className="mthumb" style={{ top: scrub.top, height: scrub.h }} />
+            {scrubVisible && scrubLabel && (
+              <div className="mthumb-label" style={{ top: labelTop }}>{scrubLabel}</div>
+            )}
           </div>
         )}
       </div>

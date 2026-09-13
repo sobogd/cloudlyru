@@ -674,21 +674,62 @@
     padding: 0 6px;
   }
 
+  .mscroll-wrap { position: relative; flex: 1; min-height: 0; }
   .mscroll {
-    flex: 1;
-    min-height: 0;
-    position: relative;
+    position: absolute;
+    inset: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
     transition: opacity .25s ease;
   }
+  .mscroll::-webkit-scrollbar { display: none; }
   .mempty { display: grid; place-items: center; padding: 40px 16px; }
   /* В момент модалки шапка таймлайна уезжает вверх (как общий футер вниз), сетка затухает */
   .media.has-viewer .mhead {
     transform: translateY(calc(-100% - var(--side) - env(safe-area-inset-top)));
   }
   .media.has-viewer .mscroll { opacity: 0; }
+
+  /* Кастомный ползунок: нативный скролл скрыт, поверх — тонкий thumb и подпись месяца */
+  .mrail {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 14px;
+    opacity: 0;
+    transition: opacity .2s ease;
+    pointer-events: none;
+    touch-action: none;
+  }
+  .mrail.visible { opacity: 1; pointer-events: auto; }
+  .mthumb {
+    position: absolute;
+    right: 5px;
+    width: 4px;
+    border-radius: 2px;
+    background: var(--fg-3);
+    opacity: .7;
+  }
+  .mthumb-label {
+    position: absolute;
+    right: 20px;
+    transform: translateY(-50%);
+    padding: 4px 9px;
+    background: var(--island);
+    border: 1px solid var(--island-brd);
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--fg);
+    white-space: nowrap;
+    pointer-events: none;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
 
   /* Виртуализированное поле: высоту задаёт JS, строки позиционируются translateY */
   .mvirt { position: relative; width: 100%; }

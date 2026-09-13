@@ -101,6 +101,38 @@ export class MediaFeedService {
     return rows.map(MediaFeedService.mapRow);
   }
 
+  /**
+   * Индекс по месяцам для подписи у ползунка: строка на месяц (в порядке ленты, от свежих),
+   * плюс «хвост» без даты съёмки (month = null) — он в ленте идёт самым последним. Кумулятивным
+   * счётчиком клиент сопоставляет позицию скролла с точным месяцем/годом без загрузки самих фото.
+   */
+  async months(userId: string): Promise<Array<{ month: string | null; count: number }>> {
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return [];
+    const rows = await this.prisma.$queryRaw<Array<{ month: string | null; n: bigint | number }>>(Prisma.sql`
+      SELECT to_char(mm."capturedAt", 'YYYY-MM') AS month, count(*) AS n
+      FROM "MediaMeta" mm
+      JOIN "Asset" a ON a."id" = mm."assetId"
+      JOIN "FileEntry" f ON f."assetId" = a."id"
+      WHERE f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+        AND mm."capturedAt" IS NOT NULL
+      GROUP BY 1
+      UNION ALL
+      SELECT NULL AS month, count(*) AS n
+      FROM "MediaMeta" mm
+      JOIN "Asset" a ON a."id" = mm."assetId"
+      JOIN "FileEntry" f ON f."assetId" = a."id"
+      WHERE f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+        AND mm."capturedAt" IS NULL
+      ORDER BY month DESC NULLS LAST
+    `);
+    return rows.map((r) => ({ month: r.month, count: Number(r.n) }));
+  }
+
   /** Метаданные кадра для панели «Инфо». Чужое/удалённое/вне зоны «Фото» — null (404). */
   async info(userId: string, entryId: string): Promise<MediaInfo | null> {
     const tree = await this.auth.subtreeIds(userId);

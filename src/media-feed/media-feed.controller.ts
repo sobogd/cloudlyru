@@ -35,6 +35,14 @@ export class MediaFeedController {
     return this.feed.range(user.id, Number.isFinite(off) ? off : 0, Number.isFinite(lim) ? lim : 300);
   }
 
+  /** Индекс по месяцам — для подписи у ползунка и прыжка к месяцу. */
+  @Get('months')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(600, 60_000)
+  months(@CurrentUser() user: RequestUser) {
+    return this.feed.months(user.id);
+  }
+
   /** Метаданные кадра для панели «Инфо»: своя ручка, а не общий /files/:id. */
   @Get(':entryId')
   async info(@Param('entryId') entryId: string, @CurrentUser() user: RequestUser) {

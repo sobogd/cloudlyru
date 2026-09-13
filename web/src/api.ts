@@ -503,6 +503,9 @@ export const mediaCount = () => request<number>('/media/count');
 /** Срез ленты по смещению: элементы [offset, offset+limit) в порядке ленты. */
 export const mediaRange = (offset: number, limit: number) =>
   request<MediaItem[]>(`/media/range?offset=${offset}&limit=${limit}`);
+/** Индекс по месяцам для подписи у ползунка: строка на месяц, month=null — «без даты». */
+export interface MediaMonthBucket { month: string | null; count: number }
+export const mediaMonths = () => request<MediaMonthBucket[]>('/media/months');
 /** Метаданные кадра для панели «Инфо» в модалке. */
 export interface MediaInfo {
   entryId: string;
