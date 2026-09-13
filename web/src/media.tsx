@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownToLine, Film, Image as ImageIcon, Info, Trash, X } from 'lucide-react';
+import { ArrowDownToLine, Film, Image as ImageIcon, Info, MapPin, Trash, X } from 'lucide-react';
 import * as api from './api';
 
 /**
@@ -691,10 +691,10 @@ function MediaViewer({
         else close();
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        go(-1);
+        go(1);
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        go(1);
+        go(-1);
       }
     };
     document.addEventListener('keydown', onKey);
@@ -764,7 +764,7 @@ function MediaViewer({
     if (gp.mode === 'nav' && n === 1) {
       if (!el) return;
       const w = el.clientWidth || 1;
-      const np = clamp(gp.startPos + (e.clientX - gp.startX) / w, 0, total - 1);
+      const np = clamp(gp.startPos - (e.clientX - gp.startX) / w, 0, total - 1);
       setPos(np);
       const now = performance.now();
       const dt = now - gp.lastT;
@@ -798,7 +798,7 @@ function MediaViewer({
       const p = posRef.current;
       let target = Math.round(p);
       // флик: быстрое движение — на один кадр дальше по направлению
-      if (Math.abs(gp.velX) > 0.6) target = gp.velX > 0 ? Math.ceil(p) : Math.floor(p);
+      if (Math.abs(gp.velX) > 0.6) target = gp.velX < 0 ? Math.ceil(p) : Math.floor(p);
       target = clamp(target, 0, total - 1);
       setDragging(false);
       setPos(target);
@@ -835,7 +835,7 @@ function MediaViewer({
     } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
       const w = el.clientWidth || 1;
       setDragging(true);
-      setPos((p) => clamp(p - e.deltaX / w, 0, total - 1));
+      setPos((p) => clamp(p + e.deltaX / w, 0, total - 1));
       if (wheelTimer.current) window.clearTimeout(wheelTimer.current);
       wheelTimer.current = window.setTimeout(() => {
         if (closingRef.current) return;
@@ -1102,7 +1102,20 @@ function MediaInfoPanel({ entryId, onClose }: { entryId: string; onClose: () => 
           {info.width != null && info.height != null && <InfoRow k="Кадр" v={`${info.width} × ${info.height}`} />}
           {info.make || info.model ? <InfoRow k="Камера" v={[info.make, info.model].filter(Boolean).join(' ')} /> : null}
           {info.latitude != null && info.longitude != null ? (
-            <InfoRow k="Координаты" v={`${info.latitude.toFixed(6)}, ${info.longitude.toFixed(6)}`} />
+            <div className="minfo-row">
+              <span className="minfo-k">Место</span>
+              <span className="minfo-v">
+                <a
+                  className="minfo-loc"
+                  href={`https://www.openstreetmap.org/?mlat=${info.latitude}&mlon=${info.longitude}#map=16/${info.latitude}/${info.longitude}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  title="Открыть на карте"
+                >
+                  <MapPin size={14} /> {info.latitude.toFixed(6)}, {info.longitude.toFixed(6)}
+                </a>
+              </span>
+            </div>
           ) : null}
           <InfoRow k="SHA-256" v={info.sha256} mono />
         </div>

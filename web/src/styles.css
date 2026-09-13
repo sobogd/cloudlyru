@@ -827,43 +827,39 @@
     z-index: 50;
     display: flex;
     flex-direction: column;
-    gap: var(--side);
-    padding: calc(var(--side) + env(safe-area-inset-top)) var(--side)
-             calc(var(--side) + env(safe-area-inset-bottom));
-    background: rgb(0 0 0 / .62);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
+    background: #000;
     animation: mvFade .22s ease;
   }
   @keyframes mvFade { from { opacity: 0; } to { opacity: 1; } }
 
-  .mv-head,
-  .mv-foot {
-    flex: none;
+  /* Шапка — прозрачная, прямо на фото: белые иконки и текст поверх градиентной вуали,
+     читается и в светлой, и в тёмной теме на любом снимке. */
+  .mv-head {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2;
     display: flex;
     align-items: center;
     gap: 4px;
-    height: var(--island-h);
-    padding: var(--island-pad);
-    background: var(--island);
-    border: 1px solid var(--island-brd);
-    border-radius: var(--island-radius);
-    backdrop-filter: blur(16px) saturate(1.6);
-    -webkit-backdrop-filter: blur(16px) saturate(1.6);
+    padding: calc(8px + env(safe-area-inset-top)) 12px 24px;
+    background: linear-gradient(to bottom, rgb(0 0 0 / .6), transparent);
     font-size: var(--island-fs);
+    color: #fff;
   }
+  .mv-head .iconbtn { color: #fff; }
   .mv-date {
     flex: 1;
     min-width: 0;
     padding: 0 6px;
     font-size: var(--island-fs);
-    color: var(--fg);
+    color: #fff;
+    text-shadow: 0 1px 3px rgb(0 0 0 / .8);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .mv-left { display: flex; align-items: center; gap: 4px; }
-  .mv-right { display: flex; align-items: center; gap: 4px; margin-left: auto; }
 
   .mv-stage {
     flex: 1;
@@ -871,7 +867,6 @@
     position: relative;
     overflow: hidden;
     touch-action: none;
-    border-radius: var(--island-radius);
     background: #000;
   }
   .mv-sizer { position: absolute; inset: 0; pointer-events: none; }
@@ -897,19 +892,14 @@
   }
   .mv-err .copy { color: #fff; }
 
-  /* Карточка деталки поверх кадра — между шапкой и футером, островные поля */
+  /* Деталка (инфо) поверх кадра — полноэкранный лист темы */
   .mvinfo {
     position: absolute;
+    inset: 0;
     z-index: 5;
-    top: calc(var(--side) + env(safe-area-inset-top) + var(--island-h) + var(--side));
-    bottom: calc(var(--side) + env(safe-area-inset-bottom));
-    left: var(--side);
-    right: var(--side);
     overflow-y: auto;
     overscroll-behavior: contain;
     background: var(--island-solid);
-    border: 1px solid var(--island-brd);
-    border-radius: var(--island-radius);
     padding: 0;
   }
   .minfo-head {
@@ -923,7 +913,6 @@
     padding: var(--island-pad) 12px;
     background: var(--island-solid);
     border-bottom: 1px solid var(--brd);
-    border-radius: var(--island-radius) var(--island-radius) 0 0;
   }
   .minfo-title { font-weight: 600; font-size: var(--island-fs); color: var(--fg); }
   .minfo-body { padding: 0 14px 24px; }
@@ -940,4 +929,12 @@
   .minfo-k { color: var(--fg-3); font-size: 13px; }
   .minfo-v { font-size: 13px; color: var(--fg); word-break: break-all; white-space: pre-wrap; }
   .minfo-v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .minfo-loc {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .minfo-loc:hover { text-decoration: underline; }
 }
