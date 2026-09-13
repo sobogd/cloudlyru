@@ -243,9 +243,7 @@ export default function MapSection({ onOverlayChange }: {
     const draw = () => {
       const cv = canvasRef.current;
       if (!cv) return;
-      const bounds = map.getPixelBounds();
-      const size = bounds.getSize();
-      const tl = bounds.min ?? L.point(0, 0);
+      const size = map.getSize();
       const dpr = Math.min(2, window.devicePixelRatio || 1);
       const w = Math.max(1, Math.round(size.x * dpr));
       const h = Math.max(1, Math.round(size.y * dpr));
@@ -255,7 +253,9 @@ export default function MapSection({ onOverlayChange }: {
       }
       cv.style.width = `${size.x}px`;
       cv.style.height = `${size.y}px`;
-      L.DomUtil.setPosition(cv, tl);
+      // Позицию canvas не трогаем: он лежит в своей панели, а панель уже стоит в начале
+      // координат вида — ровно там же, где отсчитываются latLngToLayerPoint. Сдвиг на
+      // pixelOrigin (он равен абсолютным пикселям проекции, миллионы) уносил слой за экран.
       const ctx = cv.getContext('2d');
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
