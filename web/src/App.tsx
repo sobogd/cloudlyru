@@ -3,20 +3,21 @@ import type { LucideIcon } from 'lucide-react';
 import {
   ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, Ban, Check, ChevronLeft, ChevronRight,
   CircleAlert, CircleCheck, CircleX, Clock, Cloud, Copy, Eraser, FileText, Film, Folder,
-  FolderOpen, Image as ImageIcon, Images, Info, KeyRound, Link2, LoaderCircle, Lock, Package,
+  FolderOpen, Image as ImageIcon, ImagePlay, Images, Info, KeyRound, Link2, LoaderCircle, Lock, Package,
   Pause, Pencil, Play, Plus, RefreshCw, Scissors, Settings as SettingsIcon, Trash, Upload,
   UserRound, X,
 } from 'lucide-react';
 import * as api from './api';
+import MediaSection from './media';
 import './styles.css';
 
-type Tab = 'files' | 'photos' | 'shares' | 'albums' | 'trash' | 'settings';
+type Tab = 'files' | 'photos' | 'media' | 'albums' | 'trash' | 'settings';
 /** Иконки навигации — компоненты lucide, а не эмодзи: они наследуют цвет и размер от кнопки.
     Settings импортируется как SettingsIcon: имя Settings занято локальным компонентом-экраном. */
 const NAV: Array<{ id: Tab; Icon: LucideIcon; label: string }> = [
   { id: 'files', Icon: Folder, label: 'Файлы' },
   { id: 'photos', Icon: ImageIcon, label: 'Фото' },
-  { id: 'shares', Icon: Link2, label: 'Шаринг' },
+  { id: 'media', Icon: ImagePlay, label: 'Медиа' },
   { id: 'albums', Icon: Images, label: 'Альбомы' },
   { id: 'trash', Icon: Trash, label: 'Корзина' },
   { id: 'settings', Icon: SettingsIcon, label: 'Настройки' },
@@ -142,7 +143,7 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
           />
         )}
         {tab === 'photos' && <Photos photoFolderId={user.photoFolderId} up={up} uploadedAt={uploadedAt} />}
-        {tab === 'shares' && <Shares />}
+        {tab === 'media' && <MediaSection FileDetail={FileDetail} />}
         {tab === 'albums' && <Albums />}
         {tab === 'trash' && <TrashPage />}
         {tab === 'settings' && <Settings login={user.login} onLogout={onLogout} />}

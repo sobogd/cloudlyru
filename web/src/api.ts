@@ -495,6 +495,22 @@ export interface TimelineStatus {
   jobState: string | null;
   jobError: string | null;
 }
+// ===== Раздел «Медиа» (изолированные ручки /media/*) =====
+/** Строка ленты «Медиа»: тот же контракт, что у TimelineItem, но из своего модуля. */
+export interface MediaItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; previewState: string; size: number }
+/** Страница ленты: keyset-курсор по entryId последней показанной записи. */
+export const mediaTimeline = (limit: number, cursor?: string) => {
+  const q = new URLSearchParams();
+  q.set('limit', String(limit));
+  if (cursor) q.set('cursor', cursor);
+  return request<MediaItem[]>(`/media/timeline?${q}`);
+};
+/** Окно вокруг кадра для полноэкранного просмотра (порядок — как у ленты, от свежих к старым). */
+export const mediaWindow = (entryId: string, before = 20, after = 20) =>
+  request<MediaItem[]>(
+    `/media/window?entryId=${encodeURIComponent(entryId)}&before=${before}&after=${after}`,
+  );
+
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }
 

@@ -12,6 +12,7 @@ import { TrashModule } from './trash/trash.module';
 import { SharesModule } from './shares/shares.module';
 import { DavModule } from './dav/dav.module';
 import { MediaModule } from './media/media.module';
+import { MediaFeedModule } from './media-feed/media-feed.module';
 import { QueueModule } from './queue/queue.module';
 import { HealthModule } from './health/health.module';
 import { UnzipModule } from './unzip/unzip.module';
@@ -31,6 +32,7 @@ import { ClipboardModule } from './clipboard/clipboard.module';
     SharesModule,
     DavModule,
     MediaModule,
+    MediaFeedModule,
     QueueModule,
     HealthModule,
     UnzipModule,
