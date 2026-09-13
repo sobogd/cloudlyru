@@ -666,35 +666,41 @@
     z-index: 50;
     display: flex;
     flex-direction: column;
-    background: #000;
+    background: var(--island-solid);
     animation: mvFade .22s ease;
   }
   @keyframes mvFade { from { opacity: 0; } to { opacity: 1; } }
 
-  /* Шапка — прозрачная, прямо на фото: белые иконки и текст поверх градиентной вуали,
-     читается и в светлой, и в тёмной теме на любом снимке. */
+  /* Шапка — остров как нижний бар: та же плашка, высота, отступы, рамка и скругление.
+     Висит над кадром, как нижняя навигация висит над контентом. */
   .mv-head {
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
+    top: calc(var(--side) + env(safe-area-inset-top));
+    left: calc(var(--side) + env(safe-area-inset-left));
+    right: calc(var(--side) + env(safe-area-inset-right));
     z-index: 2;
+    max-width: min(var(--col), calc(100% - 2 * var(--side)));
+    margin: 0 auto;
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: calc(8px + env(safe-area-inset-top)) 12px 24px;
-    background: linear-gradient(to bottom, rgb(0 0 0 / .6), transparent);
+    height: var(--island-h);
+    padding: var(--island-pad);
+    background: var(--island);
+    border: 1px solid var(--island-brd);
+    border-radius: var(--island-radius);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
     font-size: var(--island-fs);
-    color: #fff;
+    color: var(--fg);
   }
-  .mv-head .iconbtn { color: #fff; }
   .mv-date {
     flex: 1;
     min-width: 0;
     padding: 0 6px;
     font-size: var(--island-fs);
-    color: #fff;
-    text-shadow: 0 1px 3px rgb(0 0 0 / .8);
+    font-weight: 600;
+    color: var(--fg);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -706,7 +712,7 @@
     position: relative;
     overflow: hidden;
     touch-action: none;
-    background: #000;
+    background: var(--surface);
   }
   .mv-sizer { position: absolute; inset: 0; pointer-events: none; }
   .mslide {
@@ -720,7 +726,7 @@
     width: 100%;
     height: 100%;
     object-fit: contain;
-    background: #000;
+    background: var(--surface);
   }
   .mv-load,
   .mv-err {
@@ -729,7 +735,7 @@
     display: grid;
     place-items: center;
   }
-  .mv-err .copy { color: #fff; }
+  .mv-err .copy { color: var(--fg-2); }
 
   /* Деталка (инфо) поверх кадра — полноэкранный лист темы */
   .mvinfo {
