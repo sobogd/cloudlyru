@@ -42,6 +42,11 @@
   --island-solid: #ffffff;
   --island-a: 96%;
   --island: color-mix(in srgb, var(--island-solid) var(--island-a), transparent);
+  /* Плашки поверх кадра (шапка и футер модалки «Медиа»): те же острова, но заметно
+     прозрачнее. Общие 96% рассчитаны на фон страницы; над фотографией они выглядели бы
+     сплошным пятном. Кадр под плашкой виден, читаемость держит blur. */
+  --glass-a: 65%;
+  --island-glass: color-mix(in srgb, var(--island-solid) var(--glass-a), transparent);
   --island-brd: rgb(0 0 0 / .08);
 
   --surface: #ffffff;                 /* карточки и панели */
@@ -651,8 +656,8 @@
   }
   @keyframes mvFade { from { opacity: 0; } to { opacity: 1; } }
 
-  /* Шапка — карточка как нижний остров: та же высота, отступы по краям, подложка темы,
-     рамка и скругление. Полупрозрачная (--island), кадр под ней размывается blur'ом.
+  /* Шапка — карточка как нижний остров: та же высота, отступы по краям, рамка и скругление,
+     но подложка прозрачнее общей (--island-glass): кадр под ней виден, размытый blur'ом.
      Иконки и текст того же размера, что в футере (--island-icon / --island-fs). */
   .mv-head {
     position: absolute;
@@ -667,7 +672,7 @@
     gap: 4px;
     height: var(--island-h);
     padding: var(--island-pad);
-    background: var(--island);
+    background: var(--island-glass);
     border: 1px solid var(--island-brd);
     border-radius: var(--island-radius);
     backdrop-filter: blur(16px) saturate(1.6);
@@ -717,8 +722,8 @@
   }
   .mv-err .copy { color: var(--fg-2); }
 
-  /* Футер — та же карточка, что шапка: полупрозрачная плашка темы у нижнего края.
-     Слева — геометка (сразу открывает OSM), справа — метаданные кадра. */
+  /* Футер — та же карточка, что шапка: плашка --island-glass у нижнего края.
+     Внутри — прокручиваемая по горизонтали строка метаданных кадра. */
   .mv-foot {
     position: absolute;
     bottom: calc(var(--side) + env(safe-area-inset-bottom));
@@ -729,28 +734,33 @@
     margin: 0 auto;
     display: flex;
     align-items: center;
-    gap: 4px;
     height: var(--island-h);
     padding: var(--island-pad);
-    background: var(--island);
+    background: var(--island-glass);
     border: 1px solid var(--island-brd);
     border-radius: var(--island-radius);
     backdrop-filter: blur(16px) saturate(1.6);
     -webkit-backdrop-filter: blur(16px) saturate(1.6);
     font-size: var(--island-fs);
     color: var(--fg-2);
+    /* Прокрученная строка не вылезает за скруглённые углы плашки */
+    overflow: hidden;
   }
-  /* Метаданные прижаты к правому краю. Длинное имя камеры усекается многоточием,
-     а не переносится: высота футера фиксирована, как у остальных островов. */
+  /* Метаданные кадра: одна строка, прокручивается по горизонтали (скроллбар скрыт,
+     как у ленты «Медиа»). Свайп по ней не листает кадр — элемент над .mv-stage. */
   .mv-metas {
     display: flex;
     align-items: center;
-    justify-content: flex-end;
     gap: 14px;
-    margin-left: auto;
+    flex: 1;
     min-width: 0;
-    overflow: hidden;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    touch-action: pan-x;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
   }
+  .mv-metas::-webkit-scrollbar { display: none; }
   .mv-meta {
     display: inline-flex;
     align-items: center;
@@ -758,7 +768,6 @@
     flex: none;
     white-space: nowrap;
   }
-  .mv-meta:last-child { flex: 0 1 auto; min-width: 0; }
   .mv-meta svg {
     display: block;
     width: var(--island-icon);
@@ -767,5 +776,4 @@
     stroke-width: 1.75;
     color: var(--fg-3);
   }
-  .mv-meta-v { overflow: hidden; text-overflow: ellipsis; }
 }

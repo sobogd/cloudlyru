@@ -2,7 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import {
   ArrowDownToLine,
   Camera,
+  FileType,
   Film,
+  Fingerprint,
   Frame,
   HardDrive,
   Image as ImageIcon,
@@ -936,6 +938,17 @@ function MediaViewer({
     >
       <div className="mv-head">
         <span className="mv-date">{fmtMediaDate(curItem?.capturedAt) || curItem?.name || ''}</span>
+        {geo && (
+          <a
+            className="iconbtn"
+            title="Открыть на карте"
+            href={`https://www.openstreetmap.org/?mlat=${geo.latitude}&mlon=${geo.longitude}#map=16/${geo.latitude}/${geo.longitude}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <MapPin />
+          </a>
+        )}
         {curItem && (
           <a className="iconbtn" title="Скачать оригинал" href={api.fileUrl(curItem.entryId)} download>
             <ArrowDownToLine />
@@ -977,27 +990,27 @@ function MediaViewer({
         ))}
       </div>
 
-      {/* Футер: слева — геометка (открывает OSM), справа — метаданные кадра */}
+      {/* Футер — вся метадата кадра одной прокручиваемой по горизонтали строкой.
+          Даты и имени файла здесь нет. Первыми идут размер, кадр и камера; размер, тип
+          и SHA-256 уже есть в элементе ленты, а кадр, камера и координаты — только из EXIF. */}
       <div className="mv-foot">
-        {geo && (
-          <a
-            className="iconbtn"
-            title="Открыть на карте"
-            href={`https://www.openstreetmap.org/?mlat=${geo.latitude}&mlon=${geo.longitude}#map=16/${geo.latitude}/${geo.longitude}`}
-            target="_blank"
-            rel="noreferrer"
-          >
-            <MapPin />
-          </a>
-        )}
         <div className="mv-metas">
-          {info && <MetaItem Icon={HardDrive} title="Размер" value={fmtSize(info.size)} />}
+          <MetaItem Icon={HardDrive} title="Размер" value={fmtSize(curItem?.size ?? info?.size ?? 0)} />
           {info?.width != null && info?.height != null && (
             <MetaItem Icon={Frame} title="Кадр" value={`${info.width} × ${info.height}`} />
           )}
           {info && (info.make || info.model) ? (
             <MetaItem Icon={Camera} title="Камера" value={[info.make, info.model].filter(Boolean).join(' ')} />
           ) : null}
+          {curItem && <MetaItem Icon={FileType} title="Тип" value={curItem.mime} />}
+          {info?.latitude != null && info?.longitude != null && (
+            <MetaItem
+              Icon={MapPin}
+              title="Координаты"
+              value={`${info.latitude.toFixed(6)}, ${info.longitude.toFixed(6)}`}
+            />
+          )}
+          {info?.sha256 && <MetaItem Icon={Fingerprint} title="SHA-256" value={info.sha256} mono />}
         </div>
       </div>
     </div>
@@ -1127,12 +1140,13 @@ function fmtSize(bytes: number): string {
   return `${bytes} Б`;
 }
 
-/** Пункт футера: иконка и значение (размер, кадр, камера). title — подсказка при усечении. */
-function MetaItem({ Icon, value, title }: { Icon: LucideIcon; value: string; title: string }) {
+/** Пункт футера: иконка и значение (размер, кадр, камера, тип, координаты, хеш).
+    title — подпись пункта: строка прокручивается, и без подсказки смысл иконки неочевиден. */
+function MetaItem({ Icon, value, title, mono }: { Icon: LucideIcon; value: string; title: string; mono?: boolean }) {
   return (
     <span className="mv-meta" title={title}>
       <Icon />
-      <span className="mv-meta-v">{value}</span>
+      <span className={'mv-meta-v' + (mono ? ' mono' : '')}>{value}</span>
     </span>
   );
 }
