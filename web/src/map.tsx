@@ -22,14 +22,16 @@ import { patchUi, readUi } from './storage';
 
 /** С какого зума вместо теплового слоя показываем миниатюры кадров. */
 const MARKER_ZOOM = 13;
-/** Сторона экранной клетки, по которой кадры группируются в одну миниатюру. */
+/** Запас вокруг вида, в пределах которого кадры ещё участвуют в группировке, px. */
 const CLUSTER_PX = 56;
+/** Градус широты в километрах — из него считаем километровую клетку группировки. */
+const KM_DEG = 1 / 110.574;
 /** Потолок одновременных миниатюр: это DOM-узлы с картинками, больше браузер не тянет. */
 const CLUSTER_MAX = 300;
 /** Сторона клетки, в которую складываются точки теплового слоя (меньше — дороже отрисовка). */
 const HEAT_CELL = 8;
 /** Радиус пятна теплового слоя, px. */
-const HEAT_RADIUS = 26;
+const HEAT_RADIUS = 30;
 /** Размер миниатюры-кластера, px. */
 const CLUSTER_ICON = 46;
 /** Вид по умолчанию, если пользователь ещё не двигал карту. */
@@ -78,8 +80,8 @@ function makeSprite(): HTMLCanvasElement {
   const ctx = cv.getContext('2d');
   if (ctx) {
     const g = ctx.createRadialGradient(HEAT_RADIUS, HEAT_RADIUS, 0, HEAT_RADIUS, HEAT_RADIUS, HEAT_RADIUS);
-    g.addColorStop(0, 'rgba(255,255,255,0.9)');
-    g.addColorStop(0.4, 'rgba(255,255,255,0.35)');
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(0.4, 'rgba(255,255,255,0.45)');
     g.addColorStop(1, 'rgba(255,255,255,0)');
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, size, size);
@@ -87,8 +89,26 @@ function makeSprite(): HTMLCanvasElement {
   return cv;
 }
 
-/** Ключ экранной клетки: координаты клетки в одну сортируемую пару. */
-const cellKey = (gx: number, gy: number) => (gx + 4096) * 16384 + (gy + 4096);
+/**
+ * Размер клетки группировки миниатюр в градусах широты.
+ *
+ * При обычном приближении (13–15) это километр: кадры одного двора, кафе или площади —
+ * одна точка места, как в Google Photos, а не десяток точек друг на друге. Дальше клетка
+ * мельчает, иначе на сильном зуме один маркер накрывал бы весь экран и отдельные кадры
+ * было бы не выбрать.
+ */
+function clusterCellDeg(zoom: number): number {
+  if (zoom <= 15) return KM_DEG;
+  if (zoom === 16) return KM_DEG / 4;
+  if (zoom === 17) return KM_DEG / 10;
+  return KM_DEG / 100;
+}
+
+/** Ключ географической клетки: широтная и долготная полосы клетки одной строкой. */
+const cellKey = (latKey: number, lonKey: number) => `${latKey}:${lonKey}`;
+
+/** Ключ экранной клетки теплового слоя: координаты клетки в одно число. */
+const heatKey = (gx: number, gy: number) => (gx + 8192) * 65536 + (gy + 8192);
 
 export default function MapSection({ onOverlayChange }: {
   /** Открыт просмотрщик кадра — Shell прячет нижний остров, чтобы он не наезжал на футер. */
@@ -244,7 +264,7 @@ export default function MapSection({ onOverlayChange }: {
       // Вблизи вместо тепла — миниатюры, но слой не убираем совсем, а бледним: иначе карта
       // в месте без кадров выглядела бы пустой и непонятной.
       if (!pts.length) return;
-      const dim = map.getZoom() >= MARKER_ZOOM ? 0.35 : 1;
+      const dim = map.getZoom() >= MARKER_ZOOM ? 0.55 : 1;
 
       // Точки складываются в клетки: десятки тысяч пятен по одному рисовать нельзя, а клетка
       // ещё и показывает плотность — чем больше кадров, тем ярче пятно. Координаты слоя
@@ -256,7 +276,7 @@ export default function MapSection({ onOverlayChange }: {
         const x = lp.x;
         const y = lp.y;
         if (x < -HEAT_RADIUS || y < -HEAT_RADIUS || x > size.x + HEAT_RADIUS || y > size.y + HEAT_RADIUS) continue;
-        const key = cellKey(Math.floor(x / HEAT_CELL), Math.floor(y / HEAT_CELL));
+        const key = heatKey(Math.floor(x / HEAT_CELL), Math.floor(y / HEAT_CELL));
         const b = buckets.get(key);
         if (b) b.n++;
         else buckets.set(key, { x, y, n: 1 });
@@ -282,7 +302,7 @@ export default function MapSection({ onOverlayChange }: {
       // 'lighter' складывает альфу пятен — из неё и получается градиент плотности
       octx.globalCompositeOperation = 'lighter';
       for (const b of buckets.values()) {
-        octx.globalAlpha = Math.min(1, 0.22 + 0.14 * Math.sqrt(b.n));
+        octx.globalAlpha = Math.min(1, 0.45 + 0.2 * Math.sqrt(b.n));
         octx.drawImage(sprite, b.x - HEAT_RADIUS, b.y - HEAT_RADIUS);
       }
       octx.globalAlpha = 1;
@@ -293,7 +313,9 @@ export default function MapSection({ onOverlayChange }: {
       for (let i = 0; i < d.length; i += 4) {
         const a = d[i + 3];
         if (!a) continue;
-        const [r, g, bl] = heatColor(a / 255);
+        // 1.6 — гамма: середина накопления уходит в тёплые цвета, иначе бледные пятна
+        // на светлой подложке читались как «тепла нет».
+        const [r, g, bl] = heatColor(Math.min(1, (a / 255) * 1.6));
         d[i] = r;
         d[i + 1] = g;
         d[i + 2] = bl;
@@ -319,18 +341,20 @@ export default function MapSection({ onOverlayChange }: {
       setMarkers(show);
       if (!show) return;
       const size = map.getSize();
-      // Кадры одной экранной клетки — одна миниатюра; points уже идут от свежих,
-      // поэтому первый в клетке и есть самый новый кадр места. Берём только то, что
-      // попадает на экран (с запасом в клетку): иначе потолок CLUSTER_MAX съедали бы
-      // густые места за пределами вида, и в текущем месте не было бы ни одной миниатюры.
-      const cells = new Map<number, { lat: number; lon: number; n: number; idx: number }>();
+      const step = clusterCellDeg(map.getZoom());
+      // Кадры одной клетки — одна миниатюра; points уже идут от свежих, поэтому первый
+      // в клетке и есть самый новый кадр места. Берём только то, что попадает на экран:
+      // иначе потолок CLUSTER_MAX съедали бы густые места за пределами вида, и в текущем
+      // месте не было бы ни одной миниатюры.
+      const cells = new Map<string, { lat: number; lon: number; n: number; idx: number }>();
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
         const lp = map.latLngToLayerPoint([p.lat, p.lon]);
-        const x = lp.x;
-        const y = lp.y;
-        if (x < -CLUSTER_PX || y < -CLUSTER_PX || x > size.x + CLUSTER_PX || y > size.y + CLUSTER_PX) continue;
-        const key = cellKey(Math.floor(x / CLUSTER_PX), Math.floor(y / CLUSTER_PX));
+        if (lp.x < -CLUSTER_PX || lp.y < -CLUSTER_PX || lp.x > size.x + CLUSTER_PX || lp.y > size.y + CLUSTER_PX) continue;
+        // Долготная клетка уже широтной во столько раз, во сколько раз параллель короче
+        // экватора: без этого на севере клетки вытягивались бы вдоль широты.
+        const lonStep = step / Math.max(0.05, Math.cos((p.lat * Math.PI) / 180));
+        const key = cellKey(Math.round(p.lat / step), Math.round(p.lon / lonStep));
         const c = cells.get(key);
         if (c) c.n++;
         else cells.set(key, { lat: p.lat, lon: p.lon, n: 1, idx: i });

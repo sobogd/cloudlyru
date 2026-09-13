@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Activity,
   Aperture,
@@ -941,7 +942,10 @@ export function MediaViewer({
 
   const geo = info && info.latitude != null && info.longitude != null ? info : null;
 
-  return (
+  // Портал в body: модалка должна быть поверх всего. Внутри раздела она попадала в его
+  // контекст наложения — на карте это кончалось тем, что панели Leaflet (z-index 200–1000)
+  // рисовались поверх просмотрщика, и кадр «открывался под картой».
+  return createPortal(
     <div
       className={'mviewer' + (closing ? ' closing' : '')}
       style={closing ? { opacity: 0, transition: 'opacity .2s ease' } : undefined}
@@ -1049,7 +1053,8 @@ export function MediaViewer({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

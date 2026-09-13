@@ -648,7 +648,9 @@
   .mviewer {
     position: fixed;
     inset: 0;
-    z-index: 50;
+    /* Модалка уезжает в body порталом и должна быть выше всего: нижнего острова (30),
+       панели загрузки (91) и панелей Leaflet внутри раздела «Карта» (до 1000) */
+    z-index: 1000;
     display: flex;
     flex-direction: column;
     background: var(--island-solid);
