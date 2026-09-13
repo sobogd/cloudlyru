@@ -479,24 +479,8 @@ export const listTokens = () => request<ApiTokenRow[]>('/auth/tokens');
 export const createToken = (label: string) => request<{ id: string; token: string; label: string }>('/auth/tokens', { method: 'POST', body: JSON.stringify({ label }) });
 export const revokeToken = (id: string) => request<{ ok: boolean }>(`/auth/tokens/${id}`, { method: 'DELETE' });
 
-// ===== M2: timeline / albums =====
-/**
- * Строка ленты. Состояния задачи сборки здесь нет намеренно: сервер отдаёт его отдельной
- * ручкой (timelineStatus) только про незавершённые снимки — тянуть его для каждой записи
- * каждой страницы значит платить лишним запросом на строку.
- */
-export interface TimelineItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; previewState: string; size: number }
-/** Статус сборки превью (POST /timeline/status): отвечаем только про свои записи. */
-export interface TimelineStatus {
-  entryId: string;
-  /** 'none' — превью ещё нет, 'done' — собраны, 'impossible' — собрать нельзя (см. previewError). */
-  previewState: string;
-  previewError: string | null;
-  jobState: string | null;
-  jobError: string | null;
-}
 // ===== Раздел «Медиа» (изолированные ручки /media/*) =====
-/** Строка ленты «Медиа»: тот же контракт, что у TimelineItem, но из своего модуля. */
+/** Строка ленты «Медиа». */
 export interface MediaItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; previewState: string; jobState: string | null; size: number }
 /** Общее число медиа — по нему клиент считает полную высоту скролла. */
 export const mediaCount = () => request<number>('/media/count');
@@ -588,48 +572,6 @@ export const queueErrors = (opts: { limit?: number; offset?: number } = {}) => {
 /** Вернуть в очередь все упавшие задачи. */
 export const retryQueueErrors = () =>
   request<{ retried: number }>('/queue/errors/retry', { method: 'POST', body: JSON.stringify({}) });
-/**
- * День календаря «Фото»: обложка (один снимок дня) и сколько снимков в этот день всего.
- * `day` — 'YYYY-MM-DD' по дате съёмки, как она записана в файле.
- */
-export interface TimelineDayItem {
-  day: string;
-  count: number;
-  cover: TimelineItem;
-}
-/**
- * Дни диапазона месяцев для календаря: строка на день, где есть снимки. Календарь листается
- * месяцами вручную, поэтому месяцы тянем пачкой (удержание стрелки не ждёт запрос на каждый
- * месяц) — 12 месяцев это ~365 строк, всё равно меньше одной страницы ленты.
- */
-/**
- * Дни диапазона месяцев для календаря: строка на день, где есть снимки. Месяцы тянем пачкой
- * (`from`..`to`), а `signal` нужен листанию: нажатие стрелки отменяет запрос прошлого месяца,
- * чтобы ответ устаревшего месяца не перетёр уже открытый.
- */
-export const timelineDays = (from: string, to: string, signal?: AbortSignal) =>
-  request<TimelineDayItem[]>(`/timeline/days?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal });
-/** Края листания календаря: самый новый и самый старый месяцы со снимками (null — снимков нет). */
-export const timelineMonths = () =>
-  request<{ newest: string | null; oldest: string | null }>('/timeline/months');
-/**
- * Соседний снимок для полноэкранного просмотра: `entryId` — текущий кадр, `dir` — 'next' (старее)
- * или 'prev' (новее). Одним запросом, без загрузки дня или месяца; на краю ленты вернётся null.
- */
-export const neighborPhoto = (entryId: string, dir: 'next' | 'prev') =>
-  request<TimelineItem | null>(`/timeline/neighbor?entryId=${encodeURIComponent(entryId)}&dir=${dir}`);
-/**
- * Окно вокруг кадра: `before` снимков новее, `after` старее, сам кадр в середине. Порядок ответа —
- * как у ленты (от свежих к старым), поэтому «следующий» кадр лежит правее по массиву. Просмотр
- * берёт ±20 и листает внутри окна без сети; когда кадр подходит к краю, окно добирается от края.
- */
-export const timelineWindow = (entryId: string, before = 20, after = 20) =>
-  request<TimelineItem[]>(
-    `/timeline/window?entryId=${encodeURIComponent(entryId)}&before=${before}&after=${after}`,
-  );
-/** Статусы сборки превью по списку записей: спрашиваем только про незавершённые снимки. */
-export const timelineStatus = (entryIds: string[]) =>
-  request<TimelineStatus[]>('/timeline/status', { method: 'POST', body: JSON.stringify({ entryIds }) });
 export const listAlbums = () => request<AlbumInfo[]>('/albums');
 export const getAlbum = (id: string) => request<AlbumView>(`/albums/${id}`);
 export const createAlbum = (name: string) => request<AlbumInfo>('/albums', { method: 'POST', body: JSON.stringify({ name }) });

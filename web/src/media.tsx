@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDownToLine, Film, Image as ImageIcon, Info, MapPin, Trash, X } from 'lucide-react';
 import * as api from './api';
+import { patchUi, readUi } from './storage';
 
 /**
  * Раздел «Медиа» — изолированная от «Фото»/«Видео» поверхность просмотра.
@@ -30,6 +31,10 @@ const FETCH_DEBOUNCE_MS = 500;
 const FETCH_CHUNK = 500;
 /** Как часто переспрашиваем статусы неготовых превью. */
 const STATUS_POLL_MS = 4000;
+/** Сколько держать палец на ползунке, прежде чем он станет таскабельным. */
+const ARM_MS = 1000;
+/** Сдвиг до активации, после которого удержание отменяется (случайный свайп). */
+const ARM_MOVE_SLOP = 8;
 
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
@@ -87,6 +92,10 @@ export default function MediaSection({ onOverlayChange }: {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
   const [scrub, setScrub] = useState<{ top: number; h: number; monthKey: string | null | undefined }>({ top: 0, h: 24, monthKey: undefined });
   const [scrubVisible, setScrubVisible] = useState(false);
+  /** Ползунок: idle — обычный, arming — палец удерживается (идёт отсчёт), armed — можно таскать. */
+  const [scrubState, setScrubState] = useState<'idle' | 'arming' | 'armed'>('idle');
+  /** Позиция ленты из localStorage, сохранённая в прошлый раз (читаем один раз при входе). */
+  const [savedMedia] = useState(() => readUi().media);
 
   useEffect(() => {
     onOverlayChange?.(openIdx != null);
@@ -101,8 +110,16 @@ export default function MediaSection({ onOverlayChange }: {
   const debounceRef = useRef<number | null>(null);
   const rafRef = useRef(0);
   const hideTimer = useRef<number | null>(null);
-  const dragRef = useRef(false);
+  /** Ползунок активирован удержанием: true — сейчас можно тянуть (скраб следует за пальцем). */
+  const armedRef = useRef(false);
+  const holdStartRef = useRef(0);
+  const holdTimerRef = useRef<number | null>(null);
   const railRef = useRef<HTMLDivElement>(null);
+  /** Восстановление позиции уже отработало (или сохранять было нечего). */
+  const restoredRef = useRef(false);
+  const persistTimer = useRef<number | null>(null);
+  const openIdxRef = useRef<number | null>(null);
+  openIdxRef.current = openIdx;
 
   const [cols, setCols] = useState(1);
   const colsRef = useRef(1);
@@ -300,6 +317,18 @@ export default function MediaSection({ onOverlayChange }: {
     setScrub((s) => (s.top === t && s.h === h && s.monthKey === monthKey ? s : { top: t, h, monthKey }));
   }, []);
 
+  /** Записать позицию ленты (top) и открытый кадр в localStorage с дебаунсом.
+      Значения захватываются в момент вызова — таймер не читает DOM после размонтирования. */
+  const persistMedia = useCallback((top: number) => {
+    if (persistTimer.current != null) window.clearTimeout(persistTimer.current);
+    const index = Math.max(0, Math.floor(top / ROW)) * colsRef.current;
+    const open = openIdxRef.current;
+    persistTimer.current = window.setTimeout(() => {
+      persistTimer.current = null;
+      patchUi({ media: { index, scrollTop: top, openIdx: open } });
+    }, 400);
+  }, []);
+
   const onScroll = useCallback(() => {
     if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => {
@@ -313,20 +342,45 @@ export default function MediaSection({ onOverlayChange }: {
       setScrubVisible(true);
       if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
       hideTimer.current = window.setTimeout(() => setScrubVisible(false), 1000);
+      persistMedia(top);
     });
-  }, [updateRange, scheduleFetch, updateScrub]);
+  }, [updateRange, scheduleFetch, updateScrub, persistMedia]);
 
-  // Первый экран — сразу после того, как узнали общее число и ширину.
+  // Первый экран — сразу после того, как узнали общее число и ширину. Если позиция была
+  // сохранена в прошлый раз, возвращаемся к ней (и к открытому кадру модалки).
   useLayoutEffect(() => {
     if (total == null || total === 0) return;
     const el = scrollRef.current;
     if (!el) return;
+    const c = cols;
+    let top = 0;
+    let open: number | null = null;
+    if (!restoredRef.current) {
+      restoredRef.current = true;
+      if (savedMedia) {
+        const oi = typeof savedMedia.openIdx === 'number' ? clamp(savedMedia.openIdx, 0, total - 1) : null;
+        const base = oi ?? (savedMedia.index ?? 0);
+        const row = Math.max(0, Math.floor(base / c));
+        top = Math.min(row * ROW, Math.max(0, el.scrollHeight - el.clientHeight));
+        if (oi != null) open = oi;
+      }
+    }
+    if (top > 0) el.scrollTop = top;
+    if (open != null) setOpenIdx(open);
     const vh = el.clientHeight || 600;
-    const lastRow = Math.min(Math.ceil(total / cols) - 1, Math.ceil(vh / ROW) + OVERSCAN);
-    const iEnd = Math.min(total - 1, (lastRow + 1) * cols - 1);
-    if (iEnd >= 0) void fetchRange(0, iEnd);
-    updateRange(0);
-  }, [total, cols, fetchRange, updateRange]);
+    const firstRow = Math.max(0, Math.floor(top / ROW) - OVERSCAN);
+    const lastRow = Math.min(Math.ceil(total / c) - 1, Math.ceil((top + vh) / ROW) + OVERSCAN);
+    const iStart = firstRow * c;
+    const iEnd = Math.min(total - 1, (lastRow + 1) * c - 1);
+    if (iStart <= iEnd) void fetchRange(iStart, iEnd);
+    updateRange(top);
+  }, [total, cols, fetchRange, updateRange, savedMedia]);
+
+  // Открыли/закрыли модалку — сохраняем кадр сразу (скролл при этом не обязательно двигался).
+  useEffect(() => {
+    if (!restoredRef.current) return;
+    persistMedia(scrollRef.current?.scrollTop ?? 0);
+  }, [openIdx, persistMedia]);
 
   // Месяц в шапке — от первого видимого снимка; обновляется, когда пришёл новый кусок.
   useLayoutEffect(() => {
@@ -374,7 +428,9 @@ export default function MediaSection({ onOverlayChange }: {
     setOpenIdx(nt <= 0 ? null : Math.min(index, nt - 1));
   }, []);
 
-  // Перетаскивание ползунка: pointer → scrollTop (скраб по всей ленте).
+  // Ползунок: перетаскивание только после удержания. Быстрый тап ничего не двигает —
+  // он не должен случайно перелистывать ленту. Палец держится ARM_MS, ползунок
+  // подсвечивается (arming), затем активируется (armed) и следует за пальцем.
   const scrubTo = (clientY: number) => {
     const el = scrollRef.current;
     const rail = railRef.current;
@@ -389,22 +445,45 @@ export default function MediaSection({ onOverlayChange }: {
     const frac = maxTop > 0 ? clamp(y - h / 2, 0, maxTop) / maxTop : 0;
     el.scrollTop = frac * maxScroll;
   };
+  const cancelHold = () => {
+    if (holdTimerRef.current != null) {
+      window.clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+  };
   const onRailPointerDown = (e: React.PointerEvent) => {
-    dragRef.current = true;
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
       /* ignore */
     }
     setScrubVisible(true);
-    scrubTo(e.clientY);
+    cancelHold();
+    armedRef.current = false;
+    holdStartRef.current = e.clientY;
+    setScrubState('arming');
+    holdTimerRef.current = window.setTimeout(() => {
+      holdTimerRef.current = null;
+      armedRef.current = true;
+      setScrubState('armed');
+      scrubTo(e.clientY);
+    }, ARM_MS);
   };
   const onRailPointerMove = (e: React.PointerEvent) => {
-    if (!dragRef.current) return;
-    scrubTo(e.clientY);
+    if (armedRef.current) {
+      scrubTo(e.clientY);
+      return;
+    }
+    // до активации заметный сдвиг отменяет удержание — случайный свайп не срабатывает
+    if (holdTimerRef.current != null && Math.abs(e.clientY - holdStartRef.current) > ARM_MOVE_SLOP) {
+      cancelHold();
+      setScrubState('idle');
+    }
   };
   const onRailPointerUp = () => {
-    dragRef.current = false;
+    cancelHold();
+    armedRef.current = false;
+    setScrubState('idle');
   };
 
   const scrubLabel = scrub.monthKey === undefined ? '' : scrub.monthKey === null ? 'Без даты' : monthLabel(scrub.monthKey);
@@ -444,7 +523,11 @@ export default function MediaSection({ onOverlayChange }: {
         </div>
         {openIdx == null && total != null && total > 0 && (
           <div
-            className={'mrail' + (scrubVisible ? ' visible' : '')}
+            className={
+              'mrail' +
+              (scrubVisible ? ' visible' : '') +
+              (scrubState === 'arming' ? ' arming' : scrubState === 'armed' ? ' armed' : '')
+            }
             ref={railRef}
             onPointerDown={onRailPointerDown}
             onPointerMove={onRailPointerMove}
@@ -455,39 +538,14 @@ export default function MediaSection({ onOverlayChange }: {
               if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
             }}
             onPointerLeave={() => {
-              if (dragRef.current) return;
+              if (armedRef.current || holdTimerRef.current != null) return;
               if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
               hideTimer.current = window.setTimeout(() => setScrubVisible(false), 600);
             }}
           >
             <div className="mthumb" style={{ top: scrub.top, height: scrub.h }} />
             {scrubVisible && scrubLabel && (
-              <div
-                className="mthumb-label"
-                style={{ top: labelTop }}
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  dragRef.current = true;
-                  try {
-                    e.currentTarget.setPointerCapture(e.pointerId);
-                  } catch {
-                    /* ignore */
-                  }
-                  setScrubVisible(true);
-                  scrubTo(e.clientY);
-                }}
-                onPointerMove={(e) => {
-                  if (!dragRef.current) return;
-                  e.stopPropagation();
-                  scrubTo(e.clientY);
-                }}
-                onPointerUp={() => {
-                  dragRef.current = false;
-                }}
-                onPointerCancel={() => {
-                  dragRef.current = false;
-                }}
-              >
+              <div className="mthumb-label" style={{ top: labelTop }} aria-hidden>
                 {scrubLabel}
               </div>
             )}
