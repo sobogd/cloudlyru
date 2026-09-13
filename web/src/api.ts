@@ -523,12 +523,12 @@ export interface MediaInfo {
 export const mediaInfo = (entryId: string) =>
   request<MediaInfo>(`/media/${encodeURIComponent(entryId)}`);
 
-/** Точка на карте: запись с геометкой. Порядок — как в ленте «Медиа» (от свежих). */
+/** Точка на карте: запись с геометкой. Порядок — как в ленте «Медиа» (от свежих),
+    поэтому индекс точки совпадает с порядком листания в просмотрщике. */
 export interface MapPoint {
   entryId: string;
   lat: number;
   lon: number;
-  capturedAt: string | null;
 }
 /** Все геометки ленты для вкладки «Карта»: total — сколько всего, points — что влезло. */
 export const mediaMap = () =>

@@ -18,17 +18,22 @@ export const MEDIA_RANGE_MAX = 1000;
 /** Потолок одного запроса статусов превью. */
 export const MEDIA_STATUS_MAX = 500;
 /**
- * Потолок точек карты: это одна точка на кадр со всей библиотеки, и она уходит в браузер
- * целиком (тепловой слой считает клиент). 20 000 точек — это уже сотни тысяч фото на карте.
+ * Потолок точек карты: на кадр приходится одна точка, и они уходят в браузер целиком
+ * (тепловой слой считает клиент). 50 000 точек — это ~3 МБ JSON, 400–500 КБ по сети
+ * с brotli, и хватает на библиотеку в десятки тысяч геотегированных кадров.
  */
-export const MEDIA_MAP_MAX = 20_000;
+export const MEDIA_MAP_MAX = 50_000;
 
-/** Точка на карте: запись с геометкой. Минимум полей — карте не нужны имя, тип и размер. */
+/**
+ * Точка на карте: запись с геометкой. Только то, что нужно карте, — ни имени, ни размера,
+ * ни даты: миниатюра берётся по `entryId` (`/files/:id/thumb`), а дата и название — из
+ * `/media/:entryId`, который запрашивается при открытии кадра. Координаты округлены до
+ * пяти знаков (~1 м): лишние знаки только раздувают ответ.
+ */
 export interface MediaMapPoint {
   entryId: string;
   lat: number;
   lon: number;
-  capturedAt: string | null;
 }
 
 /** Строка ленты «Медиа». */
@@ -84,6 +89,9 @@ export interface MediaInfo {
 
 /** Число из raw: всё, что не конечное число (включая строки и null), — это «нет данных». */
 const rawNum = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+/** Координата до пяти знаков: точнее метра карте не нужно, а хвост float только раздувает ответ. */
+const round5 = (v: number): number => Math.round(v * 1e5) / 1e5;
+
 /** Непустая строка из raw. */
 const rawStr = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null);
 
@@ -111,14 +119,14 @@ export class MediaFeedService {
    * (от свежих к старым), чтобы индекс точки совпадал с порядком листания в модалке.
    *
    * Отдаём минимум полей: имена, размеры и sha256 карте не нужны — миниатюра берётся по
-   * `entryId` (`/files/:id/thumb`), а детали кадра подтягиваются при открытии. Библиотека
-   * целиком в браузер не поедет: потолок MEDIA_MAP_MAX, `total` показывает, сколько всего.
+   * `entryId` (`/files/:id/thumb`), а детали кадра подтягиваются при открытии. Потолок —
+   * MEDIA_MAP_MAX: `total` и `truncated` показывают, влезла ли библиотека целиком.
    */
   async mapPoints(userId: string): Promise<{ total: number; truncated: boolean; points: MediaMapPoint[] }> {
     const tree = await this.auth.subtreeIds(userId);
     if (!tree.length) return { total: 0, truncated: false, points: [] };
-    const rows = await this.prisma.$queryRaw<Array<{ id: string; lat: number; lon: number; capturedAt: Date | null; n: bigint | number }>>(Prisma.sql`
-      SELECT f."id", mm."latitude" AS lat, mm."longitude" AS lon, mm."capturedAt",
+    const rows = await this.prisma.$queryRaw<Array<{ id: string; lat: number; lon: number; n: bigint | number }>>(Prisma.sql`
+      SELECT f."id", mm."latitude" AS lat, mm."longitude" AS lon,
              count(*) OVER () AS n
       FROM "MediaMeta" mm
       JOIN "Asset" a ON a."id" = mm."assetId"
@@ -137,9 +145,8 @@ export class MediaFeedService {
       truncated: total > rows.length,
       points: rows.map((r) => ({
         entryId: r.id,
-        lat: Number(r.lat),
-        lon: Number(r.lon),
-        capturedAt: r.capturedAt ? new Date(r.capturedAt).toISOString() : null,
+        lat: round5(Number(r.lat)),
+        lon: round5(Number(r.lon)),
       })),
     };
   }

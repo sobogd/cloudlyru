@@ -261,14 +261,21 @@ export default function MapSection({ onOverlayChange }: {
       const show = map.getZoom() >= MARKER_ZOOM && pts.length > 0;
       setMarkers(show);
       if (!show) return;
-      const tl = map.getPixelBounds().min ?? L.point(0, 0);
+      const bounds = map.getPixelBounds();
+      const size = bounds.getSize();
+      const tl = bounds.min ?? L.point(0, 0);
       // Кадры одной экранной клетки — одна миниатюра; points уже идут от свежих,
-      // поэтому первый в клетке и есть самый новый кадр места.
+      // поэтому первый в клетке и есть самый новый кадр места. Берём только то, что
+      // попадает на экран (с запасом в клетку): иначе потолок CLUSTER_MAX съедали бы
+      // густые места за пределами вида, и в текущем месте не было бы ни одной миниатюры.
       const cells = new Map<number, { lat: number; lon: number; n: number; idx: number }>();
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
         const lp = map.latLngToLayerPoint([p.lat, p.lon]);
-        const key = cellKey(Math.floor((lp.x - tl.x) / CLUSTER_PX), Math.floor((lp.y - tl.y) / CLUSTER_PX));
+        const x = lp.x - tl.x;
+        const y = lp.y - tl.y;
+        if (x < -CLUSTER_PX || y < -CLUSTER_PX || x > size.x + CLUSTER_PX || y > size.y + CLUSTER_PX) continue;
+        const key = cellKey(Math.floor(x / CLUSTER_PX), Math.floor(y / CLUSTER_PX));
         const c = cells.get(key);
         if (c) c.n++;
         else cells.set(key, { lat: p.lat, lon: p.lon, n: 1, idx: i });
@@ -356,7 +363,7 @@ export default function MapSection({ onOverlayChange }: {
             name: d.name,
             mime: d.mime,
             sha256: d.sha256,
-            capturedAt: p.capturedAt,
+            capturedAt: d.capturedAt,
             size: d.size,
             previewState: 'done',
             jobState: null,
