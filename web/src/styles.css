@@ -651,9 +651,9 @@
   }
   @keyframes mvFade { from { opacity: 0; } to { opacity: 1; } }
 
-  /* Шапка — карточка как нижний остров: те же высота, отступы по краям, рамка и скругление,
-     но подложки нет — только граница, кадр виден сквозь неё. Иконки и текст того же размера,
-     что в футере (--island-icon / --island-fs). */
+  /* Шапка — карточка как нижний остров: та же высота, отступы по краям, подложка темы,
+     рамка и скругление. Полупрозрачная (--island), кадр под ней размывается blur'ом.
+     Иконки и текст того же размера, что в футере (--island-icon / --island-fs). */
   .mv-head {
     position: absolute;
     top: calc(var(--side) + env(safe-area-inset-top));
@@ -667,9 +667,11 @@
     gap: 4px;
     height: var(--island-h);
     padding: var(--island-pad);
-    background: none;
+    background: var(--island);
     border: 1px solid var(--island-brd);
     border-radius: var(--island-radius);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
     font-size: var(--island-fs);
     color: var(--fg);
   }
@@ -715,50 +717,55 @@
   }
   .mv-err .copy { color: var(--fg-2); }
 
-  /* Деталка (инфо) поверх кадра — полноэкранный лист темы */
-  .mvinfo {
+  /* Футер — та же карточка, что шапка: полупрозрачная плашка темы у нижнего края.
+     Слева — геометка (сразу открывает OSM), справа — метаданные кадра. */
+  .mv-foot {
     position: absolute;
-    inset: 0;
-    z-index: 5;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    background: var(--island-solid);
-    padding: 0;
-  }
-  .minfo-head {
-    position: sticky;
-    top: 0;
-    z-index: 1;
+    bottom: calc(var(--side) + env(safe-area-inset-bottom));
+    left: calc(var(--side) + env(safe-area-inset-left));
+    right: calc(var(--side) + env(safe-area-inset-right));
+    z-index: 2;
+    max-width: min(var(--col), calc(100% - 2 * var(--side)));
+    margin: 0 auto;
     display: flex;
     align-items: center;
     gap: 4px;
     height: var(--island-h);
-    padding: var(--island-pad) 12px;
-    background: var(--island-solid);
-    border-bottom: 1px solid var(--brd);
+    padding: var(--island-pad);
+    background: var(--island);
+    border: 1px solid var(--island-brd);
+    border-radius: var(--island-radius);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
+    font-size: var(--island-fs);
+    color: var(--fg-2);
   }
-  .minfo-title { font-weight: 600; font-size: 17px; color: var(--fg); }
-  .minfo-head .iconbtn svg { width: 24px; height: 24px; }
-  .minfo-body { padding: 0 14px 24px; }
-  .minfo-load { display: grid; place-items: center; padding: 48px 0; }
-  .minfo-row {
-    display: grid;
-    grid-template-columns: 128px 1fr;
-    gap: 10px;
-    align-items: baseline;
-    padding: 12px 0;
-    border-bottom: 1px solid var(--brd);
+  /* Метаданные прижаты к правому краю. Длинное имя камеры усекается многоточием,
+     а не переносится: высота футера фиксирована, как у остальных островов. */
+  .mv-metas {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 14px;
+    margin-left: auto;
+    min-width: 0;
+    overflow: hidden;
   }
-  .minfo-row:last-child { border-bottom: 0; }
-  .minfo-k { color: var(--fg-3); font-size: 15px; }
-  .minfo-v { font-size: 16px; color: var(--fg); word-break: break-all; white-space: pre-wrap; }
-  .minfo-v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }
-  .minfo-loc {
+  .mv-meta {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    color: var(--accent);
-    text-decoration: none;
+    gap: 5px;
+    flex: none;
+    white-space: nowrap;
   }
-  .minfo-loc:hover { text-decoration: underline; }
+  .mv-meta:last-child { flex: 0 1 auto; min-width: 0; }
+  .mv-meta svg {
+    display: block;
+    width: var(--island-icon);
+    height: var(--island-icon);
+    flex: none;
+    stroke-width: 1.75;
+    color: var(--fg-3);
+  }
+  .mv-meta-v { overflow: hidden; text-overflow: ellipsis; }
 }

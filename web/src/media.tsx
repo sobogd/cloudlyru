@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownToLine, Film, Image as ImageIcon, Info, MapPin, Trash, X } from 'lucide-react';
+import {
+  ArrowDownToLine,
+  Camera,
+  Film,
+  Frame,
+  HardDrive,
+  Image as ImageIcon,
+  MapPin,
+  Trash,
+  X,
+  type LucideIcon,
+} from 'lucide-react';
 import * as api from './api';
 import { patchUi, readUi } from './storage';
 
@@ -605,7 +616,8 @@ function MediaViewer({
   const [natMap, setNatMap] = useState<Map<number, { w: number; h: number }>>(() => new Map());
   const [stage, setStage] = useState({ w: 0, h: 0 });
   const [closing, setClosing] = useState(false);
-  const [detail, setDetail] = useState(false);
+  /** Метаданные текущего кадра — для футера (размер, кадр, камера, геометка). */
+  const [info, setInfo] = useState<api.MediaInfo | null>(null);
 
   const stageRef = useRef<HTMLDivElement>(null);
 
@@ -643,13 +655,29 @@ function MediaViewer({
   // Новый кадр — сбрасываем зум (натуральный размер соседа уже лежит в natMap).
   useEffect(() => {
     setZoom({ scale: 1, tx: 0, ty: 0 });
-    setDetail(false);
   }, [k]);
 
   // Догружаем текущий кадр и соседей, чтобы свайп не упирался в пустоту.
   useEffect(() => {
     ensure(Math.max(0, k - 1), Math.min(total - 1, k + 1));
   }, [k, total, ensure]);
+
+  // Метаданные кадра — по id записи, а не по индексу: листание меняет только индекс.
+  const curEntryId = curItem?.entryId;
+  useEffect(() => {
+    setInfo(null);
+    if (!curEntryId) return;
+    let stopped = false;
+    api
+      .mediaInfo(curEntryId)
+      .then((d) => {
+        if (!stopped) setInfo(d);
+      })
+      .catch(() => undefined);
+    return () => {
+      stopped = true;
+    };
+  }, [curEntryId]);
 
   const recordNat = useCallback((i: number, s: { w: number; h: number }) => {
     setNatMap((prev) => {
@@ -707,8 +735,7 @@ function MediaViewer({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (detail) setDetail(false);
-        else close();
+        close();
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
         go(1);
@@ -719,10 +746,10 @@ function MediaViewer({
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [detail, go, close]);
+  }, [go, close]);
 
   const onPointerDown = (e: React.PointerEvent) => {
-    if (closing || detail) return;
+    if (closing) return;
     const el = stageRef.current;
     if (!el) return;
     try {
@@ -836,7 +863,7 @@ function MediaViewer({
   // Нативный слушатель (passive:false), иначе preventDefault не сработает.
   const wheelHandlerRef = useRef<(e: WheelEvent) => void>(() => {});
   wheelHandlerRef.current = (e: WheelEvent) => {
-    if (closing || detail) return;
+    if (closing) return;
     e.preventDefault();
     const gp = g.current;
     const el = stageRef.current;
@@ -893,12 +920,13 @@ function MediaViewer({
     if (!confirm(`Удалить «${curItem.name}» в корзину?`)) return;
     try {
       await api.deleteFile(curItem.entryId);
-      setDetail(false);
       onDelete(k);
     } catch (e) {
       alert((e as Error).message);
     }
   };
+
+  const geo = info && info.latitude != null && info.longitude != null ? info : null;
 
   return (
     <div
@@ -908,10 +936,6 @@ function MediaViewer({
     >
       <div className="mv-head">
         <span className="mv-date">{fmtMediaDate(curItem?.capturedAt) || curItem?.name || ''}</span>
-        <span style={{ flex: 1 }} />
-        <button className="iconbtn" title="Инфо" disabled={!curItem} onClick={() => setDetail((d) => !d)}>
-          <Info />
-        </button>
         {curItem && (
           <a className="iconbtn" title="Скачать оригинал" href={api.fileUrl(curItem.entryId)} download>
             <ArrowDownToLine />
@@ -953,9 +977,29 @@ function MediaViewer({
         ))}
       </div>
 
-      {detail && curItem && (
-        <MediaInfoPanel entryId={curItem.entryId} onClose={() => setDetail(false)} />
-      )}
+      {/* Футер: слева — геометка (открывает OSM), справа — метаданные кадра */}
+      <div className="mv-foot">
+        {geo && (
+          <a
+            className="iconbtn"
+            title="Открыть на карте"
+            href={`https://www.openstreetmap.org/?mlat=${geo.latitude}&mlon=${geo.longitude}#map=16/${geo.latitude}/${geo.longitude}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <MapPin />
+          </a>
+        )}
+        <div className="mv-metas">
+          {info && <MetaItem Icon={HardDrive} title="Размер" value={fmtSize(info.size)} />}
+          {info?.width != null && info?.height != null && (
+            <MetaItem Icon={Frame} title="Кадр" value={`${info.width} × ${info.height}`} />
+          )}
+          {info && (info.make || info.model) ? (
+            <MetaItem Icon={Camera} title="Камера" value={[info.make, info.model].filter(Boolean).join(' ')} />
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1069,8 +1113,9 @@ function Slide({
   );
 }
 
-// =============================== Инфо кадра ===============================
+// =============================== Метаданные кадра ===============================
 
+/** Человекочитаемый размер файла для футера кадра. */
 function fmtSize(bytes: number): string {
   if (!bytes || !Number.isFinite(bytes)) return '—';
   const gb = 1024 * 1024 * 1024;
@@ -1082,64 +1127,12 @@ function fmtSize(bytes: number): string {
   return `${bytes} Б`;
 }
 
-function InfoRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
+/** Пункт футера: иконка и значение (размер, кадр, камера). title — подсказка при усечении. */
+function MetaItem({ Icon, value, title }: { Icon: LucideIcon; value: string; title: string }) {
   return (
-    <div className="minfo-row">
-      <span className="minfo-k">{k}</span>
-      <span className={'minfo-v' + (mono ? ' mono' : '')}>{v}</span>
-    </div>
-  );
-}
-
-/** Панель «Инфо» в модалке: свой UI и своя ручка /media/:entryId, не из «Файлов». */
-function MediaInfoPanel({ entryId, onClose }: { entryId: string; onClose: () => void }) {
-  const [info, setInfo] = useState<api.MediaInfo | null>(null);
-  const [err, setErr] = useState('');
-  useEffect(() => {
-    api.mediaInfo(entryId).then(setInfo).catch((e) => setErr((e as Error).message));
-  }, [entryId]);
-  return (
-    <div className="mvinfo">
-      <div className="minfo-head">
-        <span className="minfo-title">Инфо</span>
-        <span style={{ flex: 1 }} />
-        <button className="iconbtn" title="Закрыть" onClick={onClose}>
-          <X />
-        </button>
-      </div>
-      {err && <div className="err" style={{ padding: '10px 14px' }}>{err}</div>}
-      {!info && !err && (
-        <div className="minfo-load">
-          <span className="spin" />
-        </div>
-      )}
-      {info && (
-        <div className="minfo-body">
-          <InfoRow k="Имя" v={info.name} />
-          <InfoRow k="Дата съёмки" v={info.capturedAt ? fmtMediaDate(info.capturedAt) : '—'} />
-          <InfoRow k="Тип" v={info.mime} />
-          <InfoRow k="Размер" v={fmtSize(info.size)} />
-          {info.width != null && info.height != null && <InfoRow k="Кадр" v={`${info.width} × ${info.height}`} />}
-          {info.make || info.model ? <InfoRow k="Камера" v={[info.make, info.model].filter(Boolean).join(' ')} /> : null}
-          {info.latitude != null && info.longitude != null ? (
-            <div className="minfo-row">
-              <span className="minfo-k">Место</span>
-              <span className="minfo-v">
-                <a
-                  className="minfo-loc"
-                  href={`https://www.openstreetmap.org/?mlat=${info.latitude}&mlon=${info.longitude}#map=16/${info.latitude}/${info.longitude}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  title="Открыть на карте"
-                >
-                  <MapPin size={17} /> {info.latitude.toFixed(6)}, {info.longitude.toFixed(6)}
-                </a>
-              </span>
-            </div>
-          ) : null}
-          <InfoRow k="SHA-256" v={info.sha256} mono />
-        </div>
-      )}
-    </div>
+    <span className="mv-meta" title={title}>
+      <Icon />
+      <span className="mv-meta-v">{value}</span>
+    </span>
   );
 }
