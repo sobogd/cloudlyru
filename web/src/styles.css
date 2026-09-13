@@ -651,37 +651,32 @@
   }
   @keyframes mvFade { from { opacity: 0; } to { opacity: 1; } }
 
-  /* Шапка — без острова: просто дата и кнопки поверх кадра, у верхнего края.
-     Крупнее остальных островов: это просмотр кадра, иконки и дата должны читаться сразу. */
+  /* Шапка — карточка как нижний остров: те же высота, отступы по краям, рамка и скругление,
+     но подложки нет — только граница, кадр виден сквозь неё. Иконки и текст того же размера,
+     что в футере (--island-icon / --island-fs). */
   .mv-head {
-    --mv-icon: 26px;
-    --mv-fs: 18px;
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
+    top: calc(var(--side) + env(safe-area-inset-top));
+    left: calc(var(--side) + env(safe-area-inset-left));
+    right: calc(var(--side) + env(safe-area-inset-right));
     z-index: 2;
+    max-width: min(var(--col), calc(100% - 2 * var(--side)));
+    margin: 0 auto;
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: calc(10px + env(safe-area-inset-top)) 12px;
-    font-size: var(--mv-fs);
+    height: var(--island-h);
+    padding: var(--island-pad);
+    background: none;
+    border: 1px solid var(--island-brd);
+    border-radius: var(--island-radius);
+    font-size: var(--island-fs);
     color: var(--fg);
-  }
-  .mv-head .iconbtn {
-    min-width: calc(var(--mv-icon) + 10px);
-    min-height: calc(var(--mv-icon) + 10px);
-    padding: 4px;
-  }
-  .mv-head .iconbtn svg {
-    width: var(--mv-icon);
-    height: var(--mv-icon);
   }
   .mv-date {
     flex: 1;
     min-width: 0;
     padding: 0 6px;
-    font-size: var(--mv-fs);
     font-weight: 600;
     color: var(--fg);
     overflow: hidden;
