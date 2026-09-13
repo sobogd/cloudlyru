@@ -233,14 +233,23 @@ export class MediaController {
   }
 
   /**
-   * Снимки одного дня — для полноэкранного просмотра, где листаются фото по очереди
-   * (`day` — 'YYYY-MM-DD').
+   * Соседний снимок для полноэкранного просмотра: `entryId` — текущий кадр, `dir` — 'next'
+   * (старее) или 'prev' (новее). Просмотр листает снимки по одному и не грузит ни день, ни месяц;
+   * на краю ленты отвечаем null.
    */
-  @Get('timeline/photos')
+  @Get('timeline/neighbor')
   @UseGuards(RateLimitGuard)
   @RateLimit(1200, 60_000)
-  timelinePhotos(@CurrentUser() user: RequestUser, @Query('day') day?: string) {
-    return this.media.timelinePhotos(user.id, typeof day === 'string' && day ? day : undefined);
+  timelineNeighbor(
+    @CurrentUser() user: RequestUser,
+    @Query('entryId') entryId?: string,
+    @Query('dir') dir?: string,
+  ) {
+    return this.media.timelineNeighbor(
+      user.id,
+      typeof entryId === 'string' && entryId ? entryId : undefined,
+      typeof dir === 'string' && dir ? dir : undefined,
+    );
   }
 
   /**

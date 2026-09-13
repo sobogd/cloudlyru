@@ -188,9 +188,6 @@ html, body { overscroll-behavior: none; }
   text-shadow: 0 1px 2px rgba(0, 0, 0, .95), 0 0 5px rgba(0, 0, 0, .85); }
 .calcell.off .calnum { color: #5c6779; font-weight: 400; text-shadow: none; }
 .calmeta { width: min(100%, 350px); margin: 10px auto 0; font-size: 12px; color: #6d7889; text-align: center; }
-/* Догрузка дня при листании на краю: просмотр остаётся на экране, поверх — спиннер */
-.viewwait { position: absolute; left: 0; right: 0; bottom: 64px; z-index: 6; display: grid;
-  place-items: center; pointer-events: none; }
 /* Открытый день в шапке просмотра: вместо имени файла — дата и место снимка среди снимков дня. */
 .calday { flex: 1; min-width: 0; padding: 0 6px; font-size: 13px; color: #e6e8eb; text-align: center;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

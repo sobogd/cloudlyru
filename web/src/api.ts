@@ -567,11 +567,11 @@ export const timelineDays = (from: string, to: string) =>
 export const timelineMonths = () =>
   request<{ newest: string | null; oldest: string | null }>('/timeline/months');
 /**
- * Все снимки одного дня — для полноэкранного просмотра: там листаются фото по очереди, а не дни
- * календаря, поэтому день берём целиком (обычно единицы-десятки строк).
+ * Соседний снимок для полноэкранного просмотра: `entryId` — текущий кадр, `dir` — 'next' (старее)
+ * или 'prev' (новее). Одним запросом, без загрузки дня или месяца; на краю ленты вернётся null.
  */
-export const dayPhotos = (day: string) =>
-  request<TimelineItem[]>(`/timeline/photos?day=${encodeURIComponent(day)}`);
+export const neighborPhoto = (entryId: string, dir: 'next' | 'prev') =>
+  request<TimelineItem | null>(`/timeline/neighbor?entryId=${encodeURIComponent(entryId)}&dir=${dir}`);
 /** Статусы сборки превью по списку записей: спрашиваем только про незавершённые снимки. */
 export const timelineStatus = (entryIds: string[]) =>
   request<TimelineStatus[]>('/timeline/status', { method: 'POST', body: JSON.stringify({ entryIds }) });

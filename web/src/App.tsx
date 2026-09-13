@@ -19,7 +19,7 @@ const NAV: Array<{ id: Tab; icon: string; label: string }> = [
 type UiState = {
   tab?: Tab;
   files?: { stack?: Array<{ id?: string; name: string }>; openFile?: string | null; folderMeta?: boolean };
-  photos?: { month?: string | null; openDay?: string | null; openEntryId?: string | null; detailId?: string | null };
+  photos?: { month?: string | null; photo?: api.TimelineItem | null; detailId?: string | null };
   albums?: { openId?: string | null };
 };
 const UI_KEY = 'cloudlyru:ui';
@@ -955,8 +955,6 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
 
 /** Кружок дня не бывает шире 50 px: календарь не растёт больше 7 × 50 = 350 px. */
 const GRID_CELL = 50;
-/** Сколько превью держим готовыми в памяти (дальние вытесняются, их достанет кэш браузера). */
-const PREVIEW_CACHE_MAX = 48;
 /** Сколько месяцев держим загруженными: листание туда-обратно не должно ходить в сеть. */
 const MONTH_CACHE_MAX = 36;
 /** Сколько месяцев тянем одним запросом: удержание стрелки не должно ждать каждый месяц. */
@@ -996,33 +994,6 @@ function currentMonthKey(): string {
 function dayTitle(day: string): string {
   const [y, m, d] = day.split('-').map(Number);
   return new Date(y, m - 1, d).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
-}
-
-/**
- * Кэш превью в памяти. Готовый кадр держим Image-объектом: переключение на соседний снимок и
- * возврат из деталки показывают кадр сразу — без сети и без повторного декода. Кэш ограничен по
- * размеру, поэтому дальние кадры вытесняются: их потом достанет браузерный кэш (max-age=600).
- */
-type WarmPreview = { img: HTMLImageElement; ok: boolean; failed: boolean };
-const previewCache = new Map<string, WarmPreview>();
-
-/** Начать (или взять уже начатую) загрузку превью. Возвращает запись кэша — её же и слушаем. */
-function warmPreview(src: string): WarmPreview {
-  const hit = previewCache.get(src);
-  if (hit) return hit;
-  const img = new Image();
-  img.decoding = 'async';
-  const rec: WarmPreview = { img, ok: false, failed: false };
-  img.onload = () => { rec.ok = true; };
-  img.onerror = () => { rec.failed = true; };
-  img.src = src;
-  previewCache.set(src, rec);
-  while (previewCache.size > PREVIEW_CACHE_MAX) {
-    const oldest = previewCache.keys().next().value;
-    if (oldest === undefined) break;
-    previewCache.delete(oldest);
-  }
-  return rec;
 }
 
 /** Статус сборки превью: приходит ручкой /timeline/status, а не внутри самих дней. */
@@ -1084,7 +1055,7 @@ function DayCell({ day, row, status, onOpen }: {
   day: number;
   row: api.TimelineDayItem | null;
   status?: PreviewStatus;
-  onOpen: (day: string, entryId: string) => void;
+  onOpen: (row: api.TimelineDayItem) => void;
 }) {
   if (!row) {
     return <div className="calcell off" title={`${day} — снимков нет`}><span className="calnum">{day}</span></div>;
@@ -1095,7 +1066,7 @@ function DayCell({ day, row, status, onOpen }: {
     <div
       className={photo ? 'calcell' : 'calcell wait'}
       title={`${day} — снимков: ${row.count}${photo ? '' : st.hopeless ? ', превью не собрать' : ', превью собирается'}`}
-      onClick={() => onOpen(row.day, row.cover.entryId)}
+      onClick={() => onOpen(row)}
     >
       {photo && <img className="calphoto" src={api.previewUrl(row.cover.sha256!)} alt="" loading="lazy" />}
       <span className="calnum">{day}</span>
@@ -1109,8 +1080,13 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const [month, setMonth] = useState<string>(() => saved?.month ?? currentMonthKey());
   /** Края листания — самый новый и самый старый месяцы со снимками (null — снимков нет). */
   const [bounds, setBounds] = useState<{ newest: string | null; oldest: string | null } | null>(null);
-  /** Открытая страница просмотра: день, его снимки и позиция в них. */
-  const [view, setView] = useState<{ day: string; items: api.TimelineItem[]; idx: number } | null>(null);
+  /**
+   * Открытый кадр — ровно один снимок. Просмотр ничего не прогревает и не держит ни день, ни
+   * месяц: по стрелке спрашивает у сервера соседний снимок по id и сразу переключается на него.
+   */
+  const [photo, setPhoto] = useState<api.TimelineItem | null>(() => saved?.photo ?? null);
+  /** Идёт запрос за соседним снимком: повторные нажатия в это время игнорируем. */
+  const [stepping, setStepping] = useState(false);
   /** Полноценная деталка (как в «Файлах») — открывается кнопкой ℹ️ из просмотра. */
   const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
   /** Статусы сборки превью: спрашиваем только про те снимки, что видит пользователь. */
@@ -1121,14 +1097,11 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   /** Палец на стрелке: пока держат, месяцы только листаются — запрос уходит после отпускания. */
   const [holding, setHolding] = useState(false);
   const [version, setVersion] = useState(0);
-  const [viewLoading, setViewLoading] = useState(false);
 
   // Дни по месяцам в кэше: месяц — маленький ответ, поэтому соседние держим под рукой.
   const cacheRef = useRef(new Map<string, api.TimelineDayItem[]>());
   const inflightRef = useRef(new Map<string, Promise<void>>());
   const refreshTimerRef = useRef<number | null>(null);
-  /** F5: снимок, который был открыт, чтобы вернуться ровно в него, а не в обложку дня. */
-  const [restoreEntryId, setRestoreEntryId] = useState<string | null>(saved?.openEntryId ?? null);
 
   const put = useCallback((key: string, rows: api.TimelineDayItem[]) => {
     const cache = cacheRef.current;
@@ -1228,8 +1201,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
 
   // Запоминаем экран (месяц, открытый снимок, деталку) — F5 возвращает туда же.
   useEffect(() => {
-    patchUi({ photos: { month, openDay: view?.day ?? null, openEntryId: view?.items[view.idx]?.entryId ?? null, detailId } });
-  }, [month, view, detailId]);
+    patchUi({ photos: { month, photo, detailId } });
+  }, [month, photo, detailId]);
 
   const atNewest = Boolean(bounds?.newest && month >= bounds.newest);
   const atOldest = Boolean(bounds?.oldest && month <= bounds.oldest);
@@ -1241,7 +1214,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
       if (delta < 0 && atOldest) return m;
       return next;
     });
-    setView(null);
+    setPhoto(null);
   }, [atNewest, atOldest]);
 
   const holdPrev = useHoldRepeat(() => gotoMonth(-1), !atOldest);
@@ -1267,107 +1240,37 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
 
   const photoCount = dayRows.reduce((n, r) => n + r.count, 0);
 
-  /** Дни месяца, в которых есть снимки, от новых к старым — по ним ходит просмотр. */
-  const monthDays = (key: string) => (cacheRef.current.get(key) ?? []).map((r) => r.day);
-
-  /** Ключ месяца, подрезанный по краям галереи (раньше 2000 и позже последнего снимка не ходим). */
-  const clipMonth = (key: string): string => {
-    let out = key;
-    if (bounds?.oldest && out < bounds.oldest) out = bounds.oldest;
-    if (bounds?.newest && out > bounds.newest) out = bounds.newest;
-    return out;
-  };
-
   /**
-   * Ближайший день со снимками в направлении step (+1 — старее, −1 — новее). Просмотр НЕ
-   * ограничен месяцем: пустые месяцы пропускаем и идём дальше, месяцы догружаем пачкой, а
-   * останавливаемся только на краю галереи — на самом первом или самом последнем снимке.
+   * Листание в просмотре: спрашиваем у сервера соседний снимок по id и сразу переключаемся на
+   * него (одна строка по индексу, ~2 мс). Метаданные соседа приходят раньше картинки, поэтому
+   * лоадер крутится уже на новом кадре, а не поверх предыдущего.
    */
-  const neighborDay = async (day: string, step: number): Promise<string | null> => {
-    const own = day.slice(0, 7);
-    // месяц самого дня мог быть ещё не загружен (например, экран восстановили после F5):
-    // без этого соседние дни того же месяца потерялись бы
-    if (!cacheRef.current.has(own)) {
-      try {
-        await ensureRange(own, own);
-      } catch {
-        return null;
-      }
-    }
-    const days = monthDays(own);
-    const i = days.indexOf(day);
-    if (i >= 0 && days[i + step]) return days[i + step];
-
-    // Дальше идём месяцами в сторону движения: пустые месяцы (паузы в съёмке) пропускаем.
-    const dir = step > 0 ? -1 : 1;
-    for (let key = shiftMonth(own, dir), hop = 0; hop < 240; hop++, key = shiftMonth(key, dir)) {
-      if (dir < 0 && bounds?.oldest && key < bounds.oldest) return null;
-      if (dir > 0 && bounds?.newest && key > bounds.newest) return null;
-      if (!cacheRef.current.has(key)) {
-        const from = clipMonth(dir < 0 ? shiftMonth(key, -(MONTH_CHUNK - 1)) : key);
-        const to = clipMonth(dir < 0 ? key : shiftMonth(key, MONTH_CHUNK - 1));
-        try {
-          await ensureRange(from, to);
-        } catch {
-          return null;
-        }
-      }
-      const list = monthDays(key);
-      if (list.length) return step > 0 ? list[0] : list[list.length - 1];
-    }
-    return null;
-  };
-
-  /** Открыть день: страница просмотра — отдельная, поэтому день грузим целиком. */
-  const openDay = useCallback(async (day: string, entryId?: string, at: 'first' | 'last' | number = 'first') => {
-    setViewLoading(true);
+  const stepPhoto = async (dir: 'next' | 'prev') => {
+    if (!photo || stepping) return;
+    setStepping(true);
     try {
-      const items = await api.dayPhotos(day);
-      if (!items.length) { setView(null); return; }
-      let idx = 0;
-      if (entryId) {
-        const found = items.findIndex((it) => it.entryId === entryId);
-        if (found >= 0) idx = found;
-      } else if (at === 'last') idx = items.length - 1;
-      else if (typeof at === 'number') idx = Math.min(Math.max(at, 0), items.length - 1);
-      setView({ day, items, idx });
+      const next = await api.neighborPhoto(photo.entryId, dir);
+      if (next) {
+        setPhoto(next);
+        const key = next.capturedAt?.slice(0, 7);
+        if (key) setMonth(key); // календарь под просмотром идёт вместе со снимком
+      }
+      // null — край галереи: остаёмся на текущем кадре
     } catch (e) {
       setLoadErr((e as Error).message);
-      setView(null);
     } finally {
-      setViewLoading(false);
+      setStepping(false);
     }
-  }, []);
-
-  // Восстановление после F5: день был открыт — открываем его же и встаём на тот же снимок.
-  useEffect(() => {
-    if (!restoreEntryId || view) return;
-    const day = saved?.openDay;
-    setRestoreEntryId(null);
-    if (day) void openDay(day, restoreEntryId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [restoreEntryId, view]);
-
-  /** Листание в просмотре: снимок за снимком, а на краю дня — соседний день. */
-  const stepPhoto = async (step: number) => {
-    if (!view) return;
-    const next = view.items[view.idx + step];
-    if (next) { setView({ ...view, idx: view.idx + step }); return; }
-    const day = await neighborDay(view.day, step);
-    if (!day) return;
-    setMonth(day.slice(0, 7)); // календарь под просмотром идёт вместе с днём
-    await openDay(day, undefined, step > 0 ? 'first' : 'last');
   };
 
-  // Спрашиваем статусы только про то, что видно: обложки дней месяца и снимки открытого дня.
-  const current = view ? view.items[view.idx] ?? null : null;
+  // Спрашиваем статусы только про то, что видно: обложки дней месяца и открытый кадр.
   const askIds = useMemo(() => {
     const ids = new Set<string>();
     for (const r of dayRows) if (r.cover.previewState !== 'done') ids.add(r.cover.entryId);
-    for (const it of view?.items ?? []) if (it.previewState !== 'done') ids.add(it.entryId);
+    if (photo && photo.previewState !== 'done') ids.add(photo.entryId);
     return [...ids];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dayRows, view, version, statuses]);
+  }, [dayRows, photo, version, statuses]);
   const askIdsRef = useRef(askIds);
   askIdsRef.current = askIds;
   useEffect(() => {
@@ -1398,18 +1301,9 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     return () => { stopped = true; clearInterval(t); };
   }, [askIds.length]);
 
-  // Превью соседних снимков греем заранее: листание не должно ждать загрузку.
-  useEffect(() => {
-    if (!view) return;
-    for (const step of [-1, 1, 2]) {
-      const it = view.items[view.idx + step];
-      if (it?.sha256 && /^image\//.test(it.mime)) warmPreview(api.previewUrl(it.sha256, 1080));
-    }
-  }, [view]);
-
   // Пока открыт просмотр или деталка, страница под ними не прокручивается: иначе получался
   // «двойной скролл» — сдвигалась и галерея, и просмотр.
-  const overlay = Boolean(view || detailId);
+  const overlay = Boolean(photo || detailId);
   useEffect(() => {
     if (!overlay) return;
     const y = window.scrollY;
@@ -1425,32 +1319,21 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     };
   }, [overlay]);
 
-  /** Удаление снимка: день мог остаться с другими снимками, поэтому день и месяц перечитываем. */
-  const forgetEntry = useCallback((entryId: string) => {
+  /**
+   * Удаление кадра: соседа запоминаем ДО удаления (после него записи уже нет и соседа не найти),
+   * затем переключаемся на него, а если соседа нет — закрываем просмотр.
+   */
+  const forgetEntry = useCallback((entryId: string, next?: api.TimelineItem | null) => {
     setStatuses((prev) => {
-      const next = new Map(prev);
-      next.delete(entryId);
-      return next;
+      const nextMap = new Map(prev);
+      nextMap.delete(entryId);
+      return nextMap;
     });
     setDetailId(null);
-    const day = view?.day;
-    const rest = view ? view.items.filter((it) => it.entryId !== entryId) : [];
-    if (day && rest.length) {
-      setView({ day, items: rest, idx: Math.min(view!.idx, rest.length - 1) });
-    } else if (day) {
-      // День опустел: уходим на соседний день со снимками, а если такого нет — закрываем просмотр.
-      void (async () => {
-        setView(null);
-        const older = await neighborDay(day, 1);
-        const newer = older ?? (await neighborDay(day, -1));
-        if (newer) { setMonth(newer.slice(0, 7)); await openDay(newer); }
-      })();
-    } else {
-      setView(null);
-    }
-    const key = day ? day.slice(0, 7) : month;
-    void ensureRange(key, key, true).catch(() => undefined);
-  }, [view, month, ensureRange, openDay]);
+    setPhoto(next ?? null);
+    const key = (next?.capturedAt ?? photo?.capturedAt)?.slice(0, 7) ?? month;
+    void ensureRange(key, key, true).catch(() => undefined); // день и счётчики месяца перечитываем
+  }, [photo, month, ensureRange]);
 
   const retryPreview = useCallback(async (entryId: string) => {
     try {
@@ -1466,7 +1349,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   }, []);
 
   const busy = up.busy;
-  const view2 = current ? previewState(current, statuses.get(current.entryId)) : null;
+  const view2 = photo ? previewState(photo, statuses.get(photo.entryId)) : null;
 
   // ===== Экран-календарь =====
   return (
@@ -1482,7 +1365,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           onPointerCancel={() => { holdPrev.stop(); setHolding(false); }}
           onClick={(e) => { if (e.detail === 0) gotoMonth(-1); }}
         >◀️</button>
-        <button className="caltitle" title="К последнему месяцу со снимками" onClick={() => { if (bounds?.newest) setMonth(bounds.newest); setView(null); }}>
+        <button className="caltitle" title="К последнему месяцу со снимками" onClick={() => { if (bounds?.newest) setMonth(bounds.newest); setPhoto(null); }}>
           {monthTitleOf(month)}
         </button>
         <button
@@ -1501,7 +1384,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
 
       <div className="calgrid" style={{ gridTemplateColumns: `repeat(${CAL_COLS}, minmax(0, 1fr))` }}>
         {cells.map((c, i) => (c
-          ? <DayCell key={c.day} day={c.day} row={c.row} status={c.row ? statuses.get(c.row.cover.entryId) : undefined} onOpen={openDay} />
+          ? <DayCell key={c.day} day={c.day} row={c.row} status={c.row ? statuses.get(c.row.cover.entryId) : undefined} onOpen={(row) => setPhoto(row.cover)} />
           : <div key={`b${i}`} className="calcell blank" />))}
       </div>
 
@@ -1543,22 +1426,18 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
         </label>
       )}
 
-      {/* ===== Экран просмотра: отдельная страница, листаются снимки по очереди ===== */}
-      {view && current && view2 && (
+      {/* ===== Экран просмотра: отдельная страница, кадр за кадром ===== */}
+      {photo && view2 && (
         <div className="full">
           <div className="mediaarea">
-            {view2.ready && current.sha256 && /^video\//.test(current.mime) ? (
+            {view2.ready && photo.sha256 && /^video\//.test(photo.mime) ? (
               // Тот же компонент, что в деталке файла: у него есть фолбэк на оригинал для
               // браузеров без AV1 (Safari/iOS) и playsInline для телефона.
-              <VideoPreview key={current.entryId} meta={{ id: current.entryId, sha256: current.sha256, name: current.name }} />
-            ) : view2.ready && current.sha256 ? (
-              // key по снимку: у каждого своя геометрия и свой зум. Миниатюра (thumb) лежит
-              // размытой под кадром — переход выглядит мгновенным, пока идёт 1080.
-              <PhotoZoom
-                key={current.entryId}
-                src={api.previewUrl(current.sha256, 1080)}
-                thumb={api.previewUrl(current.sha256)}
-              />
+              <VideoPreview key={photo.entryId} meta={{ id: photo.entryId, sha256: photo.sha256, name: photo.name }} />
+            ) : view2.ready && photo.sha256 ? (
+              // key по снимку: у каждого своя геометрия и свой зум. Ничего не прогреваем —
+              // лоадер этого кадра и есть ожидание загрузки.
+              <PhotoZoom key={photo.entryId} src={api.previewUrl(photo.sha256, 1080)} />
             ) : (
               <div className="panel">
                 {view2.failed ? (
@@ -1568,8 +1447,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                       <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c', maxHeight: 180, overflow: 'auto' }}>{view2.jobError}</pre>
                     )}
                     <div className="row" style={{ justifyContent: 'center' }}>
-                      <button className="btn ghost" onClick={() => void retryPreview(current.entryId)}>⟳ Пересобрать</button>
-                      <a className="btn ghost" href={api.fileUrl(current.entryId)} download>⬇️ Скачать оригинал</a>
+                      <button className="btn ghost" onClick={() => void retryPreview(photo.entryId)}>⟳ Пересобрать</button>
+                      <a className="btn ghost" href={api.fileUrl(photo.entryId)} download>⬇️ Скачать оригинал</a>
                     </div>
                   </>
                 ) : view2.hopeless ? (
@@ -1578,8 +1457,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                       {view2.impossible && view2.jobError ? `Превью не собрать: ${view2.jobError}` : 'Превью для этого файла собрать нельзя'}
                     </div>
                     <div className="row" style={{ justifyContent: 'center' }}>
-                      <button className="btn ghost" onClick={() => void retryPreview(current.entryId)}>⟳ Поставить задачу</button>
-                      <a className="btn ghost" href={api.fileUrl(current.entryId)} download>⬇️ Скачать оригинал</a>
+                      <button className="btn ghost" onClick={() => void retryPreview(photo.entryId)}>⟳ Поставить задачу</button>
+                      <a className="btn ghost" href={api.fileUrl(photo.entryId)} download>⬇️ Скачать оригинал</a>
                     </div>
                   </div>
                 ) : (
@@ -1592,33 +1471,32 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
             )}
           </div>
           <div className="tbar">
-            <button className="iconbtn" title="Назад в календарь" onClick={() => setView(null)}>◀️</button>
-            {/* В просмотре листаются снимки: показываем день и место снимка среди снимков дня */}
+            <button className="iconbtn" title="Назад в календарь" onClick={() => setPhoto(null)}>◀️</button>
+            {/* Просмотр держит один кадр — в шапке его дата съёмки (та самая «деталка»), а если
+                даты нет, имя файла */}
             <span className="calday">
-              {dayTitle(view.day)}
-              {view.items.length > 1 ? ` · ${view.idx + 1} из ${view.items.length}` : ''}
+              {photo.capturedAt ? fmtExifDate(photo.capturedAt) ?? dayTitle(photo.capturedAt.slice(0, 10)) : photo.name}
             </span>
-            <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(current.entryId)}>ℹ️</button>
+            <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(photo.entryId)}>ℹ️</button>
             {/* Скачивание живёт только в деталке (ℹ️) — из превью его убрали */}
             <button
               className="iconbtn"
               title="Удалить (в корзину)"
               onClick={async () => {
-                if (!confirm(`Удалить «${current.name}» в корзину?`)) return;
+                if (!confirm(`Удалить «${photo.name}» в корзину?`)) return;
                 try {
-                  await api.deleteFile(current.entryId);
-                  forgetEntry(current.entryId);
+                  // соседа запоминаем до удаления: после него записи уже нет
+                  const next = await api.neighborPhoto(photo.entryId, 'next').catch(() => null);
+                  await api.deleteFile(photo.entryId);
+                  forgetEntry(photo.entryId, next);
                 } catch (e) {
                   alert((e as Error).message);
                 }
               }}
             >🗑</button>
-            <button className="iconbtn" title="Предыдущий снимок" onClick={() => void stepPhoto(-1)}>⬅️</button>
-            <button className="iconbtn" title="Следующий снимок" onClick={() => void stepPhoto(1)}>➡️</button>
+            <button className="iconbtn" title="Предыдущий снимок" disabled={stepping} onClick={() => void stepPhoto('prev')}>⬅️</button>
+            <button className="iconbtn" title="Следующий снимок" disabled={stepping} onClick={() => void stepPhoto('next')}>➡️</button>
           </div>
-          {viewLoading && (
-            <div className="viewwait"><span className="spin" /></div>
-          )}
         </div>
       )}
 
@@ -1633,7 +1511,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
 }
 
 // Зум только для фото (щипок/дабл-тап/пан); страница при этом не зуммится
-function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
+function PhotoZoom({ src }: { src: string }) {
   const box = useRef<HTMLDivElement>(null);
   const nat = useRef({ w: 0, h: 0 });
   const [g, setG] = useState({ ox: 0, oy: 0, bw: 1, bh: 1, z: 1, tx: 0, ty: 0 });
@@ -1741,27 +1619,13 @@ function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
     }
   };
 
-  // Готовый кадр отдаём сразу: он либо уже в кэше (соседа грели заранее), либо догружается —
-  // и тогда мы просто ждём ту же самую запись кэша, а не заводим вторую загрузку.
-  useEffect(() => {
-    const rec = warmPreview(src);
-    const apply = () => {
-      nat.current = { w: rec.img.naturalWidth, h: rec.img.naturalHeight };
-      setState('ready');
-      commit(1, 0, 0);
-    };
-    if (rec.ok) { apply(); return; }
-    if (rec.failed) { setState('failed'); return; }
-    // Без этого при 404 спиннер висел бы вечно: состояние меняется только по onLoad.
-    const onFail = () => setState('failed');
-    rec.img.addEventListener('load', apply);
-    rec.img.addEventListener('error', onFail);
-    return () => {
-      rec.img.removeEventListener('load', apply);
-      rec.img.removeEventListener('error', onFail);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src]);
+  // Кадр грузит сам <img> (см. разметку ниже): никакого прогрева и никакого второго запроса.
+  // Размер нужен до показа — поэтому ждём onLoad и только потом считаем геометрию.
+  const onLoaded = (img: HTMLImageElement) => {
+    nat.current = { w: img.naturalWidth, h: img.naturalHeight };
+    setState('ready');
+    commit(1, 0, 0);
+  };
 
   return (
     <div
@@ -1773,18 +1637,6 @@ function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
     >
       {/* Миниатюра из сетки под кадром: пока 1080 грузится, видно хоть что-то осмысленное —
           переключение ⬅️/➡️ не выглядит пустым экраном. */}
-      {state !== 'ready' && thumb && (
-        <img
-          src={thumb}
-          alt=""
-          aria-hidden
-          draggable={false}
-          style={{
-            position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover',
-            filter: 'blur(16px)', transform: 'scale(1.1)', opacity: 0.5, pointerEvents: 'none',
-          }}
-        />
-      )}
       {state === 'loading' && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
           <span className="spin" />
@@ -1795,12 +1647,14 @@ function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
           <div className="copy">Превью не открылось — файл мог быть удалён, попробуйте обновить ленту</div>
         </div>
       )}
-      {state === 'ready' && (
+      {state !== 'failed' && (
         <img
           src={src}
           alt=""
           draggable={false}
-          style={{
+          onLoad={(e) => onLoaded(e.currentTarget)}
+          onError={() => setState('failed')}
+          style={state === 'ready' ? {
             position: 'absolute',
             left: g.ox + g.tx,
             top: g.oy + g.ty,
@@ -1810,7 +1664,7 @@ function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
             maxHeight: 'none',
             userSelect: 'none', WebkitUserSelect: 'none',
             touchAction: 'none',
-          }}
+          } : { display: 'none' }}
         />
       )}
     </div>

@@ -804,17 +804,39 @@ export class MediaService {
   }
 
   /**
-   * Все снимки одного дня — для полноэкранного просмотра, где листаются ФОТО по очереди, а не
-   * дни календаря. День — это единица листания на экране-календаре, но в просмотре снимки идут
-   * подряд, поэтому клиент добирает день целиком (обычно это единицы-десятки строк).
-   * `day` — 'YYYY-MM-DD'; чужой формат — пустой ответ.
+   * Соседний снимок в порядке ленты (capturedAt DESC NULLS LAST, id DESC) — то, что нужно
+   * полноэкранному просмотру, чтобы листать снимки по одному. Просмотру не нужен ни день целиком,
+   * ни тем более месяц: он держит один кадр и спрашивает следующий по id (одна строка по индексу).
+   *
+   * `dir` — 'next' (снимок дальше по ленте, то есть старее) или 'prev' (новее). На краю ленты
+   * возвращаем null: листать больше некуда, клиент остаётся на текущем кадре.
    */
-  async timelinePhotos(userId: string, day?: string): Promise<TimelineItem[]> {
-    if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return [];
+  async timelineNeighbor(userId: string, entryId?: string, dir?: string): Promise<TimelineItem | null> {
+    if (!entryId || (dir !== 'next' && dir !== 'prev')) return null;
     const tree = await this.auth.subtreeIds(userId);
-    if (!tree.length) return [];
-    const from = `${day} 00:00:00`;
-    const to = `${MediaService.nextDay(day)} 00:00:00`;
+    if (!tree.length) return null;
+    const cursor = await this.timelineCursor(tree, entryId);
+    if (!cursor) return null;
+    // Порядок ленты: сверху свежие, снизу хвост без даты. Предикат «строго до/после курсора»
+    // разписан по обе стороны от NULL — иначе снимки без даты съёмки выпадали бы из листания.
+    const cmp = dir === 'next'
+      ? Prisma.sql`(
+          (mm."capturedAt" IS NULL AND ${cursor.capturedAt}::timestamp IS NOT NULL)
+          OR (mm."capturedAt" IS NOT NULL AND ${cursor.capturedAt}::timestamp IS NOT NULL
+              AND (mm."capturedAt" < ${cursor.capturedAt}::timestamp
+                   OR (mm."capturedAt" = ${cursor.capturedAt}::timestamp AND f."id" < ${cursor.id})))
+          OR (mm."capturedAt" IS NULL AND ${cursor.capturedAt}::timestamp IS NULL AND f."id" < ${cursor.id})
+        )`
+      : Prisma.sql`(
+          (mm."capturedAt" IS NOT NULL AND ${cursor.capturedAt}::timestamp IS NULL)
+          OR (mm."capturedAt" IS NOT NULL AND ${cursor.capturedAt}::timestamp IS NOT NULL
+              AND (mm."capturedAt" > ${cursor.capturedAt}::timestamp
+                   OR (mm."capturedAt" = ${cursor.capturedAt}::timestamp AND f."id" > ${cursor.id})))
+          OR (mm."capturedAt" IS NULL AND ${cursor.capturedAt}::timestamp IS NULL AND f."id" > ${cursor.id})
+        )`;
+    const order = dir === 'next'
+      ? Prisma.sql`ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC`
+      : Prisma.sql`ORDER BY mm."capturedAt" ASC NULLS FIRST, f."id" ASC`;
     const rows = await this.prisma.$queryRaw<TimelineRow[]>(Prisma.sql`
       SELECT f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt"
       FROM "MediaMeta" mm
@@ -823,12 +845,13 @@ export class MediaService {
       WHERE f."deletedAt" IS NULL
         AND f."zone" = ${ZONE_PHOTOS}
         AND f."folderId" = ANY(${tree})
-        AND mm."capturedAt" >= ${from}::timestamp
-        AND mm."capturedAt" < ${to}::timestamp
-      ORDER BY mm."capturedAt" DESC, f."id" DESC
-      LIMIT ${TIMELINE_MAX}
+        AND ${cmp}
+      ${order}
+      LIMIT 1
     `);
-    return rows.map((r) => ({
+    const r = rows[0];
+    if (!r) return null;
+    return {
       entryId: r.id,
       name: r.name,
       sha256: r.sha256 ?? undefined,
@@ -836,7 +859,7 @@ export class MediaService {
       mime: r.mime,
       previewState: r.previewState,
       size: Number(r.size ?? 0),
-    }));
+    };
   }
 
   /** Следующий день к 'YYYY-MM-DD' (для границы выборки: [день, следующий день)). */
