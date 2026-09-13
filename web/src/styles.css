@@ -34,7 +34,6 @@
      подпись делает его выше, чем шапку с одной иконкой, поэтому высоту задаём явно
      и одинаково всем островам. Менять что-то одно — остальное пересчитается. */
   --island-h: calc(var(--island-icon) + var(--island-lbl) + var(--island-pad) * 2);
-  --gap-air: 6px;                     /* воздух между островом и содержимым под ним */
 
   /* Фон: страница прозрачная — за неё отвечает браузер (системный фон).
      Острова — почти непрозрачные «плашки»: под ними проезжает содержимое, и сквозь
@@ -65,8 +64,6 @@
   --warn: #b7791f;
   --danger: #de3b3b;
 
-  --media: #000;                      /* подложка фото и видео — всегда тёмная */
-  --overlay-fg: #f5f6f8;              /* текст поверх медиа */
 }
 
 /* --- Токены: тёмная тема --------------------------------------------------- */
@@ -97,8 +94,6 @@
     --warn: #d9a343;
     --danger: #ff6b6b;
 
-    --media: #000;
-    --overlay-fg: #f5f6f8;
   }
 }
 
@@ -124,7 +119,6 @@
   --color-ok: var(--ok);
   --color-warn: var(--warn);
   --color-danger: var(--danger);
-  --color-media: var(--media);
 
   --radius-island: var(--island-radius);
 }
@@ -151,8 +145,7 @@
      у них фиксированный размер, чтобы все острова были одного роста. */
   .icon svg,
   .iconbtn svg,
-  .navico svg,
-  .brandico svg {
+  .navico svg {
     display: block;
     width: var(--island-icon);
     height: var(--island-icon);
@@ -173,14 +166,15 @@
   .content {
     max-width: var(--col);
     margin: 0 auto;
-    padding: calc(var(--island-h) + var(--side) + var(--gap-air)) 12px
-             calc(var(--island-h) + var(--side) + var(--gap-air) + env(safe-area-inset-bottom));
+    padding: calc(var(--side) + env(safe-area-inset-top)) 12px
+             calc(var(--island-h) + var(--side) * 2 + env(safe-area-inset-bottom));
   }
 
-  /* ===== Остров =====
-     Одна и та же плашка у шапки сверху, нижней навигации и шапок разделов (стрелки в «Фото»,
-     действия в деталках): полупрозрачная подложка с blur, скругление, рамка. Тени нет —
-     острова плоские, от фона их отделяют только рамка и подложка. */
+  /* ===== Острова =====
+     Нижняя навигация и шапки разделов (список файлов, стрелки в «Фото», деталки, панель
+     просмотра кадра) — одна и та же плашка: подложка темы, рамка, скругление, одинаковая
+     высота. Тени нет: от фона их отделяют только рамка и подложка. Верхнего острова
+     в каркасе нет — наверху ничто не занимает место. */
   .island {
     position: fixed;
     left: calc(var(--side) + env(safe-area-inset-left));
@@ -194,19 +188,6 @@
     backdrop-filter: blur(16px) saturate(1.6);
     -webkit-backdrop-filter: blur(16px) saturate(1.6);
   }
-
-  /* Верхний остров — ровно того же роста, что нижний: иконка 16px плюс те же отступы.
-     Название проекта словом не дублируем. Место под безопасную зону учтено отступом сверху. */
-  .island-top {
-    top: calc(var(--side) + env(safe-area-inset-top));
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    height: var(--island-h);
-    padding: var(--island-pad);
-    font-size: var(--island-fs);
-  }
-  .brandico { display: inline-flex; color: var(--accent); line-height: 1; }
 
   /* Нижний остров — навигация; место под жест «домой» учтено отступом снизу */
   .island-bottom {
@@ -332,16 +313,16 @@
   /* ===== Шапки разделов — тоже острова =====
      Липкая панель действий внутри колонки контента (шапка списка файлов, стрелки календаря,
      действия в деталке). Оформлена как остров: по ширине ровно колонка, скруглена, с рамкой.
-     Липнет ниже верхнего острова, чтобы они не наезжали друг на друга. */
+     Верхнего острова в каркасе нет, поэтому липнет прямо к верху экрана. */
   .filehead {
     position: sticky;
-    top: calc(var(--island-h) + var(--side) + var(--gap-air));
+    top: calc(var(--side) + env(safe-area-inset-top));
     z-index: 6;
     display: flex;
     align-items: center;
     gap: 4px;
     height: var(--island-h);
-    margin: -6px 0 10px;
+    margin: 0 0 10px;
     padding: var(--island-pad);
     background: var(--island);
     border: 1px solid var(--island-brd);
@@ -435,8 +416,21 @@
   /* Превью содержимого в деталке файла (фото / видео / PDF).
      Внутренней прокрутки у превью нет: медиа вписано в блок, скролл один — у самой деталки. */
   .preview { margin: 10px 0 0; border: 1px solid var(--brd); border-radius: 14px; background: var(--surface-2); overflow: hidden; }
-  .pmedia { display: grid; place-items: center; max-height: 60vh; overflow: hidden; background: var(--media); padding: 2px; }
+  /* Превью внутри карточки: своя рамка, фон — поверхность карточки. Чёрная подложка здесь
+     больше не нужна: она тем же чёрным пятном вылезала из карточки деталки. */
+  .pmedia {
+    display: grid;
+    place-items: center;
+    max-height: 60vh;
+    overflow: hidden;
+    background: var(--surface-2);
+    border-radius: 12px;
+    padding: 2px;
+  }
   .pmedia img, .pmedia video { max-width: 100%; max-height: 60vh; display: block; }
+  /* У видео поле вокруг кадра рисует сам элемент — в карточке оно должно быть цвета
+     поверхности, иначе внутри карточки остаётся чёрный прямоугольник. */
+  .pmedia video, .mediaarea video { background: var(--surface-2); }
   .pmedia canvas { display: block; max-width: 100%; max-height: 60vh; }
   .pbar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-top: 1px solid var(--brd); background: var(--surface-2); color: var(--fg); }
   .pnote { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px; }
@@ -449,7 +443,7 @@
      листать месяцы можно было из любого места и шапки не наезжали друг на друга. */
   .calnav {
     position: sticky;
-    top: calc(var(--island-h) + var(--side) + var(--gap-air));
+    top: calc(var(--side) + env(safe-area-inset-top));
     z-index: 6;
     display: flex;
     align-items: center;
@@ -519,7 +513,7 @@
   .calwrap {
     display: grid;
     place-items: center;
-    min-height: calc(100dvh - var(--island-h) * 2 - var(--side) * 4 - var(--gap-air) * 2);
+    min-height: calc(100dvh - var(--island-h) * 2 - var(--side) * 4);
   }
   .calcenter { display: grid; justify-items: center; width: 100%; }
   /* Ожидание месяца: пока данных нет, на экране только месяц с годом и лоадер */
@@ -528,12 +522,11 @@
   /* Открытый день в шапке просмотра: вместо имени файла — дата и место снимка среди снимков дня. */
   .calday {
     flex: 1; min-width: 0; padding: 0 6px;
-    font-size: 13px; color: var(--overlay-fg); text-align: center;
+    font-size: var(--island-fs); color: var(--fg); text-align: center;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
 
   /* ===== Просмотр фото и файлов (полноэкранные слои) ===== */
-  .viewer { position: fixed; inset: 0; background: rgb(0 0 0 / .8); z-index: 40; display: grid; place-items: center; }
 
   /* Просмотр фото — слой поверх галереи, а не отдельный экран вместо неё: сетка остаётся
      смонтированной (превью не перезагружаются), прокрутка страницы под слоем заперта, поэтому
@@ -546,8 +539,8 @@
     position: fixed;
     left: calc(var(--side) + env(safe-area-inset-left));
     right: calc(var(--side) + env(safe-area-inset-right));
-    /* Верхний остров + его отступ + зазор: ровно то же, что отступ контента .content */
-    top: calc(var(--island-h) + var(--side) + env(safe-area-inset-top));
+    /* Тот же отступ сверху, что у колонки контента: острова сверху больше нет */
+    top: calc(var(--side) + env(safe-area-inset-top));
     bottom: calc(var(--island-h) + var(--side) * 2 + env(safe-area-inset-bottom));
     z-index: 8;
     max-width: min(var(--col), calc(100% - 2 * var(--side)));
@@ -602,8 +595,8 @@
     flex: none;
   }
   .tbar button, .tbar a { pointer-events: auto; }
-  /* Поверх медиа иконки всегда светлые — независимо от темы */
-  .tbar .iconbtn { color: var(--overlay-fg); }
+  /* Иконки в панели — того же цвета, что в футере и остальных островах: панель стала
+     обычной плашкой с фоном темы, и светлый «поверх фото» цвет на ней не читался. */
   /* Кнопка «+»: одна на фото и видео, всегда под большим пальцем — над нижним островом */
   .fab {
     position: fixed;

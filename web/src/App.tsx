@@ -124,11 +124,6 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
 
   return (
     <div className="app">
-      {/* Шапка-остров: та же плашка, что нижняя навигация, только с иконкой приложения.
-          Контент прокручивается под ней. */}
-      <header className="island island-top">
-        <span className="brandico" title="CloudlyRu"><Cloud /></span>
-      </header>
       <main className="content">
         {up.rows.length > 0 && (
           <UploadPanel
