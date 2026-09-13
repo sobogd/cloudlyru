@@ -52,8 +52,10 @@ const TRANSIENT_ERR =
 const MAX_ERROR_CHARS = 600;
 /** Префикс временных каталогов задач — для чистки осиротевших после SIGKILL/pm2 reload. */
 const TMP_PREFIX = 'clq-';
-/** Каталог старше этого возраста считаем мусором (мастер 4K может идти часами). */
+/** Файл задачи старше этого возраста считаем мусором (мастер 4K может идти часами). */
 const TMP_STALE_MS = 12 * 60 * 60 * 1000;
+/** Как часто подчищать осиротевшее, пока конвертер работает не перезапускаясь. */
+const TMP_CLEAN_EVERY_MS = 10 * 60 * 1000;
 
 /** Параметры источника, влияющие на команду ffmpeg (HDR/10 бит/каналы/длительность). */
 interface SourceProbe {
@@ -104,6 +106,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private stopped = false;
   /** Тик не перекрывается сам с собой (задачи внутри тика запускаются параллельно). */
   private ticking = false;
+  /** Когда последний раз подчищали /tmp (см. TMP_CLEAN_EVERY_MS). */
+  private tmpCleanedAt = Date.now();
   /**
    * Задачи в работе сейчас: id → { assetId, group, child } — по нему считаются свободные слоты
    * (фото идут параллельно) и убивается процесс задачи по таймауту.
@@ -147,9 +151,33 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
           /* занят/нет прав — не повод падать */
         }
       }
-      if (removed) this.logger.log(`очищено осиротевших временных каталогов: ${removed}`);
+      if (removed) this.logger.log(`очищено осиротевших временных файлов: ${removed}`);
     } catch (e) {
       this.logger.warn(`cleanup tmp: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Временные файлы задачи лежат не только в её каталоге: heif-convert кладёт рядом с ним PNG
+   * (и exiftool — вытащенный gain map), ffmpeg — постер и превью видео, pdftoppm — страницы PDF.
+   * Каталог убирается в finally, а эти файлы оставались в /tmp навсегда: ночь конвертации HEIC
+   * накопила 53 ГБ, диск кончился — упали и деплой (scp), и API (500).
+   * Префикс — `clq-<jobId>`: он же начало имён производных файлов задачи, чужие не задеваем.
+   */
+  private removeJobTmp(jobId: string): void {
+    const prefix = `${TMP_PREFIX}${jobId}`;
+    try {
+      const dir = tmpdir();
+      for (const name of readdirSync(dir)) {
+        if (!name.startsWith(prefix)) continue;
+        try {
+          rmSync(join(dir, name), { recursive: true, force: true });
+        } catch {
+          /* занят — доберёт чистка устаревшего */
+        }
+      }
+    } catch {
+      /* нет доступа к /tmp — не повод ронять задачу */
     }
   }
 
@@ -314,6 +342,13 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`tick: ${(e as Error).message}`);
     } finally {
       this.ticking = false;
+      // Раз в 10 минут подчищаем осиротевшее: если процесс убили, finally не отработал, а
+      // конвертер после этого может работать сутками без перезапуска (одной чистки на старте мало).
+      const now = Date.now();
+      if (now - this.tmpCleanedAt > TMP_CLEAN_EVERY_MS) {
+        this.tmpCleanedAt = now;
+        this.cleanupTmp();
+      }
     }
   }
 
@@ -452,6 +487,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     } finally {
       this.active.delete(job.id);
       rmSync(dir, { recursive: true, force: true });
+      // и файлы, которые задача писала рядом с каталогом, а не внутри него
+      this.removeJobTmp(job.id);
     }
   }
 
