@@ -726,7 +726,9 @@
     font-weight: 600;
     color: var(--fg);
     white-space: nowrap;
-    pointer-events: none;
+    pointer-events: auto;
+    cursor: grab;
+    touch-action: none;
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
   }

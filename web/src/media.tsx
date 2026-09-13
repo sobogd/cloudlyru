@@ -420,7 +420,34 @@ export default function MediaSection({ onOverlayChange }: {
           >
             <div className="mthumb" style={{ top: scrub.top, height: scrub.h }} />
             {scrubVisible && scrubLabel && (
-              <div className="mthumb-label" style={{ top: labelTop }}>{scrubLabel}</div>
+              <div
+                className="mthumb-label"
+                style={{ top: labelTop }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  dragRef.current = true;
+                  try {
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                  } catch {
+                    /* ignore */
+                  }
+                  setScrubVisible(true);
+                  scrubTo(e.clientY);
+                }}
+                onPointerMove={(e) => {
+                  if (!dragRef.current) return;
+                  e.stopPropagation();
+                  scrubTo(e.clientY);
+                }}
+                onPointerUp={() => {
+                  dragRef.current = false;
+                }}
+                onPointerCancel={() => {
+                  dragRef.current = false;
+                }}
+              >
+                {scrubLabel}
+              </div>
             )}
           </div>
         )}
@@ -483,7 +510,8 @@ function MediaViewer({
   const [pos, setPos] = useState(idx);
   const [dragging, setDragging] = useState(false);
   const [zoom, setZoom] = useState<ZoomState>({ scale: 1, tx: 0, ty: 0 });
-  const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
+  /** Натуральные размеры по индексу кадра: сосед, загруженный заранее, не теряет размер. */
+  const [natMap, setNatMap] = useState<Map<number, { w: number; h: number }>>(() => new Map());
   const [stage, setStage] = useState({ w: 0, h: 0 });
   const [closing, setClosing] = useState(false);
   const [detail, setDetail] = useState(false);
@@ -494,8 +522,7 @@ function MediaViewer({
   posRef.current = pos;
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
-  const fitRef = useRef(nat ? fitGeom(stage.w, stage.h, nat.w, nat.h) : null);
-  fitRef.current = nat && stage.w > 0 ? fitGeom(stage.w, stage.h, nat.w, nat.h) : null;
+  const fitRef = useRef<ReturnType<typeof fitGeom> | null>(null);
 
   const g = useRef({
     mode: 'idle' as 'idle' | 'nav' | 'pan' | 'pinch',
@@ -514,16 +541,17 @@ function MediaViewer({
 
   const k = clamp(Math.round(pos), 0, total - 1);
   const curItem = getItem(k);
+  const curNat = natMap.get(k);
+  fitRef.current = curNat && stage.w > 0 ? fitGeom(stage.w, stage.h, curNat.w, curNat.h) : null;
 
   // Позиция догоняет индекс после снапа/навигации кнопками/удаления.
   useEffect(() => {
     setPos(idx);
   }, [idx]);
 
-  // Новый кадр — сбрасываем зум и ждём его натуральный размер.
+  // Новый кадр — сбрасываем зум (натуральный размер соседа уже лежит в natMap).
   useEffect(() => {
     setZoom({ scale: 1, tx: 0, ty: 0 });
-    setNat(null);
     setDetail(false);
   }, [k]);
 
@@ -531,6 +559,16 @@ function MediaViewer({
   useEffect(() => {
     ensure(Math.max(0, k - 1), Math.min(total - 1, k + 1));
   }, [k, total, ensure]);
+
+  const recordNat = useCallback((i: number, s: { w: number; h: number }) => {
+    setNatMap((prev) => {
+      const cur = prev.get(i);
+      if (cur && cur.w === s.w && cur.h === s.h) return prev;
+      const next = new Map(prev);
+      next.set(i, s);
+      return next;
+    });
+  }, []);
 
   // Escape закрывает (если не открыта деталка — она закрывается первой).
   useEffect(() => {
@@ -801,7 +839,7 @@ function MediaViewer({
               item={item}
               stage={stage}
               zoom={i === k ? zoom : { scale: 1, tx: 0, ty: 0 }}
-              onNat={i === k && item ? setNat : undefined}
+              onNat={(s) => recordNat(i, s)}
             />
           </div>
         ))}
