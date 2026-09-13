@@ -73,7 +73,9 @@ html, body { overscroll-behavior: none; }
   pointer-events: none; }
 .tbar button, .tbar a { pointer-events: auto; }
 .iconbtn { border: 0; background: none; color: #fff; font-size: 20px; line-height: 1;
-  padding: 6px 8px; cursor: pointer; border-radius: 8px; text-decoration: none; }
+  padding: 6px 8px; cursor: pointer; border-radius: 8px; text-decoration: none;
+  /* удержание стрелок календаря: без выделения, без зума по двойному тапу и без меню */
+  touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .iconbtn:disabled { opacity: 0.3; }
 .iconbtn:active { background: rgba(255,255,255,.18); }
 .det-info { position: absolute; top: 50px; left: 12px; z-index: 5; pointer-events: none;
@@ -167,9 +169,7 @@ html, body { overscroll-behavior: none; }
 
 /* Сетка дней: всегда 7 колонок; шире 7 кружков по 50 px календарь не растёт и стоит по центру.
    Размер клетки считает сам CSS (fr внутри min(100%, 350px)) — JS его не меряет и не пересчитывает. */
-.calweek, .calgrid { display: grid; width: min(100%, 350px); margin: 0 auto; }
-.calweek { height: 20px; box-sizing: border-box; font-size: 11px; color: #6d7889; text-align: center; }
-.calweek span { line-height: 20px; }
+.calgrid { display: grid; width: min(100%, 350px); margin: 0 auto; }
 .calcell { position: relative; aspect-ratio: 1; display: grid; place-items: center; }
 .calcell.blank { visibility: hidden; }
 .calcell.off { cursor: default; }
@@ -177,17 +177,21 @@ html, body { overscroll-behavior: none; }
 /* Превью дня ещё собирается: кружок тёмный, но число на месте — день видно и можно открыть */
 .calcell.wait::before { content: ''; position: absolute; inset: 1px; border-radius: 50%; background: #171c24; }
 /* Фото дня — кружок под числом: притемнено и под затемняющей вуалью, чтобы число читалось
-   на любом снимке (даже на белом небе контраст числа с фоном остаётся не ниже ~4:1). */
-.calphoto { position: absolute; inset: 1px; width: auto; height: auto; border-radius: 50%;
-  object-fit: cover; filter: brightness(.5) saturate(.85); }
+   на любом снимке (даже на белом небе контраст числа с фоном остаётся не ниже ~4:1).
+   Ширину и высоту задаём явно (calc(100% - 2px)): у картинки с width:auto размер берётся из её
+   собственных пикселей, и тогда фото вылезает за пределы кружка. */
+.calphoto { position: absolute; top: 1px; left: 1px; width: calc(100% - 2px); height: calc(100% - 2px);
+  border-radius: 50%; object-fit: cover; overflow: hidden; filter: brightness(.5) saturate(.85); }
 .calcell:not(.off):not(.wait)::after { content: ''; position: absolute; inset: 1px; border-radius: 50%;
   background: radial-gradient(circle at 50% 50%, rgba(0, 0, 0, .15), rgba(0, 0, 0, .45)); }
 .calnum { position: relative; z-index: 1; font-size: 13px; font-weight: 600; color: #e6e8eb;
   text-shadow: 0 1px 2px rgba(0, 0, 0, .95), 0 0 5px rgba(0, 0, 0, .85); }
 .calcell.off .calnum { color: #5c6779; font-weight: 400; text-shadow: none; }
 .calmeta { width: min(100%, 350px); margin: 10px auto 0; font-size: 12px; color: #6d7889; text-align: center; }
-/* Открытый день в шапке просмотра: в календаре открыт день, а не файл, поэтому вместо имени
-   файла показываем дату и сколько в этот день снимков. */
+/* Догрузка дня при листании на краю: просмотр остаётся на экране, поверх — спиннер */
+.viewwait { position: absolute; left: 0; right: 0; bottom: 64px; z-index: 6; display: grid;
+  place-items: center; pointer-events: none; }
+/* Открытый день в шапке просмотра: вместо имени файла — дата и место снимка среди снимков дня. */
 .calday { flex: 1; min-width: 0; padding: 0 6px; font-size: 13px; color: #e6e8eb; text-align: center;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 

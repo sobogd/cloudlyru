@@ -557,11 +557,21 @@ export interface TimelineDayItem {
   cover: TimelineItem;
 }
 /**
- * Дни одного месяца для календаря: строка на день, где есть снимки. Календарь листается
- * месяцами вручную, поэтому за раз берём ровно месяц — ~30 строк вместо сотен строк ленты.
+ * Дни диапазона месяцев для календаря: строка на день, где есть снимки. Календарь листается
+ * месяцами вручную, поэтому месяцы тянем пачкой (удержание стрелки не ждёт запрос на каждый
+ * месяц) — 12 месяцев это ~365 строк, всё равно меньше одной страницы ленты.
  */
-export const timelineDays = (month: string) =>
-  request<TimelineDayItem[]>(`/timeline/days?month=${encodeURIComponent(month)}`);
+export const timelineDays = (from: string, to: string) =>
+  request<TimelineDayItem[]>(`/timeline/days?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+/** Края листания календаря: самый новый и самый старый месяцы со снимками (null — снимков нет). */
+export const timelineMonths = () =>
+  request<{ newest: string | null; oldest: string | null }>('/timeline/months');
+/**
+ * Все снимки одного дня — для полноэкранного просмотра: там листаются фото по очереди, а не дни
+ * календаря, поэтому день берём целиком (обычно единицы-десятки строк).
+ */
+export const dayPhotos = (day: string) =>
+  request<TimelineItem[]>(`/timeline/photos?day=${encodeURIComponent(day)}`);
 /** Статусы сборки превью по списку записей: спрашиваем только про незавершённые снимки. */
 export const timelineStatus = (entryIds: string[]) =>
   request<TimelineStatus[]>('/timeline/status', { method: 'POST', body: JSON.stringify({ entryIds }) });

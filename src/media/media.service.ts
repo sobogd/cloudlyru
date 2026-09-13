@@ -48,6 +48,12 @@ export const FULL_SIZE = 1080;
 export const TIMELINE_MAX = 1000;
 /** Сколько записей можно спросить одним запросом статусов превью. */
 export const TIMELINE_STATUS_MAX = 500;
+/**
+ * Сколько месяцев можно запросить одним заходом в календарь (`from`..`to`). Клиент листает
+ * месяцы вручную и тянет их пачкой, чтобы удержание стрелки не ждало отдельный запрос на каждый
+ * месяц; 12 месяцев — это ~365 строк, то есть всё равно меньше одной страницы ленты.
+ */
+export const TIMELINE_DAYS_MONTHS_MAX = 12;
 /** Сколько байт читаем из начала объекта, прежде чем тянуть его целиком. */
 const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 /**
@@ -724,10 +730,10 @@ export class MediaService {
    * Обложка — самый свежий снимок дня с готовым превью; если готовых нет, просто самый свежий:
    * день с ещё не собранным превью должен показать картинку, как только она появится.
    */
-  async timelineDays(userId: string, month?: string): Promise<TimelineDayItem[]> {
+  async timelineDays(userId: string, from?: string, to?: string): Promise<TimelineDayItem[]> {
     const tree = await this.auth.subtreeIds(userId);
     if (!tree.length) return [];
-    const { from, to } = MediaService.monthBounds(month);
+    const range = MediaService.monthRange(from, to);
     const rows = await this.prisma.$queryRaw<TimelineDayRow[]>(Prisma.sql`
       WITH days AS (
         SELECT date_trunc('day', mm."capturedAt")::date AS day,
@@ -739,8 +745,8 @@ export class MediaService {
         WHERE f."deletedAt" IS NULL
           AND f."zone" = ${ZONE_PHOTOS}
           AND f."folderId" = ANY(${tree})
-          AND mm."capturedAt" >= ${from}::timestamp
-          AND mm."capturedAt" < ${to}::timestamp
+          AND mm."capturedAt" >= ${range.from}::timestamp
+          AND mm."capturedAt" < ${range.to}::timestamp
         GROUP BY 1
       )
       SELECT to_char(d.day, 'YYYY-MM-DD') AS day, d.n,
@@ -767,22 +773,107 @@ export class MediaService {
   }
 
   /**
-   * Границы месяца 'YYYY-MM' как naive-timestamp: [первое число, первое число следующего месяца).
-   * Даты съёмки в БД naive (см. sqlTimestamp), поэтому и границы передаём строкой без пояса —
-   * иначе на сервере с Europe/Madrid месяц начинался бы на час раньше и первый день уезжал.
-   * Кривой month (не 'YYYY-MM' или несуществующий номер) — текущий месяц.
+   * Края листания календаря: самый новый и самый старый месяцы, за которые есть снимки. Клиент
+   * по ним гасит стрелки, а не по «сегодня»: если в этом месяце ещё ничего не снято, календарь
+   * открывается на последнем месяце со снимками, и листать дальше некуда с обеих сторон.
    */
-  private static monthBounds(month?: string): { from: string; to: string } {
-    const m = /^(\d{4})-(\d{2})$/.exec(month ?? '');
+  async timelineMonths(userId: string): Promise<{ newest: string | null; oldest: string | null }> {
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return { newest: null, oldest: null };
+    const rows = await this.prisma.$queryRaw<Array<{ newest: string | null; oldest: string | null }>>(Prisma.sql`
+      SELECT to_char(max(mm."capturedAt"), 'YYYY-MM') AS newest,
+             to_char(min(mm."capturedAt"), 'YYYY-MM') AS oldest
+      FROM "MediaMeta" mm
+      JOIN "Asset" a ON a."id" = mm."assetId"
+      JOIN "FileEntry" f ON f."assetId" = a."id"
+      WHERE f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+        AND mm."capturedAt" IS NOT NULL
+    `);
+    return { newest: rows[0]?.newest ?? null, oldest: rows[0]?.oldest ?? null };
+  }
+
+  /**
+   * Все снимки одного дня — для полноэкранного просмотра, где листаются ФОТО по очереди, а не
+   * дни календаря. День — это единица листания на экране-календаре, но в просмотре снимки идут
+   * подряд, поэтому клиент добирает день целиком (обычно это единицы-десятки строк).
+   * `day` — 'YYYY-MM-DD'; чужой формат — пустой ответ.
+   */
+  async timelinePhotos(userId: string, day?: string): Promise<TimelineItem[]> {
+    if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return [];
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return [];
+    const from = `${day} 00:00:00`;
+    const to = `${MediaService.nextDay(day)} 00:00:00`;
+    const rows = await this.prisma.$queryRaw<TimelineRow[]>(Prisma.sql`
+      SELECT f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt"
+      FROM "MediaMeta" mm
+      JOIN "Asset" a ON a."id" = mm."assetId"
+      JOIN "FileEntry" f ON f."assetId" = a."id"
+      WHERE f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})
+        AND mm."capturedAt" >= ${from}::timestamp
+        AND mm."capturedAt" < ${to}::timestamp
+      ORDER BY mm."capturedAt" DESC, f."id" DESC
+      LIMIT ${TIMELINE_MAX}
+    `);
+    return rows.map((r) => ({
+      entryId: r.id,
+      name: r.name,
+      sha256: r.sha256 ?? undefined,
+      capturedAt: r.capturedAt ? new Date(r.capturedAt).toISOString() : null,
+      mime: r.mime,
+      previewState: r.previewState,
+      size: Number(r.size ?? 0),
+    }));
+  }
+
+  /** Следующий день к 'YYYY-MM-DD' (для границы выборки: [день, следующий день)). */
+  private static nextDay(day: string): string {
+    const [y, m, d] = day.split('-').map(Number);
+    const next = new Date(Date.UTC(y, m - 1, d + 1));
+    return `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, '0')}-${String(next.getUTCDate()).padStart(2, '0')}`;
+  }
+
+  /**
+   * Границы диапазона месяцев 'YYYY-MM' как naive-timestamp: [первое число from, первое число
+   * после to). Даты съёмки в БД naive (см. sqlTimestamp), поэтому и границы передаём строкой без
+   * пояса — иначе на сервере с Europe/Madrid первый день месяца уезжал бы на час назад.
+   * Кривой ввод и слишком длинный диапазон (больше TIMELINE_DAYS_MONTHS_MAX месяцев) схлопываем:
+   * так один запрос не может вытянуть всю историю.
+   */
+  private static monthRange(from?: string, to?: string): { from: string; to: string } {
     const now = new Date();
-    const valid = m && Number(m[2]) >= 1 && Number(m[2]) <= 12;
-    const year = valid ? Number(m[1]) : now.getFullYear();
-    const mon = valid ? Number(m[2]) : now.getMonth() + 1;
-    const start = `${String(year).padStart(4, '0')}-${String(mon).padStart(2, '0')}-01 00:00:00`;
-    const nextYear = mon === 12 ? year + 1 : year;
-    const nextMon = mon === 12 ? 1 : mon + 1;
-    const end = `${String(nextYear).padStart(4, '0')}-${String(nextMon).padStart(2, '0')}-01 00:00:00`;
-    return { from: start, to: end };
+    const fallback = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const ok = (v?: string): boolean => Boolean(v && /^\d{4}-(0[1-9]|1[0-2])$/.test(v));
+    const head = ok(from) ? (from as string) : fallback;
+    let tail = ok(to) ? (to as string) : head;
+    if (tail < head) tail = head;
+    let span = MediaService.monthDistance(head, tail);
+    if (span > TIMELINE_DAYS_MONTHS_MAX) {
+      tail = MediaService.shiftMonthKey(head, TIMELINE_DAYS_MONTHS_MAX);
+      span = TIMELINE_DAYS_MONTHS_MAX;
+    }
+    return {
+      from: `${head}-01 00:00:00`,
+      to: `${MediaService.shiftMonthKey(tail, 1)}-01 00:00:00`,
+    };
+  }
+
+  /** Месяц со сдвигом: shiftMonthKey('2026-01', -1) === '2025-12'. */
+  private static shiftMonthKey(key: string, delta: number): string {
+    const [y, m] = key.split('-').map(Number);
+    const d = new Date(Date.UTC(y, m - 1 + delta, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  }
+
+  /** Сколько месяцев между ключами (включительно по границам не важно — нужен только порядок). */
+  private static monthDistance(from: string, to: string): number {
+    const [fy, fm] = from.split('-').map(Number);
+    const [ty, tm] = to.split('-').map(Number);
+    return (ty - fy) * 12 + (tm - fm);
   }
 
   /**

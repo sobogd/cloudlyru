@@ -207,15 +207,40 @@ export class MediaController {
   }
 
   /**
-   * Дни месяца для календаря «Фото»: на каждый день, где есть снимки, — обложка и счётчик.
-   * `month` — 'YYYY-MM' (без него текущий месяц). Клиент листает месяцы вручную, поэтому за один
-   * запрос отдаётся ровно один месяц: ~30 строк вместо сотен строк ленты.
+   * Дни диапазона месяцев для календаря «Фото»: на каждый день, где есть снимки, — обложка и
+   * счётчик. `from`/`to` — 'YYYY-MM' включительно (без них текущий месяц). Клиент листает месяцы
+   * вручную и тянет их пачкой, поэтому диапазон ограничен TIMELINE_DAYS_MONTHS_MAX месяцами:
+   * даже 12 месяцев — это ~365 строк, меньше одной страницы ленты.
    */
   @Get('timeline/days')
   @UseGuards(RateLimitGuard)
   @RateLimit(1200, 60_000)
-  timelineDays(@CurrentUser() user: RequestUser, @Query('month') month?: string) {
-    return this.media.timelineDays(user.id, typeof month === 'string' && month ? month : undefined);
+  timelineDays(@CurrentUser() user: RequestUser, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.media.timelineDays(
+      user.id,
+      typeof from === 'string' && from ? from : undefined,
+      typeof to === 'string' && to ? to : undefined,
+    );
+  }
+
+  /**
+   * Края листания календаря: самый новый и самый старый месяцы со снимками. По ним клиент гасит
+   * стрелки — листать дальше последнего снимка некуда ни вперёд, ни назад.
+   */
+  @Get('timeline/months')
+  timelineMonths(@CurrentUser() user: RequestUser) {
+    return this.media.timelineMonths(user.id);
+  }
+
+  /**
+   * Снимки одного дня — для полноэкранного просмотра, где листаются фото по очереди
+   * (`day` — 'YYYY-MM-DD').
+   */
+  @Get('timeline/photos')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(1200, 60_000)
+  timelinePhotos(@CurrentUser() user: RequestUser, @Query('day') day?: string) {
+    return this.media.timelinePhotos(user.id, typeof day === 'string' && day ? day : undefined);
   }
 
   /**
