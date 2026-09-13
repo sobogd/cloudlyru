@@ -25,15 +25,15 @@ import { patchUi, readUi } from './storage';
  * точек на экране и тем точнее видно, где именно снимали. Слишком крупные клетки на
  * дальней карте превращались в несколько больших плиток, которые закрывали саму карту.
  */
-const CLUSTER_PX = 48;
+const CLUSTER_PX = 36;
 /**
- * Потолок одновременных миниатюр: это DOM-узлы с картинками. При клетке 48 px на широком
- * экране их помещается около 300, поэтому запас — 400; на телефоне упирается в экран раньше.
+ * Потолок одновременных миниатюр: это DOM-узлы с картинками. Колонка контента не шире
+ * 1000 px, и при клетке 36 px в неё помещается меньше 600 клеток — потолок с запасом,
+ * чтобы вид не оставался с «дырками» там, где точки не влезли.
  */
-const CLUSTER_MAX = 400;
-/** Сторона миниатюры-кластера: мелкие точки, чтобы поле точек не закрывало карту. */
-const CLUSTER_SIDE_MIN = 24;
-const CLUSTER_SIDE_MAX = 38;
+const CLUSTER_MAX = 600;
+/** Сторона точки: одна на всех — поле точек должно читаться как сетка, а не как случайные пятна. */
+const CLUSTER_SIDE = 26;
 /** Вид по умолчанию, если пользователь ещё не двигал карту. */
 const DEFAULT_VIEW = { lat: 20, lon: 10, zoom: 2 };
 /**
@@ -42,16 +42,6 @@ const DEFAULT_VIEW = { lat: 20, lon: 10, zoom: 2 };
  * outliers (отпуск на другом конце света) первый вид не растягивают.
  */
 const FIRST_CELL = 0.05;
-
-/**
- * Сторона точки: чем больше кадров в клетке, тем крупнее миниатюра — плотность видно сразу.
- * Рост логарифмический: разницу между 10 и 100 кадрами видно, а между 400 и 3000 — уже нет,
- * и упираться в потолок размера незачем.
- */
-function clusterSide(n: number): number {
-  const k = Math.min(1, Math.log10(n + 1) / 2.5);
-  return Math.round(CLUSTER_SIDE_MIN + (CLUSTER_SIDE_MAX - CLUSTER_SIDE_MIN) * k);
-}
 
 /** Ключ клетки — её координаты в мировых пикселях (одна строка, чтобы не путать с лат/лон). */
 const cellKey = (gx: number, gy: number) => `${gx}:${gy}`;
@@ -222,7 +212,7 @@ export default function MapSection({ onOverlayChange }: {
       // Густые точки первыми: они уходят под мелкие и не закрывают их собой
       const list = [...cells.values()].sort((a, b) => b.n - a.n).slice(0, CLUSTER_MAX);
       for (const c of list) {
-        const side = clusterSide(c.n);
+        const side = CLUSTER_SIDE;
         // ids идут в порядке ленты (points отсортированы от свежих): первым открываем
         // самый новый кадр группы, дальше листание идёт только по этой группе
         const group = c.ids;
@@ -232,8 +222,7 @@ export default function MapSection({ onOverlayChange }: {
           className: 'map-cluster',
           html:
             `<img src="${api.thumbUrl(pts[group[0]].entryId)}" alt="" loading="lazy" decoding="async">` +
-            // размер счётчика едет за размером точки: на мелких точках крупный бейдж не влезал
-            (c.n > 1 ? `<i style="--side:${side}px">${c.n}</i>` : ''),
+            (c.n > 1 ? `<i>${c.n}</i>` : ''),
           iconSize: [side, side],
           iconAnchor: [side / 2, side / 2],
         });
