@@ -48,12 +48,21 @@ body { background: #0f1115; }
 @keyframes sp { to { transform: rotate(360deg); } }
 .navbtn { font-size: 20px; }
 html, body { overscroll-behavior: none; }
-/* Деталка: канвас ровно от верха экрана до нижнего нав-бара (без «мёртвых» полос),
-   чтобы фото/видео в позиции по умолчанию было отцентрировано по вертикали. */
-.full { position: relative; margin: -12px -12px 0; overflow: hidden; background: #000;
+/* Просмотр фото — оверлей поверх галереи, а не отдельный экран вместо неё: сетка остаётся
+   смонтированной (превью не перезагружаются), прокрутка страницы под оверлеем заперта, поэтому
+   двойного скролла нет. Высота та же, что была: до нижнего нав-бара. */
+.full { position: fixed; left: 0; right: 0; top: 0; z-index: 8; max-width: 1000px; margin: 0 auto;
+  overflow: hidden; background: #000;
   display: flex; flex-direction: column;
   height: calc(100dvh - 39px);
   height: calc(100dvh - 39px - env(safe-area-inset-bottom)); }
+
+/* Деталка фото — вторым оверлеем, поверх просмотра: свой единственный скролл, страница заперта.
+   max-width здесь по content-box: 1000 + padding 24 = ровно ширина колонки .content. */
+.ovl { position: fixed; left: 0; right: 0; top: 0; z-index: 9; max-width: 1000px; margin: 0 auto;
+  bottom: calc(39px + env(safe-area-inset-bottom));
+  overflow-y: auto; overscroll-behavior: contain; background: #0f1115; padding: 0 12px 24px; }
+.ovl .filehead { margin: 0 -12px 10px; }
 .mediaarea { flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden;
   touch-action: none; background: #000; }
 .zoomed { transform-origin: 0 0; will-change: transform; max-width: none; max-height: none; }
@@ -135,11 +144,12 @@ html, body { overscroll-behavior: none; }
 .metav { font-size: 13px; color: #e6e8eb; word-break: break-all; white-space: pre-wrap; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 
-/* Превью содержимого в деталке файла (фото / видео / PDF) */
+/* Превью содержимого в деталке файла (фото / видео / PDF).
+   Внутренней прокрутки у превью нет: медиа вписано в блок, скролл один — у самой деталки. */
 .preview { margin: 10px 0 0; border: 1px solid #262b33; border-radius: 12px; background: #0d1016; overflow: hidden; }
-.pmedia { display: grid; place-items: center; max-height: 60vh; overflow: auto; background: #000; padding: 2px; }
+.pmedia { display: grid; place-items: center; max-height: 60vh; overflow: hidden; background: #000; padding: 2px; }
 .pmedia img, .pmedia video { max-width: 100%; max-height: 60vh; display: block; }
-.pmedia canvas { display: block; }
+.pmedia canvas { display: block; max-width: 100%; max-height: 60vh; }
 .pbar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-top: 1px solid #262b33; background: #10141b; }
 .pnote { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px; }
 /* Дамп тегов из файла: строк бывает несколько десятков, по умолчанию свёрнут */
@@ -152,12 +162,10 @@ html, body { overscroll-behavior: none; }
    крутится на transform — он дешёвый. */
 .cellph { aspect-ratio: 1; background: #171c24; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 2px; overflow: hidden; }
-/* Месяц целиком можно не раскладывать и не рисовать, пока он за экраном: лента листается
-   до десятков тысяч снимков, и без этого браузер держит в расчёте все загруженные строки.
-   contain-intrinsic-size с auto помнит последнюю высоту, поэтому полоса прокрутки не скачет. */
-.monthblock { content-visibility: auto; contain-intrinsic-size: auto 1200px; }
-.monthhead { position: sticky; top: 0; z-index: 4; display: flex; align-items: baseline; gap: 8px;
-  margin: 0 0 4px; padding: 7px 2px 6px; font-size: 14px; color: #cfd6e0;
+/* Шапка месяца: высота задана жёстко — от неё считается раскладка виртуализации ленты
+   (MONTH_HEAD_H в App.tsx), поэтому «на глаз» её менять нельзя. */
+.monthhead { position: sticky; top: 0; z-index: 4; display: flex; align-items: center; gap: 8px;
+  height: 34px; box-sizing: border-box; margin: 0; padding: 0 2px; font-size: 14px; color: #cfd6e0;
   background: rgba(15, 17, 21, .94); backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }
 .monthhead .meta { font-size: 11px; }
 

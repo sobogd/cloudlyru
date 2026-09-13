@@ -967,6 +967,19 @@ const STATUS_POLL_MS = 4000;
 /** Задержка перед перечитыванием ленты после загрузки: файлы идут пачкой, лента нужна один раз. */
 const REFRESH_DEBOUNCE_MS = 1500;
 
+/**
+ * Высота шапки месяца в пикселях. Задана жёстко в CSS (.monthhead) и повторена здесь: от неё
+ * считается раскладка виртуализации, а она обязана совпадать с настоящей — иначе позиция
+ * прокрутки уезжает тем сильнее, чем длиннее лента.
+ */
+const MONTH_HEAD_H = 34;
+/** Запас ленты вокруг экрана: строки выше и ниже остаются смонтированными — свайп не мигает. */
+const VIRT_OVERSCAN = 900;
+/** Шаг пересчёта видимого окна: React не перерисовывается на каждый пиксель прокрутки. */
+const VIRT_STEP = 200;
+/** Сколько превью держим готовыми в памяти (дальние вытесняются, их достанет кэш браузера). */
+const PREVIEW_CACHE_MAX = 48;
+
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
 /**
@@ -1017,6 +1030,107 @@ function previewState(item: api.TimelineItem, status?: PreviewStatus) {
 }
 
 /**
+ * Кэш превью в памяти. Готовый кадр держим Image-объектом: переключение ⬅️/➡️ и возврат из
+ * деталки показывают снимок сразу — без сети и без повторного декода. Кэш ограничен по размеру,
+ * поэтому дальние кадры вытесняются: их потом достанет браузерный кэш (`private, max-age=600`).
+ */
+type WarmPreview = { img: HTMLImageElement; ok: boolean; failed: boolean };
+const previewCache = new Map<string, WarmPreview>();
+
+/** Начать (или взять уже начатую) загрузку превью. Возвращает запись кэша — её же и слушаем. */
+function warmPreview(src: string): WarmPreview {
+  const hit = previewCache.get(src);
+  if (hit) return hit;
+  const img = new Image();
+  img.decoding = 'async';
+  const rec: WarmPreview = { img, ok: false, failed: false };
+  img.onload = () => { rec.ok = true; };
+  img.onerror = () => { rec.failed = true; };
+  img.src = src;
+  previewCache.set(src, rec);
+  while (previewCache.size > PREVIEW_CACHE_MAX) {
+    const oldest = previewCache.keys().next().value;
+    if (oldest === undefined) break;
+    previewCache.delete(oldest);
+  }
+  return rec;
+}
+
+/** Уже готовое превью по ссылке — без запуска загрузки (ячейки сетки грузит сам <img>). */
+function previewReady(src: string): boolean {
+  return previewCache.get(src)?.ok === true;
+}
+
+/**
+ * Месяц ленты в раскладке виртуализации: где он начинается, где начинаются его строки и сколько
+ * всего занимает. По этим числам считается, какие строки вообще монтировать.
+ */
+type MonthBox = {
+  key: string;
+  title: string;
+  cells: api.TimelineItem[];
+  rows: number;
+  top: number;
+  rowsTop: number;
+  height: number;
+  last: boolean;
+};
+
+/** Строки месяца, попадающие в видимое окно (в строках, не в пикселях); null — месяц за экраном. */
+function visibleRows(m: MonthBox, win: { top: number; bottom: number }, cell: number): [number, number] | null {
+  if (m.rowsTop >= win.bottom || m.rowsTop + m.rows * cell <= win.top) return null;
+  const first = Math.max(0, Math.floor((win.top - m.rowsTop) / cell));
+  const last = Math.min(m.rows, Math.ceil((win.bottom - m.rowsTop) / cell));
+  return [first, last];
+}
+
+/**
+ * Видимое окно ленты в координатах контейнера сетки: [top, bottom] с запасом VIRT_OVERSCAN.
+ * Слушаем прокрутку окна и ресайз; значение округляем шагом VIRT_STEP, чтобы React не
+ * перерисовывался на каждый пиксель. `deps` — то, после чего окно надо перемерить (число
+ * записей, колонки, размер ячейки): высота контейнера меняется, и старая граница уже врёт.
+ */
+function useVirtualWindow(ref: React.RefObject<HTMLDivElement | null>, deps: unknown[]) {
+  const [win, setWin] = useState(() => {
+    const ih = window.innerHeight || 800;
+    return { top: -VIRT_OVERSCAN, bottom: Math.ceil((ih + VIRT_OVERSCAN) / VIRT_STEP) * VIRT_STEP };
+  });
+  const winRef = useRef(win);
+  winRef.current = win;
+  const depsKey = deps.join('|');
+
+  useEffect(() => {
+    let raf = 0;
+    const measure = () => {
+      raf = 0;
+      const el = ref.current;
+      if (!el) return;
+      // Верх контейнера берём в координатах экрана, а не через scrollY: так окно остаётся верным
+      // и когда над сеткой появилась панель загрузки и сдвинула её вниз.
+      const shift = -el.getBoundingClientRect().top;
+      const next = {
+        top: Math.floor((shift - VIRT_OVERSCAN) / VIRT_STEP) * VIRT_STEP,
+        bottom: Math.ceil((shift + (window.innerHeight || 800) + VIRT_OVERSCAN) / VIRT_STEP) * VIRT_STEP,
+      };
+      const prev = winRef.current;
+      if (next.top !== prev.top || next.bottom !== prev.bottom) setWin(next);
+    };
+    const onScroll = () => { if (!raf) raf = requestAnimationFrame(measure); };
+    measure();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll);
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ref, depsKey]);
+
+  return win;
+}
+
+/**
  * Сколько превью в ряд: колонок ровно столько, чтобы ячейка не стала шире GRID_CELL.
  * Ширина 160 → 4, 150 → 3, 140 → 3. Меряем сам контейнер, поэтому одинаково работает
  * и на компе, и на телефоне; при повороте экрана/ресайзе пересчитывается.
@@ -1025,6 +1139,9 @@ function previewState(item: api.TimelineItem, status?: PreviewStatus) {
  */
 function useGrid(ref: React.RefObject<HTMLDivElement | null>) {
   const widthRef = useRef(0);
+  // Ширина нужна и в разметке: ширина колонки = высота строки, а по ней считается раскладка
+  // виртуализации. Держим её состоянием, чтобы окно пересчитывалось при повороте экрана.
+  const [width, setWidth] = useState(() => window.innerWidth || GRID_CELL);
   const [cols, setCols] = useState(() => Math.max(1, Math.ceil((window.innerWidth || GRID_CELL) / GRID_CELL)));
   useEffect(() => {
     const el = ref.current;
@@ -1033,6 +1150,7 @@ function useGrid(ref: React.RefObject<HTMLDivElement | null>) {
       const w = el.clientWidth;
       if (w <= 0) return;
       widthRef.current = w;
+      setWidth(w);
       setCols(Math.max(1, Math.ceil(w / GRID_CELL)));
     };
     apply();
@@ -1040,7 +1158,7 @@ function useGrid(ref: React.RefObject<HTMLDivElement | null>) {
     ro.observe(el);
     return () => ro.disconnect();
   }, [ref]);
-  return { cols, widthRef };
+  return { cols, width, widthRef };
 }
 
 /**
@@ -1121,7 +1239,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
-  const { cols, widthRef } = useGrid(gridRef);
+  const { cols, width, widthRef } = useGrid(gridRef);
   // полноценная деталка (как в «Файлах»): открывается кнопкой ℹ️ из просмотра
   const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
   // открытый файл после F5 восстанавливаем по entryId (индекс в ленте мог сдвинуться)
@@ -1254,20 +1372,78 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const media = useMemo(() => items.filter((it) => /^(image|video)\//.test(it.mime || '')), [items]);
   const openIdx = openId ? media.findIndex((it) => it.entryId === openId) : -1;
   const current = openIdx >= 0 ? media[openIdx] : null;
+  /** Открыт просмотр или деталка: они лежат оверлеем поверх галереи, страница под ними заперта. */
+  const overlay = Boolean(current || detailId);
+
+  // Лента по месяцам: порядок берём из порядка записей (свежие сверху), «Без даты» — последняя.
+  const sections = useMemo(() => {
+    type Section = { key: string; title: string; cells: api.TimelineItem[] };
+    const out: Section[] = [];
+    const byKey = new Map<string, Section>();
+    for (const it of media) {
+      const key = monthKeyOf(it.capturedAt);
+      let section = byKey.get(key);
+      if (!section) {
+        section = { key, title: monthTitleOf(key), cells: [] };
+        byKey.set(key, section);
+        out.push(section);
+      }
+      section.cells.push(it);
+    }
+    return out;
+  }, [media]);
+
+  // Раскладка виртуализации. Ширина колонки = высота строки (плитка квадратная), поэтому высоты
+  // месяцев считаются точно, а не «на глаз»: сумма совпадает с настоящей высотой разметки, и
+  // окно видимости не уезжает тем сильнее, чем длиннее лента.
+  const cell = width > 0 ? width / cols : GRID_CELL;
+  const layout = useMemo<MonthBox[]>(() => {
+    let top = 0;
+    return sections.map((s, i) => {
+      const rows = Math.ceil(s.cells.length / cols);
+      const box: MonthBox = {
+        key: s.key || 'nodate',
+        title: s.title,
+        cells: s.cells,
+        rows,
+        top,
+        rowsTop: top + MONTH_HEAD_H,
+        height: MONTH_HEAD_H + rows * cell,
+        last: i === sections.length - 1,
+      };
+      top += box.height;
+      return box;
+    });
+  }, [sections, cols, cell]);
+
+  /** Монтируем только строки вокруг экрана: тысяч узлов и картинок в памяти больше нет. */
+  const win = useVirtualWindow(gridRef, [media.length, cols, cell]);
+
+  /** Записи, которые сейчас на экране (с запасом виртуализации) — по ним и спрашиваем статусы. */
+  const visibleIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const m of layout) {
+      const range = visibleRows(m, win, cell);
+      if (!range) continue;
+      for (let i = range[0] * cols; i < Math.min(range[1] * cols, m.cells.length); i++) ids.add(m.cells[i].entryId);
+    }
+    return ids;
+  }, [layout, win, cell, cols]);
 
   // Кого ещё спрашивать про сборку превью: тех, о ком ответа нет, и тех, у кого задача идёт.
-  // Остальные (готово, упало, задачи нет) выпадают — опрос сам останавливается.
+  // Только видимые записи: плейсхолдеры видны лишь у них, а лента бывает на десятки тысяч
+  // снимков. Остальные (готово, упало, задачи нет) выпадают — опрос сам останавливается.
   const askIds = useMemo(
     () =>
       items
         .filter((it) => {
-          if (it.previewState === 'done') return false;
+          if (it.previewState === 'done' || !visibleIds.has(it.entryId)) return false;
           const st = statuses.get(it.entryId);
           if (!st) return true;
           return st.jobState === 'pending' || st.jobState === 'processing';
         })
         .map((it) => it.entryId),
-    [items, statuses],
+    [items, statuses, visibleIds],
   );
   const askIdsRef = useRef(askIds);
   askIdsRef.current = askIds;
@@ -1313,12 +1489,12 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   }, [askIds.length]);
 
   // Бесконечная прокрутка: маркер внизу списка попал в зону видимости — тянем следующую страницу.
-  // Пересоздаём наблюдатель при выходе из полноэкранного просмотра: пока он открыт, маркера в
-  // DOM нет, и старый наблюдатель следил бы за оторванным узлом.
-  const viewerOpen = Boolean(current);
+  // Пока открыт просмотр, следующую страницу не тянем: экран занят снимком, а маркер стоит под
+  // оверлеем и «виден» наблюдателю — без этой проверки лента грузилась бы в фоне зря.
+  const viewerOpen = overlay;
   useEffect(() => {
     const el = sentinelRef.current;
-    if (!el) return;
+    if (!el || viewerOpen) return;
     const io = new IntersectionObserver(
       (entries) => { if (entries.some((e) => e.isIntersecting)) void load('more'); },
       { rootMargin: `${SCROLL_PREFETCH_PX}px 0px` },
@@ -1330,28 +1506,10 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   // Догрузка не должна ждать прокрутки: если маркер всё ещё на экране (высокий монитор),
   // событие пересечения не придёт — проверяем позицию сами после каждого пополнения ленты.
   useEffect(() => {
-    if (firstLoad || loadingMore || !hasMore || !items.length) return;
+    if (firstLoad || loadingMore || !hasMore || !items.length || overlay) return;
     const el = sentinelRef.current;
     if (el && el.getBoundingClientRect().top <= window.innerHeight + SCROLL_PREFETCH_PX) void load('more');
   }, [items.length, firstLoad, loadingMore, hasMore, load, viewerOpen]);
-
-  // Лента по месяцам: порядок берём из порядка записей (свежие сверху), «Без даты» — последняя.
-  const sections = useMemo(() => {
-    type Section = { key: string; title: string; cells: api.TimelineItem[] };
-    const out: Section[] = [];
-    const byKey = new Map<string, Section>();
-    for (const it of media) {
-      const key = monthKeyOf(it.capturedAt);
-      let section = byKey.get(key);
-      if (!section) {
-        section = { key, title: monthTitleOf(key), cells: [] };
-        byKey.set(key, section);
-        out.push(section);
-      }
-      section.cells.push(it);
-    }
-    return out;
-  }, [media]);
 
   const openCell = useCallback((entryId: string) => setOpenId(entryId), []);
 
@@ -1359,13 +1517,22 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   useEffect(() => {
     if (!restoreId || !items.length) return;
     if (items.some((it) => it.entryId === restoreId)) {
+      // Прокручиваем ленту к этому снимку: после закрытия просмотра список стоит там, где был
+      // до перезагрузки, а не в начале ленты.
+      const box = layout.find((m) => m.cells.some((c) => c.entryId === restoreId));
+      const el = gridRef.current;
+      if (box && el && cell > 0) {
+        const idx = box.cells.findIndex((c) => c.entryId === restoreId);
+        const rowTop = el.getBoundingClientRect().top + window.scrollY + box.rowsTop + Math.floor(idx / cols) * cell;
+        window.scrollTo(0, Math.max(0, rowTop - (window.innerHeight || 800) / 2));
+      }
       setOpenId(restoreId);
       setRestoreId(null);
       return;
     }
     // первой страницы не хватило или файла больше нет — деталку не восстанавливаем
     if (!firstLoad) { setRestoreId(null); setDetailId(null); }
-  }, [items, restoreId, firstLoad]);
+  }, [items, restoreId, firstLoad, layout, cols, cell]);
 
   // запоминаем открытый файл/деталку для F5
   useEffect(() => {
@@ -1385,83 +1552,42 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     setDetailId((id) => (id === entryId ? null : id));
   }, []);
 
-  // ===== Экран просмотра =====
-  if (current) {
-    const it = current;
-    const { ready, failed, hopeless, impossible, jobError } = previewState(it, statuses.get(it.entryId));
-    // полноценная деталка: те же метаданные и кнопки, что в «Файлах»
-    if (detailId) {
-      return <FileDetail entryId={detailId} onBack={() => setDetailId(null)} onDeleted={forgetEntry} />;
+  // ===== Просмотр: оверлей поверх галереи =====
+  // Раньше просмотр и деталка возвращались вместо сетки — сетка размонтировалась, картинки
+  // грузились заново, а прокрутка страницы сбивалась (шапка просмотра уезжала за верх экрана).
+  // Теперь сетка остаётся смонтированной под оверлеем, и возврат назад ничего не теряет.
+  const goto = useCallback((i: number) => setOpenId(media[i]?.entryId ?? null), [media]);
+
+  // Превью соседей по ленте греем заранее: ⬅️/➡️ должны показывать кадр сразу, а не ждать
+  // загрузку. Двух вперёд и одного назад хватает на обычное листание.
+  useEffect(() => {
+    if (!openId) return;
+    const i = media.findIndex((it) => it.entryId === openId);
+    if (i < 0) return;
+    for (const j of [i - 1, i + 1, i + 2]) {
+      const it = media[j];
+      if (it?.sha256 && /^image\//.test(it.mime)) warmPreview(api.previewUrl(it.sha256, 1080));
     }
-    const goto = (i: number) => setOpenId(media[i]?.entryId ?? null);
-    return (
-      <div className="full">
-        {/* медиа занимает весь канвас (верх экрана → нав-бар); шапка/инфо — поверх */}
-        <div className="mediaarea">
-          {ready && it.sha256 && /^video\//.test(it.mime) ? (
-            // Тот же компонент, что в деталке файла: у него есть фолбэк на оригинал для
-            // браузеров без AV1 (Safari/iOS) и playsInline для телефона.
-            <VideoPreview meta={{ id: it.entryId, sha256: it.sha256, name: it.name }} />
-          ) : ready && it.sha256 ? (
-            <PhotoZoom src={api.previewUrl(it.sha256, 1080)} />
-          ) : (
-            <div className="panel">
-              {failed ? (
-                <>
-                  <div className="copy">❌ Не удалось собрать превью</div>
-                  {jobError && (
-                    <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c', maxHeight: 180, overflow: 'auto' }}>{jobError}</pre>
-                  )}
-                  <div className="row" style={{ justifyContent: 'center' }}>
-                    <button className="btn ghost" onClick={() => void retryPreview(it.entryId)}>⟳ Пересобрать</button>
-                    <a className="btn ghost" href={api.fileUrl(it.entryId)} download>⬇️ Скачать оригинал</a>
-                  </div>
-                </>
-              ) : hopeless ? (
-                // Собрать нельзя: сервер знает причину (нет оригинала, слишком большой файл,
-                // формат не конвертируется) и отдаёт её в previewError.
-                <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
-                  <div className="copy">
-                    {impossible && jobError ? `Превью не собрать: ${jobError}` : 'Превью для этого файла собрать нельзя'}
-                  </div>
-                  <div className="row" style={{ justifyContent: 'center' }}>
-                    <button className="btn ghost" onClick={() => void retryPreview(it.entryId)}>⟳ Поставить задачу</button>
-                    <a className="btn ghost" href={api.fileUrl(it.entryId)} download>⬇️ Скачать оригинал</a>
-                  </div>
-                </div>
-              ) : (
-                <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
-                  <span className="spin" />
-                  <div className="copy">⏳ Готовлю превью…</div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-        <div className="tbar">
-          <button className="iconbtn" title="Назад в галерею" onClick={() => setOpenId(null)}>◀️</button>
-          <span style={{ flex: 1 }} />
-          <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(it.entryId)}>ℹ️</button>
-          {/* Скачивание живёт только в деталке (ℹ️) — из превью его убрали */}
-          <button
-            className="iconbtn"
-            title="Удалить (в корзину)"
-            onClick={async () => {
-              if (!confirm(`Удалить «${it.name}» в корзину?`)) return;
-              try {
-                await api.deleteFile(it.entryId);
-                forgetEntry(it.entryId);
-              } catch (e) {
-                alert((e as Error).message);
-              }
-            }}
-          >🗑</button>
-          <button className="iconbtn" disabled={openIdx === 0} title="Назад" onClick={() => goto(openIdx - 1)}>⬅️</button>
-          <button className="iconbtn" disabled={openIdx >= media.length - 1} title="Вперёд" onClick={() => goto(openIdx + 1)}>➡️</button>
-        </div>
-      </div>
-    );
-  }
+  }, [openId, media]);
+
+  // Пока открыт оверлей, страница под ним не прокручивается: иначе получался «двойной скролл» —
+  // сдвигалась и сама галерея, и просмотр. Позицию прокрутки возвращаем на место при закрытии.
+  useEffect(() => {
+    if (!overlay) return;
+    const y = window.scrollY;
+    const de = document.documentElement;
+    const prevDe = de.style.overflow;
+    const prevBody = document.body.style.overflow;
+    de.style.overflow = 'hidden';
+    document.body.style.overflow = 'hidden';
+    return () => {
+      de.style.overflow = prevDe;
+      document.body.style.overflow = prevBody;
+      if (window.scrollY !== y) window.scrollTo(0, y);
+    };
+  }, [overlay]);
+
+  const view = current ? previewState(current, statuses.get(current.entryId)) : null;
 
   const gridStyle: React.CSSProperties = {
     display: 'grid',
@@ -1471,55 +1597,67 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
 
   // ===== Экран-сетка =====
   return (
-    <div ref={gridRef}>
-      {/* Первая загрузка: место под ленту уже занято плейсхолдерами — экран не «прыгает» */}
-      {firstLoad && !items.length && (
-        <div style={gridStyle}>
-          {Array.from({ length: cols * 4 }, (_, i) => <div key={i} className="cellph" />)}
-        </div>
-      )}
-
-      {sections.map((s, si) => (
-        <section className="monthblock" key={s.key || 'nodate'}>
-          <div className="monthhead">
-            <span>{s.title}</span>
-            {/* Счётчик — по загруженным записям: у последнего месяца лента ещё не долистана,
-                поэтому честно помечаем его плюсом. */}
-            <span className="meta">{s.cells.length}{si === sections.length - 1 && hasMore ? '+' : ''}</span>
-          </div>
+    <div>
+      <div ref={gridRef}>
+        {/* Первая загрузка: место под ленту уже занято плейсхолдерами — экран не «прыгает» */}
+        {firstLoad && !items.length && (
           <div style={gridStyle}>
-            {s.cells.map((it) => (
-              <PhotoCell key={it.entryId} item={it} status={statuses.get(it.entryId)} onOpen={openCell} onRetry={retryPreview} />
-            ))}
+            {Array.from({ length: cols * 4 }, (_, i) => <div key={i} className="cellph" />)}
           </div>
-        </section>
-      ))}
+        )}
 
-      {!firstLoad && !media.length && (
-        <div className="copy" style={{ padding: '12px 2px' }}>
-          {loadErr ? (
-            <>
-              Не удалось загрузить ленту: {loadErr}
-              <div className="row"><button className="btn ghost" onClick={reload}>Повторить</button></div>
-            </>
-          ) : 'Нет фото и видео. Нажмите «+» — медиа оптимизируется и появится здесь автоматически.'}
-        </div>
-      )}
+        {layout.map((m) => {
+          const range = visibleRows(m, win, cell);
+          return (
+            <section className="monthblock" key={m.key}>
+              <div className="monthhead">
+                <span>{m.title}</span>
+                {/* Счётчик — по загруженным записям: у последнего месяца лента ещё не долистана,
+                    поэтому честно помечаем его плюсом. */}
+                <span className="meta">{m.cells.length}{m.last && hasMore ? '+' : ''}</span>
+              </div>
+              {/* Месяц за экраном держим одной распоркой: узлов и картинок не плодим, но высоту
+                  сохраняем настоящую — полоса прокрутки и позиция не сбиваются. */}
+              {range ? (
+                <div style={{ ...gridStyle, paddingTop: range[0] * cell, paddingBottom: (m.rows - range[1]) * cell }}>
+                  {m.cells.slice(range[0] * cols, range[1] * cols).map((it) => (
+                    <PhotoCell key={it.entryId} item={it} status={statuses.get(it.entryId)} onOpen={openCell} onRetry={retryPreview} />
+                  ))}
+                </div>
+              ) : (
+                <div style={{ height: m.rows * cell }} />
+              )}
+            </section>
+          );
+        })}
 
-      <div ref={sentinelRef} style={{ height: 1 }} />
-      {loadingMore && <div className="copy" style={{ textAlign: 'center', padding: '12px 0' }}>Загружаю…</div>}
-      {loadErr && !!items.length && (
-        <div className="row" style={{ justifyContent: 'center' }}>
-          <button className="btn ghost" onClick={() => void load('more')}>Повторить</button>
-        </div>
-      )}
-      {!!items.length && !hasMore && !loadingMore && (
-        <div className="copy" style={{ textAlign: 'center', padding: '8px 0 0' }}>Это всё — {media.length}</div>
-      )}
+        {!firstLoad && !media.length && (
+          <div className="copy" style={{ padding: '12px 2px' }}>
+            {loadErr ? (
+              <>
+                Не удалось загрузить ленту: {loadErr}
+                <div className="row"><button className="btn ghost" onClick={reload}>Повторить</button></div>
+              </>
+            ) : 'Нет фото и видео. Нажмите «+» — медиа оптимизируется и появится здесь автоматически.'}
+          </div>
+        )}
+
+        <div ref={sentinelRef} style={{ height: 1 }} />
+        {loadingMore && <div className="copy" style={{ textAlign: 'center', padding: '12px 0' }}>Загружаю…</div>}
+        {loadErr && !!items.length && (
+          <div className="row" style={{ justifyContent: 'center' }}>
+            <button className="btn ghost" onClick={() => void load('more')}>Повторить</button>
+          </div>
+        )}
+        {!!items.length && !hasMore && !loadingMore && (
+          <div className="copy" style={{ textAlign: 'center', padding: '8px 0 0' }}>Это всё — {media.length}</div>
+        )}
+      </div>
 
       {/* Плавающая кнопка загрузки: одна на фото и видео, тип сервер определяет по формату.
-          Роль кнопки задаём явно: label с скрытым input с клавиатуры не нажимается. */}
-      {photoFolderId && (
+          Роль кнопки задаём явно: label с скрытым input с клавиатуры не нажимается.
+          Под оверлеем просмотра её нет — иначе она висела бы поверх снимка. */}
+      {photoFolderId && !overlay && (
         <label
           className={busy ? 'fab off' : 'fab'}
           role="button"
@@ -1547,15 +1685,97 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           />
         </label>
       )}
+
+      {current && view && (
+        <div className="full">
+          {/* медиа занимает весь канвас (верх экрана → нав-бар); шапка/инфо — поверх */}
+          <div className="mediaarea">
+            {view.ready && current.sha256 && /^video\//.test(current.mime) ? (
+              // Тот же компонент, что в деталке файла: у него есть фолбэк на оригинал для
+              // браузеров без AV1 (Safari/iOS) и playsInline для телефона.
+              <VideoPreview key={current.entryId} meta={{ id: current.entryId, sha256: current.sha256, name: current.name }} />
+            ) : view.ready && current.sha256 ? (
+              // key по записи: у каждого снимка своя геометрия и свой зум. Миниатюра из сетки
+              // (thumb) лежит размытой под кадром — переключение выглядит мгновенным даже тогда,
+              // когда полноразмерное превью ещё не догрузилось.
+              <PhotoZoom
+                key={current.entryId}
+                src={api.previewUrl(current.sha256, 1080)}
+                thumb={api.previewUrl(current.sha256)}
+              />
+            ) : (
+              <div className="panel">
+                {view.failed ? (
+                  <>
+                    <div className="copy">❌ Не удалось собрать превью</div>
+                    {view.jobError && (
+                      <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c', maxHeight: 180, overflow: 'auto' }}>{view.jobError}</pre>
+                    )}
+                    <div className="row" style={{ justifyContent: 'center' }}>
+                      <button className="btn ghost" onClick={() => void retryPreview(current.entryId)}>⟳ Пересобрать</button>
+                      <a className="btn ghost" href={api.fileUrl(current.entryId)} download>⬇️ Скачать оригинал</a>
+                    </div>
+                  </>
+                ) : view.hopeless ? (
+                  // Собрать нельзя: сервер знает причину (нет оригинала, слишком большой файл,
+                  // формат не конвертируется) и отдаёт её в previewError.
+                  <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
+                    <div className="copy">
+                      {view.impossible && view.jobError ? `Превью не собрать: ${view.jobError}` : 'Превью для этого файла собрать нельзя'}
+                    </div>
+                    <div className="row" style={{ justifyContent: 'center' }}>
+                      <button className="btn ghost" onClick={() => void retryPreview(current.entryId)}>⟳ Поставить задачу</button>
+                      <a className="btn ghost" href={api.fileUrl(current.entryId)} download>⬇️ Скачать оригинал</a>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', placeItems: 'center', gap: 10 }}>
+                    <span className="spin" />
+                    <div className="copy">⏳ Готовлю превью…</div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="tbar">
+            <button className="iconbtn" title="Назад в галерею" onClick={() => setOpenId(null)}>◀️</button>
+            <span style={{ flex: 1 }} />
+            <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(current.entryId)}>ℹ️</button>
+            {/* Скачивание живёт только в деталке (ℹ️) — из превью его убрали */}
+            <button
+              className="iconbtn"
+              title="Удалить (в корзину)"
+              onClick={async () => {
+                if (!confirm(`Удалить «${current.name}» в корзину?`)) return;
+                try {
+                  await api.deleteFile(current.entryId);
+                  forgetEntry(current.entryId);
+                } catch (e) {
+                  alert((e as Error).message);
+                }
+              }}
+            >🗑</button>
+            <button className="iconbtn" disabled={openIdx === 0} title="Назад" onClick={() => goto(openIdx - 1)}>⬅️</button>
+            <button className="iconbtn" disabled={openIdx >= media.length - 1} title="Вперёд" onClick={() => goto(openIdx + 1)}>➡️</button>
+          </div>
+        </div>
+      )}
+
+      {/* Полноценная деталка (как в «Файлах») — вторым оверлеем, поверх просмотра: возврат из
+          неё отдаёт тот же снимок с тем же зумом, ничего не перезагружая. */}
+      {detailId && (
+        <div className="ovl" key={detailId}>
+          <FileDetail entryId={detailId} onBack={() => setDetailId(null)} onDeleted={forgetEntry} />
+        </div>
+      )}
     </div>
   );
 }
 
 
 // Зум только для фото (щипок/дабл-тап/пан); страница при этом не зуммится
-function PhotoZoom({ src }: { src: string }) {
+function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
   const box = useRef<HTMLDivElement>(null);
-  const [loaded, setLoaded] = useState(false);
   const nat = useRef({ w: 0, h: 0 });
   const [g, setG] = useState({ ox: 0, oy: 0, bw: 1, bh: 1, z: 1, tx: 0, ty: 0 });
   const gcur = useRef(g);
@@ -1563,8 +1783,7 @@ function PhotoZoom({ src }: { src: string }) {
   const pinch = useRef({ d0: 0, z0: 1, ix: 0, iy: 0 });
   const pan0 = useRef({ tx: 0, ty: 0, px: 0, py: 0 });
   const lastTap = useRef(0);
-  const [ready, setReady] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const [state, setState] = useState<'loading' | 'ready' | 'failed'>('loading');
 
   const clampN = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -1663,16 +1882,27 @@ function PhotoZoom({ src }: { src: string }) {
     }
   };
 
-  const onLoadImg = () => {
-    const img = new Image();
-    img.onload = () => {
-      nat.current = { w: img.naturalWidth, h: img.naturalHeight };
-      setLoaded(true);
+  // Готовый кадр отдаём сразу: он либо уже в кэше (соседа грели заранее), либо догружается —
+  // и тогда мы просто ждём ту же самую запись кэша, а не заводим вторую загрузку.
+  useEffect(() => {
+    const rec = warmPreview(src);
+    const apply = () => {
+      nat.current = { w: rec.img.naturalWidth, h: rec.img.naturalHeight };
+      setState('ready');
       commit(1, 0, 0);
-      setReady(true);
     };
-    img.src = src;
-  };
+    if (rec.ok) { apply(); return; }
+    if (rec.failed) { setState('failed'); return; }
+    // Без этого при 404 спиннер висел бы вечно: состояние меняется только по onLoad.
+    const onFail = () => setState('failed');
+    rec.img.addEventListener('load', apply);
+    rec.img.addEventListener('error', onFail);
+    return () => {
+      rec.img.removeEventListener('load', apply);
+      rec.img.removeEventListener('error', onFail);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [src]);
 
   return (
     <div
@@ -1682,15 +1912,31 @@ function PhotoZoom({ src }: { src: string }) {
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
     >
-      {!ready && (
+      {/* Миниатюра из сетки под кадром: пока 1080 грузится, видно хоть что-то осмысленное —
+          переключение ⬅️/➡️ не выглядит пустым экраном. */}
+      {state !== 'ready' && thumb && (
+        <img
+          src={thumb}
+          alt=""
+          aria-hidden
+          draggable={false}
+          style={{
+            position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover',
+            filter: 'blur(16px)', transform: 'scale(1.1)', opacity: 0.5, pointerEvents: 'none',
+          }}
+        />
+      )}
+      {state === 'loading' && (
         <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
-          {failed
-            // Без этого при 404 превью спиннер висел бы вечно: ready ставится только по onLoad.
-            ? <div className="copy">Превью не открылось — файл мог быть удалён, попробуйте обновить ленту</div>
-            : <span className="spin" />}
+          <span className="spin" />
         </div>
       )}
-      {loaded && (
+      {state === 'failed' && (
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 16 }}>
+          <div className="copy">Превью не открылось — файл мог быть удалён, попробуйте обновить ленту</div>
+        </div>
+      )}
+      {state === 'ready' && (
         <img
           src={src}
           alt=""
@@ -1708,16 +1954,16 @@ function PhotoZoom({ src }: { src: string }) {
           }}
         />
       )}
-      {/* прогрев размера */}
-      <img src={src} alt="" onLoad={onLoadImg} onError={() => setFailed(true)} style={{ display: 'none' }} />
     </div>
   );
 }
 
 // #4: лоадер для изображений. Плейсхолдер — часть ячейки: пока превью не пришло, на его месте
 // уже стоит серый квадрат со спиннером, поэтому сетка не «прыгает» при подгрузке.
+// Готовое превью берём из кэша: строка, вернувшаяся в окно виртуализации (или галерея под
+// открытым просмотром), показывает кадр сразу — без спиннера и без повторной загрузки.
 function LoadImg({ src }: { src: string }) {
-  const [ok, setOk] = useState(false);
+  const [ok, setOk] = useState(() => previewReady(src));
   return (
     <div style={{ position: 'relative', width: '100%', aspectRatio: '1', background: '#1b212b', overflow: 'hidden' }}>
       {!ok && (
