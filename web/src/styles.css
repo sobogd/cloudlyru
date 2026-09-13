@@ -199,6 +199,11 @@
     height: var(--island-h);
     padding: var(--island-pad);
     font-size: var(--island-fs);
+    transition: transform .3s cubic-bezier(.2, .7, .2, 1);
+  }
+  /* Модалка «Медиа» — общий футер уезжает вниз за экран, не наезжая на футер с листанием */
+  .island-bottom.nav-hidden {
+    transform: translateY(calc(100% + var(--side) + env(safe-area-inset-bottom)));
   }
   .navbtn {
     flex: 1;
@@ -658,6 +663,7 @@
     backdrop-filter: blur(16px) saturate(1.6);
     -webkit-backdrop-filter: blur(16px) saturate(1.6);
     font-size: var(--island-fs);
+    transition: opacity .25s ease;
   }
   .mmonth {
     flex: 1;
@@ -675,8 +681,13 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+    transition: opacity .25s ease;
   }
   .mempty { display: grid; place-items: center; padding: 40px 16px; }
+  /* В момент модалки таймлайн плавно уходит в прозрачность — сетка не просвечивает
+     сквозь подложку, фон за модалкой остаётся чистым. */
+  .media.has-viewer .mhead,
+  .media.has-viewer .mscroll { opacity: 0; }
 
   /* Виртуализированное поле: высоту задаёт JS, строки позиционируются translateY */
   .mvirt { position: relative; width: 100%; }

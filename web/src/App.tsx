@@ -100,6 +100,8 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
   // и прогресс-панель видна в любом разделе. uploadedAt — сигнал спискам перечитать себя.
   const [uploadedAt, setUploadedAt] = useState(0);
   const up = useBulkUpload(() => setUploadedAt(Date.now()));
+  // «Медиа» в модалке прячет общий нижний остров, чтобы он не наезжал на футер модалки.
+  const [navHidden, setNavHidden] = useState(false);
 
   // Запрет «свайпа обновления страницы» (pull-to-refresh): на современных браузерах —
   // CSS overscroll-behavior:none; здесь фолбэк JS для старых Safari, где CSS не работает.
@@ -143,13 +145,13 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
           />
         )}
         {tab === 'photos' && <Photos photoFolderId={user.photoFolderId} up={up} uploadedAt={uploadedAt} />}
-        {tab === 'media' && <MediaSection FileDetail={FileDetail} />}
+        {tab === 'media' && <MediaSection FileDetail={FileDetail} onOverlayChange={setNavHidden} />}
         {tab === 'albums' && <Albums />}
         {tab === 'trash' && <TrashPage />}
         {tab === 'settings' && <Settings login={user.login} onLogout={onLogout} />}
       </main>
       {/* Нижний остров-навигация: иконка + подпись, активная вкладка подсвечена */}
-      <nav className="island island-bottom">
+      <nav className={'island island-bottom' + (navHidden ? ' nav-hidden' : '')}>
         {NAV.map(({ id, Icon, label }) => (
           <button
             key={id}

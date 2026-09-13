@@ -65,12 +65,20 @@ function fitGeom(cw: number, ch: number, nw: number, nh: number) {
 
 // =============================== Таймлайн ===============================
 
-export default function MediaSection({ FileDetail }: { FileDetail: DetailComponent }) {
+export default function MediaSection({ FileDetail, onOverlayChange }: {
+  FileDetail: DetailComponent;
+  /** Модалка открыта/закрыта — Shell прячет общий футер, чтобы он не наезжал на футер модалки. */
+  onOverlayChange?: (open: boolean) => void;
+}) {
   const [items, setItems] = useState<MediaItem[]>([]);
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [openIdx, setOpenIdx] = useState<number | null>(null);
+
+  useEffect(() => {
+    onOverlayChange?.(openIdx != null);
+  }, [openIdx, onOverlayChange]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const itemsRef = useRef(items);
@@ -214,7 +222,7 @@ export default function MediaSection({ FileDetail }: { FileDetail: DetailCompone
   }, [loadMore]);
 
   return (
-    <div className="media">
+    <div className={'media' + (openIdx != null ? ' has-viewer' : '')}>
       <div className="mhead">
         <span className="mmonth">{month ? monthLabel(month) : 'Медиа'}</span>
       </div>
