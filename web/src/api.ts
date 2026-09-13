@@ -494,7 +494,7 @@ export const mediaMonths = () => request<MediaMonthBucket[]>('/media/months');
 export interface MediaStatusItem { entryId: string; previewState: string; jobState: string | null }
 export const mediaStatus = (entryIds: string[]) =>
   request<MediaStatusItem[]>('/media/status', { method: 'POST', body: JSON.stringify({ entryIds }) });
-/** Метаданные кадра для панели «Инфо» в модалке. */
+/** Метаданные кадра для футера модалки «Медиа»: колонки MediaMeta + разобранные теги из raw. */
 export interface MediaInfo {
   entryId: string;
   name: string;
@@ -508,6 +508,17 @@ export interface MediaInfo {
   model: string | null;
   latitude: number | null;
   longitude: number | null;
+  /** EXIF фото: объектив, диафрагма, выдержка (строкой), ISO, фокусное расстояние. */
+  lens: string | null;
+  fNumber: number | null;
+  exposureTime: string | null;
+  iso: number | null;
+  focalLength: number | null;
+  focalLength35: number | null;
+  /** ffprobe видео: длительность, кадров в секунду, кодек. */
+  durationSec: number | null;
+  fps: number | null;
+  videoCodec: string | null;
 }
 export const mediaInfo = (entryId: string) =>
   request<MediaInfo>(`/media/${encodeURIComponent(entryId)}`);

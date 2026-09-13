@@ -1,15 +1,24 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
+  Aperture,
   ArrowDownToLine,
+  CalendarClock,
   Camera,
+  Clock,
   FileType,
   Film,
-  Fingerprint,
+  Focus,
   Frame,
+  Gauge,
   HardDrive,
   Image as ImageIcon,
   MapPin,
+  Ruler,
+  Scaling,
+  Timer,
   Trash,
+  Video,
   X,
   type LucideIcon,
 } from 'lucide-react';
@@ -937,7 +946,11 @@ function MediaViewer({
       onTransitionEnd={onRootTransitionEnd}
     >
       <div className="mv-head">
-        <span className="mv-date">{fmtMediaDate(curItem?.capturedAt) || curItem?.name || ''}</span>
+        {/* Дата и время — тем же пунктом «иконка + значение», что и метадата в футере */}
+        <span className="mv-item mv-date" title="Дата и время съёмки">
+          <CalendarClock />
+          <span className="mv-item-v">{fmtMediaDate(curItem?.capturedAt) || curItem?.name || ''}</span>
+        </span>
         {geo && (
           <a
             className="iconbtn"
@@ -991,8 +1004,9 @@ function MediaViewer({
       </div>
 
       {/* Футер — вся метадата кадра одной прокручиваемой по горизонтали строкой.
-          Даты и имени файла здесь нет. Первыми идут размер, кадр и камера; размер, тип
-          и SHA-256 уже есть в элементе ленты, а кадр, камера и координаты — только из EXIF. */}
+          Ни даты, ни имени файла, ни SHA-256 здесь нет: дата — в шапке, имя и хеш
+          в деталке не нужны. Сначала то, что видно и без EXIF (размер, кадр, камера),
+          дальше параметры съёмки, тип и координаты; у видео вместо EXIF — свои теги. */}
       <div className="mv-foot">
         <div className="mv-metas">
           <MetaItem Icon={HardDrive} title="Размер" value={fmtSize(curItem?.size ?? info?.size ?? 0)} />
@@ -1002,6 +1016,27 @@ function MediaViewer({
           {info && (info.make || info.model) ? (
             <MetaItem Icon={Camera} title="Камера" value={[info.make, info.model].filter(Boolean).join(' ')} />
           ) : null}
+          {info?.lens && <MetaItem Icon={Focus} title="Объектив" value={info.lens} />}
+          {info?.fNumber != null && (
+            <MetaItem Icon={Aperture} title="Диафрагма" value={`f/${trimNum(info.fNumber, 1)}`} />
+          )}
+          {info?.exposureTime && <MetaItem Icon={Timer} title="Выдержка" value={info.exposureTime} />}
+          {info?.iso != null && <MetaItem Icon={Gauge} title="Светочувствительность" value={`ISO ${trimNum(info.iso, 0)}`} />}
+          {info?.focalLength != null && (
+            <MetaItem Icon={Ruler} title="Фокусное расстояние" value={`${trimNum(info.focalLength, 1)} мм`} />
+          )}
+          {info?.focalLength35 != null && (
+            <MetaItem
+              Icon={Scaling}
+              title="Фокусное расстояние в 35-мм эквиваленте"
+              value={`${trimNum(info.focalLength35, 0)} мм (35 мм экв.)`}
+            />
+          )}
+          {info?.durationSec != null && (
+            <MetaItem Icon={Clock} title="Длительность" value={fmtDuration(info.durationSec)} />
+          )}
+          {info?.fps != null && <MetaItem Icon={Activity} title="Кадров в секунду" value={`${trimNum(info.fps, 2)} к/с`} />}
+          {info?.videoCodec && <MetaItem Icon={Video} title="Кодек видео" value={info.videoCodec} />}
           {curItem && <MetaItem Icon={FileType} title="Тип" value={curItem.mime} />}
           {info?.latitude != null && info?.longitude != null && (
             <MetaItem
@@ -1010,7 +1045,6 @@ function MediaViewer({
               value={`${info.latitude.toFixed(6)}, ${info.longitude.toFixed(6)}`}
             />
           )}
-          {info?.sha256 && <MetaItem Icon={Fingerprint} title="SHA-256" value={info.sha256} mono />}
         </div>
       </div>
     </div>
@@ -1140,13 +1174,28 @@ function fmtSize(bytes: number): string {
   return `${bytes} Б`;
 }
 
-/** Пункт футера: иконка и значение (размер, кадр, камера, тип, координаты, хеш).
+/** Число тега без хвостовых нулей: 1.8 → «1.8», 100 → «100», 24.0 → «24». */
+function trimNum(v: number, digits: number): string {
+  return String(Number(v.toFixed(digits)));
+}
+
+/** Длительность видео для футера: «1:23» до часа, «1:02:03» дальше. */
+function fmtDuration(sec: number): string {
+  const total = Math.max(0, Math.round(sec));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+/** Пункт метаданных: иконка и значение — той же подачей, что дата в шапке.
     title — подпись пункта: строка прокручивается, и без подсказки смысл иконки неочевиден. */
-function MetaItem({ Icon, value, title, mono }: { Icon: LucideIcon; value: string; title: string; mono?: boolean }) {
+function MetaItem({ Icon, value, title }: { Icon: LucideIcon; value: string; title: string }) {
   return (
-    <span className="mv-meta" title={title}>
+    <span className="mv-item" title={title}>
       <Icon />
-      <span className={'mv-meta-v' + (mono ? ' mono' : '')}>{value}</span>
+      <span className="mv-item-v">{value}</span>
     </span>
   );
 }

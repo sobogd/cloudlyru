@@ -669,7 +669,8 @@
     margin: 0 auto;
     display: flex;
     align-items: center;
-    gap: 4px;
+    /* Кнопки-действия не слипаются: между иконками воздух */
+    gap: 10px;
     height: var(--island-h);
     padding: var(--island-pad);
     background: var(--island-glass);
@@ -680,15 +681,29 @@
     font-size: var(--island-fs);
     color: var(--fg);
   }
+  /* Строка «иконка + значение» — одна подача и в шапке (дата), и в футере (метаданные):
+     иконка 16px цветом подписей, текст 13px цветом второстепенного текста. */
+  .mv-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    white-space: nowrap;
+  }
+  .mv-item > svg {
+    display: block;
+    width: var(--island-icon);
+    height: var(--island-icon);
+    flex: none;
+    stroke-width: 1.75;
+    color: var(--fg-3);
+  }
+  .mv-item-v { overflow: hidden; text-overflow: ellipsis; }
+  /* Дата — такой же пункт, но занимает всю свободную ширину и усекается многоточием */
   .mv-date {
     flex: 1;
-    min-width: 0;
     padding: 0 6px;
-    font-weight: 600;
-    color: var(--fg);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    color: var(--fg-2);
   }
 
   .mv-stage {
@@ -761,19 +776,6 @@
     -ms-overflow-style: none;
   }
   .mv-metas::-webkit-scrollbar { display: none; }
-  .mv-meta {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    flex: none;
-    white-space: nowrap;
-  }
-  .mv-meta svg {
-    display: block;
-    width: var(--island-icon);
-    height: var(--island-icon);
-    flex: none;
-    stroke-width: 1.75;
-    color: var(--fg-3);
-  }
+  /* Пункты не сжимаются и не усекаются: строка уезжает вбок и прокручивается */
+  .mv-metas > .mv-item { flex: none; }
 }

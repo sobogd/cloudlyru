@@ -31,7 +31,14 @@ export interface MediaItem {
   size: number;
 }
 
-/** Метаданные кадра для панели «Инфо» (отдельная ручка /media/:entryId). */
+/**
+ * Метаданные кадра для футера модалки «Медиа» (отдельная ручка /media/:entryId).
+ *
+ * Параметры съёмки берём из `MediaMeta.raw` — там лежит полный набор тегов: EXIF для фото
+ * (диафрагма, выдержка, ISO, фокусное, объектив) и ffprobe для видео (длительность, fps,
+ * кодеки). Отдельных колонок под них нет, поэтому поля «плоские» и nullable: у фото пусто
+ * в видео-полях и наоборот, а у ассетов, разобранных до появления поля, — вообще везде.
+ */
 export interface MediaInfo {
   entryId: string;
   name: string;
@@ -45,7 +52,27 @@ export interface MediaInfo {
   model: string | null;
   latitude: number | null;
   longitude: number | null;
+  /** Объектив (EXIF LensModel). */
+  lens: string | null;
+  /** Диафрагма, например 1.8 (показываем как f/1.8). */
+  fNumber: number | null;
+  /** Выдержка строкой из EXIF: «1/120» или «2.5 с». */
+  exposureTime: string | null;
+  iso: number | null;
+  /** Фокусное расстояние, мм. */
+  focalLength: number | null;
+  /** Оно же в 35-мм эквиваленте, мм. */
+  focalLength35: number | null;
+  /** Видео: длительность, кадров в секунду, кодек. */
+  durationSec: number | null;
+  fps: number | null;
+  videoCodec: string | null;
 }
+
+/** Число из raw: всё, что не конечное число (включая строки и null), — это «нет данных». */
+const rawNum = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+/** Непустая строка из raw. */
+const rawStr = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null);
 
 /** Сырые строки запросов: Postgres отдаёт timestamptz как Date, bigint как BigInt. */
 interface MediaRow {
@@ -142,7 +169,7 @@ export class MediaFeedService {
     return rows.map((r) => ({ month: r.month, count: Number(r.n) }));
   }
 
-  /** Метаданные кадра для панели «Инфо». Чужое/удалённое/вне зоны «Фото» — null (404). */
+  /** Метаданные кадра для футера модалки. Чужое/удалённое/вне зоны «Фото» — null (404). */
   async info(userId: string, entryId: string): Promise<MediaInfo | null> {
     const tree = await this.auth.subtreeIds(userId);
     if (!tree.length) return null;
@@ -157,13 +184,23 @@ export class MediaFeedService {
             mime: true,
             size: true,
             media: {
-              select: { capturedAt: true, width: true, height: true, make: true, model: true, latitude: true, longitude: true },
+              select: {
+                capturedAt: true,
+                width: true,
+                height: true,
+                make: true,
+                model: true,
+                latitude: true,
+                longitude: true,
+                raw: true,
+              },
             },
           },
         },
       },
     });
     if (!row) return null;
+    const raw = (row.asset.media?.raw ?? null) as Record<string, unknown> | null;
     return {
       entryId: row.id,
       name: row.name,
@@ -177,6 +214,15 @@ export class MediaFeedService {
       model: row.asset.media?.model ?? null,
       latitude: row.asset.media?.latitude ?? null,
       longitude: row.asset.media?.longitude ?? null,
+      lens: rawStr(raw?.lens),
+      fNumber: rawNum(raw?.fNumber),
+      exposureTime: rawStr(raw?.exposureTime),
+      iso: rawNum(raw?.iso),
+      focalLength: rawNum(raw?.focalLength),
+      focalLength35: rawNum(raw?.focalLength35),
+      durationSec: rawNum(raw?.durationSec),
+      fps: rawNum(raw?.fps),
+      videoCodec: rawStr(raw?.videoCodec),
     };
   }
 
