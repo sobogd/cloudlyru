@@ -1935,10 +1935,37 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
     setNotice('');
     try {
       const r = await api.rebuildPreviews();
+      // Дубли (лишние строки на один файл) пересчёт схлопывает сам — если такие были, говорим.
+      const dupes = r.deduped ? ` · схлопнуто дублей: ${r.deduped.toLocaleString('ru-RU')}` : '';
       setNotice(
         r.queued
-          ? `Поставлено задач: ${r.queued.toLocaleString('ru-RU')}${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}`
-          : `Новых задач нет — всё, что можно собрать, уже в очереди${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}`,
+          ? `Поставлено задач: ${r.queued.toLocaleString('ru-RU')}${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}${dupes}`
+          : `Новых задач нет — всё, что можно собрать, уже в очереди${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}${dupes}`,
+      );
+      await load();
+    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+
+  // Очистка: удалить все строки очереди, включая упавшие. Собранные превью остаются, поэтому
+  // очередь пуста ровно до «Пересчитать» — оно и поставит задачи тем файлам, где превью нет.
+  const clear = async () => {
+    const parts: string[] = [];
+    if (remaining) parts.push(`в остатке ${remaining.toLocaleString('ru-RU')}`);
+    if (q?.errors) parts.push(`упавших ${q.errors.toLocaleString('ru-RU')}`);
+    const ok = confirm(
+      `Удалить все строки очереди${parts.length ? ` (${parts.join(', ')})` : ''}?\n\n` +
+        'Собранные превью останутся на месте. Задача, которая считается сейчас, не прервётся.\n' +
+        'Чтобы вернуть недостающие превью в очередь — нажмите «Пересчитать».',
+    );
+    if (!ok) return;
+    setBusy(true);
+    setNotice('');
+    try {
+      const r = await api.clearQueue();
+      setNotice(
+        `Очередь очищена — удалено строк: ${r.removed.toLocaleString('ru-RU')}.` +
+          (r.resumed ? ` PDF с недорисованными страницами: ${r.resumed.toLocaleString('ru-RU')} — их вернёт пересчёт.` : '') +
+          ' Нажмите «Пересчитать», чтобы поставить задачи файлам без превью.',
       );
       await load();
     } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
@@ -1953,6 +1980,9 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
         <span style={{ flex: 1 }} />
         <button className={q?.paused ? 'btn' : 'btn ghost'} disabled={!q} onClick={togglePause} title="Пауза мягкая: текущая задача докачивается, новые не берутся">
           {q?.paused ? '▶️ Продолжить' : '⏸ Пауза'}
+        </button>
+        <button className="btn ghost" disabled={busy || !q} onClick={clear} title="Удалить все строки очереди. Собранные превью остаются — вернуть недостающие можно кнопкой «Пересчитать»">
+          🧹 Очистить
         </button>
         <button className="btn ghost" disabled={busy || !q} onClick={rebuild} title="Найти файлы без превью и поставить им задачи">
           {busy ? '…' : '⟳ Пересчитать'}

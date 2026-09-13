@@ -126,6 +126,10 @@ export class QueueController {
   @Post('errors/retry')
   async retryErrors(@CurrentUser() user: RequestUser) {
     const tree = await this.auth.subtreeIds(user.id);
+    // Дубли строк сначала: у файла, где рядом с упавшей строкой лежит ожидающая, перевод
+    // failed→pending упал бы на частичном уникальном индексе — то есть кнопка отдавала бы 500
+    // и не возвращала в работу вообще ничего.
+    await this.queue.dedupeJobs();
     const res = await this.prisma.job.updateMany({
       where: {
         state: 'failed',
@@ -135,6 +139,32 @@ export class QueueController {
     });
     this.logger.log(`ошибки очереди возвращены в работу: ${res.count}`);
     return { retried: res.count };
+  }
+
+  /**
+   * Полная очистка очереди: удаляем все строки задач — и ожидающие, и упавшие. Это очистка
+   * списка, а не откат превью: собранное лежит на ассете (Asset.previewState = 'done') и
+   * остаётся на месте. Поэтому после очистки очередь пуста ровно до нажатия «Пересчитать»,
+   * а пересчёт ставит задачи тем файлам, у которых превью ещё нет.
+   * Задача, которая считается прямо сейчас, не прерывается: строка уходит, а сама конвертация
+   * дойдёт до конца и выставит превью (оборвать AV1 на середине — потерять часы работы).
+   */
+  @Post('clear')
+  async clear(@CurrentUser() user: RequestUser) {
+    const tree = await this.auth.subtreeIds(user.id);
+    const mine = { entries: { some: { folderId: { in: tree }, deletedAt: null } } };
+    // У PDF, у которого отрисована только часть страниц, остаток держится строкой очереди —
+    // сам файл уже помечен «готово». Удалить строку молча значит потерять остальные страницы
+    // навсегда: пересчёт такие файлы не подхватывает. Поэтому снимаем отметку «готово» — тогда
+    // пересчёт поставит задачу заново, а воркер дорисует недостающие страницы (готовые он
+    // пропускает по списку ключей в S3).
+    const resumed = await this.prisma.asset.updateMany({
+      where: { ...mine, previewState: 'done', jobs: { some: { kind: 'pdf', state: 'pending' } } },
+      data: { previewState: 'none' },
+    });
+    const res = await this.prisma.job.deleteMany({ where: { asset: mine } });
+    this.logger.log(`очередь очищена: удалено строк ${res.count}, PDF с недорисованными страницами вернутся в пересчёт: ${resumed.count}`);
+    return { removed: res.count, resumed: resumed.count };
   }
 
   /**
@@ -149,6 +179,11 @@ export class QueueController {
     // Превью собираются только для медиа-зоны «Фото»: в «Файлах» файл лежит как есть.
     const inPhotos = { entries: { some: { folderId: { in: tree }, deletedAt: null, zone: ZONE_PHOTOS } } };
     const maxMb = Math.round(CONVERT_MAX_BYTES / 1024 / 1024);
+
+    // Дубли строк от прежних версий (PDF заводил вторую задачу на остаток страниц) — схлопываем
+    // до подсчёта: иначе один файл считался бы в остатке дважды, а «нет строки» перестало бы
+    // означать «задачи нет».
+    const deduped = await this.queue.dedupeJobs();
 
     // Сначала закрываем то, что собрать нельзя. Иначе такие файлы каждый пересчёт попадали бы
     // в очередь заново и вечно висели в остатке. Это свойства содержимого — они не изменятся.
@@ -189,9 +224,10 @@ export class QueueController {
       queued += res.count;
     }
     this.logger.log(
-      `пересчёт: поставлено задач ${queued}, закрыто как «собрать нельзя» ${bySize.count + byType.count} (по размеру ${bySize.count}, по типу ${byType.count})`,
+      `пересчёт: поставлено задач ${queued}, закрыто как «собрать нельзя» ${bySize.count + byType.count} (по размеру ${bySize.count}, по типу ${byType.count})` +
+        (deduped ? `, схлопнуто дублей ${deduped}` : ''),
     );
-    return { queued, impossible: bySize.count + byType.count };
+    return { queued, impossible: bySize.count + byType.count, deduped };
   }
 
   /**
