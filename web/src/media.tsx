@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownToLine, ArrowLeft, ArrowRight, Film, Image as ImageIcon, Info, Trash, X } from 'lucide-react';
+import { ArrowDownToLine, Film, Image as ImageIcon, Info, Trash, X } from 'lucide-react';
 import * as api from './api';
 
 /**
@@ -44,9 +44,7 @@ function fmtMediaDate(iso?: string | null): string {
   const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
   if (!m) return iso;
   const [, y, mo, d, h, mi] = m;
-  const dt = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi));
-  const date = dt.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
-  return `${date} · ${h}:${mi}`;
+  return `${d}.${mo}.${y.slice(2)} ${h}:${mi}`;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -536,7 +534,7 @@ function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => v
         title="Превью не собрано"
         aria-label="Превью не собрано"
       >
-        <span className="mcell-ico"><Icon size={16} /></span>
+        <span className="mcell-ico"><Icon size={22} /></span>
       </button>
     );
   }
@@ -551,7 +549,7 @@ function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => v
     >
       {!failed && <span className="mcell-skel" />}
       {failed ? (
-        <span className="mcell-ico"><Icon size={16} /></span>
+        <span className="mcell-ico"><Icon size={22} /></span>
       ) : (
         <img src={api.previewUrl(item.sha256!)} alt="" loading="lazy" decoding="async" draggable={false} onError={() => setFailed(true)} />
       )}
@@ -643,18 +641,6 @@ function MediaViewer({
     });
   }, []);
 
-  // Escape закрывает (если не открыта деталка — она закрывается первой).
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (detail) setDetail(false);
-        else close();
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [detail]);
-
   const commitZoom = useCallback((z: number, tx: number, ty: number) => {
     const fit = fitRef.current;
     if (!fit) return;
@@ -696,6 +682,24 @@ function MediaViewer({
     },
     [total, onNavigate],
   );
+
+  // Клавиатура: Esc — закрыть, ←/→ — листание (на десктопе вместо свайпа).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (detail) setDetail(false);
+        else close();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        go(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        go(1);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [detail, go, close]);
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (closing || detail) return;
@@ -760,7 +764,7 @@ function MediaViewer({
     if (gp.mode === 'nav' && n === 1) {
       if (!el) return;
       const w = el.clientWidth || 1;
-      const np = clamp(gp.startPos - (e.clientX - gp.startX) / w, 0, total - 1);
+      const np = clamp(gp.startPos + (e.clientX - gp.startX) / w, 0, total - 1);
       setPos(np);
       const now = performance.now();
       const dt = now - gp.lastT;
@@ -794,7 +798,7 @@ function MediaViewer({
       const p = posRef.current;
       let target = Math.round(p);
       // флик: быстрое движение — на один кадр дальше по направлению
-      if (Math.abs(gp.velX) > 0.6) target = gp.velX < 0 ? Math.ceil(p) : Math.floor(p);
+      if (Math.abs(gp.velX) > 0.6) target = gp.velX > 0 ? Math.ceil(p) : Math.floor(p);
       target = clamp(target, 0, total - 1);
       setDragging(false);
       setPos(target);
@@ -831,7 +835,7 @@ function MediaViewer({
     } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
       const w = el.clientWidth || 1;
       setDragging(true);
-      setPos((p) => clamp(p + e.deltaX / w, 0, total - 1));
+      setPos((p) => clamp(p - e.deltaX / w, 0, total - 1));
       if (wheelTimer.current) window.clearTimeout(wheelTimer.current);
       wheelTimer.current = window.setTimeout(() => {
         if (closingRef.current) return;
@@ -885,6 +889,17 @@ function MediaViewer({
       <div className="mv-head">
         <span className="mv-date">{fmtMediaDate(curItem?.capturedAt) || curItem?.name || ''}</span>
         <span style={{ flex: 1 }} />
+        <button className="iconbtn" title="Инфо" disabled={!curItem} onClick={() => setDetail((d) => !d)}>
+          <Info />
+        </button>
+        {curItem && (
+          <a className="iconbtn" title="Скачать оригинал" href={api.fileUrl(curItem.entryId)} download>
+            <ArrowDownToLine />
+          </a>
+        )}
+        <button className="iconbtn" title="Удалить (в корзину)" disabled={!curItem} onClick={() => void del()}>
+          <Trash />
+        </button>
         <button className="iconbtn" title="Закрыть" onClick={close}>
           <X />
         </button>
@@ -916,30 +931,6 @@ function MediaViewer({
             />
           </div>
         ))}
-      </div>
-
-      <div className="mv-foot">
-        <div className="mv-left">
-          <button className="iconbtn" title="Инфо" disabled={!curItem} onClick={() => setDetail((d) => !d)}>
-            <Info />
-          </button>
-          {curItem && (
-            <a className="iconbtn" title="Скачать оригинал" href={api.fileUrl(curItem.entryId)} download>
-              <ArrowDownToLine />
-            </a>
-          )}
-          <button className="iconbtn" title="Удалить (в корзину)" disabled={!curItem} onClick={() => void del()}>
-            <Trash />
-          </button>
-        </div>
-        <div className="mv-right">
-          <button className="iconbtn" title="Предыдущий снимок" disabled={k <= 0} onClick={() => go(-1)}>
-            <ArrowLeft />
-          </button>
-          <button className="iconbtn" title="Следующий снимок" disabled={k >= total - 1} onClick={() => go(1)}>
-            <ArrowRight />
-          </button>
-        </div>
       </div>
 
       {detail && curItem && (

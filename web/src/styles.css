@@ -224,10 +224,7 @@
   .navico { display: inline-flex; line-height: 1; }
   /* Подписи в нижнем баре: на узком экране под шесть колонок текста не хватает — там остаются
      только иконки, на широком показываем и слово. Доступность держит aria-label кнопки. */
-  .navlbl { font-size: var(--island-fs); line-height: var(--island-lbl); white-space: nowrap; }
-  @media (max-width: 560px) {
-    .navlbl { display: none; }
-  }
+  .navlbl { display: none; }
 
   /* ===== Формы и кнопки ===== */
   input, select, textarea {
@@ -905,7 +902,7 @@
     position: absolute;
     z-index: 5;
     top: calc(var(--side) + env(safe-area-inset-top) + var(--island-h) + var(--side));
-    bottom: calc(var(--side) + env(safe-area-inset-bottom) + var(--island-h) + var(--side));
+    bottom: calc(var(--side) + env(safe-area-inset-bottom));
     left: var(--side);
     right: var(--side);
     overflow-y: auto;
