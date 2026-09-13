@@ -157,13 +157,12 @@ export default function MapSection({ onOverlayChange }: {
       minZoom: 2,
       maxZoom: 19,
       worldCopyJump: true,
-      zoomControl: true,
-      attributionControl: true,
+      // Кнопок +/− и подписи OSM на карте нет: зум — колесом, щипком и двойным тапом,
+      // а весь служебный текст занимал место над нижним островом.
+      zoomControl: false,
+      attributionControl: false,
     });
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '© OpenStreetMap',
-    }).addTo(map);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
     // Отдельная панель под тепловой слой: canvas лежит среди панелей карты и потому
     // переезжает вместе с тайлами — во время панорамирования перерисовка не нужна.
     const pane = map.createPane('heat');
@@ -201,13 +200,15 @@ export default function MapSection({ onOverlayChange }: {
       // Вблизи вместо тепла — миниатюры: два слоя одновременно читались бы плохо.
       if (!pts.length || map.getZoom() >= MARKER_ZOOM) return;
 
-      // Точки складываются в клетки: 20 000 пятен по одному рисовать нельзя, а клетка
-      // ещё и показывает плотность — чем больше кадров, тем ярче пятно.
+      // Точки складываются в клетки: десятки тысяч пятен по одному рисовать нельзя, а клетка
+      // ещё и показывает плотность — чем больше кадров, тем ярче пятно. Координаты слоя
+      // (latLngToLayerPoint) уже отсчитаны от начала вида — ровно та система, в которой
+      // стоит сам canvas, поэтому вычитать pixelOrigin второй раз нельзя.
       const buckets = new Map<number, { x: number; y: number; n: number }>();
       for (const p of pts) {
         const lp = map.latLngToLayerPoint([p.lat, p.lon]);
-        const x = lp.x - tl.x;
-        const y = lp.y - tl.y;
+        const x = lp.x;
+        const y = lp.y;
         if (x < -HEAT_RADIUS || y < -HEAT_RADIUS || x > size.x + HEAT_RADIUS || y > size.y + HEAT_RADIUS) continue;
         const key = cellKey(Math.floor(x / HEAT_CELL), Math.floor(y / HEAT_CELL));
         const b = buckets.get(key);
@@ -261,9 +262,7 @@ export default function MapSection({ onOverlayChange }: {
       const show = map.getZoom() >= MARKER_ZOOM && pts.length > 0;
       setMarkers(show);
       if (!show) return;
-      const bounds = map.getPixelBounds();
-      const size = bounds.getSize();
-      const tl = bounds.min ?? L.point(0, 0);
+      const size = map.getSize();
       // Кадры одной экранной клетки — одна миниатюра; points уже идут от свежих,
       // поэтому первый в клетке и есть самый новый кадр места. Берём только то, что
       // попадает на экран (с запасом в клетку): иначе потолок CLUSTER_MAX съедали бы
@@ -272,8 +271,8 @@ export default function MapSection({ onOverlayChange }: {
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
         const lp = map.latLngToLayerPoint([p.lat, p.lon]);
-        const x = lp.x - tl.x;
-        const y = lp.y - tl.y;
+        const x = lp.x;
+        const y = lp.y;
         if (x < -CLUSTER_PX || y < -CLUSTER_PX || x > size.x + CLUSTER_PX || y > size.y + CLUSTER_PX) continue;
         const key = cellKey(Math.floor(x / CLUSTER_PX), Math.floor(y / CLUSTER_PX));
         const c = cells.get(key);
