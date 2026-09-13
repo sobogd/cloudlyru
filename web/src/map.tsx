@@ -95,6 +95,8 @@ export default function MapSection({ onOverlayChange }: {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
   /** Зум достаточный, чтобы вместо тепла показывать миниатюры. */
   const [markers, setMarkers] = useState(false);
+  /** Сколько кадров попадает в текущий вид: ноль — показываем подсказку «здесь кадров нет». */
+  const [visibleCount, setVisibleCount] = useState(-1);
 
   const hostRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -197,8 +199,10 @@ export default function MapSection({ onOverlayChange }: {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, size.x, size.y);
       const pts = pointsRef.current;
-      // Вблизи вместо тепла — миниатюры: два слоя одновременно читались бы плохо.
-      if (!pts.length || map.getZoom() >= MARKER_ZOOM) return;
+      // Вблизи вместо тепла — миниатюры, но слой не убираем совсем, а бледним: иначе карта
+      // в месте без кадров выглядела бы пустой и непонятной.
+      if (!pts.length) return;
+      const dim = map.getZoom() >= MARKER_ZOOM ? 0.35 : 1;
 
       // Точки складываются в клетки: десятки тысяч пятен по одному рисовать нельзя, а клетка
       // ещё и показывает плотность — чем больше кадров, тем ярче пятно. Координаты слоя
@@ -226,7 +230,9 @@ export default function MapSection({ onOverlayChange }: {
         off.width = w;
         off.height = h;
       }
-      const octx = off.getContext('2d');
+      // willReadFrequently: альфу этого canvas мы читаем на каждой перерисовке, и без флага
+      // браузер гоняет пиксели между GPU и CPU — на телефоне это заметно.
+      const octx = off.getContext('2d', { willReadFrequently: true });
       const sprite = spriteRef.current;
       if (!octx || !sprite) return;
       octx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -251,7 +257,9 @@ export default function MapSection({ onOverlayChange }: {
         d[i + 2] = bl;
       }
       octx.putImageData(img, 0, 0);
+      ctx.globalAlpha = dim;
       ctx.drawImage(off, 0, 0, size.x, size.y);
+      ctx.globalAlpha = 1;
     };
 
     const syncMarkers = () => {
@@ -259,6 +267,12 @@ export default function MapSection({ onOverlayChange }: {
       if (!layer) return;
       layer.clearLayers();
       const pts = pointsRef.current;
+      // Кадры в текущем виде: нужно отдельно от зума миниатюр — по этому признаку показываем
+      // «в этой области кадров нет», когда пользователь уехал туда, где съёмок не было.
+      const view = map.getBounds().pad(0.05);
+      let inView = 0;
+      for (const p of pts) if (view.contains([p.lat, p.lon])) inView++;
+      setVisibleCount(inView);
       const show = map.getZoom() >= MARKER_ZOOM && pts.length > 0;
       setMarkers(show);
       if (!show) return;
@@ -333,12 +347,14 @@ export default function MapSection({ onOverlayChange }: {
     if (points == null) return;
     drawRef.current();
     markersRef.current();
-    // Вид восстанавливаем только один раз и только если прошлого вида нет: иначе после
-    // каждого удаления кадра карта прыгала бы обратно «показать всё».
-    if (!savedView && !fittedRef.current) {
-      fittedRef.current = true;
-      fitAll();
-    }
+    if (fittedRef.current) return;
+    fittedRef.current = true;
+    // Восстановленный вид принимаем, только если в нём есть кадры: прошлая версия карты
+    // сохраняла любой вид, и можно было открыть вкладку в пустом месте и решить,
+    // что карта не работает.
+    const box = mapRef.current?.getBounds().pad(0.1);
+    const hasPhotos = !!box && points.some((p) => box.contains([p.lat, p.lon]));
+    if (!savedView || !hasPhotos) fitAll();
   }, [points, savedView, fitAll]);
 
   // ---- Источник кадров для просмотрщика: у карты нет ленты, детали берём по entryId ----
@@ -407,15 +423,22 @@ export default function MapSection({ onOverlayChange }: {
       </div>
       <div className="mapbox">
         <div className="map-host" ref={hostRef} />
-        {error && <div className="err map-note">{error}</div>}
-        {points == null && !error && <div className="map-note"><span className="spin" /></div>}
-        {points != null && count === 0 && !error && (
+        {error && <div className="map-pill err">{error}</div>}
+        {!error && points == null && <div className="map-pill">Загружаю метки…</div>}
+        {!error && points != null && count === 0 && (
           <div className="map-note copy">
-            Здесь появятся кадры с геометкой. Координаты берутся из EXIF фото и видео — у снимков
-            без геоданных их нет.
+            Здесь появятся кадры с геометкой. Координаты берутся из EXIF фото и видео, а само
+            превью должно быть уже собрано — у снимков без геоданных или без превью их нет.
           </div>
         )}
-        {!markers && count > 0 && <div className="map-legend">Плотность съёмки · приблизьте, чтобы увидеть кадры</div>}
+        {!error && points != null && count > 0 && visibleCount === 0 && (
+          <button type="button" className="map-pill map-pill-btn" onClick={fitAll}>
+            <LocateFixed /> В этой области кадров нет — показать все
+          </button>
+        )}
+        {!error && points != null && count > 0 && visibleCount !== 0 && !markers && (
+          <div className="map-pill">Плотность съёмки · приблизьте, чтобы увидеть кадры</div>
+        )}
       </div>
 
       {openIdx != null && points != null && points.length > 0 && (
