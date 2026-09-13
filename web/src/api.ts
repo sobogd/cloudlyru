@@ -532,6 +532,12 @@ export const retryPreview = (entryId: string) =>
 /** Пересчёт: найти файлы, у которых превью нет, и поставить им задачи. */
 export const rebuildPreviews = () =>
   request<{ queued: number; impossible: number }>('/queue/rebuild', { method: 'POST', body: JSON.stringify({}) });
+/**
+ * Полная очистка очереди: удаляются все строки задач, включая упавшие. Собранные превью
+ * не трогаются — после очистки очередь пуста, пока не нажали «Пересчитать».
+ */
+export const clearQueue = () =>
+  request<{ removed: number }>('/queue/clear', { method: 'POST', body: JSON.stringify({}) });
 /** Пауза конвертации (мягкая: текущая задача докачивается, новые не берутся). */
 export const setQueuePaused = (paused: boolean) =>
   request<{ paused: boolean }>('/queue/pause', { method: 'POST', body: JSON.stringify({ paused }) });

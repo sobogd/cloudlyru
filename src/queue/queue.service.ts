@@ -512,7 +512,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       else this.logger.log(`✓ ${tag}`);
     } catch (e) {
       const msg = (e as Error).message || 'error';
-      const row = await this.prisma.job.findUnique({ where: { id: job.id } });
+      // Строки может уже не быть: ассет вычистили из корзины или очередь очистили кнопкой,
+      // пока задача считалась. Тогда писать статус некуда — в логе остаётся сама ошибка.
+      const row = await this.prisma.job.findUnique({ where: { id: job.id } }).catch(() => null);
       const attempts = row?.attempts ?? 1;
       const transient = this.isTransient(msg);
       if (transient && attempts < MAX_ATTEMPTS) {
@@ -521,14 +523,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(
           `✗ ${tag}: ${msg.slice(0, 200)} — повтор через ${Math.round(delay / 1000)} с (попытка ${attempts} из ${MAX_ATTEMPTS})`,
         );
-        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: truncErr(msg) } });
+        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: truncErr(msg) } }).catch(() => undefined);
       } else {
         // постоянная ошибка: три попытки подряд дают тот же результат, а очередь занята.
         // Строка остаётся со статусом ошибки — её видно на странице ошибок и можно повторить.
         const why = transient ? `попытки исчерпаны (${attempts})` : 'ошибка не временная — повтор не поможет';
         this.retryAfter.delete(job.id);
         this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)} — ${why}`);
-        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } });
+        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } }).catch(() => undefined);
       }
     } finally {
       this.active.delete(job.id);
