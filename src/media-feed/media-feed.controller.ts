@@ -6,46 +6,33 @@ import { notFound } from '../common/errors';
 
 /**
  * Ручки раздела «Медиа». Изолированы от «Фото» (`MediaController` / `/timeline`):
- * здесь только лента и окно просмотра. Отдача самих превью/оригиналов и удаление —
- * общие низкоуровневые ручки (`/previews/:sha`, `/files/:id`), они к разделу не относятся.
+ * общее число, срез по смещению и метаданные кадра. Отдача самих превью/оригиналов и
+ * удаление — общие низкоуровневые ручки (`/previews/:sha`, `/files/:id`).
  */
 @Controller('media')
 export class MediaFeedController {
   constructor(private readonly feed: MediaFeedService) {}
 
-  /** Страница ленты: `limit` — размер, `cursor` — entryId последней показанной записи. */
-  @Get('timeline')
+  /** Общее число медиа — клиент по нему считает полную высоту скролла. */
+  @Get('count')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
-  timeline(
-    @CurrentUser() user: RequestUser,
-    @Query('limit') limit?: string,
-    @Query('cursor') cursor?: string,
-  ) {
-    const lim = limit ? Number(limit) : 300;
-    return this.feed.timeline(
-      user.id,
-      Number.isFinite(lim) ? lim : 300,
-      typeof cursor === 'string' && cursor ? cursor : undefined,
-    );
+  count(@CurrentUser() user: RequestUser) {
+    return this.feed.count(user.id);
   }
 
-  /** Окно вокруг кадра для полноэкранного просмотра: `before` новее, `after` старее. */
-  @Get('window')
+  /** Срез ленты по смещению: `offset` — позиция, `limit` — сколько взять. */
+  @Get('range')
   @UseGuards(RateLimitGuard)
-  @RateLimit(1200, 60_000)
-  window(
+  @RateLimit(600, 60_000)
+  range(
     @CurrentUser() user: RequestUser,
-    @Query('entryId') entryId?: string,
-    @Query('before') before?: string,
-    @Query('after') after?: string,
+    @Query('offset') offset?: string,
+    @Query('limit') limit?: string,
   ) {
-    return this.feed.window(
-      user.id,
-      typeof entryId === 'string' && entryId ? entryId : undefined,
-      before,
-      after,
-    );
+    const off = Number(offset);
+    const lim = Number(limit);
+    return this.feed.range(user.id, Number.isFinite(off) ? off : 0, Number.isFinite(lim) ? lim : 300);
   }
 
   /** Метаданные кадра для панели «Инфо»: своя ручка, а не общий /files/:id. */

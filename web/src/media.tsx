@@ -5,13 +5,15 @@ import * as api from './api';
 /**
  * Раздел «Медиа» — изолированная от «Фото»/«Видео» поверхность просмотра.
  *
- * Таймлайн: бесконечная лента зоны «Фото» (фото + видео), виртуализированная сетка из
- * квадратов 50×50 (ровно то превью, что отдаёт сервер — без апскейла и лишнего трафика).
+ * Таймлайн: виртуализированная сетка 50×50 (ровно превью сервера). С бэка берём только
+ * общее число элементов (`/media/count`), считаем полную высоту скролла, а сами элементы
+ * запрашиваем по диапазону индексов (`/media/range?offset&limit`) после остановки скролла
+ * (дебаунс) — поэтому скроллбар полной высоты сразу, а сеть ходит только за видимой частью.
  * В липкой шапке-острове — месяц и год того снимка, что сейчас под верхом прокрутки.
  *
  * Модалка: 3 блока (шапка/фото/футер), плавное появление-затухание, зум щипком и дабл-тапом,
- * листание свайпом пальцем и на трекпаде — аналог гугла: свайп тащит кадр за пальцем, на
- * отпускании снап по расстоянию/скорости. При зуме свайп панорамирует снимок, а не листает.
+ * листание свайпом пальцем и на трекпаде. «Вперёд/назад» — чисто клиентское (индекс ± 1),
+ * сеть нужна только за 1080-превью текущего кадра.
  */
 
 type MediaItem = api.MediaItem;
@@ -22,10 +24,10 @@ const GAP = 3;
 const ROW = CELL + GAP;
 /** Сколько строк вне экрана держим смонтированными (запас на быстрый скролл). */
 const OVERSCAN = 3;
-/** Размер страницы ленты. */
-const PAGE = 300;
-/** Окно просмотра и порог добора ленты в модалке. */
-const WIN_EDGE = 6;
+/** Дебаунс запроса видимой части после остановки скролла. */
+const FETCH_DEBOUNCE_MS = 500;
+/** Сколько элементов просим одним запросом range. */
+const FETCH_CHUNK = 500;
 
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
@@ -60,9 +62,8 @@ export default function MediaSection({ onOverlayChange }: {
   /** Модалка открыта/закрыта — Shell прячет общий футер, чтобы он не наезжал на футер модалки. */
   onOverlayChange?: (open: boolean) => void;
 }) {
-  const [items, setItems] = useState<MediaItem[]>([]);
-  const [hasMore, setHasMore] = useState(true);
-  const [loading, setLoading] = useState(false);
+  const [total, setTotal] = useState<number | null>(null);
+  const [items, setItems] = useState<Map<number, MediaItem>>(() => new Map());
   const [error, setError] = useState('');
   const [openIdx, setOpenIdx] = useState<number | null>(null);
 
@@ -71,56 +72,37 @@ export default function MediaSection({ onOverlayChange }: {
   }, [openIdx, onOverlayChange]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const totalRef = useRef<number | null>(null);
+  totalRef.current = total;
   const itemsRef = useRef(items);
   itemsRef.current = items;
-  const loadingRef = useRef(false);
-  const hasMoreRef = useRef(true);
   const seqRef = useRef(0);
+  const debounceRef = useRef<number | null>(null);
+  const rafRef = useRef(0);
 
   const [cols, setCols] = useState(1);
+  const colsRef = useRef(1);
+  colsRef.current = cols;
   const [viewport, setViewport] = useState({ w: 0, h: 0 });
   const [range, setRange] = useState<[number, number]>([0, OVERSCAN]);
   const [month, setMonth] = useState('');
 
-  const loadMore = useCallback(async () => {
-    if (loadingRef.current || !hasMoreRef.current) return;
-    loadingRef.current = true;
-    setLoading(true);
-    const seq = ++seqRef.current;
-    const cursor = itemsRef.current[itemsRef.current.length - 1]?.entryId;
-    try {
-      const page = await api.mediaTimeline(PAGE, cursor);
-      if (seq !== seqRef.current) return;
-      hasMoreRef.current = page.length >= PAGE;
-      setHasMore(hasMoreRef.current);
-      setItems((prev) => {
-        const seen = new Set(prev.map((i) => i.entryId));
-        const add = page.filter((i) => !seen.has(i.entryId));
-        return [...prev, ...add];
-      });
-      setError('');
-    } catch (e) {
-      if (seq !== seqRef.current) return;
-      if ((e as { code?: string }).code === 'cursor_stale') {
-        // Запись-курсор исчезла посреди прокрутки: не считаем это концом ленты, а просим
-        // пользователя перечитать раздел (обычно после удаления/переноса на другом устройстве).
-        hasMoreRef.current = false;
-        setHasMore(false);
-        setError('Лента изменилась на сервере — перезагрузите страницу');
-      } else {
-        setError((e as Error).message);
-      }
-    } finally {
-      if (seq === seqRef.current) {
-        loadingRef.current = false;
-        setLoading(false);
-      }
-    }
-  }, []);
-
+  // Общее число элементов — один раз при входе в раздел.
   useEffect(() => {
-    void loadMore();
-  }, [loadMore]);
+    let stopped = false;
+    api.mediaCount()
+      .then((n) => {
+        if (stopped) return;
+        setTotal(n);
+        totalRef.current = n;
+      })
+      .catch((e) => {
+        if (!stopped) setError((e as Error).message);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, []);
 
   // Измеряем скролл-контейнер: от ширины зависит число колонок.
   useLayoutEffect(() => {
@@ -137,8 +119,49 @@ export default function MediaSection({ onOverlayChange }: {
     return () => ro.disconnect();
   }, []);
 
-  const rowCount = Math.ceil(items.length / cols);
+  const rowCount = total == null ? 0 : Math.ceil(total / cols);
   const totalH = Math.max(0, rowCount * ROW - GAP);
+
+  const getItem = useCallback((i: number) => itemsRef.current.get(i), []);
+
+  /** Догрузить диапазон индексов [start, end] включительно (только отсутствующие куски). */
+  const fetchRange = useCallback(async (start: number, end: number) => {
+    const t = totalRef.current;
+    if (t == null) return;
+    start = Math.max(0, start);
+    end = Math.min(t - 1, end);
+    if (start > end) return;
+    const map = itemsRef.current;
+    // собираем непрерывные куски ещё не загруженных индексов
+    const spans: Array<[number, number]> = [];
+    let a = -1;
+    for (let i = start; i <= end; i++) {
+      if (!map.has(i)) {
+        if (a === -1) a = i;
+      } else if (a !== -1) {
+        spans.push([a, i - 1]);
+        a = -1;
+      }
+    }
+    if (a !== -1) spans.push([a, end]);
+    for (const [s, e] of spans) {
+      for (let off = s; off <= e; off += FETCH_CHUNK) {
+        const len = Math.min(FETCH_CHUNK, e - off + 1);
+        const seq = ++seqRef.current;
+        try {
+          const page = await api.mediaRange(off, len);
+          if (seq !== seqRef.current) return; // индекс сдвинули (удаление) — данные устарели
+          setItems((prev) => {
+            const next = new Map(prev);
+            for (let j = 0; j < page.length; j++) next.set(off + j, page[j]);
+            return next;
+          });
+        } catch (err) {
+          if (seq === seqRef.current) setError((err as Error).message);
+        }
+      }
+    }
+  }, []);
 
   const updateRange = useCallback(
     (top: number) => {
@@ -150,66 +173,88 @@ export default function MediaSection({ onOverlayChange }: {
     [viewport.h, rowCount],
   );
 
-  const rafRef = useRef(0);
+  /** Запрос видимой части — только после остановки скролла (дебаунс). */
+  const scheduleFetch = useCallback(() => {
+    if (debounceRef.current != null) window.clearTimeout(debounceRef.current);
+    debounceRef.current = window.setTimeout(() => {
+      debounceRef.current = null;
+      const el = scrollRef.current;
+      const t = totalRef.current;
+      if (!el || t == null) return;
+      const c = colsRef.current;
+      const top = el.scrollTop;
+      const vh = el.clientHeight || 600;
+      const firstRow = Math.max(0, Math.floor(top / ROW) - OVERSCAN);
+      const lastRow = Math.min(Math.ceil(t / c) - 1, Math.ceil((top + vh) / ROW) + OVERSCAN);
+      if (lastRow < 0) return;
+      const iStart = firstRow * c;
+      const iEnd = Math.min(t - 1, (lastRow + 1) * c - 1);
+      if (iStart <= iEnd) void fetchRange(iStart, iEnd);
+    }, FETCH_DEBOUNCE_MS);
+  }, [fetchRange]);
+
   const onScroll = useCallback(() => {
     if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = 0;
       const el = scrollRef.current;
       if (!el) return;
-      const top = el.scrollTop;
-      updateRange(top);
-      const firstRow = Math.max(0, Math.floor(top / ROW));
-      const item = itemsRef.current[firstRow * cols];
-      const key = item?.capturedAt?.slice(0, 7) ?? '';
-      setMonth((m) => (m === key ? m : key));
-      if (hasMoreRef.current && !loadingRef.current && top + el.clientHeight > el.scrollHeight - 900) {
-        void loadMore();
-      }
+      updateRange(el.scrollTop);
+      scheduleFetch();
     });
-  }, [updateRange, cols, loadMore]);
+  }, [updateRange, scheduleFetch]);
 
-  // После догрузки/ресайза пересчитываем видимый диапазон и месяц.
+  // Первый экран — сразу после того, как узнали общее число и ширину.
+  useLayoutEffect(() => {
+    if (total == null || total === 0) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const vh = el.clientHeight || 600;
+    const lastRow = Math.min(Math.ceil(total / cols) - 1, Math.ceil(vh / ROW) + OVERSCAN);
+    const iEnd = Math.min(total - 1, (lastRow + 1) * cols - 1);
+    if (iEnd >= 0) void fetchRange(0, iEnd);
+    updateRange(0);
+  }, [total, cols, fetchRange, updateRange]);
+
+  // Месяц в шапке — от первого видимого снимка; обновляется, когда пришёл новый кусок.
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const top = el.scrollTop;
-    updateRange(top);
-    const firstRow = Math.max(0, Math.floor(top / ROW));
-    const item = itemsRef.current[firstRow * cols];
-    setMonth((m) => {
-      const key = item?.capturedAt?.slice(0, 7) ?? '';
-      return m === key ? m : key;
-    });
-  }, [updateRange, cols, items.length]);
+    const firstRow = Math.max(0, Math.floor(el.scrollTop / ROW));
+    const item = itemsRef.current.get(firstRow * colsRef.current);
+    const key = item?.capturedAt?.slice(0, 7) ?? '';
+    setMonth((m) => (m === key ? m : key));
+  }, [items, cols]);
 
   const rows = useMemo(() => {
-    const out: Array<{ y: number; start: number; cells: MediaItem[] }> = [];
+    const out: Array<{ y: number; start: number; cells: Array<MediaItem | undefined> }> = [];
+    if (total == null) return out;
     for (let r = range[0]; r <= range[1] && r >= 0; r++) {
       const start = r * cols;
-      const cells = items.slice(start, start + cols);
-      if (!cells.length) continue;
+      if (start >= total) break;
+      const count = Math.min(cols, total - start);
+      const cells: Array<MediaItem | undefined> = [];
+      for (let ci = 0; ci < count; ci++) cells.push(items.get(start + ci));
       out.push({ y: r * ROW, start, cells });
     }
     return out;
-  }, [range, items, cols]);
+  }, [range, items, cols, total]);
 
-  const handleDelete = useCallback((entryId: string) => {
-    const cur = itemsRef.current;
-    const i = cur.findIndex((x) => x.entryId === entryId);
-    if (i < 0) return;
-    const next = cur.filter((x) => x.entryId !== entryId);
-    setItems(next);
-    if (!next.length) {
-      setOpenIdx(null);
-      return;
-    }
-    setOpenIdx(Math.min(i, next.length - 1));
+  const handleDelete = useCallback((index: number) => {
+    seqRef.current++; // отменяем летящие загрузки — индексы сдвинулись
+    setItems((prev) => {
+      const next = new Map<number, MediaItem>();
+      for (const [k, v] of prev) {
+        if (k === index) continue;
+        next.set(k > index ? k - 1 : k, v);
+      }
+      return next;
+    });
+    const nt = (totalRef.current ?? 1) - 1;
+    totalRef.current = nt;
+    setTotal(nt);
+    setOpenIdx(nt <= 0 ? null : Math.min(index, nt - 1));
   }, []);
-
-  const handleNeedMore = useCallback(() => {
-    if (hasMoreRef.current) void loadMore();
-  }, [loadMore]);
 
   return (
     <div className={'media' + (openIdx != null ? ' has-viewer' : '')}>
@@ -218,42 +263,46 @@ export default function MediaSection({ onOverlayChange }: {
       </div>
       <div className="mscroll" ref={scrollRef} onScroll={onScroll}>
         {error && <div className="err" style={{ padding: '8px 4px' }}>{error}</div>}
-        {!items.length && !loading && !error && (
+        {total == null && !error && (
+          <div className="mempty">
+            <span className="spin" />
+          </div>
+        )}
+        {total === 0 && !error && (
           <div className="mempty">
             <span className="copy">Здесь появятся фото и видео из раздела «Фото»</span>
           </div>
         )}
-        <div className="mvirt" style={{ height: totalH }}>
-          {rows.map((row) => (
-            <div className="mrow" key={row.start} style={{ transform: `translateY(${row.y}px)` }}>
-              {row.cells.map((it, ci) => (
-                <Cell key={it.entryId} item={it} onClick={() => setOpenIdx(row.start + ci)} />
-              ))}
-            </div>
-          ))}
-        </div>
-        {loading && (
-          <div className="mloading">
-            <span className="spin" />
+        {total != null && total > 0 && (
+          <div className="mvirt" style={{ height: totalH }}>
+            {rows.map((row) => (
+              <div className="mrow" key={row.start} style={{ transform: `translateY(${row.y}px)` }}>
+                {row.cells.map((it, ci) => (
+                  <Cell key={row.start + ci} item={it} onClick={() => it && setOpenIdx(row.start + ci)} />
+                ))}
+              </div>
+            ))}
           </div>
         )}
       </div>
 
-      {openIdx != null && items[openIdx] && (
+      {openIdx != null && total != null && total > 0 && (
         <MediaViewer
-          items={items}
+          total={total}
           idx={openIdx}
+          getItem={getItem}
+          ensure={fetchRange}
           onNavigate={setOpenIdx}
           onClose={() => setOpenIdx(null)}
           onDelete={handleDelete}
-          onNeedMore={handleNeedMore}
         />
       )}
     </div>
   );
 }
 
-function Cell({ item, onClick }: { item: MediaItem; onClick: () => void }) {
+function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => void }) {
+  if (!item) return <div className="mcell off" />;
   const ready = item.previewState === 'done' && !!item.sha256;
   const video = /^video\//.test(item.mime);
   return (
@@ -275,19 +324,21 @@ function Cell({ item, onClick }: { item: MediaItem; onClick: () => void }) {
 type ZoomState = { scale: number; tx: number; ty: number };
 
 function MediaViewer({
-  items,
+  total,
   idx,
+  getItem,
+  ensure,
   onNavigate,
   onClose,
   onDelete,
-  onNeedMore,
 }: {
-  items: MediaItem[];
+  total: number;
   idx: number;
+  getItem: (i: number) => MediaItem | undefined;
+  ensure: (start: number, end: number) => void;
   onNavigate: (idx: number) => void;
   onClose: () => void;
-  onDelete: (entryId: string) => void;
-  onNeedMore: () => void;
+  onDelete: (index: number) => void;
 }) {
   const [pos, setPos] = useState(idx);
   const [dragging, setDragging] = useState(false);
@@ -321,8 +372,8 @@ function MediaViewer({
   const lastTap = useRef({ t: 0, x: 0, y: 0 });
   const wheelTimer = useRef<number | null>(null);
 
-  const k = clamp(Math.round(pos), 0, items.length - 1);
-  const curItem = items[k];
+  const k = clamp(Math.round(pos), 0, total - 1);
+  const curItem = getItem(k);
 
   // Позиция догоняет индекс после снапа/навигации кнопками/удаления.
   useEffect(() => {
@@ -336,10 +387,10 @@ function MediaViewer({
     setDetail(false);
   }, [k]);
 
-  // Добор ленты, когда листаем к краю загруженного.
+  // Догружаем текущий кадр и соседей, чтобы свайп не упирался в пустоту.
   useEffect(() => {
-    if (items.length - k <= WIN_EDGE) onNeedMore();
-  }, [k, items.length, onNeedMore]);
+    ensure(Math.max(0, k - 1), Math.min(total - 1, k + 1));
+  }, [k, total, ensure]);
 
   // Escape закрывает (если не открыта деталка — она закрывается первой).
   useEffect(() => {
@@ -387,12 +438,12 @@ function MediaViewer({
 
   const go = useCallback(
     (delta: number) => {
-      const t = clamp(Math.round(posRef.current) + delta, 0, items.length - 1);
+      const t = clamp(Math.round(posRef.current) + delta, 0, total - 1);
       setDragging(false);
       setPos(t);
       onNavigate(t);
     },
-    [items.length, onNavigate],
+    [total, onNavigate],
   );
 
   const onPointerDown = (e: React.PointerEvent) => {
@@ -458,7 +509,7 @@ function MediaViewer({
     if (gp.mode === 'nav' && n === 1) {
       if (!el) return;
       const w = el.clientWidth || 1;
-      const np = clamp(gp.startPos - (e.clientX - gp.startX) / w, 0, items.length - 1);
+      const np = clamp(gp.startPos - (e.clientX - gp.startX) / w, 0, total - 1);
       setPos(np);
       const now = performance.now();
       const dt = now - gp.lastT;
@@ -493,7 +544,7 @@ function MediaViewer({
       let target = Math.round(p);
       // флик: быстрое движение — на один кадр дальше по направлению
       if (Math.abs(gp.velX) > 0.6) target = gp.velX < 0 ? Math.ceil(p) : Math.floor(p);
-      target = clamp(target, 0, items.length - 1);
+      target = clamp(target, 0, total - 1);
       setDragging(false);
       setPos(target);
       onNavigate(target);
@@ -529,13 +580,13 @@ function MediaViewer({
     } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
       const w = el.clientWidth || 1;
       setDragging(true);
-      setPos((p) => clamp(p + e.deltaX / w, 0, items.length - 1));
+      setPos((p) => clamp(p + e.deltaX / w, 0, total - 1));
       if (wheelTimer.current) window.clearTimeout(wheelTimer.current);
       wheelTimer.current = window.setTimeout(() => {
         if (closingRef.current) return;
         setDragging(false);
         const p = posRef.current;
-        const t = clamp(Math.round(p), 0, items.length - 1);
+        const t = clamp(Math.round(p), 0, total - 1);
         setPos(t);
         onNavigate(t);
       }, 110);
@@ -556,14 +607,11 @@ function MediaViewer({
 
   // Слайды: текущий + соседи по ленте. Трансформ — (индекс − pos) в процентах ширины:
   // непрерывен и при свайпе, и при смене «текущего» на середине.
-  const slides = useMemo(() => {
-    const out: Array<{ i: number; item: MediaItem }> = [];
-    for (let i = k - 1; i <= k + 1; i++) {
-      if (i < 0 || i >= items.length) continue;
-      out.push({ i, item: items[i] });
-    }
-    return out;
-  }, [k, items]);
+  const slides: Array<{ i: number; item: MediaItem | undefined }> = [];
+  for (let i = k - 1; i <= k + 1; i++) {
+    if (i < 0 || i >= total) continue;
+    slides.push({ i, item: getItem(i) });
+  }
 
   const del = async () => {
     if (!curItem) return;
@@ -571,7 +619,7 @@ function MediaViewer({
     try {
       await api.deleteFile(curItem.entryId);
       setDetail(false);
-      onDelete(curItem.entryId);
+      onDelete(k);
     } catch (e) {
       alert((e as Error).message);
     }
@@ -603,7 +651,7 @@ function MediaViewer({
         {slides.map(({ i, item }) => (
           <div
             className="mslide"
-            key={item.entryId}
+            key={i}
             style={{
               transform: `translateX(${(i - pos) * 100}%)`,
               transition: dragging ? 'none' : 'transform .28s cubic-bezier(.2,.7,.2,1)',
@@ -613,7 +661,7 @@ function MediaViewer({
               item={item}
               stage={stage}
               zoom={i === k ? zoom : { scale: 1, tx: 0, ty: 0 }}
-              onNat={i === k ? setNat : undefined}
+              onNat={i === k && item ? setNat : undefined}
             />
           </div>
         ))}
@@ -621,13 +669,15 @@ function MediaViewer({
 
       <div className="mv-foot">
         <div className="mv-left">
-          <button className="iconbtn" title="Инфо" onClick={() => setDetail((d) => !d)}>
+          <button className="iconbtn" title="Инфо" disabled={!curItem} onClick={() => setDetail((d) => !d)}>
             <Info />
           </button>
-          <a className="iconbtn" title="Скачать оригинал" href={api.fileUrl(curItem.entryId)} download>
-            <ArrowDownToLine />
-          </a>
-          <button className="iconbtn" title="Удалить (в корзину)" onClick={() => void del()}>
+          {curItem && (
+            <a className="iconbtn" title="Скачать оригинал" href={api.fileUrl(curItem.entryId)} download>
+              <ArrowDownToLine />
+            </a>
+          )}
+          <button className="iconbtn" title="Удалить (в корзину)" disabled={!curItem} onClick={() => void del()}>
             <Trash />
           </button>
         </div>
@@ -635,7 +685,7 @@ function MediaViewer({
           <button className="iconbtn" title="Предыдущий снимок" disabled={k <= 0} onClick={() => go(-1)}>
             <ArrowLeft />
           </button>
-          <button className="iconbtn" title="Следующий снимок" disabled={k >= items.length - 1} onClick={() => go(1)}>
+          <button className="iconbtn" title="Следующий снимок" disabled={k >= total - 1} onClick={() => go(1)}>
             <ArrowRight />
           </button>
         </div>
@@ -670,13 +720,22 @@ function Slide({
   zoom,
   onNat,
 }: {
-  item: MediaItem;
+  item: MediaItem | undefined;
   stage: { w: number; h: number };
   zoom: ZoomState;
   onNat?: (s: { w: number; h: number }) => void;
 }) {
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
   const [failed, setFailed] = useState(false);
+
+  if (!item) {
+    return (
+      <div className="mv-load">
+        <span className="spin" />
+      </div>
+    );
+  }
+
   const isVideo = /^video\//.test(item.mime);
 
   if (isVideo) {

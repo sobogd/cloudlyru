@@ -498,18 +498,11 @@ export interface TimelineStatus {
 // ===== Раздел «Медиа» (изолированные ручки /media/*) =====
 /** Строка ленты «Медиа»: тот же контракт, что у TimelineItem, но из своего модуля. */
 export interface MediaItem { entryId: string; name: string; capturedAt: string | null; mime: string; sha256?: string; previewState: string; size: number }
-/** Страница ленты: keyset-курсор по entryId последней показанной записи. */
-export const mediaTimeline = (limit: number, cursor?: string) => {
-  const q = new URLSearchParams();
-  q.set('limit', String(limit));
-  if (cursor) q.set('cursor', cursor);
-  return request<MediaItem[]>(`/media/timeline?${q}`);
-};
-/** Окно вокруг кадра для полноэкранного просмотра (порядок — как у ленты, от свежих к старым). */
-export const mediaWindow = (entryId: string, before = 20, after = 20) =>
-  request<MediaItem[]>(
-    `/media/window?entryId=${encodeURIComponent(entryId)}&before=${before}&after=${after}`,
-  );
+/** Общее число медиа — по нему клиент считает полную высоту скролла. */
+export const mediaCount = () => request<number>('/media/count');
+/** Срез ленты по смещению: элементы [offset, offset+limit) в порядке ленты. */
+export const mediaRange = (offset: number, limit: number) =>
+  request<MediaItem[]>(`/media/range?offset=${offset}&limit=${limit}`);
 /** Метаданные кадра для панели «Инфо» в модалке. */
 export interface MediaInfo {
   entryId: string;
