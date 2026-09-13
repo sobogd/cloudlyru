@@ -124,9 +124,10 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
 
   return (
     <div className="app">
-      {/* Шапка-остров: плавающая плашка сверху, контент прокручивается под ней */}
+      {/* Шапка-остров: та же плашка, что нижняя навигация, только с иконкой приложения.
+          Контент прокручивается под ней. */}
       <header className="island island-top">
-        <h1>CloudlyRu</h1>
+        <span className="brandico" title="CloudlyRu"><Cloud /></span>
       </header>
       <main className="content">
         {up.rows.length > 0 && (
@@ -626,7 +627,7 @@ function mediaRows(raw: Record<string, unknown> | null): Array<[string, string]>
   return rows;
 }
 
-function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: () => void; onDeleted?: (entryId: string) => void }) {
+function FileDetail({ entryId, onBack, onDeleted, inOverlay }: { entryId: string; onBack: () => void; onDeleted?: (entryId: string) => void; inOverlay?: boolean }) {
   const [meta, setMeta] = useState<api.FileMeta | null>(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
@@ -709,7 +710,7 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
 
   return (
     <div>
-      <div className="filehead">
+      <div className={inOverlay ? 'filehead in-ovl' : 'filehead'}>
         <button className="iconbtn" title="Назад" onClick={onBack}><ArrowLeft /></button>
         <span style={{ flex: 1 }} />
         {ready && (
@@ -1604,7 +1605,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
       {/* Полноценная деталка (как в «Файлах») — вторым оверлеем, поверх просмотра. */}
       {detailId && (
         <div className="ovl" key={detailId}>
-          <FileDetail entryId={detailId} onBack={() => setDetailId(null)} onDeleted={forgetEntry} />
+          <FileDetail entryId={detailId} onBack={() => setDetailId(null)} onDeleted={forgetEntry} inOverlay />
         </div>
       )}
     </div>

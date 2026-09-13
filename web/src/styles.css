@@ -24,13 +24,14 @@
   --island-radius: 1rem;              /* скругление островов */
   --col: 1000px;                      /* ширина колонки контента */
 
-  /* Фон: страница прозрачная, острова — полупрозрачная «плёнка» поверх системного фона */
+  /* Фон: страница прозрачная — за неё отвечает браузер (системный фон).
+     Острова — почти непрозрачные «плашки»: под ними проезжает содержимое, и сквозь
+     прозрачность оно читалось бы прямо в шапке. Плотность задаёт --island-a. */
   --canvas: transparent;
-  --island: rgb(255 255 255 / .78);
   --island-solid: #ffffff;
-  --island-brd: rgb(0 0 0 / .07);
-  --island-shadow: 0 6px 24px rgb(0 0 0 / .10), 0 1px 2px rgb(0 0 0 / .06);
-  --scrim: rgb(255 255 255 / .72);    /* плёнка стики-панелей внутри контента */
+  --island-a: 96%;
+  --island: color-mix(in srgb, var(--island-solid) var(--island-a), transparent);
+  --island-brd: rgb(0 0 0 / .08);
 
   --surface: #ffffff;                 /* карточки и панели */
   --surface-2: #f4f4f7;               /* вложенные блоки, строки */
@@ -60,11 +61,9 @@
 @media (prefers-color-scheme: dark) {
   :root {
     --canvas: transparent;
-    --island: rgb(22 26 34 / .74);
     --island-solid: #161a22;
-    --island-brd: rgb(255 255 255 / .09);
-    --island-shadow: 0 8px 28px rgb(0 0 0 / .5), 0 1px 2px rgb(0 0 0 / .4);
-    --scrim: rgb(15 17 21 / .78);
+    --island-a: 96%;
+    --island-brd: rgb(255 255 255 / .10);
 
     --surface: #161a22;
     --surface-2: #1c212b;
@@ -138,7 +137,8 @@
      currentColor наследуется от кнопки, поэтому цвета иконок те же, что у текста. */
   .icon svg,
   .iconbtn svg,
-  .navbtn svg {
+  .navbtn svg,
+  .brandico svg {
     display: block;
     width: 1em;
     height: 1em;
@@ -162,9 +162,10 @@
              calc(72px + var(--side) + env(safe-area-inset-bottom));
   }
 
-  /* ===== Острова: шапка сверху, навигация снизу =====
-     Оба плавающие, с зазором от краёв экрана и от краёв колонки. Фон — полупрозрачный,
-     с blur: сквозь остров видно системный фон. */
+  /* ===== Остров =====
+     Одна и та же плашка у шапки сверху, нижней навигации и шапок разделов (стрелки в «Фото»,
+     действия в деталках): полупрозрачная подложка с blur, скругление, рамка. Тени нет —
+     острова плоские, от фона их отделяют только рамка и подложка. */
   .island {
     position: fixed;
     left: calc(var(--side) + env(safe-area-inset-left));
@@ -175,20 +176,19 @@
     background: var(--island);
     border: 1px solid var(--island-brd);
     border-radius: var(--island-radius);
-    box-shadow: var(--island-shadow);
     backdrop-filter: blur(16px) saturate(1.6);
     -webkit-backdrop-filter: blur(16px) saturate(1.6);
   }
 
+  /* Верхний остров — тот же по высоте и отступам, что нижний: одна иконка приложения слева.
+     Название проекта словом не дублируем. Место под безопасную зону учтено отступом сверху. */
   .island-top {
     top: calc(var(--side) + env(safe-area-inset-top));
     display: flex;
     align-items: center;
-    gap: 8px;
-    min-height: 46px;
-    padding: 6px 8px 6px 14px;
+    padding: 10px;
   }
-  .island-top h1 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 650; }
+  .brandico { color: var(--accent); font-size: 20px; line-height: 1; }
 
   /* Нижний остров — навигация; место под жест «домой» учтено отступом снизу */
   .island-bottom {
@@ -196,7 +196,7 @@
     display: flex;
     align-items: stretch;
     justify-content: space-around;
-    padding: 4px;
+    padding: 10px 4px;
   }
   .navbtn {
     flex: 1;
@@ -305,21 +305,29 @@
   .loginbox .brand { display: grid; justify-items: center; gap: 6px; color: var(--accent); }
   .loginbox h2 { margin: 0 0 4px; text-align: center; }
 
-  /* ===== Шапки разделов =====
-     Не остров: липкая панель внутри колонки контента, без зазора от её краёв. */
+  /* ===== Шапки разделов — тоже острова =====
+     Липкая панель действий внутри колонки контента (шапка списка файлов, стрелки календаря,
+     действия в деталке). Оформлена как остров: по ширине ровно колонка, скруглена, с рамкой.
+     Липнет ниже верхнего острова, чтобы они не наезжали друг на друга. */
   .filehead {
     position: sticky;
-    top: calc(56px + var(--side));
+    top: calc(58px + var(--side));
     z-index: 6;
     display: flex;
     align-items: center;
     gap: 6px;
-    margin: -12px -12px 10px;
-    padding: 9px 8px 9px 10px;
-    background: var(--scrim);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--brd);
+    margin: -6px 0 10px;
+    padding: 5px 6px;
+    background: var(--island);
+    border: 1px solid var(--island-brd);
+    border-radius: var(--island-radius);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
+  }
+  /* Деталка фото — свой слой поверх просмотра: липнуть некуда, шапка стоит в начале списка */
+  .filehead.in-ovl {
+    position: static;
+    margin: 0 0 10px;
   }
   .filehead strong { font-size: 16px; white-space: nowrap; }
   .filehead strong.detname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -410,23 +418,24 @@
   .tags > summary { cursor: pointer; padding: 10px 2px; border-top: 1px solid var(--brd); }
 
   /* ===== Фото: календарь по месяцам ===== */
-  /* Шапка календаря: стрелки + месяц. Липнет под островом-шапкой, чтобы листать месяцы
-     можно было из любого места. */
+  /* Шапка календаря — остров со стрелками и месяцем. Липнет ниже верхнего острова, чтобы
+     листать месяцы можно было из любого места и шапки не наезжали друг на друга. */
   .calnav {
     position: sticky;
-    top: calc(56px + var(--side));
+    top: calc(58px + var(--side));
     z-index: 6;
     display: flex;
     align-items: center;
     gap: 4px;
-    height: 44px;
+    height: 46px;
     box-sizing: border-box;
-    margin: 0 -12px 6px;
-    padding: 0 8px;
-    background: var(--scrim);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--brd);
+    margin: 0 0 6px;
+    padding: 0 6px;
+    background: var(--island);
+    border: 1px solid var(--island-brd);
+    border-radius: var(--island-radius);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
   }
   .caltitle {
     flex: 1;
@@ -477,7 +486,7 @@
   .calmeta { width: min(100%, 380px); margin: 10px auto 0; font-size: 12px; color: var(--fg-3); text-align: center; }
   /* Месяц стоит по центру экрана и по вертикали, и по горизонтали: высота области — всё, что
      осталось от экрана после шапки календаря и нижнего острова-навигации (его отступ даёт .content). */
-  .calwrap { display: grid; place-items: center; min-height: calc(100dvh - 44px - 130px); }
+  .calwrap { display: grid; place-items: center; min-height: calc(100dvh - 46px - 130px); }
   .calcenter { display: grid; justify-items: center; width: 100%; }
   /* Ожидание месяца: пока данных нет, на экране только месяц с годом и лоадер */
   .calload { display: grid; justify-items: center; gap: 16px; }
@@ -513,9 +522,10 @@
   }
 
   /* Деталка фото — вторым оверлеем, поверх просмотра: свой единственный скролл, страница заперта.
+     Начинается под верхним островом (как и контент), иначе шапка деталки накрывала бы его.
      max-width здесь по content-box: 1000 + padding 24 = ровно ширина колонки .content. */
   .ovl {
-    position: fixed; left: 0; right: 0; top: 0; z-index: 9;
+    position: fixed; left: 0; right: 0; top: calc(56px + var(--side)); z-index: 9;
     max-width: var(--col); margin: 0 auto;
     bottom: calc(72px + var(--side) + env(safe-area-inset-bottom));
     overflow-y: auto;
@@ -524,14 +534,22 @@
     background: var(--island-solid);
     padding: 0 12px 24px;
   }
-  .ovl .filehead { margin: 0 -12px 10px; top: 0; }
 
-  /* Шапка поверх медиа (прозрачная, тач сквозь неё проходит к зуму) */
+  /* Шапка поверх медиа — остров поверх снимка. Подложка тёмная независимо от темы (снимок
+     под ней любой), поэтому иконки и текст здесь всегда светлые. Тач сквозь остров проходит
+     к зуму — активные только сами кнопки. */
   .tbar {
-    position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+    position: absolute;
+    top: 8px; left: 8px; right: 8px;
+    z-index: 5;
     display: flex; align-items: center; gap: 2px;
-    padding: 8px 10px;
-    background: linear-gradient(to bottom, rgb(0 0 0 / .6), rgb(0 0 0 / 0));
+    min-height: 42px;
+    padding: 3px 6px;
+    background: rgb(0 0 0 / .5);
+    border: 1px solid rgb(255 255 255 / .12);
+    border-radius: var(--island-radius);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
     color: var(--overlay-fg);
     pointer-events: none;
   }
@@ -539,7 +557,10 @@
   /* Поверх медиа иконки всегда светлые — независимо от темы */
   .tbar .iconbtn { color: var(--overlay-fg); }
   .det-info {
-    position: absolute; top: 50px; left: 12px; z-index: 5;
+    position: absolute;
+    top: calc(8px + 42px + 8px);   /* под островом-шапкой просмотра: 8px зазор + 42px остров + 8px */
+    left: 12px;
+    z-index: 5;
     pointer-events: none;
     max-width: calc(100% - 24px);
     font-size: 13px; color: var(--overlay-fg); word-break: break-all;
@@ -562,7 +583,6 @@
     font-size: 26px; line-height: 1;
     border: 0;
     cursor: pointer;
-    box-shadow: 0 6px 18px rgb(0 0 0 / .45);
     user-select: none;
   }
   .fab:active { background: var(--accent-2); }
