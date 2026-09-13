@@ -21,21 +21,19 @@ import { patchUi, readUi } from './storage';
  */
 
 /**
- * Сторона клетки группировки, px, по зуму. Издалека клетка крупная: иначе на карте мира
- * висят сотни миниатюр и закрывают саму карту. Вблизи клетка мелкая, и точки расходятся
- * до отдельных кадров.
+ * Сторона клетки группировки, px. Клетка мелкая намеренно: чем она меньше, тем больше
+ * точек на экране и тем точнее видно, где именно снимали. Слишком крупные клетки на
+ * дальней карте превращались в несколько больших плиток, которые закрывали саму карту.
  */
-function clusterCellPx(zoom: number): number {
-  if (zoom <= 5) return 170; // мир и континенты — точка на регион
-  if (zoom <= 8) return 120; // страны
-  if (zoom <= 11) return 90; // города
-  return 70; // районы и ближе
-}
-/** Потолок одновременных миниатюр: это DOM-узлы с картинками, больше браузер не тянет. */
-const CLUSTER_MAX = 300;
-/** Сторона миниатюры-кластера: от одиночного кадра до плотной точки места. */
-const CLUSTER_SIDE_MIN = 34;
-const CLUSTER_SIDE_MAX = 56;
+const CLUSTER_PX = 48;
+/**
+ * Потолок одновременных миниатюр: это DOM-узлы с картинками. При клетке 48 px на широком
+ * экране их помещается около 300, поэтому запас — 400; на телефоне упирается в экран раньше.
+ */
+const CLUSTER_MAX = 400;
+/** Сторона миниатюры-кластера: мелкие точки, чтобы поле точек не закрывало карту. */
+const CLUSTER_SIDE_MIN = 24;
+const CLUSTER_SIDE_MAX = 38;
 /** Вид по умолчанию, если пользователь ещё не двигал карту. */
 const DEFAULT_VIEW = { lat: 20, lon: 10, zoom: 2 };
 /**
@@ -199,7 +197,7 @@ export default function MapSection({ onOverlayChange }: {
 
       const zoom = map.getZoom();
       const size = map.getSize();
-      const cell = clusterCellPx(zoom);
+      const cell = CLUSTER_PX;
       const margin = cell;
       const tl = map.getPixelBounds().min ?? L.point(0, 0);
       const cells = new Map<string, { lat: number; lon: number; n: number; ids: number[] }>();
@@ -234,7 +232,8 @@ export default function MapSection({ onOverlayChange }: {
           className: 'map-cluster',
           html:
             `<img src="${api.thumbUrl(pts[group[0]].entryId)}" alt="" loading="lazy" decoding="async">` +
-            (c.n > 1 ? `<i>${c.n}</i>` : ''),
+            // размер счётчика едет за размером точки: на мелких точках крупный бейдж не влезал
+            (c.n > 1 ? `<i style="--side:${side}px">${c.n}</i>` : ''),
           iconSize: [side, side],
           iconAnchor: [side / 2, side / 2],
         });

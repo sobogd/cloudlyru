@@ -779,20 +779,22 @@
     object-fit: cover;
     border-radius: 10px;
   }
+  /* Счётчик группы: размер считается от стороны самой точки (--side приходит из разметки),
+     иначе на мелких миниатюрах бейдж занимал бы её целиком. */
   .map-cluster i {
     position: absolute;
-    right: -5px;
-    bottom: -5px;
-    min-width: 17px;
-    height: 17px;
-    padding: 0 4px;
-    border-radius: 9px;
+    right: -4px;
+    bottom: -4px;
+    min-width: calc(var(--side, 38px) * 0.45);
+    height: calc(var(--side, 38px) * 0.45);
+    padding: 0 calc(var(--side, 38px) * 0.1);
+    border-radius: calc(var(--side, 38px) * 0.23);
     background: var(--accent);
     color: var(--accent-fg);
-    font-size: 10px;
+    font-size: calc(var(--side, 38px) * 0.27);
     font-style: normal;
     font-weight: 600;
-    line-height: 17px;
+    line-height: calc(var(--side, 38px) * 0.45);
     text-align: center;
   }
   /* Плашка-статус поверх карты: загрузка, ошибка, подсказка или «кадров в этой области нет».
