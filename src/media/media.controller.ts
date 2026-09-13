@@ -207,6 +207,18 @@ export class MediaController {
   }
 
   /**
+   * Дни месяца для календаря «Фото»: на каждый день, где есть снимки, — обложка и счётчик.
+   * `month` — 'YYYY-MM' (без него текущий месяц). Клиент листает месяцы вручную, поэтому за один
+   * запрос отдаётся ровно один месяц: ~30 строк вместо сотен строк ленты.
+   */
+  @Get('timeline/days')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(1200, 60_000)
+  timelineDays(@CurrentUser() user: RequestUser, @Query('month') month?: string) {
+    return this.media.timelineDays(user.id, typeof month === 'string' && month ? month : undefined);
+  }
+
+  /**
    * Статусы сборки превью по списку записей: клиент спрашивает только про те снимки, которые
    * ещё собираются, и не перечитывает из-за них всю ленту.
    */

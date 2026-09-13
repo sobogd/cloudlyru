@@ -19,13 +19,11 @@ const NAV: Array<{ id: Tab; icon: string; label: string }> = [
 type UiState = {
   tab?: Tab;
   files?: { stack?: Array<{ id?: string; name: string }>; openFile?: string | null; folderMeta?: boolean };
-  photos?: { viewEntryId?: string | null; detailId?: string | null; mode?: PhotoView };
+  photos?: { month?: string | null; openDay?: string | null; detailId?: string | null };
   albums?: { openId?: string | null };
 };
 const UI_KEY = 'cloudlyru:ui';
 
-/** Вид галереи: лента фото подряд или календарь по месяцам (переключается табами сверху). */
-type PhotoView = 'list' | 'calendar';
 
 function readUi(): UiState {
   try { return JSON.parse(sessionStorage.getItem(UI_KEY) || '{}') as UiState; } catch { return {}; }
@@ -946,71 +944,33 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
 }
 
 
-// ================= Фото (медиатека: лента по месяцам + полноэкранный просмотр) =================
-// Показывает только содержимое системной папки «Фото» (зона PHOTOS); сама папка скрыта из
-// «Файлы» и WebDAV. Лента листается курсором (страница = 25 рядов), сгруппирована по месяцам
-// съёмки, свежие сверху. Плейсхолдер показывает, что превью ещё собирается; состояние сборки
-// клиент спрашивает отдельной ручкой только про незавершённые снимки. Загрузка — плавающей
-// кнопкой «+» внизу (фото и видео), удаление — из деталки в корзину.
+// ================= Фото (календарь по месяцам + полноэкранный просмотр) =================
+// Экран — календарь: один месяц на странице, дни в кружках, месяцы листаются вручную (◀️/▶️).
+// Данные берём ручкой /timeline/days: на каждый день месяца одна строка — обложка (один снимок)
+// и сколько снимков в этот день. Это ~30 строк и один запрос на месяц вместо сотен строк ленты:
+// календарю не нужны все снимки месяца, только по одному на день. Прокрутки-ленты на экране нет
+// вообще (листаются месяцы), поэтому и виртуализация не нужна — в DOM максимум один месяц.
 
-/** Превью в списке — квадрат 50×50 px (столько же отдаёт сервер); шире 50 px ячейку не делаем. */
+/** Кружок дня не бывает шире 50 px: календарь не растёт больше 7 × 50 = 350 px. */
 const GRID_CELL = 50;
-/** Плитка вплотную: между превью нет отступов — снимки читаются одним массивом. */
-const GRID_GAP = 0;
-/** Сколько рядов догружаем за одну прокрутку: страница = колонки × это число. */
-const GRID_ROWS_PER_PAGE = 25;
-/** За сколько пикселей до конца ленты начинаем тянуть следующую страницу. */
-const SCROLL_PREFETCH_PX = 300;
-/** Потолок страницы на сервере (TIMELINE_MAX): больше за раз не просим. */
-const TIMELINE_PAGE_MAX = 1000;
-/** Сколько записей спрашиваем одним запросом статусов (потолок сервера — 500). */
-const STATUS_BATCH = 200;
-/** Как часто переспрашиваем статусы снимков, которые ещё собираются. */
-const STATUS_POLL_MS = 4000;
-/** Задержка перед перечитыванием ленты после загрузки: файлы идут пачкой, лента нужна один раз. */
-const REFRESH_DEBOUNCE_MS = 1500;
-
-/**
- * Высота шапки месяца в пикселях. Задана жёстко в CSS (.monthhead) и повторена здесь: от неё
- * считается раскладка виртуализации, а она обязана совпадать с настоящей — иначе позиция
- * прокрутки уезжает тем сильнее, чем длиннее лента.
- */
-const MONTH_HEAD_H = 34;
-/** Запас ленты вокруг экрана: строки выше и ниже остаются смонтированными — свайп не мигает. */
-const VIRT_OVERSCAN = 900;
-/** Шаг пересчёта видимого окна: React не перерисовывается на каждый пиксель прокрутки. */
-const VIRT_STEP = 200;
 /** Сколько превью держим готовыми в памяти (дальние вытесняются, их достанет кэш браузера). */
 const PREVIEW_CACHE_MAX = 48;
-/**
- * Высота строки дней недели в календаре. Задана жёстко в CSS (.calweek) и повторена здесь:
- * от неё считается высота месяца в раскладке виртуализации.
- */
-const WEEK_HEAD_H = 20;
+/** Сколько месяцев держим загруженными: листание туда-обратно не должно каждый раз ходить в сеть. */
+const MONTH_CACHE_MAX = 24;
+/** Как часто переспрашиваем статусы снимков, которые ещё собираются. */
+const STATUS_POLL_MS = 4000;
+/** Задержка перед перечитыванием месяца после загрузки: файлы идут пачкой, месяц нужен один раз. */
+const REFRESH_DEBOUNCE_MS = 1500;
 /** Неделя в календаре начинается с понедельника — как в русском календаре. */
 const WEEKDAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
-/** В календаре ровно 7 колонок на любом экране: шире, чем 7 кружков по 50 px, он не растёт. */
+/** В календаре ровно 7 колонок на любом экране. */
 const CAL_COLS = 7;
 
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
-/**
- * Ключ месяца по дате съёмки. EXIF-даты показываем «как в файле» (см. fmtExifDate) — без
- * пересчёта в местное время, поэтому берём компоненты строки, а не Date с таймзоной браузера.
- * Пустой ключ — снимки без даты: они идут в конце ленты отдельной группой.
- */
-function monthKeyOf(capturedAt: string | null): string {
-  return capturedAt && /^\d{4}-\d{2}/.test(capturedAt) ? capturedAt.slice(0, 7) : '';
-}
 function monthTitleOf(key: string): string {
-  if (!key) return 'Без даты';
   const [year, month] = key.split('-');
   return `${MONTHS[Number(month) - 1] ?? key} ${year}`;
-}
-
-/** Ключ дня по дате съёмки ('YYYY-MM-DD'); пусто — даты нет (в календарь такие снимки не попадают). */
-function dayKeyOf(capturedAt: string | null): string {
-  return capturedAt && /^\d{4}-\d{2}-\d{2}/.test(capturedAt) ? capturedAt.slice(0, 10) : '';
 }
 
 /** Соседний месяц по ключу 'YYYY-MM': shiftMonth('2026-01', -1) === '2025-12'. */
@@ -1026,43 +986,16 @@ function currentMonthKey(): string {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 }
 
-/**
- * Порядок ленты — тот же, что у сервера: по дате съёмки вниз, внутри одной секунды по id вниз,
- * записи без даты — в самый конец. Нужен после слияния: обновление подхватывает снимки сверху,
- * и без сортировки «Без даты» уезжала бы в начало, а месяцы шли бы не по порядку.
- */
-function sortTimeline<T extends { capturedAt: string | null; entryId: string }>(list: T[]): T[] {
-  return [...list].sort((a, b) => {
-    const at = a.capturedAt ? Date.parse(a.capturedAt) : null;
-    const bt = b.capturedAt ? Date.parse(b.capturedAt) : null;
-    if (at === null && bt === null) return a.entryId < b.entryId ? 1 : a.entryId > b.entryId ? -1 : 0;
-    if (at === null) return 1;
-    if (bt === null) return -1;
-    if (at !== bt) return bt - at;
-    return a.entryId < b.entryId ? 1 : -1; // та же секунда — по id вниз, как на сервере
-  });
-}
-
-/** Статус сборки превью: приходит ручкой /timeline/status, а не внутри самой ленты. */
-type PreviewStatus = { previewState: string; previewError: string | null; jobState: string | null; jobError: string | null };
-
-/** Готов ли снимок к показу и что с задачей сборки: ответ статусов уточняет данные ленты. */
-function previewState(item: api.TimelineItem, status?: PreviewStatus) {
-  const state = status?.previewState ?? item.previewState;
-  const ready = state === 'done';
-  const jobState = status?.jobState ?? null;
-  // Причина известна серверу: «собрать нельзя» — это состояние ассета, а не догадка клиента
-  // по отсутствию задачи (раньше «превью не будет» выводилось из jobState === null).
-  const jobError = status?.jobError ?? (state === 'impossible' ? status?.previewError ?? null : null);
-  const impossible = state === 'impossible';
-  const hopeless = !ready && (impossible || jobState === 'failed');
-  return { ready, jobState, jobError, failed: jobState === 'failed', impossible, hopeless };
+/** День месяца человеческим текстом: '2026-09-13' → «13 сентября 2026». */
+function dayTitle(day: string): string {
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
 }
 
 /**
- * Кэш превью в памяти. Готовый кадр держим Image-объектом: переключение ⬅️/➡️ и возврат из
- * деталки показывают снимок сразу — без сети и без повторного декода. Кэш ограничен по размеру,
- * поэтому дальние кадры вытесняются: их потом достанет браузерный кэш (`private, max-age=600`).
+ * Кэш превью в памяти. Готовый кадр держим Image-объектом: переключение на соседний день и
+ * возврат из деталки показывают снимок сразу — без сети и без повторного декода. Кэш ограничен
+ * по размеру, поэтому дальние кадры вытесняются: их потом достанет браузерный кэш (max-age=600).
  */
 type WarmPreview = { img: HTMLImageElement; ok: boolean; failed: boolean };
 const previewCache = new Map<string, WarmPreview>();
@@ -1086,510 +1019,188 @@ function warmPreview(src: string): WarmPreview {
   return rec;
 }
 
-/** Уже готовое превью по ссылке — без запуска загрузки (ячейки сетки грузит сам <img>). */
-function previewReady(src: string): boolean {
-  return previewCache.get(src)?.ok === true;
+/** Статус сборки превью: приходит ручкой /timeline/status, а не внутри самих дней. */
+type PreviewStatus = { previewState: string; previewError: string | null; jobState: string | null; jobError: string | null };
+
+/** Готов ли снимок к показу и что с задачей сборки: ответ статусов уточняет данные дня. */
+function previewState(item: api.TimelineItem, status?: PreviewStatus) {
+  const state = status?.previewState ?? item.previewState;
+  const ready = state === 'done';
+  const jobState = status?.jobState ?? null;
+  // Причина известна серверу: «собрать нельзя» — это состояние ассета, а не догадка клиента
+  // по отсутствию задачи (раньше «превью не будет» выводилось из jobState === null).
+  const jobError = status?.jobError ?? (state === 'impossible' ? status?.previewError ?? null : null);
+  const impossible = state === 'impossible';
+  const hopeless = !ready && (impossible || jobState === 'failed');
+  return { ready, jobState, jobError, failed: jobState === 'failed', impossible, hopeless };
 }
 
 /**
- * Месяц ленты в раскладке виртуализации: где он начинается, где начинаются его строки и сколько
- * всего занимает. По этим числам считается, какие строки вообще монтировать.
+ * Кружок дня: под числом — обложка дня (один снимок из этого дня). Превью ещё собирается —
+ * кружок тёмный, но число видно; в дни без снимков число приглушено и кружок не рисуется.
  */
-type MonthBox = {
-  key: string;
-  title: string;
-  cells: api.TimelineItem[];
-  rows: number;
-  top: number;
-  rowsTop: number;
-  height: number;
-  last: boolean;
-};
-
-/** Минимум, по которому считается видимая часть: у ленты и у календаря свои «месяцы». */
-type RowsBox = { rowsTop: number; rows: number };
-
-/** Клетка дня в календаре: обложка — самый свежий снимок дня, count — сколько их в этот день. */
-type CalDay = { day: number; item: api.TimelineItem | null; count: number };
-
-/** Месяц календаря: клетки по дням (пустые — до первого дня и после последнего) и его место в ленте. */
-type CalMonth = {
-  key: string;
-  title: string;
-  cells: Array<CalDay | null>;
-  count: number;
-  rows: number;
-  top: number;
-  rowsTop: number;
-  height: number;
-  last: boolean;
-};
-
-/** Строки месяца, попадающие в видимое окно (в строках, не в пикселях); null — месяц за экраном. */
-function visibleRows(m: RowsBox, win: { top: number; bottom: number }, cell: number): [number, number] | null {
-  if (m.rowsTop >= win.bottom || m.rowsTop + m.rows * cell <= win.top) return null;
-  const first = Math.max(0, Math.floor((win.top - m.rowsTop) / cell));
-  const last = Math.min(m.rows, Math.ceil((win.bottom - m.rowsTop) / cell));
-  return [first, last];
-}
-
-/**
- * Видимое окно ленты в координатах контейнера сетки: [top, bottom] с запасом VIRT_OVERSCAN.
- * Слушаем прокрутку окна и ресайз; значение округляем шагом VIRT_STEP, чтобы React не
- * перерисовывался на каждый пиксель. `deps` — то, после чего окно надо перемерить (число
- * записей, колонки, размер ячейки): высота контейнера меняется, и старая граница уже врёт.
- */
-function useVirtualWindow(ref: React.RefObject<HTMLDivElement | null>, deps: unknown[]) {
-  const [win, setWin] = useState(() => {
-    const ih = window.innerHeight || 800;
-    return { top: -VIRT_OVERSCAN, bottom: Math.ceil((ih + VIRT_OVERSCAN) / VIRT_STEP) * VIRT_STEP };
-  });
-  const winRef = useRef(win);
-  winRef.current = win;
-  const depsKey = deps.join('|');
-
-  useEffect(() => {
-    let raf = 0;
-    const measure = () => {
-      raf = 0;
-      const el = ref.current;
-      if (!el) return;
-      // Верх контейнера берём в координатах экрана, а не через scrollY: так окно остаётся верным
-      // и когда над сеткой появилась панель загрузки и сдвинула её вниз.
-      const shift = -el.getBoundingClientRect().top;
-      const next = {
-        top: Math.floor((shift - VIRT_OVERSCAN) / VIRT_STEP) * VIRT_STEP,
-        bottom: Math.ceil((shift + (window.innerHeight || 800) + VIRT_OVERSCAN) / VIRT_STEP) * VIRT_STEP,
-      };
-      const prev = winRef.current;
-      if (next.top !== prev.top || next.bottom !== prev.bottom) setWin(next);
-    };
-    const onScroll = () => { if (!raf) raf = requestAnimationFrame(measure); };
-    measure();
-    window.addEventListener('scroll', onScroll, { passive: true });
-    window.addEventListener('resize', onScroll);
-    return () => {
-      window.removeEventListener('scroll', onScroll);
-      window.removeEventListener('resize', onScroll);
-      if (raf) cancelAnimationFrame(raf);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ref, depsKey]);
-
-  return win;
-}
-
-/**
- * Сколько превью в ряд: колонок ровно столько, чтобы ячейка не стала шире GRID_CELL.
- * Ширина 160 → 4, 150 → 3, 140 → 3. Меряем сам контейнер, поэтому одинаково работает
- * и на компе, и на телефоне; при повороте экрана/ресайзе пересчитывается.
- * Ширину отдаём ещё и ссылкой: по ней считается размер страницы, а он нужен синхронно —
- * до первого рендера состояния (`cols` на первом кадре равен догадке по ширине окна).
- */
-function useGrid(ref: React.RefObject<HTMLDivElement | null>) {
-  const widthRef = useRef(0);
-  // Ширина нужна и в разметке: ширина колонки = высота строки, а по ней считается раскладка
-  // виртуализации. Держим её состоянием, чтобы окно пересчитывалось при повороте экрана.
-  const [width, setWidth] = useState(() => window.innerWidth || GRID_CELL);
-  const [cols, setCols] = useState(() => Math.max(1, Math.ceil((window.innerWidth || GRID_CELL) / GRID_CELL)));
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const apply = () => {
-      const w = el.clientWidth;
-      if (w <= 0) return;
-      widthRef.current = w;
-      setWidth(w);
-      setCols(Math.max(1, Math.ceil(w / GRID_CELL)));
-    };
-    apply();
-    const ro = new ResizeObserver(apply);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [ref]);
-  return { cols, width, widthRef };
-}
-
-/**
- * Ячейка плитки. Отдельный memo-компонент: без него любое состояние раздела (открытый снимок,
- * догрузка страницы, ошибка) пересобирало бы JSX всех загруженных ячеек — а их тысячи.
- */
-const PhotoCell = memo(function PhotoCell({
-  item,
-  status,
-  onOpen,
-  onRetry,
-}: {
-  item: api.TimelineItem;
+function DayCell({ day, row, status, onOpen }: {
+  day: number;
+  row: api.TimelineDayItem | null;
   status?: PreviewStatus;
-  onOpen: (entryId: string) => void;
-  onRetry: (entryId: string) => void;
+  onOpen: (day: string) => void;
 }) {
-  const { ready, failed, hopeless, jobError } = previewState(item, status);
-  const isVideo = /^video\//.test(item.mime || '');
-
-  if (ready && item.sha256) {
-    return (
-      <div style={{ position: 'relative', cursor: 'pointer' }} onClick={() => onOpen(item.entryId)}>
-        <LoadImg src={api.previewUrl(item.sha256)} />
-        {isVideo && <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#fff', fontSize: 14, textShadow: '0 0 12px #000' }}>▶</span>}
-      </div>
-    );
+  if (!row) {
+    return <div className="calcell off" title={`${day} — снимков нет`}><span className="calnum">{day}</span></div>;
   }
-
-  // Идёт сборка — плейсхолдер со спиннером; задача упала или превью собрать нельзя (нет
-  // оригинала, слишком большой файл, формат) — причина и две кнопки, чтобы спиннер не висел вечно.
-  const showError = failed || hopeless;
+  const st = previewState(row.cover, status);
+  const photo = st.ready && row.cover.sha256;
   return (
     <div
-      title={showError ? shortErr(jobError, 110) : 'превью собирается'}
-      className="cellph"
-      style={{ color: failed ? '#ff8a8a' : '#8a95a6', fontSize: 8, textAlign: 'center', padding: 2, cursor: 'pointer' }}
-      onClick={() => onOpen(item.entryId)}
+      className={photo ? 'calcell' : 'calcell wait'}
+      title={`${day} — снимков: ${row.count}${photo ? '' : st.hopeless ? ', превью не собрать' : ', превью собирается'}`}
+      onClick={() => onOpen(row.day)}
     >
-      {showError ? (
-        <>
-          <span style={{ overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflowWrap: 'anywhere' }}>
-            {failed ? `❌ ${shortErr(jobError, 70)}` : '📄 нет превью'}
-          </span>
-          <span style={{ display: 'flex', gap: 2 }}>
-            <button
-              className="iconbtn"
-              title={failed ? 'Пересобрать превью' : 'Поставить задачу сборки превью'}
-              style={{ fontSize: 12, padding: '0 3px' }}
-              onClick={(e) => { e.stopPropagation(); onRetry(item.entryId); }}
-            >⟳</button>
-            <a
-              className="iconbtn"
-              title="Скачать оригинал"
-              href={api.fileUrl(item.entryId)}
-              download
-              style={{ fontSize: 12, padding: '0 3px' }}
-              onClick={(e) => e.stopPropagation()}
-            >⬇️</a>
-          </span>
-        </>
-      ) : <span className="spin" />}
+      {photo && <img className="calphoto" src={api.previewUrl(row.cover.sha256!)} alt="" loading="lazy" />}
+      <span className="calnum">{day}</span>
     </div>
   );
-});
+}
 
 function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null; up: Uploader; uploadedAt: number }) {
   const [saved] = useState(() => readUi().photos);
-  /** Вид галереи: лента фото подряд или календарь по месяцам. Выбор переживает F5. */
-  const [mode, setMode] = useState<PhotoView>(() => (saved?.mode === 'calendar' ? 'calendar' : 'list'));
-  const [items, setItems] = useState<api.TimelineItem[]>([]);
-  /** Статусы сборки превью (см. previewState). Держим отдельно от ленты: лента не должна
-   *  перечитываться из-за того, что у одного снимка дособралось превью. */
-  const [statuses, setStatuses] = useState<Map<string, PreviewStatus>>(() => new Map());
-  /** Открытый снимок — по entryId, а не по индексу: лента догружается и список под просмотром меняется. */
-  const [openId, setOpenId] = useState<string | null>(null);
-  const [firstLoad, setFirstLoad] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState(true);
-  const [loadErr, setLoadErr] = useState<string | null>(null);
-  const gridRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  const { cols, width, widthRef } = useGrid(gridRef);
-  // полноценная деталка (как в «Файлах»): открывается кнопкой ℹ️ из просмотра
+  /** Видимый месяц ('YYYY-MM'): листается вручную и переживает F5. */
+  const [month, setMonth] = useState<string>(() =>
+    (saved?.month && /^\d{4}-\d{2}$/.test(saved.month) ? saved.month : currentMonthKey()));
+  /** Открытый день ('YYYY-MM-DD'): его обложка показывается в полноэкранном просмотре. */
+  const [openDay, setOpenDay] = useState<string | null>(saved?.openDay ?? null);
+  /** Полноценная деталка (как в «Файлах») — открывается кнопкой ℹ️ из просмотра. */
   const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
-  // открытый файл после F5 восстанавливаем по entryId (индекс в ленте мог сдвинуться)
-  const [restoreId, setRestoreId] = useState<string | null>(saved?.viewEntryId ?? null);
+  /** Статусы сборки превью обложек: их не больше 31 на месяц, отдельный запрос дешёвый. */
+  const [statuses, setStatuses] = useState<Map<string, PreviewStatus>>(() => new Map());
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  /** Месяц, который грузится прямо сейчас (для строки состояния), и версия кэша (для перерисовки). */
+  const [pending, setPending] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
 
-  /** Размер страницы по живой ширине плитки: 25 рядов по столько колонок, сколько влезло. */
-  const pageLimit = useCallback(() => {
-    const width = gridRef.current?.clientWidth || widthRef.current || window.innerWidth;
-    const columns = Math.max(1, Math.ceil(width / GRID_CELL));
-    return Math.min(Math.max(columns * GRID_ROWS_PER_PAGE, 60), TIMELINE_PAGE_MAX);
-  }, [widthRef]);
-  const itemsRef = useRef(items);
-  itemsRef.current = items;
-  const hasMoreRef = useRef(hasMore);
-  hasMoreRef.current = hasMore;
-  const loadingRef = useRef(false);
-  const refreshBusyRef = useRef(false);
+  // Дни по месяцам в кэше: месяц — один маленький ответ (~30 строк), поэтому соседние держим под
+  // рукой — листание ◀️/▶️ и переход через границу месяца должны быть мгновенными.
+  const cacheRef = useRef(new Map<string, api.TimelineDayItem[]>());
+  const inflightRef = useRef(new Map<string, Promise<api.TimelineDayItem[]>>());
   const refreshTimerRef = useRef<number | null>(null);
-  /** Записи, которых сервер в ленте больше не знает (удалили или перенесли из «Фото»).
-   *  Помним их до перезагрузки: иначе они возвращались бы из страницы-дубликата. */
-  const goneRef = useRef(new Set<string>());
 
-  /** Страница ленты: первая — с начала, следующая — по курсору (entryId последней записи). */
-  const load = useCallback(async (mode: 'reset' | 'more', retry = 0): Promise<void> => {
-    if (loadingRef.current) return;
-    if (mode === 'more' && (!hasMoreRef.current || !itemsRef.current.length)) return;
-    const limit = pageLimit();
-    const cursor = mode === 'more' ? itemsRef.current[itemsRef.current.length - 1]?.entryId : undefined;
-    loadingRef.current = true;
-    if (mode === 'more') setLoadingMore(true);
-    try {
-      const page = await api.timeline({ limit, cursor });
-      const known = new Set(itemsRef.current.map((p) => p.entryId));
-      const gone = goneRef.current;
-      const fresh =
-        mode === 'more' ? page.filter((p) => !known.has(p.entryId) && !gone.has(p.entryId)) : page.filter((p) => !gone.has(p.entryId));
-      if (mode === 'reset') {
-        setItems(fresh);
-        setStatuses(new Map());
-      } else if (fresh.length) {
-        setItems((prev) => {
-          const seen = new Set(prev.map((p) => p.entryId));
-          return sortTimeline([...prev, ...fresh.filter((p) => !seen.has(p.entryId))]);
-        });
-      }
-      // Страница не добавила ничего нового, хотя записи пришли: сервер переупорядочил ленту
-      // (у видео дата съёмки уточняется после ffprobe, у фото дату дописывает разбор боком),
-      // и «строго после курсора» снова отдаёт показанное. Без этой проверки тот же запрос
-      // повторялся бы бесконечно, пока маркер догрузки на экране.
-      setHasMore(mode === 'more' && !fresh.length ? false : page.length >= limit);
-      setLoadErr(null);
-    } catch (e) {
-      const err = e as Error & { status?: number; code?: string };
-      // Курсор протух (запись удалили или перенесли из «Фото»): убираем её из ленты и пробуем
-      // ещё раз с предыдущей — так прокрутка продолжается, а не встаёт навсегда.
-      if (mode === 'more' && err.code === 'cursor_stale' && retry < 2 && itemsRef.current.length > 1) {
-        const trimmed = itemsRef.current.slice(0, -1);
-        itemsRef.current = trimmed;
-        setItems(trimmed);
-        loadingRef.current = false;
-        setLoadingMore(false);
-        return load('more', retry + 1);
-      }
-      setLoadErr(err.message);
-      if (mode === 'more' && err.code === 'cursor_stale') setHasMore(false);
-    } finally {
-      loadingRef.current = false;
-      setLoadingMore(false);
-      setFirstLoad(false);
+  const put = useCallback((key: string, rows: api.TimelineDayItem[]) => {
+    const cache = cacheRef.current;
+    cache.delete(key); // порядок вставки = свежесть: первыми вытесняем самые давно смотренные
+    cache.set(key, rows);
+    while (cache.size > MONTH_CACHE_MAX) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
     }
-  }, [pageLimit]);
-
-  /**
-   * Перечитать голову ленты: подхватить снимки, появившиеся сверху, и обновить данные тех,
-   * что уже показаны. Список не заменяем, а сливаем по entryId — иначе терялась бы прокрутка.
-   */
-  const refreshHead = useCallback(async () => {
-    if (refreshBusyRef.current || loadingRef.current || !itemsRef.current.length) return;
-    refreshBusyRef.current = true;
-    try {
-      const limit = Math.min(Math.max(itemsRef.current.length, pageLimit()), TIMELINE_PAGE_MAX);
-      const page = await api.timeline({ limit });
-      const gone = goneRef.current;
-      const byId = new Map(page.map((p) => [p.entryId, p]));
-      const known = new Set(itemsRef.current.map((p) => p.entryId));
-      const fresh = page.filter((p) => !known.has(p.entryId) && !gone.has(p.entryId));
-      setItems((prev) => sortTimeline([...fresh, ...prev.map((p) => byId.get(p.entryId) ?? p)]));
-    } catch { /* не критично: лента уже показана */ } finally {
-      refreshBusyRef.current = false;
-    }
-  }, [pageLimit]);
-
-  /** Перечитать ленту с задержкой: загрузка шлёт сигнал на каждый файл, а перечитать нужно раз. */
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimerRef.current !== null) return;
-    refreshTimerRef.current = window.setTimeout(() => {
-      refreshTimerRef.current = null;
-      void refreshHead();
-    }, REFRESH_DEBOUNCE_MS);
-  }, [refreshHead]);
-
-  /** Пересобрать превью: сервер снова ставит задачу, а мы снимаем её прежний статус. */
-  const retryPreview = useCallback(async (entryId: string) => {
-    try {
-      await api.retryPreview(entryId);
-      setStatuses((prev) => {
-        const next = new Map(prev);
-        next.delete(entryId);
-        return next;
-      });
-    } catch (e) {
-      alert((e as Error).message);
-    }
+    setVersion((v) => v + 1);
   }, []);
 
-  useEffect(() => { void load('reset'); }, [load]);
-  // Перезагрузка ленты (кнопка «Повторить») — единственный случай, когда забываем список
-  // исчезнувших записей: с этого момента верим серверу заново.
-  const reload = useCallback(() => {
-    goneRef.current = new Set();
-    void load('reset');
-  }, [load]);
+  /** Дни месяца: из кэша, а если его там нет — запросом (force — перечитать после изменений). */
+  const ensureMonth = useCallback((key: string, force = false): Promise<api.TimelineDayItem[]> => {
+    const cached = cacheRef.current.get(key);
+    if (!force && cached) return Promise.resolve(cached);
+    const running = inflightRef.current.get(key);
+    if (running && !force) return running;
+    const request = (async () => {
+      setPending(key);
+      try {
+        const rows = await api.timelineDays(key);
+        put(key, rows);
+        setLoadErr(null);
+        return rows;
+      } finally {
+        inflightRef.current.delete(key);
+        setPending((p) => (p === key ? null : p));
+      }
+    })();
+    inflightRef.current.set(key, request);
+    return request;
+  }, [put]);
+
+  // Текущий месяц — сразу; следом греем соседей, чтобы листание не ждало сеть.
+  useEffect(() => {
+    void ensureMonth(month).catch((e) => setLoadErr((e as Error).message));
+  }, [month, ensureMonth]);
+  useEffect(() => {
+    if (!cacheRef.current.has(month)) return;
+    void ensureMonth(shiftMonth(month, -1)).catch(() => undefined);
+    const newer = shiftMonth(month, 1);
+    if (newer <= currentMonthKey()) void ensureMonth(newer).catch(() => undefined);
+  }, [month, version, ensureMonth]);
+
+  // Файл догрузился — перечитываем месяц (с задержкой: файлы идут пачкой, месяц нужен один раз).
+  useEffect(() => {
+    if (!uploadedAt || refreshTimerRef.current !== null) return;
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      void ensureMonth(month, true).catch(() => undefined);
+    }, REFRESH_DEBOUNCE_MS);
+  }, [uploadedAt, month, ensureMonth]);
   useEffect(() => () => { if (refreshTimerRef.current !== null) window.clearTimeout(refreshTimerRef.current); }, []);
 
-  // Файл догрузился — показываем его в ленте (с задержкой: файлы идут пачкой).
-  useEffect(() => { if (uploadedAt) scheduleRefresh(); }, [uploadedAt, scheduleRefresh]);
+  // Запоминаем экран (месяц, открытый день, деталку) — F5 возвращает туда же.
+  useEffect(() => { patchUi({ photos: { month, openDay, detailId } }); }, [month, openDay, detailId]);
 
-  const busy = up.busy;
-  // Лента содержит только медиа (сервер фильтрует по зоне «Фото»), фильтр тут — страховка.
-  const media = useMemo(() => items.filter((it) => /^(image|video)\//.test(it.mime || '')), [items]);
-  const openIdx = openId ? media.findIndex((it) => it.entryId === openId) : -1;
-  const current = openIdx >= 0 ? media[openIdx] : null;
-  /** Открыт просмотр или деталка: они лежат оверлеем поверх галереи, страница под ними заперта. */
+  const dayRows = cacheRef.current.get(month) ?? [];
+
+  // Клетки месяца: пустые до первого числа и после последнего — сетка всегда ровная.
+  const cells = useMemo(() => {
+    const byDay = new Map((cacheRef.current.get(month) ?? []).map((r) => [r.day, r]));
+    const [y, m] = month.split('-').map(Number);
+    const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const offset = (new Date(Date.UTC(y, m - 1, 1)).getUTCDay() + 6) % 7; // Пн — первый столбец
+    const out: Array<{ day: number; row: api.TimelineDayItem | null } | null> = new Array(offset).fill(null);
+    for (let d = 1; d <= days; d++) {
+      const key = `${month}-${String(d).padStart(2, '0')}`;
+      out.push({ day: d, row: byDay.get(key) ?? null });
+    }
+    while (out.length % CAL_COLS !== 0) out.push(null);
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [month, version]);
+
+  const photoCount = dayRows.reduce((n, r) => n + r.count, 0);
+
+  // Открытый день ищем среди дней его собственного месяца: просмотр может быть открыт и в другом
+  // месяце (перешли через границу или восстановили экран после F5).
+  const openMonth = openDay ? openDay.slice(0, 7) : null;
+  const openRows = openMonth ? (cacheRef.current.get(openMonth) ?? []) : [];
+  const openIdx = openDay ? openRows.findIndex((r) => r.day === openDay) : -1;
+  const current = openIdx >= 0 ? openRows[openIdx] : null;
   const overlay = Boolean(current || detailId);
+  const view = current ? previewState(current.cover, statuses.get(current.cover.entryId)) : null;
 
-  // Лента по месяцам: порядок берём из порядка записей (свежие сверху), «Без даты» — последняя.
-  const sections = useMemo(() => {
-    type Section = { key: string; title: string; cells: api.TimelineItem[] };
-    const out: Section[] = [];
-    const byKey = new Map<string, Section>();
-    for (const it of media) {
-      const key = monthKeyOf(it.capturedAt);
-      let section = byKey.get(key);
-      if (!section) {
-        section = { key, title: monthTitleOf(key), cells: [] };
-        byKey.set(key, section);
-        out.push(section);
-      }
-      section.cells.push(it);
-    }
-    return out;
-  }, [media]);
+  // Восстановление после F5: месяц открытого дня мог не загрузиться — просим его.
+  useEffect(() => {
+    if (!openMonth || cacheRef.current.has(openMonth)) return;
+    void ensureMonth(openMonth).catch(() => undefined);
+  }, [openMonth, version, ensureMonth]);
+  // Дня больше нет (снимки удалили) — закрываем просмотр, а не оставляем пустой экран.
+  useEffect(() => {
+    if (!openDay || !openMonth) return;
+    const rows = cacheRef.current.get(openMonth);
+    if (!rows) return;
+    if (!rows.some((r) => r.day === openDay)) setOpenDay(null);
+  }, [openDay, openMonth, version]);
 
-  // Раскладка виртуализации. Ширина колонки = высота строки (плитка квадратная), поэтому высоты
-  // месяцев считаются точно, а не «на глаз»: сумма совпадает с настоящей высотой разметки, и
-  // окно видимости не уезжает тем сильнее, чем длиннее лента.
-  const cell = width > 0 ? width / cols : GRID_CELL;
-  const layout = useMemo<MonthBox[]>(() => {
-    let top = 0;
-    return sections.map((s, i) => {
-      const rows = Math.ceil(s.cells.length / cols);
-      const box: MonthBox = {
-        key: s.key || 'nodate',
-        title: s.title,
-        cells: s.cells,
-        rows,
-        top,
-        rowsTop: top + MONTH_HEAD_H,
-        height: MONTH_HEAD_H + rows * cell,
-        last: i === sections.length - 1,
-      };
-      top += box.height;
-      return box;
-    });
-  }, [sections, cols, cell]);
-
-  // ===== Календарь: месяцы от текущего назад, по 7 дней в строке =====
-  // Кружок дня — миниатюра самого свежего снимка этого дня, поверх неё число. Экран узкий или
-  // широкий — колонок всё равно семь: кружок не шире GRID_CELL, поэтому шире 7×50 календарь
-  // не растёт и на большом мониторе остаётся компактной колонкой по центру.
-  const calCell = width > 0 ? Math.min(GRID_CELL, width / CAL_COLS) : GRID_CELL;
-  const calLayout = useMemo<CalMonth[]>(() => {
-    // Дни, в которые что-то снято: обложка дня — первый снимок (лента отсортирована свежими вверх).
-    const byDay = new Map<string, api.TimelineItem[]>();
-    let oldest = '';
-    let newest = '';
-    for (const it of media) {
-      const day = dayKeyOf(it.capturedAt);
-      if (!day) continue; // без даты съёмки в календарь не поставить — такие видны в ленте
-      const list = byDay.get(day);
-      if (list) list.push(it);
-      else byDay.set(day, [it]);
-      const key = day.slice(0, 7);
-      if (!oldest || key < oldest) oldest = key;
-      if (!newest || key > newest) newest = key;
-    }
-    // От текущего месяца назад: пустые месяцы тоже показываем — иначе календарь «перепрыгивал» бы
-    // через паузы в съёмке. Если снимки датированы будущим (сбитые часы камеры) — начинаем с них.
-    const start = newest && newest > currentMonthKey() ? newest : currentMonthKey();
-    if (!oldest || oldest > start) oldest = start;
-
-    const out: CalMonth[] = [];
-    let top = 0;
-    for (let key = start; key >= oldest; key = shiftMonth(key, -1)) {
-      const [y, m] = key.split('-').map(Number);
-      const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
-      const offset = (new Date(Date.UTC(y, m - 1, 1)).getUTCDay() + 6) % 7; // Пн — первый столбец
-      const rows = Math.ceil((offset + days) / CAL_COLS);
-      const cells: Array<CalDay | null> = new Array(rows * CAL_COLS).fill(null);
-      let count = 0;
-      for (let d = 1; d <= days; d++) {
-        const items = byDay.get(`${key}-${String(d).padStart(2, '0')}`);
-        if (items?.length) count += items.length;
-        cells[offset + d - 1] = { day: d, item: items?.[0] ?? null, count: items?.length ?? 0 };
-      }
-      const box: CalMonth = {
-        key,
-        title: monthTitleOf(key),
-        cells,
-        count,
-        rows,
-        top,
-        rowsTop: top + MONTH_HEAD_H + WEEK_HEAD_H,
-        height: MONTH_HEAD_H + WEEK_HEAD_H + rows * calCell,
-        last: false,
-      };
-      top += box.height;
-      out.push(box);
-    }
-    // Самый старый месяц — тот, что ещё долистывается: помечаем его плюсом у счётчика.
-    if (out.length) out[out.length - 1].last = true;
-    return out;
-  }, [media, calCell]);
-
-  /** Монтируем только строки вокруг экрана: тысяч узлов и картинок в памяти больше нет. */
-  const win = useVirtualWindow(gridRef, [media.length, cols, cell, mode]);
-
-  /** Записи, которые сейчас на экране (с запасом виртуализации) — по ним и спрашиваем статусы. */
-  const visibleIds = useMemo(() => {
-    const ids = new Set<string>();
-    if (mode === 'calendar') {
-      // В календаре на экране только обложки дней: их и спрашиваем.
-      for (const m of calLayout) {
-        const range = visibleRows(m, win, calCell);
-        if (!range) continue;
-        for (let i = range[0] * CAL_COLS; i < Math.min(range[1] * CAL_COLS, m.cells.length); i++) {
-          const cellDay = m.cells[i];
-          if (cellDay?.item) ids.add(cellDay.item.entryId);
-        }
-      }
-      return ids;
-    }
-    for (const m of layout) {
-      const range = visibleRows(m, win, cell);
-      if (!range) continue;
-      for (let i = range[0] * cols; i < Math.min(range[1] * cols, m.cells.length); i++) ids.add(m.cells[i].entryId);
-    }
-    return ids;
-  }, [mode, layout, calLayout, win, cell, calCell, cols]);
-
-  // Кого ещё спрашивать про сборку превью: тех, о ком ответа нет, и тех, у кого задача идёт.
-  // Только видимые записи: плейсхолдеры видны лишь у них, а лента бывает на десятки тысяч
-  // снимков. Остальные (готово, упало, задачи нет) выпадают — опрос сам останавливается.
+  // Спрашиваем статусы только про недособранные обложки видимого месяца — их не больше 31.
   const askIds = useMemo(
-    () =>
-      items
-        .filter((it) => {
-          if (it.previewState === 'done' || !visibleIds.has(it.entryId)) return false;
-          const st = statuses.get(it.entryId);
-          if (!st) return true;
-          return st.jobState === 'pending' || st.jobState === 'processing';
-        })
-        .map((it) => it.entryId),
-    [items, statuses, visibleIds],
+    () => dayRows.filter((r) => r.cover.previewState !== 'done').map((r) => r.cover.entryId),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dayRows, version, statuses],
   );
   const askIdsRef = useRef(askIds);
   askIdsRef.current = askIds;
-  const lastAskRef = useRef(0);
   useEffect(() => {
     if (!askIds.length) return;
     let stopped = false;
     const tick = async () => {
-      const now = Date.now();
-      if (now - lastAskRef.current < 1500) return; // не частим: сервер тоже считает запросы
-      lastAskRef.current = now;
-      const ids = askIdsRef.current.slice(0, STATUS_BATCH);
+      const ids = askIdsRef.current;
       if (!ids.length) return;
       try {
         const rows = await api.timelineStatus(ids);
-        if (stopped) return;
-        const answered = new Set(rows.map((row) => row.entryId));
-        const gone = ids.filter((id) => !answered.has(id));
-        if (gone.length) {
-          // Сервер не знает эти записи: их удалили или перенесли из «Фото» — держать их в ленте
-          // плейсхолдерами смысла нет (и спрашивать про них заново тоже).
-          const drop = new Set(gone);
-          for (const id of drop) goneRef.current.add(id);
-          setItems((prev) => prev.filter((p) => !drop.has(p.entryId)));
-        }
+        if (stopped || !rows.length) return;
         setStatuses((prev) => {
           const next = new Map(prev);
           for (const row of rows) {
@@ -1609,90 +1220,18 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     return () => { stopped = true; clearInterval(t); };
   }, [askIds.length]);
 
-  // Бесконечная прокрутка: маркер внизу списка попал в зону видимости — тянем следующую страницу.
-  // Пока открыт просмотр, следующую страницу не тянем: экран занят снимком, а маркер стоит под
-  // оверлеем и «виден» наблюдателю — без этой проверки лента грузилась бы в фоне зря.
-  const viewerOpen = overlay;
+  // Превью соседних дней греем заранее: листание ⬅️/➡️ не должно ждать загрузку.
   useEffect(() => {
-    const el = sentinelRef.current;
-    if (!el || viewerOpen) return;
-    const io = new IntersectionObserver(
-      (entries) => { if (entries.some((e) => e.isIntersecting)) void load('more'); },
-      { rootMargin: `${SCROLL_PREFETCH_PX}px 0px` },
-    );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [load, viewerOpen]);
-
-  // Догрузка не должна ждать прокрутки: если маркер всё ещё на экране (высокий монитор),
-  // событие пересечения не придёт — проверяем позицию сами после каждого пополнения ленты.
-  useEffect(() => {
-    if (firstLoad || loadingMore || !hasMore || !items.length || overlay) return;
-    const el = sentinelRef.current;
-    if (el && el.getBoundingClientRect().top <= window.innerHeight + SCROLL_PREFETCH_PX) void load('more');
-  }, [items.length, firstLoad, loadingMore, hasMore, load, viewerOpen]);
-
-  const openCell = useCallback((entryId: string) => setOpenId(entryId), []);
-
-  // восстановление открытого файла после F5: ждём ленту и находим его по entryId
-  useEffect(() => {
-    if (!restoreId || !items.length) return;
-    if (items.some((it) => it.entryId === restoreId)) {
-      // Прокручиваем ленту к этому снимку: после закрытия просмотра список стоит там, где был
-      // до перезагрузки, а не в начале ленты. В календаре позиция ленты смысла не имеет.
-      const box = mode === 'list' ? layout.find((m) => m.cells.some((c) => c.entryId === restoreId)) : undefined;
-      const el = gridRef.current;
-      if (box && el && cell > 0) {
-        const idx = box.cells.findIndex((c) => c.entryId === restoreId);
-        const rowTop = el.getBoundingClientRect().top + window.scrollY + box.rowsTop + Math.floor(idx / cols) * cell;
-        window.scrollTo(0, Math.max(0, rowTop - (window.innerHeight || 800) / 2));
-      }
-      setOpenId(restoreId);
-      setRestoreId(null);
-      return;
+    if (!current) return;
+    for (const step of [-1, 1, 2]) {
+      const row = openRows[openIdx + step];
+      if (row?.cover.sha256 && /^image\//.test(row.cover.mime)) warmPreview(api.previewUrl(row.cover.sha256, 1080));
     }
-    // первой страницы не хватило или файла больше нет — деталку не восстанавливаем
-    if (!firstLoad) { setRestoreId(null); setDetailId(null); }
-  }, [items, restoreId, firstLoad, layout, cols, cell, mode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openDay, openRows]);
 
-  // запоминаем открытый файл/деталку для F5
-  useEffect(() => {
-    if (restoreId) return; // пока не восстановили — не затираем сохранённое
-    patchUi({ photos: { viewEntryId: openId, detailId, mode } });
-  }, [openId, detailId, mode, restoreId]);
-
-  /** Удаление снимка: из ленты убираем сразу, иначе ячейка остаётся фантомом до перезагрузки. */
-  const forgetEntry = useCallback((entryId: string) => {
-    setItems((prev) => prev.filter((p) => p.entryId !== entryId));
-    setStatuses((prev) => {
-      const next = new Map(prev);
-      next.delete(entryId);
-      return next;
-    });
-    setOpenId((id) => (id === entryId ? null : id));
-    setDetailId((id) => (id === entryId ? null : id));
-  }, []);
-
-  // ===== Просмотр: оверлей поверх галереи =====
-  // Раньше просмотр и деталка возвращались вместо сетки — сетка размонтировалась, картинки
-  // грузились заново, а прокрутка страницы сбивалась (шапка просмотра уезжала за верх экрана).
-  // Теперь сетка остаётся смонтированной под оверлеем, и возврат назад ничего не теряет.
-  const goto = useCallback((i: number) => setOpenId(media[i]?.entryId ?? null), [media]);
-
-  // Превью соседей по ленте греем заранее: ⬅️/➡️ должны показывать кадр сразу, а не ждать
-  // загрузку. Двух вперёд и одного назад хватает на обычное листание.
-  useEffect(() => {
-    if (!openId) return;
-    const i = media.findIndex((it) => it.entryId === openId);
-    if (i < 0) return;
-    for (const j of [i - 1, i + 1, i + 2]) {
-      const it = media[j];
-      if (it?.sha256 && /^image\//.test(it.mime)) warmPreview(api.previewUrl(it.sha256, 1080));
-    }
-  }, [openId, media]);
-
-  // Пока открыт оверлей, страница под ним не прокручивается: иначе получался «двойной скролл» —
-  // сдвигалась и сама галерея, и просмотр. Позицию прокрутки возвращаем на место при закрытии.
+  // Пока открыт просмотр или деталка, страница под ними не прокручивается: иначе получался
+  // «двойной скролл» — сдвигалась и галерея, и просмотр.
   useEffect(() => {
     if (!overlay) return;
     const y = window.scrollY;
@@ -1708,138 +1247,92 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     };
   }, [overlay]);
 
-  const view = current ? previewState(current, statuses.get(current.entryId)) : null;
-
-  const gridStyle: React.CSSProperties = {
-    display: 'grid',
-    gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-    gap: GRID_GAP,
-  };
-  const calGridStyle: React.CSSProperties = {
-    display: 'grid',
-    gridTemplateColumns: `repeat(${CAL_COLS}, ${calCell}px)`,
-    width: calCell * CAL_COLS,
-    margin: '0 auto',
-  };
-  /** Переключение вида: раскладки разные, старая позиция прокрутки смысла не имеет. */
-  const switchMode = (next: PhotoView) => {
-    if (next === mode) return;
-    setMode(next);
-    window.scrollTo(0, 0);
+  const gotoMonth = (delta: number) => {
+    const next = shiftMonth(month, delta);
+    if (next > currentMonthKey()) return; // будущего в галерее нет
+    setMonth(next);
+    setOpenDay(null);
   };
 
-  // ===== Экран галереи: табы вида + лента или календарь =====
+  /** Листание по дням со снимками: на краю месяца уходим в соседний и открываем ближайший день. */
+  const gotoDay = async (step: number) => {
+    if (!openDay) return;
+    const next = openRows[openIdx + step];
+    if (next) { setOpenDay(next.day); return; }
+    const target = shiftMonth(openDay.slice(0, 7), step > 0 ? -1 : 1);
+    if (step < 0 && target > currentMonthKey()) return;
+    let rows: api.TimelineDayItem[];
+    try {
+      rows = await ensureMonth(target);
+    } catch {
+      return;
+    }
+    if (!rows.length) return; // в соседнем месяце снимков нет — остаёмся на месте
+    const row = step > 0 ? rows[0] : rows[rows.length - 1];
+    setMonth(target);
+    setOpenDay(row.day);
+  };
+
+  /** Удаление снимка: день мог остаться с другими снимками, поэтому месяц перечитываем. */
+  const forgetEntry = useCallback((entryId: string) => {
+    setStatuses((prev) => {
+      const next = new Map(prev);
+      next.delete(entryId);
+      return next;
+    });
+    setDetailId(null);
+    const key = openDay ? openDay.slice(0, 7) : month;
+    setOpenDay(null);
+    void ensureMonth(key, true).catch(() => undefined);
+  }, [openDay, month, ensureMonth]);
+
+  const retryPreview = useCallback(async (entryId: string) => {
+    try {
+      await api.retryPreview(entryId);
+      setStatuses((prev) => {
+        const next = new Map(prev);
+        next.delete(entryId);
+        return next;
+      });
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }, []);
+
+  const busy = up.busy;
+
   return (
     <div>
-      {/* Переключатель вида: всегда сверху и на виду — листать галерею можно и так, и так */}
-      <div className="phototabs" role="tablist" aria-label="Вид галереи">
-        <button
-          role="tab"
-          aria-selected={mode === 'list'}
-          className={mode === 'list' ? 'ptab active' : 'ptab'}
-          onClick={() => switchMode('list')}
-        >Список</button>
-        <button
-          role="tab"
-          aria-selected={mode === 'calendar'}
-          className={mode === 'calendar' ? 'ptab active' : 'ptab'}
-          onClick={() => switchMode('calendar')}
-        >Календарь</button>
+      {/* Шапка календаря: месяц и листание. Заголовок ведёт к текущему месяцу — из глубины
+          истории иначе пришлось бы щёлкать ▶️ десятки раз. */}
+      <div className="calnav">
+        <button className="iconbtn" title="Предыдущий месяц" onClick={() => gotoMonth(-1)}>◀️</button>
+        <button className="caltitle" title="К текущему месяцу" onClick={() => { setMonth(currentMonthKey()); setOpenDay(null); }}>
+          {monthTitleOf(month)}
+        </button>
+        <button className="iconbtn" title="Следующий месяц" onClick={() => gotoMonth(1)} disabled={month >= currentMonthKey()}>▶️</button>
       </div>
 
-      <div ref={gridRef}>
-        {/* Первая загрузка: место под ленту уже занято плейсхолдерами — экран не «прыгает» */}
-        {firstLoad && !items.length && (
-          <div style={gridStyle}>
-            {Array.from({ length: cols * 4 }, (_, i) => <div key={i} className="cellph" />)}
-          </div>
-        )}
+      {loadErr && <div className="err" style={{ margin: '8px 2px' }}>Не удалось загрузить месяц: {loadErr}</div>}
 
-        {mode === 'list' && layout.map((m) => {
-          const range = visibleRows(m, win, cell);
-          return (
-            <section className="monthblock" key={m.key}>
-              <div className="monthhead">
-                <span>{m.title}</span>
-                {/* Счётчик — по загруженным записям: у последнего месяца лента ещё не долистана,
-                    поэтому честно помечаем его плюсом. */}
-                <span className="meta">{m.cells.length}{m.last && hasMore ? '+' : ''}</span>
-              </div>
-              {/* Месяц за экраном держим одной распоркой: узлов и картинок не плодим, но высоту
-                  сохраняем настоящую — полоса прокрутки и позиция не сбиваются. */}
-              {range ? (
-                <div style={{ ...gridStyle, paddingTop: range[0] * cell, paddingBottom: (m.rows - range[1]) * cell }}>
-                  {m.cells.slice(range[0] * cols, range[1] * cols).map((it) => (
-                    <PhotoCell key={it.entryId} item={it} status={statuses.get(it.entryId)} onOpen={openCell} onRetry={retryPreview} />
-                  ))}
-                </div>
-              ) : (
-                <div style={{ height: m.rows * cell }} />
-              )}
-            </section>
-          );
-        })}
-
-        {mode === 'calendar' && calLayout.map((m) => {
-          const range = visibleRows(m, win, calCell);
-          return (
-            <section className="monthblock" key={m.key}>
-              <div className="monthhead calhead">
-                <span>{m.title}</span>
-                <span className="meta">{m.count}{m.last && hasMore ? '+' : ''}</span>
-              </div>
-              {/* Дни недели — над каждым месяцем: семь колонок на любом экране */}
-              <div className="calweek" style={{ width: calCell * CAL_COLS }}>
-                {WEEKDAYS.map((w) => <span key={w}>{w}</span>)}
-              </div>
-              {range ? (
-                <div style={{ ...calGridStyle, paddingTop: range[0] * calCell, paddingBottom: (m.rows - range[1]) * calCell }}>
-                  {m.cells.slice(range[0] * CAL_COLS, range[1] * CAL_COLS).map((c, i) => (c ? (
-                    <div
-                      key={c.day}
-                      className={c.count ? 'calcell' : 'calcell off'}
-                      title={c.count ? `${c.day} — снимков: ${c.count}` : `${c.day} — снимков нет`}
-                      onClick={c.item ? () => openCell(c.item!.entryId) : undefined}
-                    >
-                      {/* Обложка дня: миниатюра 50×50 списка — она уже в браузерном кэше сетки.
-                          Число лежит поверх фото и притемняется тенью, чтобы читалось. */}
-                      {c.item?.sha256 && <img className="calphoto" src={api.previewUrl(c.item.sha256)} alt="" loading="lazy" />}
-                      <span className="calnum">{c.day}</span>
-                    </div>
-                  ) : <div key={`x${i}`} className="calcell blank" />))}
-                </div>
-              ) : (
-                <div style={{ height: m.rows * calCell }} />
-              )}
-            </section>
-          );
-        })}
-
-        {!firstLoad && !media.length && (
-          <div className="copy" style={{ padding: '12px 2px' }}>
-            {loadErr ? (
-              <>
-                Не удалось загрузить ленту: {loadErr}
-                <div className="row"><button className="btn ghost" onClick={reload}>Повторить</button></div>
-              </>
-            ) : 'Нет фото и видео. Нажмите «+» — медиа оптимизируется и появится здесь автоматически.'}
-          </div>
-        )}
-
-        <div ref={sentinelRef} style={{ height: 1 }} />
-        {loadingMore && <div className="copy" style={{ textAlign: 'center', padding: '12px 0' }}>Загружаю…</div>}
-        {loadErr && !!items.length && (
-          <div className="row" style={{ justifyContent: 'center' }}>
-            <button className="btn ghost" onClick={() => void load('more')}>Повторить</button>
-          </div>
-        )}
-        {!!items.length && !hasMore && !loadingMore && (
-          <div className="copy" style={{ textAlign: 'center', padding: '8px 0 0' }}>Это всё — {media.length}</div>
-        )}
+      <div className="calweek" style={{ gridTemplateColumns: `repeat(${CAL_COLS}, minmax(0, 1fr))` }}>
+        {WEEKDAYS.map((w) => <span key={w}>{w}</span>)}
+      </div>
+      <div className="calgrid" style={{ gridTemplateColumns: `repeat(${CAL_COLS}, minmax(0, 1fr))` }}>
+        {cells.map((c, i) => (c
+          ? <DayCell key={c.day} day={c.day} row={c.row} status={c.row ? statuses.get(c.row.cover.entryId) : undefined} onOpen={setOpenDay} />
+          : <div key={`b${i}`} className="calcell blank" />))}
       </div>
 
-      {/* Плавающая кнопка загрузки: одна на фото и видео, тип сервер определяет по формату.
-          Роль кнопки задаём явно: label с скрытым input с клавиатуры не нажимается.
+      <div className="calmeta">
+        {pending === month && !dayRows.length
+          ? 'Загружаю…'
+          : dayRows.length
+            ? `дней со снимками: ${dayRows.length} · всего фото: ${photoCount}`
+            : 'В этом месяце снимков нет — нажмите «+», чтобы загрузить'}
+      </div>
+
+      {/* Кнопка «+»: одна на фото и видео, всегда под большим пальцем — над нижним нав-баром.
           Под оверлеем просмотра её нет — иначе она висела бы поверх снимка. */}
       {photoFolderId && !overlay && (
         <label
@@ -1874,18 +1367,17 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
         <div className="full">
           {/* медиа занимает весь канвас (верх экрана → нав-бар); шапка/инфо — поверх */}
           <div className="mediaarea">
-            {view.ready && current.sha256 && /^video\//.test(current.mime) ? (
+            {view.ready && current.cover.sha256 && /^video\//.test(current.cover.mime) ? (
               // Тот же компонент, что в деталке файла: у него есть фолбэк на оригинал для
               // браузеров без AV1 (Safari/iOS) и playsInline для телефона.
-              <VideoPreview key={current.entryId} meta={{ id: current.entryId, sha256: current.sha256, name: current.name }} />
-            ) : view.ready && current.sha256 ? (
-              // key по записи: у каждого снимка своя геометрия и свой зум. Миниатюра из сетки
-              // (thumb) лежит размытой под кадром — переключение выглядит мгновенным даже тогда,
-              // когда полноразмерное превью ещё не догрузилось.
+              <VideoPreview key={current.cover.entryId} meta={{ id: current.cover.entryId, sha256: current.cover.sha256, name: current.cover.name }} />
+            ) : view.ready && current.cover.sha256 ? (
+              // key по снимку: у каждого своя геометрия и свой зум. Миниатюра из кружка (thumb)
+              // лежит размытой под кадром — переход выглядит мгновенным, пока идёт 1080.
               <PhotoZoom
-                key={current.entryId}
-                src={api.previewUrl(current.sha256, 1080)}
-                thumb={api.previewUrl(current.sha256)}
+                key={current.cover.entryId}
+                src={api.previewUrl(current.cover.sha256, 1080)}
+                thumb={api.previewUrl(current.cover.sha256)}
               />
             ) : (
               <div className="panel">
@@ -1896,8 +1388,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                       <pre className="copy" style={{ whiteSpace: 'pre-wrap', color: '#ff9c9c', maxHeight: 180, overflow: 'auto' }}>{view.jobError}</pre>
                     )}
                     <div className="row" style={{ justifyContent: 'center' }}>
-                      <button className="btn ghost" onClick={() => void retryPreview(current.entryId)}>⟳ Пересобрать</button>
-                      <a className="btn ghost" href={api.fileUrl(current.entryId)} download>⬇️ Скачать оригинал</a>
+                      <button className="btn ghost" onClick={() => void retryPreview(current.cover.entryId)}>⟳ Пересобрать</button>
+                      <a className="btn ghost" href={api.fileUrl(current.cover.entryId)} download>⬇️ Скачать оригинал</a>
                     </div>
                   </>
                 ) : view.hopeless ? (
@@ -1908,8 +1400,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                       {view.impossible && view.jobError ? `Превью не собрать: ${view.jobError}` : 'Превью для этого файла собрать нельзя'}
                     </div>
                     <div className="row" style={{ justifyContent: 'center' }}>
-                      <button className="btn ghost" onClick={() => void retryPreview(current.entryId)}>⟳ Поставить задачу</button>
-                      <a className="btn ghost" href={api.fileUrl(current.entryId)} download>⬇️ Скачать оригинал</a>
+                      <button className="btn ghost" onClick={() => void retryPreview(current.cover.entryId)}>⟳ Поставить задачу</button>
+                      <a className="btn ghost" href={api.fileUrl(current.cover.entryId)} download>⬇️ Скачать оригинал</a>
                     </div>
                   </div>
                 ) : (
@@ -1922,25 +1414,29 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
             )}
           </div>
           <div className="tbar">
-            <button className="iconbtn" title="Назад в галерею" onClick={() => setOpenId(null)}>◀️</button>
-            <span style={{ flex: 1 }} />
-            <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(current.entryId)}>ℹ️</button>
+            <button className="iconbtn" title="Назад в календарь" onClick={() => setOpenDay(null)}>◀️</button>
+            {/* В календаре открыт день, а не файл: вместо имени показываем дату и число снимков */}
+            <span className="calday">
+              {dayTitle(current.day)}
+              {current.count > 1 ? ` · ${current.count} фото` : ''}
+            </span>
+            <button className="iconbtn" title="Инфо и действия" onClick={() => setDetailId(current.cover.entryId)}>ℹ️</button>
             {/* Скачивание живёт только в деталке (ℹ️) — из превью его убрали */}
             <button
               className="iconbtn"
               title="Удалить (в корзину)"
               onClick={async () => {
-                if (!confirm(`Удалить «${current.name}» в корзину?`)) return;
+                if (!confirm(`Удалить «${current.cover.name}» в корзину?`)) return;
                 try {
-                  await api.deleteFile(current.entryId);
-                  forgetEntry(current.entryId);
+                  await api.deleteFile(current.cover.entryId);
+                  forgetEntry(current.cover.entryId);
                 } catch (e) {
                   alert((e as Error).message);
                 }
               }}
             >🗑</button>
-            <button className="iconbtn" disabled={openIdx === 0} title="Назад" onClick={() => goto(openIdx - 1)}>⬅️</button>
-            <button className="iconbtn" disabled={openIdx >= media.length - 1} title="Вперёд" onClick={() => goto(openIdx + 1)}>➡️</button>
+            <button className="iconbtn" title="Предыдущий день со снимками" onClick={() => void gotoDay(-1)}>⬅️</button>
+            <button className="iconbtn" title="Следующий день со снимками" onClick={() => void gotoDay(1)}>➡️</button>
           </div>
         </div>
       )}
@@ -1955,7 +1451,6 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     </div>
   );
 }
-
 
 // Зум только для фото (щипок/дабл-тап/пан); страница при этом не зуммится
 function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
@@ -2141,33 +1636,6 @@ function PhotoZoom({ src, thumb }: { src: string; thumb?: string }) {
     </div>
   );
 }
-
-// #4: лоадер для изображений. Плейсхолдер — часть ячейки: пока превью не пришло, на его месте
-// уже стоит серый квадрат со спиннером, поэтому сетка не «прыгает» при подгрузке.
-// Готовое превью берём из кэша: строка, вернувшаяся в окно виртуализации (или галерея под
-// открытым просмотром), показывает кадр сразу — без спиннера и без повторной загрузки.
-function LoadImg({ src }: { src: string }) {
-  const [ok, setOk] = useState(() => previewReady(src));
-  return (
-    <div style={{ position: 'relative', width: '100%', aspectRatio: '1', background: '#1b212b', overflow: 'hidden' }}>
-      {!ok && (
-        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
-          <span className="spin" />
-        </div>
-      )}
-      <img
-        src={src}
-        alt=""
-        loading="lazy"
-        onLoad={() => setOk(true)}
-        onError={() => setOk(true)}
-        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: ok ? 1 : 0, transition: 'opacity .15s' }}
-      />
-    </div>
-  );
-}
-
-
 
 // ================= Шаринг =================
 

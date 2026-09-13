@@ -156,50 +156,40 @@ html, body { overscroll-behavior: none; }
 .tags { margin: 10px 0 0; }
 .tags > summary { cursor: pointer; padding: 10px 2px; border-top: 1px solid #1f242c; }
 
-/* Фото: плотная плитка по месяцам, плейсхолдер ячейки и плавающая кнопка загрузки */
-/* Плейсхолдер ячейки. Анимацию фона убрали: при массовом импорте таких ячеек тысячи, и
-   перерисовка цвета в каждой была заметной нагрузкой на главный поток. Спиннер внутри
-   крутится на transform — он дешёвый. */
-.cellph { aspect-ratio: 1; background: #171c24; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 2px; overflow: hidden; }
-/* Шапка месяца: высота задана жёстко — от неё считается раскладка виртуализации ленты
-   (MONTH_HEAD_H в App.tsx), поэтому «на глаз» её менять нельзя.
-   top: 40px — ровно высота .phototabs: шапка месяца липнет под табами, а не под ними. */
-.monthhead { position: sticky; top: 40px; z-index: 4; display: flex; align-items: center; gap: 8px;
-  height: 34px; box-sizing: border-box; margin: 0; padding: 0 2px; font-size: 14px; color: #cfd6e0;
+/* ---- Фото: календарь по месяцам ---- */
+/* Шапка календаря: ◀️ месяц ▶️. Липнет к верху, чтобы листать месяцы можно было из любого места. */
+.calnav { position: sticky; top: 0; z-index: 6; display: flex; align-items: center; gap: 4px;
+  height: 44px; box-sizing: border-box; margin: 0 -12px 6px; padding: 0 8px;
   background: rgba(15, 17, 21, .94); backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }
-.monthhead .meta { font-size: 11px; }
+.caltitle { flex: 1; min-width: 0; background: none; border: 0; color: #e6e8eb; font-size: 15px;
+  font-weight: 600; padding: 6px 4px; border-radius: 8px; cursor: pointer; }
+.caltitle:active { background: rgba(255, 255, 255, .08); }
 
-/* Переключатель вида галереи: «Список» и «Календарь». Высота 40px задана жёстко — на неё
-   опирается sticky-отступ шапки месяца (.monthhead), менять только вместе с ним. */
-.phototabs { position: sticky; top: 0; z-index: 6; height: 40px; box-sizing: border-box;
-  display: flex; align-items: center; gap: 6px; margin: 0 -12px 8px; padding: 0 12px;
-  background: rgba(15, 17, 21, .94); backdrop-filter: blur(8px); border-bottom: 1px solid #262b33; }
-.ptab { background: none; border: 1px solid #3a4250; color: #cfd6e0; padding: 4px 12px;
-  border-radius: 8px; font-size: 13px; cursor: pointer; }
-.ptab.active { background: #2b6cff; border-color: #2b6cff; color: #fff; }
-
-/* Календарь: семь колонок на любом экране, кружок дня не шире 50px на десктопе.
-   Высота строки дней недели задана жёстко (WEEK_HEAD_H = 20 в App.tsx) — от неё считается
-   высота месяца в раскладке виртуализации, поэтому margin у строки нулевой: любой отступ
-   разъехался бы с расчётом и увёл прокрутку тем сильнее, чем длиннее лента. */
-.calhead { max-width: 350px; margin: 0 auto; }
-.calweek { display: grid; grid-template-columns: repeat(7, 1fr); margin: 0 auto;
-  height: 20px; box-sizing: border-box; font-size: 11px; color: #6d7889; text-align: center; }
+/* Сетка дней: всегда 7 колонок; шире 7 кружков по 50 px календарь не растёт и стоит по центру.
+   Размер клетки считает сам CSS (fr внутри min(100%, 350px)) — JS его не меряет и не пересчитывает. */
+.calweek, .calgrid { display: grid; width: min(100%, 350px); margin: 0 auto; }
+.calweek { height: 20px; box-sizing: border-box; font-size: 11px; color: #6d7889; text-align: center; }
 .calweek span { line-height: 20px; }
 .calcell { position: relative; aspect-ratio: 1; display: grid; place-items: center; }
 .calcell.blank { visibility: hidden; }
 .calcell.off { cursor: default; }
 .calcell:not(.off):not(.blank) { cursor: pointer; }
+/* Превью дня ещё собирается: кружок тёмный, но число на месте — день видно и можно открыть */
+.calcell.wait::before { content: ''; position: absolute; inset: 1px; border-radius: 50%; background: #171c24; }
 /* Фото дня — кружок под числом: притемнено и под затемняющей вуалью, чтобы число читалось
-   на любом снимке (даже на белом небе: контраст числа с фоном остаётся не ниже ~4:1). */
+   на любом снимке (даже на белом небе контраст числа с фоном остаётся не ниже ~4:1). */
 .calphoto { position: absolute; inset: 1px; width: auto; height: auto; border-radius: 50%;
   object-fit: cover; filter: brightness(.5) saturate(.85); }
-.calcell:not(.off)::after { content: ''; position: absolute; inset: 1px; border-radius: 50%;
+.calcell:not(.off):not(.wait)::after { content: ''; position: absolute; inset: 1px; border-radius: 50%;
   background: radial-gradient(circle at 50% 50%, rgba(0, 0, 0, .15), rgba(0, 0, 0, .45)); }
 .calnum { position: relative; z-index: 1; font-size: 13px; font-weight: 600; color: #e6e8eb;
   text-shadow: 0 1px 2px rgba(0, 0, 0, .95), 0 0 5px rgba(0, 0, 0, .85); }
 .calcell.off .calnum { color: #5c6779; font-weight: 400; text-shadow: none; }
+.calmeta { width: min(100%, 350px); margin: 10px auto 0; font-size: 12px; color: #6d7889; text-align: center; }
+/* Открытый день в шапке просмотра: в календаре открыт день, а не файл, поэтому вместо имени
+   файла показываем дату и сколько в этот день снимков. */
+.calday { flex: 1; min-width: 0; padding: 0 6px; font-size: 13px; color: #e6e8eb; text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Кнопка «+»: одна на фото и видео, всегда под большим пальцем — над нижним нав-баром */
 .fab { position: fixed; right: 18px; bottom: calc(70px + env(safe-area-inset-bottom)); z-index: 20;

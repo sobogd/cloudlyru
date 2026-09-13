@@ -547,15 +547,21 @@ export const queueErrors = (opts: { limit?: number; offset?: number } = {}) => {
 /** Вернуть в очередь все упавшие задачи. */
 export const retryQueueErrors = () =>
   request<{ retried: number }>('/queue/errors/retry', { method: 'POST', body: JSON.stringify({}) });
-/** Лента «Фото» постранично: `limit` — размер страницы, `cursor` — entryId последней показанной
- *  записи (сервер сам знает её дату и отдаёт то, что идёт дальше). */
-export const timeline = (opts: { limit?: number; cursor?: string } = {}) => {
-  const q = new URLSearchParams();
-  if (opts.limit) q.set('limit', String(opts.limit));
-  if (opts.cursor) q.set('cursor', opts.cursor);
-  const qs = q.toString();
-  return request<TimelineItem[]>(`/timeline${qs ? `?${qs}` : ''}`);
-};
+/**
+ * День календаря «Фото»: обложка (один снимок дня) и сколько снимков в этот день всего.
+ * `day` — 'YYYY-MM-DD' по дате съёмки, как она записана в файле.
+ */
+export interface TimelineDayItem {
+  day: string;
+  count: number;
+  cover: TimelineItem;
+}
+/**
+ * Дни одного месяца для календаря: строка на день, где есть снимки. Календарь листается
+ * месяцами вручную, поэтому за раз берём ровно месяц — ~30 строк вместо сотен строк ленты.
+ */
+export const timelineDays = (month: string) =>
+  request<TimelineDayItem[]>(`/timeline/days?month=${encodeURIComponent(month)}`);
 /** Статусы сборки превью по списку записей: спрашиваем только про незавершённые снимки. */
 export const timelineStatus = (entryIds: string[]) =>
   request<TimelineStatus[]>('/timeline/status', { method: 'POST', body: JSON.stringify({ entryIds }) });
