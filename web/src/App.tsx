@@ -19,10 +19,13 @@ const NAV: Array<{ id: Tab; icon: string; label: string }> = [
 type UiState = {
   tab?: Tab;
   files?: { stack?: Array<{ id?: string; name: string }>; openFile?: string | null; folderMeta?: boolean };
-  photos?: { viewEntryId?: string | null; detailId?: string | null };
+  photos?: { viewEntryId?: string | null; detailId?: string | null; mode?: PhotoView };
   albums?: { openId?: string | null };
 };
 const UI_KEY = 'cloudlyru:ui';
+
+/** Вид галереи: лента фото подряд или календарь по месяцам (переключается табами сверху). */
+type PhotoView = 'list' | 'calendar';
 
 function readUi(): UiState {
   try { return JSON.parse(sessionStorage.getItem(UI_KEY) || '{}') as UiState; } catch { return {}; }
@@ -979,6 +982,15 @@ const VIRT_OVERSCAN = 900;
 const VIRT_STEP = 200;
 /** Сколько превью держим готовыми в памяти (дальние вытесняются, их достанет кэш браузера). */
 const PREVIEW_CACHE_MAX = 48;
+/**
+ * Высота строки дней недели в календаре. Задана жёстко в CSS (.calweek) и повторена здесь:
+ * от неё считается высота месяца в раскладке виртуализации.
+ */
+const WEEK_HEAD_H = 20;
+/** Неделя в календаре начинается с понедельника — как в русском календаре. */
+const WEEKDAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+/** В календаре ровно 7 колонок на любом экране: шире, чем 7 кружков по 50 px, он не растёт. */
+const CAL_COLS = 7;
 
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
@@ -994,6 +1006,24 @@ function monthTitleOf(key: string): string {
   if (!key) return 'Без даты';
   const [year, month] = key.split('-');
   return `${MONTHS[Number(month) - 1] ?? key} ${year}`;
+}
+
+/** Ключ дня по дате съёмки ('YYYY-MM-DD'); пусто — даты нет (в календарь такие снимки не попадают). */
+function dayKeyOf(capturedAt: string | null): string {
+  return capturedAt && /^\d{4}-\d{2}-\d{2}/.test(capturedAt) ? capturedAt.slice(0, 10) : '';
+}
+
+/** Соседний месяц по ключу 'YYYY-MM': shiftMonth('2026-01', -1) === '2025-12'. */
+function shiftMonth(key: string, delta: number): string {
+  const [y, m] = key.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1 + delta, 1));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/** Текущий месяц по календарю устройства (даты съёмки показываем «как в файле», без пересчёта). */
+function currentMonthKey(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 }
 
 /**
@@ -1076,8 +1106,27 @@ type MonthBox = {
   last: boolean;
 };
 
+/** Минимум, по которому считается видимая часть: у ленты и у календаря свои «месяцы». */
+type RowsBox = { rowsTop: number; rows: number };
+
+/** Клетка дня в календаре: обложка — самый свежий снимок дня, count — сколько их в этот день. */
+type CalDay = { day: number; item: api.TimelineItem | null; count: number };
+
+/** Месяц календаря: клетки по дням (пустые — до первого дня и после последнего) и его место в ленте. */
+type CalMonth = {
+  key: string;
+  title: string;
+  cells: Array<CalDay | null>;
+  count: number;
+  rows: number;
+  top: number;
+  rowsTop: number;
+  height: number;
+  last: boolean;
+};
+
 /** Строки месяца, попадающие в видимое окно (в строках, не в пикселях); null — месяц за экраном. */
-function visibleRows(m: MonthBox, win: { top: number; bottom: number }, cell: number): [number, number] | null {
+function visibleRows(m: RowsBox, win: { top: number; bottom: number }, cell: number): [number, number] | null {
   if (m.rowsTop >= win.bottom || m.rowsTop + m.rows * cell <= win.top) return null;
   const first = Math.max(0, Math.floor((win.top - m.rowsTop) / cell));
   const last = Math.min(m.rows, Math.ceil((win.bottom - m.rowsTop) / cell));
@@ -1227,6 +1276,8 @@ const PhotoCell = memo(function PhotoCell({
 
 function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | null; up: Uploader; uploadedAt: number }) {
   const [saved] = useState(() => readUi().photos);
+  /** Вид галереи: лента фото подряд или календарь по месяцам. Выбор переживает F5. */
+  const [mode, setMode] = useState<PhotoView>(() => (saved?.mode === 'calendar' ? 'calendar' : 'list'));
   const [items, setItems] = useState<api.TimelineItem[]>([]);
   /** Статусы сборки превью (см. previewState). Держим отдельно от ленты: лента не должна
    *  перечитываться из-за того, что у одного снимка дособралось превью. */
@@ -1416,19 +1467,89 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     });
   }, [sections, cols, cell]);
 
+  // ===== Календарь: месяцы от текущего назад, по 7 дней в строке =====
+  // Кружок дня — миниатюра самого свежего снимка этого дня, поверх неё число. Экран узкий или
+  // широкий — колонок всё равно семь: кружок не шире GRID_CELL, поэтому шире 7×50 календарь
+  // не растёт и на большом мониторе остаётся компактной колонкой по центру.
+  const calCell = width > 0 ? Math.min(GRID_CELL, width / CAL_COLS) : GRID_CELL;
+  const calLayout = useMemo<CalMonth[]>(() => {
+    // Дни, в которые что-то снято: обложка дня — первый снимок (лента отсортирована свежими вверх).
+    const byDay = new Map<string, api.TimelineItem[]>();
+    let oldest = '';
+    let newest = '';
+    for (const it of media) {
+      const day = dayKeyOf(it.capturedAt);
+      if (!day) continue; // без даты съёмки в календарь не поставить — такие видны в ленте
+      const list = byDay.get(day);
+      if (list) list.push(it);
+      else byDay.set(day, [it]);
+      const key = day.slice(0, 7);
+      if (!oldest || key < oldest) oldest = key;
+      if (!newest || key > newest) newest = key;
+    }
+    // От текущего месяца назад: пустые месяцы тоже показываем — иначе календарь «перепрыгивал» бы
+    // через паузы в съёмке. Если снимки датированы будущим (сбитые часы камеры) — начинаем с них.
+    const start = newest && newest > currentMonthKey() ? newest : currentMonthKey();
+    if (!oldest || oldest > start) oldest = start;
+
+    const out: CalMonth[] = [];
+    let top = 0;
+    for (let key = start; key >= oldest; key = shiftMonth(key, -1)) {
+      const [y, m] = key.split('-').map(Number);
+      const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+      const offset = (new Date(Date.UTC(y, m - 1, 1)).getUTCDay() + 6) % 7; // Пн — первый столбец
+      const rows = Math.ceil((offset + days) / CAL_COLS);
+      const cells: Array<CalDay | null> = new Array(rows * CAL_COLS).fill(null);
+      let count = 0;
+      for (let d = 1; d <= days; d++) {
+        const items = byDay.get(`${key}-${String(d).padStart(2, '0')}`);
+        if (items?.length) count += items.length;
+        cells[offset + d - 1] = { day: d, item: items?.[0] ?? null, count: items?.length ?? 0 };
+      }
+      const box: CalMonth = {
+        key,
+        title: monthTitleOf(key),
+        cells,
+        count,
+        rows,
+        top,
+        rowsTop: top + MONTH_HEAD_H + WEEK_HEAD_H,
+        height: MONTH_HEAD_H + WEEK_HEAD_H + rows * calCell,
+        last: false,
+      };
+      top += box.height;
+      out.push(box);
+    }
+    // Самый старый месяц — тот, что ещё долистывается: помечаем его плюсом у счётчика.
+    if (out.length) out[out.length - 1].last = true;
+    return out;
+  }, [media, calCell]);
+
   /** Монтируем только строки вокруг экрана: тысяч узлов и картинок в памяти больше нет. */
-  const win = useVirtualWindow(gridRef, [media.length, cols, cell]);
+  const win = useVirtualWindow(gridRef, [media.length, cols, cell, mode]);
 
   /** Записи, которые сейчас на экране (с запасом виртуализации) — по ним и спрашиваем статусы. */
   const visibleIds = useMemo(() => {
     const ids = new Set<string>();
+    if (mode === 'calendar') {
+      // В календаре на экране только обложки дней: их и спрашиваем.
+      for (const m of calLayout) {
+        const range = visibleRows(m, win, calCell);
+        if (!range) continue;
+        for (let i = range[0] * CAL_COLS; i < Math.min(range[1] * CAL_COLS, m.cells.length); i++) {
+          const cellDay = m.cells[i];
+          if (cellDay?.item) ids.add(cellDay.item.entryId);
+        }
+      }
+      return ids;
+    }
     for (const m of layout) {
       const range = visibleRows(m, win, cell);
       if (!range) continue;
       for (let i = range[0] * cols; i < Math.min(range[1] * cols, m.cells.length); i++) ids.add(m.cells[i].entryId);
     }
     return ids;
-  }, [layout, win, cell, cols]);
+  }, [mode, layout, calLayout, win, cell, calCell, cols]);
 
   // Кого ещё спрашивать про сборку превью: тех, о ком ответа нет, и тех, у кого задача идёт.
   // Только видимые записи: плейсхолдеры видны лишь у них, а лента бывает на десятки тысяч
@@ -1518,8 +1639,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     if (!restoreId || !items.length) return;
     if (items.some((it) => it.entryId === restoreId)) {
       // Прокручиваем ленту к этому снимку: после закрытия просмотра список стоит там, где был
-      // до перезагрузки, а не в начале ленты.
-      const box = layout.find((m) => m.cells.some((c) => c.entryId === restoreId));
+      // до перезагрузки, а не в начале ленты. В календаре позиция ленты смысла не имеет.
+      const box = mode === 'list' ? layout.find((m) => m.cells.some((c) => c.entryId === restoreId)) : undefined;
       const el = gridRef.current;
       if (box && el && cell > 0) {
         const idx = box.cells.findIndex((c) => c.entryId === restoreId);
@@ -1532,13 +1653,13 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     }
     // первой страницы не хватило или файла больше нет — деталку не восстанавливаем
     if (!firstLoad) { setRestoreId(null); setDetailId(null); }
-  }, [items, restoreId, firstLoad, layout, cols, cell]);
+  }, [items, restoreId, firstLoad, layout, cols, cell, mode]);
 
   // запоминаем открытый файл/деталку для F5
   useEffect(() => {
     if (restoreId) return; // пока не восстановили — не затираем сохранённое
-    patchUi({ photos: { viewEntryId: openId, detailId } });
-  }, [openId, detailId, restoreId]);
+    patchUi({ photos: { viewEntryId: openId, detailId, mode } });
+  }, [openId, detailId, mode, restoreId]);
 
   /** Удаление снимка: из ленты убираем сразу, иначе ячейка остаётся фантомом до перезагрузки. */
   const forgetEntry = useCallback((entryId: string) => {
@@ -1594,10 +1715,38 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
     gap: GRID_GAP,
   };
+  const calGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: `repeat(${CAL_COLS}, ${calCell}px)`,
+    width: calCell * CAL_COLS,
+    margin: '0 auto',
+  };
+  /** Переключение вида: раскладки разные, старая позиция прокрутки смысла не имеет. */
+  const switchMode = (next: PhotoView) => {
+    if (next === mode) return;
+    setMode(next);
+    window.scrollTo(0, 0);
+  };
 
-  // ===== Экран-сетка =====
+  // ===== Экран галереи: табы вида + лента или календарь =====
   return (
     <div>
+      {/* Переключатель вида: всегда сверху и на виду — листать галерею можно и так, и так */}
+      <div className="phototabs" role="tablist" aria-label="Вид галереи">
+        <button
+          role="tab"
+          aria-selected={mode === 'list'}
+          className={mode === 'list' ? 'ptab active' : 'ptab'}
+          onClick={() => switchMode('list')}
+        >Список</button>
+        <button
+          role="tab"
+          aria-selected={mode === 'calendar'}
+          className={mode === 'calendar' ? 'ptab active' : 'ptab'}
+          onClick={() => switchMode('calendar')}
+        >Календарь</button>
+      </div>
+
       <div ref={gridRef}>
         {/* Первая загрузка: место под ленту уже занято плейсхолдерами — экран не «прыгает» */}
         {firstLoad && !items.length && (
@@ -1606,7 +1755,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           </div>
         )}
 
-        {layout.map((m) => {
+        {mode === 'list' && layout.map((m) => {
           const range = visibleRows(m, win, cell);
           return (
             <section className="monthblock" key={m.key}>
@@ -1626,6 +1775,41 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                 </div>
               ) : (
                 <div style={{ height: m.rows * cell }} />
+              )}
+            </section>
+          );
+        })}
+
+        {mode === 'calendar' && calLayout.map((m) => {
+          const range = visibleRows(m, win, calCell);
+          return (
+            <section className="monthblock" key={m.key}>
+              <div className="monthhead calhead">
+                <span>{m.title}</span>
+                <span className="meta">{m.count}{m.last && hasMore ? '+' : ''}</span>
+              </div>
+              {/* Дни недели — над каждым месяцем: семь колонок на любом экране */}
+              <div className="calweek" style={{ width: calCell * CAL_COLS }}>
+                {WEEKDAYS.map((w) => <span key={w}>{w}</span>)}
+              </div>
+              {range ? (
+                <div style={{ ...calGridStyle, paddingTop: range[0] * calCell, paddingBottom: (m.rows - range[1]) * calCell }}>
+                  {m.cells.slice(range[0] * CAL_COLS, range[1] * CAL_COLS).map((c, i) => (c ? (
+                    <div
+                      key={c.day}
+                      className={c.count ? 'calcell' : 'calcell off'}
+                      title={c.count ? `${c.day} — снимков: ${c.count}` : `${c.day} — снимков нет`}
+                      onClick={c.item ? () => openCell(c.item!.entryId) : undefined}
+                    >
+                      {/* Обложка дня: миниатюра 50×50 списка — она уже в браузерном кэше сетки.
+                          Число лежит поверх фото и притемняется тенью, чтобы читалось. */}
+                      {c.item?.sha256 && <img className="calphoto" src={api.previewUrl(c.item.sha256)} alt="" loading="lazy" />}
+                      <span className="calnum">{c.day}</span>
+                    </div>
+                  ) : <div key={`x${i}`} className="calcell blank" />))}
+                </div>
+              ) : (
+                <div style={{ height: m.rows * calCell }} />
               )}
             </section>
           );
