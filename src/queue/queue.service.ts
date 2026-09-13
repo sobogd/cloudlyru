@@ -84,6 +84,12 @@ interface SourceProbe {
 interface ConvertResult {
   warn?: string;
   keepRaw?: boolean;
+  /**
+   * Работа не закончена и не упала (PDF: отрисована порция страниц) — строку задачи не
+   * удаляем, а возвращаем в очередь. Вторую строку на тот же ассет не создаём никогда:
+   * именно из-за неё файл и выглядел в очереди задвоенным.
+   */
+  requeue?: boolean;
 }
 
 function truncErr(msg: string): string {
@@ -132,6 +138,10 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit() {
     if ((env.CONVERT_ENABLED ?? 'true') !== 'true') return;
+    // Дубли сначала: если на файл лежат две строки, перевод processing→pending падает на
+    // частичном уникальном индексе (Job_one_pending_per_asset_kind) — одним запросом, то есть
+    // молча оставляет ВСЕ прерванные задачи в processing, и очередь после рестарта встаёт.
+    await this.dedupeJobs();
     // после рестарта все processing возвращаем в очередь (рестарт = прерванный воркер)
     await this.prisma.job.updateMany({ where: { state: 'processing' }, data: { state: 'pending' } }).catch(() => undefined);
     this.cleanupTmp();
@@ -140,6 +150,41 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       `конвертер запущен (mem-limit ${WORKER_MEM_KB / 1024}MB, фото параллельно ${PHOTO_PARALLEL}, ` +
         `оригиналы ${env.KEEP_ORIGINALS ? 'храним' : 'удаляем'})`,
     );
+  }
+
+  /**
+   * Схлопнуть дубли строк очереди: на файл и вид задачи остаётся ровно одна строка.
+   *
+   * Откуда дубли: PDF на длинный документ отрисовывал порцию страниц и заводил вторую задачу
+   * на остаток, пока первая была ещё в работе. Файл висел в очереди дважды (ждёт + считается),
+   * а если первый заход потом падал — ещё и в ошибках. Теперь остаток везёт та же строка
+   * (requeue), а этот метод добирает то, что уже накопилось. Порядок предпочтения при
+   * схлопывании: ожидающая строка > считающаяся > упавшая — ожидающая несёт работу, упавшая
+   * только историю, и работа важнее.
+   */
+  async dedupeJobs(): Promise<number> {
+    const removed = await this.prisma
+      .$executeRaw`
+      DELETE FROM "Job"
+      WHERE id IN (
+        SELECT id FROM (
+          SELECT id, row_number() OVER (
+            PARTITION BY "assetId", kind
+            ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'processing' THEN 1 ELSE 2 END, "createdAt" DESC
+          ) AS rn
+          FROM "Job"
+        ) ranked
+        WHERE ranked.rn > 1
+      )
+    `
+      .catch((e) => {
+        // Ошибку не глотаем молча: сырой SQL может не пройти (например, поменялась схема),
+        // и тогда дубли просто останутся — об этом должно быть видно в логе.
+        this.logger.warn(`схлопнуть дубли не вышло: ${(e as Error).message}`);
+        return 0;
+      });
+    if (removed) this.logger.warn(`схлопнуто дублей в очереди: ${removed}`);
+    return removed;
   }
 
   /** Осиротевшие каталоги задач: процесс убит (SIGKILL/pm2 reload), поэтому finally не отработал. */
@@ -505,9 +550,19 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       // res.warn = производные собраны не полностью (например у видео есть только постер):
       // задача не «failed», иначе UI показывал бы ошибку, хотя медиа доступно для просмотра.
       this.retryAfter.delete(job.id);
-      // Успех — это Asset.previewState = 'done' (его выставил convert*), а не строка задачи.
-      // Строку удаляем: очередь = список того, что осталось, готовое в ней не живёт.
-      await this.prisma.job.delete({ where: { id: job.id } }).catch(() => undefined);
+      if (res.requeue) {
+        // Остаток работы доедет этой же строкой: подтверждение — состояние 'pending'.
+        await this.prisma.job
+          .update({
+            where: { id: job.id },
+            data: { state: 'pending', attempts: 0, error: null, startedAt: null, finishedAt: null },
+          })
+          .catch(() => undefined);
+      } else {
+        // Успех — это Asset.previewState = 'done' (его выставил convert*), а не строка задачи.
+        // Строку удаляем: очередь = список того, что осталось, готовое в ней не живёт.
+        await this.prisma.job.delete({ where: { id: job.id } }).catch(() => undefined);
+      }
       if (res.warn) this.logger.warn(`△ ${tag}: ${res.warn}`);
       else this.logger.log(`✓ ${tag}`);
     } catch (e) {
@@ -741,13 +796,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // «Есть чем показать» — только если хотя бы одна страница реально лежит в S3: иначе
     // деталка показала бы число страниц и битые картинки вместо «превью готовится».
     if (existing.size + rendered > 0) await this.finishPdf(job, total);
-    // Остались страницы (упёрлись в лимит задачи или встали на паузу) — дорисуем следующей
-    // задачей: готовые страницы она пропустит по списку ключей. Если ассет вычистили — не ставим.
-    if (!stopped && missing.length > rendered) {
-      await this.prisma.job.create({ data: { assetId: job.assetId, kind: 'pdf', state: 'pending' } }).catch(() => undefined);
-      this.logger.log(`△ pdf ${sha.slice(0, 8)}: отрисовано ${rendered} из ${missing.length} оставшихся страниц`);
-    }
-    return { keepRaw: true };
+    // Остались страницы (упёрлись в лимит задачи или встали на паузу) — ту же строку вернём в
+    // очередь: следующий заход дорисует остаток, а готовые страницы пропустит по списку ключей
+    // в S3. Отдельную вторую строку на тот же файл не создаём: пока она ждала, файл висел в
+    // очереди дважды (ожидает + считается), а если первый заход падал — ещё и в ошибках.
+    // Если ассет вычистили из корзины, продолжать некуда: строку заберёт обычный путь.
+    if (stopped || missing.length <= rendered) return { keepRaw: true };
+    this.logger.log(`△ pdf ${sha.slice(0, 8)}: отрисовано ${rendered} из ${missing.length} оставшихся страниц`);
+    return { keepRaw: true, requeue: true };
   }
 
   /** Миниатюра для списка: первая страница, вписанная в квадрат GRID_SIZE на белом фоне. */

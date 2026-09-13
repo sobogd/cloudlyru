@@ -1859,10 +1859,12 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
     setNotice('');
     try {
       const r = await api.rebuildPreviews();
+      // Дубли (лишние строки на один файл) пересчёт схлопывает сам — если такие были, говорим.
+      const dupes = r.deduped ? ` · схлопнуто дублей: ${r.deduped.toLocaleString('ru-RU')}` : '';
       setNotice(
         r.queued
-          ? `Поставлено задач: ${r.queued.toLocaleString('ru-RU')}${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}`
-          : `Новых задач нет — всё, что можно собрать, уже в очереди${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}`,
+          ? `Поставлено задач: ${r.queued.toLocaleString('ru-RU')}${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}${dupes}`
+          : `Новых задач нет — всё, что можно собрать, уже в очереди${r.impossible ? ` · собрать нельзя: ${r.impossible.toLocaleString('ru-RU')}` : ''}${dupes}`,
       );
       await load();
     } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
@@ -1884,7 +1886,11 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
     setNotice('');
     try {
       const r = await api.clearQueue();
-      setNotice(`Очередь очищена — удалено строк: ${r.removed.toLocaleString('ru-RU')}. Нажмите «Пересчитать», чтобы поставить задачи файлам без превью.`);
+      setNotice(
+        `Очередь очищена — удалено строк: ${r.removed.toLocaleString('ru-RU')}.` +
+          (r.resumed ? ` PDF с недорисованными страницами: ${r.resumed.toLocaleString('ru-RU')} — их вернёт пересчёт.` : '') +
+          ' Нажмите «Пересчитать», чтобы поставить задачи файлам без превью.',
+      );
       await load();
     } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
   };
