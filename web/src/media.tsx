@@ -16,15 +16,6 @@ import * as api from './api';
 
 type MediaItem = api.MediaItem;
 
-/** Компонент деталки файла — пробрасывается из App, чтобы не тянуть сюда внутренности. */
-export interface DetailComponentProps {
-  entryId: string;
-  onBack: () => void;
-  onDeleted?: (entryId: string) => void;
-  inOverlay?: boolean;
-}
-type DetailComponent = (props: DetailComponentProps) => JSX.Element;
-
 /** Размер клетки и зазоры сетки: превью сервер отдаёт ровно 50×50, поэтому клетка = 50. */
 const CELL = 50;
 const GAP = 3;
@@ -65,8 +56,7 @@ function fitGeom(cw: number, ch: number, nw: number, nh: number) {
 
 // =============================== Таймлайн ===============================
 
-export default function MediaSection({ FileDetail, onOverlayChange }: {
-  FileDetail: DetailComponent;
+export default function MediaSection({ onOverlayChange }: {
   /** Модалка открыта/закрыта — Shell прячет общий футер, чтобы он не наезжал на футер модалки. */
   onOverlayChange?: (open: boolean) => void;
 }) {
@@ -257,7 +247,6 @@ export default function MediaSection({ FileDetail, onOverlayChange }: {
           onClose={() => setOpenIdx(null)}
           onDelete={handleDelete}
           onNeedMore={handleNeedMore}
-          FileDetail={FileDetail}
         />
       )}
     </div>
@@ -292,7 +281,6 @@ function MediaViewer({
   onClose,
   onDelete,
   onNeedMore,
-  FileDetail,
 }: {
   items: MediaItem[];
   idx: number;
@@ -300,7 +288,6 @@ function MediaViewer({
   onClose: () => void;
   onDelete: (entryId: string) => void;
   onNeedMore: () => void;
-  FileDetail: DetailComponent;
 }) {
   const [pos, setPos] = useState(idx);
   const [dragging, setDragging] = useState(false);
@@ -583,6 +570,7 @@ function MediaViewer({
     if (!confirm(`Удалить «${curItem.name}» в корзину?`)) return;
     try {
       await api.deleteFile(curItem.entryId);
+      setDetail(false);
       onDelete(curItem.entryId);
     } catch (e) {
       alert((e as Error).message);
@@ -654,17 +642,7 @@ function MediaViewer({
       </div>
 
       {detail && curItem && (
-        <div className="mvinfo">
-          <FileDetail
-            entryId={curItem.entryId}
-            onBack={() => setDetail(false)}
-            onDeleted={(id) => {
-              setDetail(false);
-              onDelete(id);
-            }}
-            inOverlay
-          />
-        </div>
+        <MediaInfoPanel entryId={curItem.entryId} onClose={() => setDetail(false)} />
       )}
     </div>
   );
@@ -767,5 +745,67 @@ function Slide({
         />
       )}
     </>
+  );
+}
+
+// =============================== Инфо кадра ===============================
+
+function fmtSize(bytes: number): string {
+  if (!bytes || !Number.isFinite(bytes)) return '—';
+  const gb = 1024 * 1024 * 1024;
+  const mb = 1024 * 1024;
+  const kb = 1024;
+  if (bytes >= gb) return `${(bytes / gb).toFixed(1)} ГБ`;
+  if (bytes >= mb) return `${(bytes / mb).toFixed(1)} МБ`;
+  if (bytes >= kb) return `${Math.round(bytes / kb)} КБ`;
+  return `${bytes} Б`;
+}
+
+function InfoRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
+  return (
+    <div className="minfo-row">
+      <span className="minfo-k">{k}</span>
+      <span className={'minfo-v' + (mono ? ' mono' : '')}>{v}</span>
+    </div>
+  );
+}
+
+/** Панель «Инфо» в модалке: свой UI и своя ручка /media/:entryId, не из «Файлов». */
+function MediaInfoPanel({ entryId, onClose }: { entryId: string; onClose: () => void }) {
+  const [info, setInfo] = useState<api.MediaInfo | null>(null);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    api.mediaInfo(entryId).then(setInfo).catch((e) => setErr((e as Error).message));
+  }, [entryId]);
+  return (
+    <div className="mvinfo">
+      <div className="minfo-head">
+        <span className="minfo-title">Инфо</span>
+        <span style={{ flex: 1 }} />
+        <button className="iconbtn" title="Закрыть" onClick={onClose}>
+          <X />
+        </button>
+      </div>
+      {err && <div className="err" style={{ padding: '10px 14px' }}>{err}</div>}
+      {!info && !err && (
+        <div className="minfo-load">
+          <span className="spin" />
+        </div>
+      )}
+      {info && (
+        <div className="minfo-body">
+          <InfoRow k="Имя" v={info.name} />
+          <InfoRow k="Дата съёмки" v={info.capturedAt ? fmtMediaDate(info.capturedAt) : '—'} />
+          <InfoRow k="Тип" v={info.mime} />
+          <InfoRow k="Размер" v={fmtSize(info.size)} />
+          {info.width != null && info.height != null && <InfoRow k="Кадр" v={`${info.width} × ${info.height}`} />}
+          {info.make || info.model ? <InfoRow k="Камера" v={[info.make, info.model].filter(Boolean).join(' ')} /> : null}
+          {info.latitude != null && info.longitude != null ? (
+            <InfoRow k="Координаты" v={`${info.latitude.toFixed(6)}, ${info.longitude.toFixed(6)}`} />
+          ) : null}
+          <InfoRow k="SHA-256" v={info.sha256} mono />
+        </div>
+      )}
+    </div>
   );
 }

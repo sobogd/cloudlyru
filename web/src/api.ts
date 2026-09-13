@@ -510,6 +510,23 @@ export const mediaWindow = (entryId: string, before = 20, after = 20) =>
   request<MediaItem[]>(
     `/media/window?entryId=${encodeURIComponent(entryId)}&before=${before}&after=${after}`,
   );
+/** Метаданные кадра для панели «Инфо» в модалке. */
+export interface MediaInfo {
+  entryId: string;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  capturedAt: string | null;
+  width: number | null;
+  height: number | null;
+  make: string | null;
+  model: string | null;
+  latitude: number | null;
+  longitude: number | null;
+}
+export const mediaInfo = (entryId: string) =>
+  request<MediaInfo>(`/media/${encodeURIComponent(entryId)}`);
 
 export interface AlbumInfo { id: string; name: string; createdAt: string; count: number }
 export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; name: string; size: number; mime: string; capturedAt: string | null }> }

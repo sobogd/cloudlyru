@@ -1,7 +1,8 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
 import { MediaFeedService } from './media-feed.service';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
+import { notFound } from '../common/errors';
 
 /**
  * Ручки раздела «Медиа». Изолированы от «Фото» (`MediaController` / `/timeline`):
@@ -45,5 +46,13 @@ export class MediaFeedController {
       before,
       after,
     );
+  }
+
+  /** Метаданные кадра для панели «Инфо»: своя ручка, а не общий /files/:id. */
+  @Get(':entryId')
+  async info(@Param('entryId') entryId: string, @CurrentUser() user: RequestUser) {
+    const info = await this.feed.info(user.id, entryId);
+    if (!info) throw notFound('media not found');
+    return info;
   }
 }

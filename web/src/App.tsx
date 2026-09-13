@@ -145,7 +145,7 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
           />
         )}
         {tab === 'photos' && <Photos photoFolderId={user.photoFolderId} up={up} uploadedAt={uploadedAt} />}
-        {tab === 'media' && <MediaSection FileDetail={FileDetail} onOverlayChange={setNavHidden} />}
+        {tab === 'media' && <MediaSection onOverlayChange={setNavHidden} />}
         {tab === 'albums' && <Albums />}
         {tab === 'trash' && <TrashPage />}
         {tab === 'settings' && <Settings login={user.login} onLogout={onLogout} />}

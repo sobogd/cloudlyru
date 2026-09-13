@@ -663,7 +663,7 @@
     backdrop-filter: blur(16px) saturate(1.6);
     -webkit-backdrop-filter: blur(16px) saturate(1.6);
     font-size: var(--island-fs);
-    transition: opacity .25s ease;
+    transition: transform .3s cubic-bezier(.2, .7, .2, 1);
   }
   .mmonth {
     flex: 1;
@@ -684,9 +684,10 @@
     transition: opacity .25s ease;
   }
   .mempty { display: grid; place-items: center; padding: 40px 16px; }
-  /* В момент модалки таймлайн плавно уходит в прозрачность — сетка не просвечивает
-     сквозь подложку, фон за модалкой остаётся чистым. */
-  .media.has-viewer .mhead,
+  /* В момент модалки шапка таймлайна уезжает вверх (как общий футер вниз), сетка затухает */
+  .media.has-viewer .mhead {
+    transform: translateY(calc(-100% - var(--side) - env(safe-area-inset-top)));
+  }
   .media.has-viewer .mscroll { opacity: 0; }
 
   /* Виртуализированное поле: высоту задаёт JS, строки позиционируются translateY */
@@ -845,6 +846,34 @@
     background: var(--island-solid);
     border: 1px solid var(--island-brd);
     border-radius: var(--island-radius);
-    padding: 0 12px 24px;
+    padding: 0;
   }
+  .minfo-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: var(--island-h);
+    padding: var(--island-pad) 12px;
+    background: var(--island-solid);
+    border-bottom: 1px solid var(--brd);
+    border-radius: var(--island-radius) var(--island-radius) 0 0;
+  }
+  .minfo-title { font-weight: 600; font-size: var(--island-fs); color: var(--fg); }
+  .minfo-body { padding: 0 14px 24px; }
+  .minfo-load { display: grid; place-items: center; padding: 48px 0; }
+  .minfo-row {
+    display: grid;
+    grid-template-columns: 118px 1fr;
+    gap: 10px;
+    align-items: baseline;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--brd);
+  }
+  .minfo-row:last-child { border-bottom: 0; }
+  .minfo-k { color: var(--fg-3); font-size: 13px; }
+  .minfo-v { font-size: 13px; color: var(--fg); word-break: break-all; white-space: pre-wrap; }
+  .minfo-v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 }

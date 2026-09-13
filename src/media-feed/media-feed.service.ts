@@ -27,6 +27,22 @@ export interface MediaItem {
   size: number;
 }
 
+/** Метаданные кадра для панели «Инфо» (отдельная ручка /media/:entryId). */
+export interface MediaInfo {
+  entryId: string;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  capturedAt: string | null;
+  width: number | null;
+  height: number | null;
+  make: string | null;
+  model: string | null;
+  latitude: number | null;
+  longitude: number | null;
+}
+
 /** Сырые строки запросов: Postgres отдаёт timestamptz как Date, bigint как BigInt. */
 interface MediaRow {
   id: string;
@@ -123,6 +139,44 @@ export class MediaFeedService {
       ORDER BY w."capturedAt" DESC NULLS LAST, w."id" DESC
     `);
     return rows.map(MediaFeedService.mapRow);
+  }
+
+  /** Метаданные кадра для панели «Инфо». Чужое/удалённое/вне зоны «Фото» — null (404). */
+  async info(userId: string, entryId: string): Promise<MediaInfo | null> {
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return null;
+    const row = await this.prisma.fileEntry.findFirst({
+      where: { id: entryId, deletedAt: null, zone: ZONE_PHOTOS, folderId: { in: tree } },
+      select: {
+        id: true,
+        name: true,
+        asset: {
+          select: {
+            sha256: true,
+            mime: true,
+            size: true,
+            media: {
+              select: { capturedAt: true, width: true, height: true, make: true, model: true, latitude: true, longitude: true },
+            },
+          },
+        },
+      },
+    });
+    if (!row) return null;
+    return {
+      entryId: row.id,
+      name: row.name,
+      mime: row.asset.mime,
+      size: Number(row.asset.size),
+      sha256: row.asset.sha256,
+      capturedAt: row.asset.media?.capturedAt ? new Date(row.asset.media.capturedAt).toISOString() : null,
+      width: row.asset.media?.width ?? null,
+      height: row.asset.media?.height ?? null,
+      make: row.asset.media?.make ?? null,
+      model: row.asset.media?.model ?? null,
+      latitude: row.asset.media?.latitude ?? null,
+      longitude: row.asset.media?.longitude ?? null,
+    };
   }
 
   private static mapRow(r: MediaRow): MediaItem {
