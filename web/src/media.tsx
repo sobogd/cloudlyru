@@ -31,10 +31,6 @@ const FETCH_DEBOUNCE_MS = 500;
 const FETCH_CHUNK = 500;
 /** Как часто переспрашиваем статусы неготовых превью. */
 const STATUS_POLL_MS = 4000;
-/** Сколько держать палец на ползунке, прежде чем он станет таскабельным. */
-const ARM_MS = 1000;
-/** Сдвиг до активации, после которого удержание отменяется (случайный свайп). */
-const ARM_MOVE_SLOP = 8;
 
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
@@ -92,8 +88,6 @@ export default function MediaSection({ onOverlayChange }: {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
   const [scrub, setScrub] = useState<{ top: number; h: number; monthKey: string | null | undefined }>({ top: 0, h: 24, monthKey: undefined });
   const [scrubVisible, setScrubVisible] = useState(false);
-  /** Ползунок: idle — обычный, arming — палец удерживается (идёт отсчёт), armed — можно таскать. */
-  const [scrubState, setScrubState] = useState<'idle' | 'arming' | 'armed'>('idle');
   /** Позиция ленты из localStorage, сохранённая в прошлый раз (читаем один раз при входе). */
   const [savedMedia] = useState(() => readUi().media);
 
@@ -110,10 +104,7 @@ export default function MediaSection({ onOverlayChange }: {
   const debounceRef = useRef<number | null>(null);
   const rafRef = useRef(0);
   const hideTimer = useRef<number | null>(null);
-  /** Ползунок активирован удержанием: true — сейчас можно тянуть (скраб следует за пальцем). */
-  const armedRef = useRef(false);
-  const holdStartRef = useRef(0);
-  const holdTimerRef = useRef<number | null>(null);
+  const dragRef = useRef(false);
   const railRef = useRef<HTMLDivElement>(null);
   /** Восстановление позиции уже отработало (или сохранять было нечего). */
   const restoredRef = useRef(false);
@@ -428,9 +419,7 @@ export default function MediaSection({ onOverlayChange }: {
     setOpenIdx(nt <= 0 ? null : Math.min(index, nt - 1));
   }, []);
 
-  // Ползунок: перетаскивание только после удержания. Быстрый тап ничего не двигает —
-  // он не должен случайно перелистывать ленту. Палец держится ARM_MS, ползунок
-  // подсвечивается (arming), затем активируется (armed) и следует за пальцем.
+  // Перетаскивание ползунка: pointer → scrollTop (скраб по всей ленте).
   const scrubTo = (clientY: number) => {
     const el = scrollRef.current;
     const rail = railRef.current;
@@ -445,46 +434,22 @@ export default function MediaSection({ onOverlayChange }: {
     const frac = maxTop > 0 ? clamp(y - h / 2, 0, maxTop) / maxTop : 0;
     el.scrollTop = frac * maxScroll;
   };
-  const cancelHold = () => {
-    if (holdTimerRef.current != null) {
-      window.clearTimeout(holdTimerRef.current);
-      holdTimerRef.current = null;
-    }
-  };
   const onRailPointerDown = (e: React.PointerEvent) => {
+    dragRef.current = true;
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
       /* ignore */
     }
     setScrubVisible(true);
-    cancelHold();
-    armedRef.current = false;
-    const startY = e.clientY;
-    holdStartRef.current = startY;
-    setScrubState('arming');
-    holdTimerRef.current = window.setTimeout(() => {
-      holdTimerRef.current = null;
-      armedRef.current = true;
-      setScrubState('armed');
-      scrubTo(startY);
-    }, ARM_MS);
+    scrubTo(e.clientY);
   };
   const onRailPointerMove = (e: React.PointerEvent) => {
-    if (armedRef.current) {
-      scrubTo(e.clientY);
-      return;
-    }
-    // до активации заметный сдвиг отменяет удержание — случайный свайп не срабатывает
-    if (holdTimerRef.current != null && Math.abs(e.clientY - holdStartRef.current) > ARM_MOVE_SLOP) {
-      cancelHold();
-      setScrubState('idle');
-    }
+    if (!dragRef.current) return;
+    scrubTo(e.clientY);
   };
   const onRailPointerUp = () => {
-    cancelHold();
-    armedRef.current = false;
-    setScrubState('idle');
+    dragRef.current = false;
   };
 
   const scrubLabel = scrub.monthKey === undefined ? '' : scrub.monthKey === null ? 'Без даты' : monthLabel(scrub.monthKey);
@@ -524,11 +489,7 @@ export default function MediaSection({ onOverlayChange }: {
         </div>
         {openIdx == null && total != null && total > 0 && (
           <div
-            className={
-              'mrail' +
-              (scrubVisible ? ' visible' : '') +
-              (scrubState === 'arming' ? ' arming' : scrubState === 'armed' ? ' armed' : '')
-            }
+            className={'mrail' + (scrubVisible ? ' visible' : '')}
             ref={railRef}
             onPointerDown={onRailPointerDown}
             onPointerMove={onRailPointerMove}
@@ -539,7 +500,7 @@ export default function MediaSection({ onOverlayChange }: {
               if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
             }}
             onPointerLeave={() => {
-              if (armedRef.current || holdTimerRef.current != null) return;
+              if (dragRef.current) return;
               if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
               hideTimer.current = window.setTimeout(() => setScrubVisible(false), 600);
             }}
