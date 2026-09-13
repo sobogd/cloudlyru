@@ -253,9 +253,11 @@ export default function MapSection({ onOverlayChange }: {
       }
       cv.style.width = `${size.x}px`;
       cv.style.height = `${size.y}px`;
-      // Позицию canvas не трогаем: он лежит в своей панели, а панель уже стоит в начале
-      // координат вида — ровно там же, где отсчитываются latLngToLayerPoint. Сдвиг на
-      // pixelOrigin (он равен абсолютным пикселям проекции, миллионы) уносил слой за экран.
+      // Canvas стоит в панели, а панель Leaflet сдвинута на величину перетаскивания (в покое
+      // сдвиг нулевой — тогда canvas закрывает вид целиком). Ставим его в минус этот сдвиг,
+      // иначе после перетаскивания слой съезжает и виден только краем.
+      const panePos = L.DomUtil.getPosition(map.getPanes().mapPane) ?? L.point(0, 0);
+      L.DomUtil.setPosition(cv, panePos.multiplyBy(-1));
       const ctx = cv.getContext('2d');
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
