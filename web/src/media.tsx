@@ -272,7 +272,7 @@ export default function MediaSection({ onOverlayChange }: {
       updateScrub(top);
       setScrubVisible(true);
       if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
-      hideTimer.current = window.setTimeout(() => setScrubVisible(false), 800);
+      hideTimer.current = window.setTimeout(() => setScrubVisible(false), 1000);
     });
   }, [updateRange, scheduleFetch, updateScrub]);
 
@@ -408,6 +408,15 @@ export default function MediaSection({ onOverlayChange }: {
             onPointerMove={onRailPointerMove}
             onPointerUp={onRailPointerUp}
             onPointerCancel={onRailPointerUp}
+            onPointerEnter={() => {
+              setScrubVisible(true);
+              if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
+            }}
+            onPointerLeave={() => {
+              if (dragRef.current) return;
+              if (hideTimer.current != null) window.clearTimeout(hideTimer.current);
+              hideTimer.current = window.setTimeout(() => setScrubVisible(false), 600);
+            }}
           >
             <div className="mthumb" style={{ top: scrub.top, height: scrub.h }} />
             {scrubVisible && scrubLabel && (
