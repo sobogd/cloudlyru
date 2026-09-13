@@ -34,6 +34,12 @@ const HEAT_RADIUS = 26;
 const CLUSTER_ICON = 46;
 /** Вид по умолчанию, если пользователь ещё не двигал карту. */
 const DEFAULT_VIEW = { lat: 20, lon: 10, zoom: 2 };
+/**
+ * Сторона клетки (в градусах), по которой ищем самое «фотографируемое» место для первого
+ * вида: ~5 км. Кадры одной поездки и одного города попадают в такую клетку, а редкие
+ * outliers (отпуск на другом конце света) первый вид не растягивают.
+ */
+const FIRST_CELL = 0.05;
 
 /** Палитра теплового слоя: накопленная плотность (0…1) → цвет. */
 const HEAT_STOPS: Array<[number, [number, number, number]]> = [
@@ -148,6 +154,42 @@ export default function MapSection({ onOverlayChange }: {
       maxZoom: 15,
     });
   }, []);
+
+  /**
+   * Первый вид — там, где кадров больше всего. Общий охват всей библиотеки (от Патагонии
+   * до Байкала, если такие поездки были) на первом открытии выглядит пустой картой мира
+   * с крошечными пятнами; полный охват остаётся на кнопке в шапке.
+   */
+  const fitFirst = useCallback(() => {
+    const map = mapRef.current;
+    const pts = pointsRef.current;
+    if (!map) return;
+    if (!pts.length) {
+      map.setView([DEFAULT_VIEW.lat, DEFAULT_VIEW.lon], DEFAULT_VIEW.zoom);
+      return;
+    }
+    const cell = (p: api.MapPoint) => `${Math.round(p.lat / FIRST_CELL)}:${Math.round(p.lon / FIRST_CELL)}`;
+    const counts = new Map<string, number>();
+    for (const p of pts) {
+      const k = cell(p);
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    let best = '';
+    let bestN = 0;
+    for (const [k, n] of counts) {
+      if (n > bestN) {
+        best = k;
+        bestN = n;
+      }
+    }
+    const near = pts.filter((p) => cell(p) === best);
+    const box = L.latLngBounds(near.map((p) => [p.lat, p.lon] as [number, number]));
+    if (!box.isValid()) {
+      fitAll();
+      return;
+    }
+    map.fitBounds(box, { padding: [60, 60], maxZoom: 16 });
+  }, [fitAll]);
 
   // Карта живёт вне React: Leaflet сам двигает тайлы, мы только рисуем тепло и маркеры.
   useEffect(() => {
@@ -354,8 +396,8 @@ export default function MapSection({ onOverlayChange }: {
     // что карта не работает.
     const box = mapRef.current?.getBounds().pad(0.1);
     const hasPhotos = !!box && points.some((p) => box.contains([p.lat, p.lon]));
-    if (!savedView || !hasPhotos) fitAll();
-  }, [points, savedView, fitAll]);
+    if (!savedView || !hasPhotos) fitFirst();
+  }, [points, savedView, fitFirst]);
 
   // ---- Источник кадров для просмотрщика: у карты нет ленты, детали берём по entryId ----
   const itemsRef = useRef(new Map<string, api.MediaItem>());
