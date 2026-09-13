@@ -167,9 +167,10 @@ html, body { overscroll-behavior: none; }
   font-weight: 600; padding: 6px 4px; border-radius: 8px; cursor: pointer; }
 .caltitle:active { background: rgba(255, 255, 255, .08); }
 
-/* Сетка дней: всегда 7 колонок; шире 7 кружков по 50 px календарь не растёт и стоит по центру.
-   Размер клетки считает сам CSS (fr внутри min(100%, 350px)) — JS его не меряет и не пересчитывает. */
-.calgrid { display: grid; width: min(100%, 350px); margin: 0 auto; }
+/* Сетка дней: всегда 7 колонок; шире 380 px календарь не растёт и стоит по центру.
+   Размер клетки считает сам CSS (fr внутри min(100%, 380px)) — JS его не меряет.
+   На мобиле ширина ограничена экраном: 7 клеток делят доступную ширину, сетка не вылезает. */
+.calgrid { display: grid; width: min(100%, 380px); margin: 0 auto; }
 .calcell { position: relative; aspect-ratio: 1; display: grid; place-items: center; }
 .calcell.blank { visibility: hidden; }
 .calcell.off { cursor: default; }
@@ -187,7 +188,16 @@ html, body { overscroll-behavior: none; }
 .calnum { position: relative; z-index: 1; font-size: 13px; font-weight: 600; color: #e6e8eb;
   text-shadow: 0 1px 2px rgba(0, 0, 0, .95), 0 0 5px rgba(0, 0, 0, .85); }
 .calcell.off .calnum { color: #5c6779; font-weight: 400; text-shadow: none; }
-.calmeta { width: min(100%, 350px); margin: 10px auto 0; font-size: 12px; color: #6d7889; text-align: center; }
+.calmeta { width: min(100%, 380px); margin: 10px auto 0; font-size: 12px; color: #6d7889; text-align: center; }
+/* Месяц стоит по центру экрана и по вертикали, и по горизонтали: высота области — всё, что
+   осталось от экрана после шапки календаря и нижнего нав-бара (его отступ даёт .content). */
+.calwrap { display: grid; place-items: center; min-height: calc(100dvh - 44px - 92px); }
+.calcenter { display: grid; justify-items: center; width: 100%; }
+/* Ожидание месяца: пока данных нет, на экране только месяц с годом и лоадер — ни сетки, ни счётчиков. */
+.calload { display: grid; justify-items: center; gap: 16px; }
+.calloadmonth { font-size: 20px; font-weight: 600; color: #e6e8eb; text-align: center; }
+/* Деталка файла до готовности данных: в теле только лоадер. */
+.detload { display: grid; place-items: center; padding: 48px 0; }
 /* Открытый день в шапке просмотра: вместо имени файла — дата и место снимка среди снимков дня. */
 .calday { flex: 1; min-width: 0; padding: 0 6px; font-size: 13px; color: #e6e8eb; text-align: center;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

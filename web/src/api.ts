@@ -563,8 +563,13 @@ export interface TimelineDayItem {
  * месяцами вручную, поэтому месяцы тянем пачкой (удержание стрелки не ждёт запрос на каждый
  * месяц) — 12 месяцев это ~365 строк, всё равно меньше одной страницы ленты.
  */
-export const timelineDays = (from: string, to: string) =>
-  request<TimelineDayItem[]>(`/timeline/days?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+/**
+ * Дни диапазона месяцев для календаря: строка на день, где есть снимки. Месяцы тянем пачкой
+ * (`from`..`to`), а `signal` нужен листанию: нажатие стрелки отменяет запрос прошлого месяца,
+ * чтобы ответ устаревшего месяца не перетёр уже открытый.
+ */
+export const timelineDays = (from: string, to: string, signal?: AbortSignal) =>
+  request<TimelineDayItem[]>(`/timeline/days?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal });
 /** Края листания календаря: самый новый и самый старый месяцы со снимками (null — снимков нет). */
 export const timelineMonths = () =>
   request<{ newest: string | null; oldest: string | null }>('/timeline/months');
@@ -574,6 +579,15 @@ export const timelineMonths = () =>
  */
 export const neighborPhoto = (entryId: string, dir: 'next' | 'prev') =>
   request<TimelineItem | null>(`/timeline/neighbor?entryId=${encodeURIComponent(entryId)}&dir=${dir}`);
+/**
+ * Окно вокруг кадра: `before` снимков новее, `after` старее, сам кадр в середине. Порядок ответа —
+ * как у ленты (от свежих к старым), поэтому «следующий» кадр лежит правее по массиву. Просмотр
+ * берёт ±20 и листает внутри окна без сети; когда кадр подходит к краю, окно добирается от края.
+ */
+export const timelineWindow = (entryId: string, before = 20, after = 20) =>
+  request<TimelineItem[]>(
+    `/timeline/window?entryId=${encodeURIComponent(entryId)}&before=${before}&after=${after}`,
+  );
 /** Статусы сборки превью по списку записей: спрашиваем только про незавершённые снимки. */
 export const timelineStatus = (entryIds: string[]) =>
   request<TimelineStatus[]>('/timeline/status', { method: 'POST', body: JSON.stringify({ entryIds }) });

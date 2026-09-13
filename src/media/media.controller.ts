@@ -253,6 +253,28 @@ export class MediaController {
   }
 
   /**
+   * Окно вокруг кадра для полноэкранного просмотра: `before` снимков новее и `after` старее, сам
+   * кадр в середине (по умолчанию ±20). Одним запросом клиент получает всё, что нужно на два
+   * десятка нажатий стрелки; дальше окно скользит от своего края, а не спрашивает соседа по одному.
+   */
+  @Get('timeline/window')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(1200, 60_000)
+  timelineWindow(
+    @CurrentUser() user: RequestUser,
+    @Query('entryId') entryId?: string,
+    @Query('before') before?: string,
+    @Query('after') after?: string,
+  ) {
+    return this.media.timelineWindow(
+      user.id,
+      typeof entryId === 'string' && entryId ? entryId : undefined,
+      before,
+      after,
+    );
+  }
+
+  /**
    * Статусы сборки превью по списку записей: клиент спрашивает только про те снимки, которые
    * ещё собираются, и не перечитывает из-за них всю ленту.
    */

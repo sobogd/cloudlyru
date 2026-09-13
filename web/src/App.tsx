@@ -600,8 +600,18 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [job, setJob] = useState<api.UnzipJob | null>(null);
+  /** Минимум ожидания на лоадере: на быстром ответе спиннер иначе мигал бы одно мгновение. */
+  const [minDone, setMinDone] = useState(false);
   const isZip = !!meta && (meta.mime === 'application/zip' || /\.zip$/i.test(meta.name));
   const busy = job?.state === 'pending' || job?.state === 'processing';
+  /** Деталка показывается целиком: и данные пришли, и минимальное ожидание прошло. */
+  const ready = Boolean(meta) && minDone;
+
+  useEffect(() => {
+    setMinDone(false);
+    const t = window.setTimeout(() => setMinDone(true), LOADER_MIN_MS);
+    return () => window.clearTimeout(t);
+  }, [entryId]);
 
   useEffect(() => {
     api.fileMeta(entryId).then(setMeta).catch((e) => setErr((e as Error).message));
@@ -671,7 +681,7 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
       <div className="filehead">
         <button className="iconbtn" title="Назад" onClick={onBack}>⬅️</button>
         <span style={{ flex: 1 }} />
-        {meta && (
+        {ready && (
           <>
             <button className="iconbtn" title="Переименовать" onClick={rename}>✏️</button>
             <button className="iconbtn" title="Копировать в другую папку" onClick={() => toClipboard('copy')}>📋</button>
@@ -686,7 +696,7 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
             onClick={startUnzip}
           >📦</button>
         )}
-        {meta && (
+        {ready && (
           <a className="iconbtn" title="Скачать" href={api.fileUrl(entryId)} download>⬇️</a>
         )}
         <button className="iconbtn" title="Удалить (в корзину)" onClick={del}>🗑</button>
@@ -719,8 +729,9 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
           )}
         </div>
       )}
-      {!meta && !err && <div className="copy" style={{ padding: '14px 6px' }}>Загрузка…</div>}
-      {meta && (
+      {/* Пока деталка не готова — только лоадер: тела ещё нет, показывать нечего. */}
+      {!ready && !err && <div className="detload"><span className="spin" /></div>}
+      {ready && meta && (
         <div className="detbody">
           <MetaRow k="Имя" v={meta.name} />
           <MetaRow k="Тип" v={meta.ext ? `${meta.ext.toUpperCase()} — ${meta.mime}` : meta.mime} />
@@ -746,7 +757,7 @@ function FileDetail({ entryId, onBack, onDeleted }: { entryId: string; onBack: (
           <MetaRow k="SHA-256" v={meta.sha256} mono />
         </div>
       )}
-      {meta && <FilePreview meta={meta} />}
+      {ready && meta && <FilePreview meta={meta} />}
       {/* Дамп тегов (EXIF/ffprobe) — десятки строк: он не должен отодвигать превью вниз,
           поэтому по умолчанию свёрнут, а сам дамп никуда не делся. */}
       {!!rows.length && (
@@ -953,12 +964,12 @@ function FolderDetail({ folderId, onBack, onDeleted }: { folderId: string; onBac
 //     дне, а на краю дня — соседний день (/timeline/photos).
 // Прокрутки на экране-календаре нет вообще, поэтому и виртуализация не нужна: в DOM один месяц.
 
-/** Кружок дня не бывает шире 50 px: календарь не растёт больше 7 × 50 = 350 px. */
-const GRID_CELL = 50;
-/** Сколько месяцев держим загруженными: листание туда-обратно не должно ходить в сеть. */
-const MONTH_CACHE_MAX = 36;
-/** Сколько месяцев тянем одним запросом: удержание стрелки не должно ждать каждый месяц. */
-const MONTH_CHUNK = 6;
+/**
+ * Сколько ждём после открытия месяца, прежде чем уйти в сеть. Кэша месяцев нет: месяц всегда
+ * перечитывается, а секунда нужна, чтобы экран успел показать, куда мы пришли, и чтобы листание
+ * удержанием не превращалось в очередь запросов.
+ */
+const MONTH_WAIT_MS = 1000;
 /** Через сколько удержания стрелки начинается ускоренное листание и с какого шага. */
 const HOLD_DELAY_MS = 380;
 const HOLD_STEP_MS = 220;
@@ -969,6 +980,14 @@ const STATUS_POLL_MS = 4000;
 const REFRESH_DEBOUNCE_MS = 1500;
 /** В календаре ровно 7 колонок на любом экране. */
 const CAL_COLS = 7;
+/**
+ * Окно просмотра: столько снимков держим по каждую сторону от открытого кадра (сервер отдаёт их
+ * одним запросом). Ближе PHOTO_WINDOW_EDGE к краю окна — добираем ещё пачку в сторону движения.
+ */
+const PHOTO_WINDOW = 20;
+const PHOTO_WINDOW_EDGE = 5;
+/** Минимум, сколько крутится лоадер кадра: без него он мигает на уже загруженной картинке. */
+const LOADER_MIN_MS = 1000;
 
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
@@ -1081,86 +1100,87 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   /** Края листания — самый новый и самый старый месяцы со снимками (null — снимков нет). */
   const [bounds, setBounds] = useState<{ newest: string | null; oldest: string | null } | null>(null);
   /**
-   * Открытый кадр — ровно один снимок. Просмотр ничего не прогревает и не держит ни день, ни
-   * месяц: по стрелке спрашивает у сервера соседний снимок по id и сразу переключается на него.
+   * Окно просмотра: снимки вокруг открытого кадра и позиция в нём. Кадр переключается по уже
+   * загруженному окну (±20 одним запросом), поэтому стрелки не ждут сеть; когда окно подходит к
+   * краю, оно добирается от своего крайнего снимка. Сам кадр — это items[idx].
    */
-  const [photo, setPhoto] = useState<api.TimelineItem | null>(() => saved?.photo ?? null);
-  /** Идёт запрос за соседним снимком: повторные нажатия в это время игнорируем. */
-  const [stepping, setStepping] = useState(false);
+  const [win, setWin] = useState<{ items: api.TimelineItem[]; idx: number }>(() => (
+    saved?.photo ? { items: [saved.photo], idx: 0 } : { items: [], idx: -1 }
+  ));
   /** Полноценная деталка (как в «Файлах») — открывается кнопкой ℹ️ из просмотра. */
   const [detailId, setDetailId] = useState<string | null>(saved?.detailId ?? null);
   /** Статусы сборки превью: спрашиваем только про те снимки, что видит пользователь. */
   const [statuses, setStatuses] = useState<Map<string, PreviewStatus>>(() => new Map());
   const [loadErr, setLoadErr] = useState<string | null>(null);
-  /** Месяц, который грузится прямо сейчас, и версия кэша (для перерисовки). */
-  const [pending, setPending] = useState<string | null>(null);
-  /** Палец на стрелке: пока держат, месяцы только листаются — запрос уходит после отпускания. */
-  const [holding, setHolding] = useState(false);
-  const [version, setVersion] = useState(0);
+  /** Дни открытого месяца: null — ещё не пришли (календарь на это время не рисуем). */
+  const [rows, setRows] = useState<api.TimelineDayItem[] | null>(null);
+  /** Фаза открытого месяца: секунда ожидания → запрос → готово. */
+  const [phase, setPhase] = useState<'wait' | 'loading' | 'ready' | 'error'>('wait');
+  /** Счётчик «перечитать месяц» (после загрузки файлов и удаления снимка). */
+  const [reload, setReload] = useState(0);
 
-  // Дни по месяцам в кэше: месяц — маленький ответ, поэтому соседние держим под рукой.
-  const cacheRef = useRef(new Map<string, api.TimelineDayItem[]>());
-  const inflightRef = useRef(new Map<string, Promise<void>>());
   const refreshTimerRef = useRef<number | null>(null);
+  /** Перечитывание без секундной паузы и без пустого экрана: сетка не мигает. */
+  const silentRef = useRef(false);
+  /** Окно и позиция для асинхронных переходов: состояние читается из ref, а не из замыкания. */
+  const winRef = useRef(win);
+  winRef.current = win;
+  /** Край галереи по стороне: дальше снимков нет — там уже нечего добирать. */
+  const endsRef = useRef({ next: false, prev: false });
 
-  const put = useCallback((key: string, rows: api.TimelineDayItem[]) => {
-    const cache = cacheRef.current;
-    cache.delete(key); // порядок вставки = свежесть: первыми вытесняем самые давно смотренные
-    cache.set(key, rows);
-    while (cache.size > MONTH_CACHE_MAX) {
-      const oldest = cache.keys().next().value;
-      if (oldest === undefined) break;
-      cache.delete(oldest);
-    }
-    setVersion((v) => v + 1);
+  const photo = win.idx >= 0 ? win.items[win.idx] ?? null : null;
+
+  const openPhoto = useCallback((item: api.TimelineItem) => {
+    endsRef.current = { next: false, prev: false };
+    // Показываем кадр сразу (метаданные уже есть) и подтягиваем окно вокруг него.
+    setWin({ items: [item], idx: 0 });
+    const key = item.capturedAt?.slice(0, 7);
+    if (key) setMonth(key); // календарь под просмотром идёт вместе со снимком
+    api.timelineWindow(item.entryId, PHOTO_WINDOW, PHOTO_WINDOW)
+      .then((items) => {
+        if (!items.length) return;
+        const idx = Math.max(0, items.findIndex((i) => i.entryId === item.entryId));
+        setWin((cur) => (cur.items[cur.idx]?.entryId === item.entryId ? { items, idx } : cur));
+      })
+      .catch((e) => setLoadErr((e as Error).message));
   }, []);
 
   /**
-   * Догрузить месяцы пачкой: from..to включительно. Уже загруженные месяцы не трогаем (у них
-   * может быть пустой список — это тоже ответ), поэтому запрос уходит только за недостающими.
+   * Добор окна от его края: пачка в сторону движения плюс сам крайний снимок. Уже известные id
+   * отбрасываем — окно растёт, но не перезапрашивает то, что в нём уже лежит.
    */
-  const ensureRange = useCallback((from: string, to: string, force = false): Promise<void> => {
-    const missing: string[] = [];
-    for (let key = from; key <= to; key = shiftMonth(key, 1)) {
-      if (force || !cacheRef.current.has(key)) missing.push(key);
-    }
-    if (!missing.length) return Promise.resolve();
-    const reqFrom = missing[0];
-    const reqTo = missing[missing.length - 1];
-    const running = inflightRef.current.get(`${reqFrom}..${reqTo}`);
-    if (running && !force) return running;
-    const request = (async () => {
-      setPending(reqFrom);
-      try {
-        const rows = await api.timelineDays(reqFrom, reqTo);
-        const byMonth = new Map<string, api.TimelineDayItem[]>();
-        for (const key of missing) byMonth.set(key, []);
-        for (const row of rows) {
-          const key = row.day.slice(0, 7);
-          const list = byMonth.get(key);
-          if (list) list.push(row);
-        }
-        for (const [key, list] of byMonth) put(key, list);
-        setLoadErr(null);
-      } catch (e) {
-        setLoadErr((e as Error).message);
-        throw e;
-      } finally {
-        inflightRef.current.delete(`${reqFrom}..${reqTo}`);
-        setPending((p) => (p === reqFrom ? null : p));
-      }
-    })();
-    inflightRef.current.set(`${reqFrom}..${reqTo}`, request);
-    return request;
-  }, [put]);
+  const extendWindow = useCallback(async (dir: 'next' | 'prev') => {
+    const cur = winRef.current;
+    if (!cur.items.length) return;
+    const edge = dir === 'next' ? cur.items[cur.items.length - 1] : cur.items[0];
+    const fresh = dir === 'next'
+      ? await api.timelineWindow(edge.entryId, 0, PHOTO_WINDOW)
+      : await api.timelineWindow(edge.entryId, PHOTO_WINDOW, 0);
+    if (fresh.length <= 1) endsRef.current[dir] = true; // кроме самого края ничего нет — это край галереи
+    setWin((c) => {
+      const seen = new Set(c.items.map((i) => i.entryId));
+      const add = fresh.filter((i) => !seen.has(i.entryId));
+      if (!add.length) return c;
+      return dir === 'next'
+        ? { items: [...c.items, ...add], idx: c.idx }
+        : { items: [...add, ...c.items], idx: c.idx + add.length };
+    });
+  }, []);
 
-  /** Пачка месяцев вокруг нужного, с запасом в сторону движения: удержание стрелки не ждёт сеть. */
-  const ensureChunk = useCallback((key: string, dir: number): Promise<void> => {
-    if (cacheRef.current.has(key)) return Promise.resolve();
-    const from = dir > 0 ? key : shiftMonth(key, -(MONTH_CHUNK - 1));
-    const to = dir > 0 ? shiftMonth(key, MONTH_CHUNK - 1) : key;
-    return ensureRange(from, to);
-  }, [ensureRange]);
+  /** Шаг в просмотре: внутри окна — мгновенно, у края окна — с добором следующей пачки. */
+  const stepPhoto = useCallback((dir: 'next' | 'prev') => {
+    const cur = winRef.current;
+    const at = dir === 'next' ? cur.idx + 1 : cur.idx - 1;
+    if (at < 0 || at >= cur.items.length) return; // край галереи: остаёмся на текущем кадре
+    setWin({ items: cur.items, idx: at });
+    const key = cur.items[at].capturedAt?.slice(0, 7);
+    if (key && key !== month) setMonth(key);
+    const left = dir === 'next' ? cur.items.length - 1 - at : at;
+    if (left <= PHOTO_WINDOW_EDGE && !endsRef.current[dir]) {
+      void extendWindow(dir).catch(() => undefined);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [month, extendWindow]);
 
   // Края листания: без них календарь открывался бы на текущем месяце, даже если снимков в нём нет.
   useEffect(() => {
@@ -1176,27 +1196,68 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
       .catch(() => undefined);
   }, []);
 
-  // Месяц грузим, когда листание остановилось: пока палец на стрелке, экран только листается,
-  // а в сеть уходит один запрос — за тем месяцем, на котором отпустили. Иначе удержание на
-  // десяток лет превращалось бы в десятки запросов, которые всё равно не успевают прийти.
+  // Кадр, восстановленный после F5, показываем сразу, а окно вокруг него собираем фоном: иначе
+  // стрелки в просмотре упёрлись бы в единственный известный снимок.
   useEffect(() => {
-    if (holding) return;
-    void ensureChunk(month, 0).catch(() => undefined);
-  }, [month, holding, ensureChunk]);
+    const restored = winRef.current.items[winRef.current.idx];
+    if (!restored) return;
+    api.timelineWindow(restored.entryId, PHOTO_WINDOW, PHOTO_WINDOW)
+      .then((items) => {
+        if (!items.length) return;
+        const idx = Math.max(0, items.findIndex((i) => i.entryId === restored.entryId));
+        // Окно не подменяем, если пользователь уже успел уйти на другой кадр.
+        setWin((cur) => (cur.items.length === 1 ? { items, idx } : cur));
+      })
+      .catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * Открытый месяц: секунда ожидания (экран успевает показать, куда мы пришли), затем запрос.
+   * Кэша месяцев нет — месяц всегда перечитывается. Любое новое нажатие стрелки меняет `month`,
+   * эффект перезапускается: таймер и запрос прошлого месяца отменяются, и мы идём дальше, не
+   * дожидаясь ответа, который уже никому не нужен.
+   */
   useEffect(() => {
-    if (holding || !cacheRef.current.has(month)) return;
-    void ensureChunk(shiftMonth(month, -1), -1).catch(() => undefined);
-    void ensureChunk(shiftMonth(month, 1), 1).catch(() => undefined);
-  }, [month, holding, version, ensureChunk]);
+    const silent = silentRef.current;
+    silentRef.current = false;
+    if (!silent) {
+      setRows(null);
+      setPhase('wait');
+    }
+    setLoadErr(null);
+    const ac = new AbortController();
+    const fire = () => {
+      if (!silent) setPhase('loading');
+      api.timelineDays(month, month, ac.signal)
+        .then((list) => {
+          if (ac.signal.aborted) return;
+          setRows(list);
+          setPhase('ready');
+        })
+        .catch((e) => {
+          if (ac.signal.aborted) return; // месяц уже сменили — это не ошибка, а отменённый запрос
+          setLoadErr((e as Error).message);
+          setPhase('error');
+        });
+    };
+    const t = window.setTimeout(fire, silent ? 0 : MONTH_WAIT_MS);
+    return () => {
+      window.clearTimeout(t);
+      ac.abort();
+    };
+  }, [month, reload]);
 
   // Файл догрузился — перечитываем месяц (с задержкой: файлы идут пачкой, месяц нужен один раз).
+  // Тихо: сетка под загрузкой не мигает лоадером.
   useEffect(() => {
     if (!uploadedAt || refreshTimerRef.current !== null) return;
     refreshTimerRef.current = window.setTimeout(() => {
       refreshTimerRef.current = null;
-      void ensureRange(month, month, true).catch(() => undefined);
+      silentRef.current = true;
+      setReload((n) => n + 1);
     }, REFRESH_DEBOUNCE_MS);
-  }, [uploadedAt, month, ensureRange]);
+  }, [uploadedAt]);
   useEffect(() => () => { if (refreshTimerRef.current !== null) window.clearTimeout(refreshTimerRef.current); }, []);
 
   // Запоминаем экран (месяц, открытый снимок, деталку) — F5 возвращает туда же.
@@ -1207,6 +1268,11 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const atNewest = Boolean(bounds?.newest && month >= bounds.newest);
   const atOldest = Boolean(bounds?.oldest && month <= bounds.oldest);
 
+  /**
+   * Шаг по месяцам. Стрелки не гаснут никогда: за краями листания месяца нет, но кнопка остаётся
+   * живой, а открытый кадр закрывается — идти дальше можно в любой момент, в том числе пока
+   * прошлый месяц ещё грузится (его запрос отменяет эффект загрузки).
+   */
   const gotoMonth = useCallback((delta: number) => {
     setMonth((m) => {
       const next = shiftMonth(m, delta);
@@ -1214,17 +1280,25 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
       if (delta < 0 && atOldest) return m;
       return next;
     });
-    setPhoto(null);
+    // Удержание стрелки зовёт это по многу раз в секунду: без изменений состояние не трогаем,
+    // иначе каждая отмена открытого кадра перерисовывала бы экран.
+    setWin((c) => (c.idx >= 0 ? { items: [], idx: -1 } : c));
   }, [atNewest, atOldest]);
 
-  const holdPrev = useHoldRepeat(() => gotoMonth(-1), !atOldest);
-  const holdNext = useHoldRepeat(() => gotoMonth(1), !atNewest);
+  /** «К последнему месяцу»: тот же шаг, только сразу на самый свежий месяц со снимками. */
+  const gotoNewest = useCallback(() => {
+    setWin((c) => (c.idx >= 0 ? { items: [], idx: -1 } : c));
+    if (bounds?.newest) setMonth(bounds.newest);
+  }, [bounds]);
 
-  const dayRows = cacheRef.current.get(month) ?? [];
+  const holdPrev = useHoldRepeat(() => gotoMonth(-1), true);
+  const holdNext = useHoldRepeat(() => gotoMonth(1), true);
+
+  const dayRows = rows ?? [];
 
   // Клетки месяца: пустые до первого числа и после последнего — сетка всегда ровная.
   const cells = useMemo(() => {
-    const byDay = new Map((cacheRef.current.get(month) ?? []).map((r) => [r.day, r]));
+    const byDay = new Map((rows ?? []).map((r) => [r.day, r]));
     const [y, m] = month.split('-').map(Number);
     const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
     const offset = (new Date(Date.UTC(y, m - 1, 1)).getUTCDay() + 6) % 7; // Пн — первый столбец
@@ -1236,32 +1310,9 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     while (out.length % CAL_COLS !== 0) out.push(null);
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [month, version]);
+  }, [month, rows]);
 
   const photoCount = dayRows.reduce((n, r) => n + r.count, 0);
-
-  /**
-   * Листание в просмотре: спрашиваем у сервера соседний снимок по id и сразу переключаемся на
-   * него (одна строка по индексу, ~2 мс). Метаданные соседа приходят раньше картинки, поэтому
-   * лоадер крутится уже на новом кадре, а не поверх предыдущего.
-   */
-  const stepPhoto = async (dir: 'next' | 'prev') => {
-    if (!photo || stepping) return;
-    setStepping(true);
-    try {
-      const next = await api.neighborPhoto(photo.entryId, dir);
-      if (next) {
-        setPhoto(next);
-        const key = next.capturedAt?.slice(0, 7);
-        if (key) setMonth(key); // календарь под просмотром идёт вместе со снимком
-      }
-      // null — край галереи: остаёмся на текущем кадре
-    } catch (e) {
-      setLoadErr((e as Error).message);
-    } finally {
-      setStepping(false);
-    }
-  };
 
   // Спрашиваем статусы только про то, что видно: обложки дней месяца и открытый кадр.
   const askIds = useMemo(() => {
@@ -1270,7 +1321,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
     if (photo && photo.previewState !== 'done') ids.add(photo.entryId);
     return [...ids];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dayRows, photo, version, statuses]);
+  }, [dayRows, photo, statuses]);
   const askIdsRef = useRef(askIds);
   askIdsRef.current = askIds;
   useEffect(() => {
@@ -1321,7 +1372,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
 
   /**
    * Удаление кадра: соседа запоминаем ДО удаления (после него записи уже нет и соседа не найти),
-   * затем переключаемся на него, а если соседа нет — закрываем просмотр.
+   * затем открываем его заново (окно строится вокруг нового кадра), а если соседа нет — закрываем
+   * просмотр. Месяц перечитываем тихо: сетка под просмотром не должна мигать лоадером.
    */
   const forgetEntry = useCallback((entryId: string, next?: api.TimelineItem | null) => {
     setStatuses((prev) => {
@@ -1330,10 +1382,19 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
       return nextMap;
     });
     setDetailId(null);
-    setPhoto(next ?? null);
+    if (next) {
+      openPhoto(next);
+    } else {
+      setWin({ items: [], idx: -1 });
+    }
     const key = (next?.capturedAt ?? photo?.capturedAt)?.slice(0, 7) ?? month;
-    void ensureRange(key, key, true).catch(() => undefined); // день и счётчики месяца перечитываем
-  }, [photo, month, ensureRange]);
+    if (key === month) {
+      silentRef.current = true; // день и счётчики месяца перечитываем без секундной паузы
+      setReload((n) => n + 1);
+    } else {
+      setMonth(key);
+    }
+  }, [photo, month, openPhoto]);
 
   const retryPreview = useCallback(async (entryId: string) => {
     try {
@@ -1358,46 +1419,54 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
         <button
           className="iconbtn"
           title="Предыдущий месяц (удерживайте — быстрее)"
-          disabled={atOldest}
-          onPointerDown={() => { holdPrev.start(); setHolding(true); }}
-          onPointerUp={() => { holdPrev.stop(); setHolding(false); }}
-          onPointerLeave={() => { holdPrev.stop(); setHolding(false); }}
-          onPointerCancel={() => { holdPrev.stop(); setHolding(false); }}
+          onPointerDown={holdPrev.start}
+          onPointerUp={holdPrev.stop}
+          onPointerLeave={holdPrev.stop}
+          onPointerCancel={holdPrev.stop}
           onClick={(e) => { if (e.detail === 0) gotoMonth(-1); }}
         >◀️</button>
-        <button className="caltitle" title="К последнему месяцу со снимками" onClick={() => { if (bounds?.newest) setMonth(bounds.newest); setPhoto(null); }}>
-          {monthTitleOf(month)}
+        {/* Название месяца во время загрузки живёт в центре экрана: в шапке его не дублируем. */}
+        <button className="caltitle" title="К последнему месяцу со снимками" onClick={gotoNewest}>
+          {phase === 'ready' ? monthTitleOf(month) : ''}
         </button>
         <button
           className="iconbtn"
           title="Следующий месяц (удерживайте — быстрее)"
-          disabled={atNewest}
-          onPointerDown={() => { holdNext.start(); setHolding(true); }}
-          onPointerUp={() => { holdNext.stop(); setHolding(false); }}
-          onPointerLeave={() => { holdNext.stop(); setHolding(false); }}
-          onPointerCancel={() => { holdNext.stop(); setHolding(false); }}
+          onPointerDown={holdNext.start}
+          onPointerUp={holdNext.stop}
+          onPointerLeave={holdNext.stop}
+          onPointerCancel={holdNext.stop}
           onClick={(e) => { if (e.detail === 0) gotoMonth(1); }}
         >▶️</button>
       </div>
 
       {loadErr && <div className="err" style={{ margin: '8px 2px' }}>Не удалось загрузить месяц: {loadErr}</div>}
 
-      <div className="calgrid" style={{ gridTemplateColumns: `repeat(${CAL_COLS}, minmax(0, 1fr))` }}>
-        {cells.map((c, i) => (c
-          ? <DayCell key={c.day} day={c.day} row={c.row} status={c.row ? statuses.get(c.row.cover.entryId) : undefined} onOpen={(row) => setPhoto(row.cover)} />
-          : <div key={`b${i}`} className="calcell blank" />))}
-      </div>
-
-      <div className="calmeta">
-        {!cacheRef.current.has(month) || (pending === month && !dayRows.length)
-          ? 'Загружаю…'
-          : dayRows.length
-            ? `дней со снимками: ${dayRows.length} · всего фото: ${photoCount}`
-            : 'В этом месяце снимков нет'}
+      {/* Пока месяц не открылся, на экране нет ничего, кроме названия месяца с годом и лоадера. */}
+      <div className="calwrap">
+        {phase === 'ready' ? (
+          <div className="calcenter">
+            <div className="calgrid" style={{ gridTemplateColumns: `repeat(${CAL_COLS}, minmax(0, 1fr))` }}>
+              {cells.map((c, i) => (c
+                ? <DayCell key={c.day} day={c.day} row={c.row} status={c.row ? statuses.get(c.row.cover.entryId) : undefined} onOpen={(row) => openPhoto(row.cover)} />
+                : <div key={`b${i}`} className="calcell blank" />))}
+            </div>
+            <div className="calmeta">
+              {dayRows.length
+                ? `дней со снимками: ${dayRows.length} · всего фото: ${photoCount}`
+                : 'В этом месяце снимков нет'}
+            </div>
+          </div>
+        ) : phase === 'error' ? null : (
+          <div className="calload">
+            <div className="calloadmonth">{monthTitleOf(month)}</div>
+            <span className="spin" />
+          </div>
+        )}
       </div>
 
       {/* Кнопка «+»: одна на фото и видео, всегда под большим пальцем — над нижним нав-баром. */}
-      {photoFolderId && !overlay && (
+      {photoFolderId && !overlay && phase === 'ready' && (
         <label
           className={busy ? 'fab off' : 'fab'}
           role="button"
@@ -1435,8 +1504,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
               // браузеров без AV1 (Safari/iOS) и playsInline для телефона.
               <VideoPreview key={photo.entryId} meta={{ id: photo.entryId, sha256: photo.sha256, name: photo.name }} />
             ) : view2.ready && photo.sha256 ? (
-              // key по снимку: у каждого своя геометрия и свой зум. Ничего не прогреваем —
-              // лоадер этого кадра и есть ожидание загрузки.
+              // key по снимку: у каждого своя геометрия и свой зум. Лоадер кадра крутится не
+              // меньше секунды — переключение ⬅️/➡️ не мигает, даже если картинка уже в памяти.
               <PhotoZoom key={photo.entryId} src={api.previewUrl(photo.sha256, 1080)} />
             ) : (
               <div className="panel">
@@ -1471,7 +1540,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
             )}
           </div>
           <div className="tbar">
-            <button className="iconbtn" title="Назад в календарь" onClick={() => setPhoto(null)}>◀️</button>
+            <button className="iconbtn" title="Назад в календарь" onClick={() => setWin({ items: [], idx: -1 })}>◀️</button>
             {/* Просмотр держит один кадр — в шапке его дата съёмки (та самая «деталка»), а если
                 даты нет, имя файла */}
             <span className="calday">
@@ -1494,8 +1563,9 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
                 }
               }}
             >🗑</button>
-            <button className="iconbtn" title="Предыдущий снимок" disabled={stepping} onClick={() => void stepPhoto('prev')}>⬅️</button>
-            <button className="iconbtn" title="Следующий снимок" disabled={stepping} onClick={() => void stepPhoto('next')}>➡️</button>
+            {/* Стрелки не гаснут: кадр берётся из уже загруженного окна, ждать сеть не нужно. */}
+            <button className="iconbtn" title="Предыдущий снимок" onClick={() => stepPhoto('prev')}>⬅️</button>
+            <button className="iconbtn" title="Следующий снимок" onClick={() => stepPhoto('next')}>➡️</button>
           </div>
         </div>
       )}
@@ -1521,6 +1591,8 @@ function PhotoZoom({ src }: { src: string }) {
   const pan0 = useRef({ tx: 0, ty: 0, px: 0, py: 0 });
   const lastTap = useRef(0);
   const [state, setState] = useState<'loading' | 'ready' | 'failed'>('loading');
+  /** Когда кадр открыли: от этого считаем минимальное время лоадера. */
+  const shownAt = useRef(Date.now());
 
   const clampN = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -1620,11 +1692,15 @@ function PhotoZoom({ src }: { src: string }) {
   };
 
   // Кадр грузит сам <img> (см. разметку ниже): никакого прогрева и никакого второго запроса.
-  // Размер нужен до показа — поэтому ждём onLoad и только потом считаем геометрию.
+  // Размер нужен до показа — поэтому ждём onLoad. Лоадер при этом держим минимум LOADER_MIN_MS:
+  // иначе на кадре, который браузер уже держит в памяти, спиннер мигал бы на одно мгновение.
   const onLoaded = (img: HTMLImageElement) => {
     nat.current = { w: img.naturalWidth, h: img.naturalHeight };
-    setState('ready');
-    commit(1, 0, 0);
+    const left = Math.max(0, LOADER_MIN_MS - (Date.now() - shownAt.current));
+    window.setTimeout(() => {
+      setState('ready');
+      commit(1, 0, 0);
+    }, left);
   };
 
   return (

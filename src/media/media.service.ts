@@ -55,6 +55,11 @@ export const TIMELINE_STATUS_MAX = 500;
  */
 export const TIMELINE_DAYS_MONTHS_MAX = 12;
 /**
+ * Потолок окна просмотра: сколько снимков можно попросить в одну сторону от текущего кадра.
+ * Клиент берёт ±20 — этого хватает, чтобы два десятка нажатий стрелки не ходили в сеть.
+ */
+export const TIMELINE_WINDOW_MAX = 50;
+/**
  * Снимки с датой съёмки раньше этого года считаем битыми (сбитые часы камеры) и в календарь не
  * пускаем. Иначе одна дата 1970 года тянет за собой полсотни пустых десятилетий листания:
  * на живых данных между 2026 и 1970 лежат 527 пустых месяцев. В «Файлах» такие снимки остаются.
@@ -817,23 +822,6 @@ export class MediaService {
     if (!tree.length) return null;
     const cursor = await this.timelineCursor(tree, entryId);
     if (!cursor) return null;
-    // Порядок ленты: сверху свежие, снизу хвост без даты. Предикат «строго до/после курсора»
-    // разписан по обе стороны от NULL — иначе снимки без даты съёмки выпадали бы из листания.
-    const cmp = dir === 'next'
-      ? Prisma.sql`(
-          (mm."capturedAt" IS NULL AND ${cursor.capturedAt}::timestamp IS NOT NULL)
-          OR (mm."capturedAt" IS NOT NULL AND ${cursor.capturedAt}::timestamp IS NOT NULL
-              AND (mm."capturedAt" < ${cursor.capturedAt}::timestamp
-                   OR (mm."capturedAt" = ${cursor.capturedAt}::timestamp AND f."id" < ${cursor.id})))
-          OR (mm."capturedAt" IS NULL AND ${cursor.capturedAt}::timestamp IS NULL AND f."id" < ${cursor.id})
-        )`
-      : Prisma.sql`(
-          (mm."capturedAt" IS NOT NULL AND ${cursor.capturedAt}::timestamp IS NULL)
-          OR (mm."capturedAt" IS NOT NULL AND ${cursor.capturedAt}::timestamp IS NOT NULL
-              AND (mm."capturedAt" > ${cursor.capturedAt}::timestamp
-                   OR (mm."capturedAt" = ${cursor.capturedAt}::timestamp AND f."id" > ${cursor.id})))
-          OR (mm."capturedAt" IS NULL AND ${cursor.capturedAt}::timestamp IS NULL AND f."id" > ${cursor.id})
-        )`;
     const order = dir === 'next'
       ? Prisma.sql`ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC`
       : Prisma.sql`ORDER BY mm."capturedAt" ASC NULLS FIRST, f."id" ASC`;
@@ -845,7 +833,7 @@ export class MediaService {
       WHERE f."deletedAt" IS NULL
         AND f."zone" = ${ZONE_PHOTOS}
         AND f."folderId" = ANY(${tree})
-        AND ${cmp}
+        AND ${MediaService.keyset(cursor, dir)}
       ${order}
       LIMIT 1
     `);
@@ -860,6 +848,93 @@ export class MediaService {
       previewState: r.previewState,
       size: Number(r.size ?? 0),
     };
+  }
+
+  /**
+   * Окно вокруг кадра: `before` снимков новее и `after` старее, сам кадр в середине. Просмотр
+   * берёт окно ±20 одним запросом, поэтому листание стрелками внутри окна идёт без сети вообще, а
+   * сеть нужна только на подходе к его краю. Порядок ответа — как у ленты: от свежих к старым,
+   * то есть следующий кадр лежит правее по массиву.
+   *
+   * Три выборки в одном запросе: две keyset-ветки (те же предикаты, что у соседа) плюс сам кадр;
+   * внешний ORDER BY разворачивает «новее» и склеивает всё в ленточный порядок.
+   */
+  async timelineWindow(userId: string, entryId?: string, before?: unknown, after?: unknown): Promise<TimelineItem[]> {
+    if (!entryId) return [];
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return [];
+    const cursor = await this.timelineCursor(tree, entryId);
+    if (!cursor) return [];
+    const nBefore = MediaService.windowSize(before);
+    const nAfter = MediaService.windowSize(after);
+    const cols = Prisma.sql`f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt"`;
+    const from = Prisma.sql`
+      FROM "MediaMeta" mm
+      JOIN "Asset" a ON a."id" = mm."assetId"
+      JOIN "FileEntry" f ON f."assetId" = a."id"
+      WHERE f."deletedAt" IS NULL
+        AND f."zone" = ${ZONE_PHOTOS}
+        AND f."folderId" = ANY(${tree})`;
+    const rows = await this.prisma.$queryRaw<TimelineRow[]>(Prisma.sql`
+      SELECT * FROM (
+        (SELECT ${cols} ${from}
+           AND ${MediaService.keyset(cursor, 'prev')}
+         ORDER BY mm."capturedAt" ASC NULLS FIRST, f."id" ASC
+         LIMIT ${nBefore})
+        UNION ALL
+        (SELECT ${cols} ${from} AND f."id" = ${cursor.id} LIMIT 1)
+        UNION ALL
+        (SELECT ${cols} ${from}
+           AND ${MediaService.keyset(cursor, 'next')}
+         ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
+         LIMIT ${nAfter})
+      ) w
+      ORDER BY w."capturedAt" DESC NULLS LAST, w."id" DESC
+    `);
+    return rows.map((r) => ({
+      entryId: r.id,
+      name: r.name,
+      sha256: r.sha256 ?? undefined,
+      capturedAt: r.capturedAt ? new Date(r.capturedAt).toISOString() : null,
+      mime: r.mime,
+      previewState: r.previewState,
+      size: Number(r.size ?? 0),
+    }));
+  }
+
+  /** Размер окна из query: 0..TIMELINE_WINDOW_MAX, мусор — 0 (за эту сторону ничего не просим). */
+  private static windowSize(v: unknown): number {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.min(Math.floor(n), TIMELINE_WINDOW_MAX);
+  }
+
+  /**
+   * Предикат «строго до/после курсора» в порядке ленты (capturedAt DESC NULLS LAST, id DESC).
+   * Разписан по обе стороны от NULL — иначе снимки без даты съёмки выпадали бы из листания.
+   *
+   * Дату курсора передаём строкой без пояса и приводим к timestamp явно (см. sqlTimestamp):
+   * Date Prisma биндит как timestamptz, и на сервере с Europe/Madrid `::timestamp` сдвигал бы
+   * границу на час — тогда у самого свежего снимка часа «следующим» оказывался он сам.
+   */
+  private static keyset(cursor: { capturedAt: Date | null; id: string }, dir: 'next' | 'prev'): Prisma.Sql {
+    const at = cursor.capturedAt ? MediaService.sqlTimestamp(cursor.capturedAt) : null;
+    if (dir === 'next') {
+      return Prisma.sql`(
+        (mm."capturedAt" IS NULL AND ${at}::timestamp IS NOT NULL)
+        OR (mm."capturedAt" IS NOT NULL AND ${at}::timestamp IS NOT NULL
+            AND (mm."capturedAt" < ${at}::timestamp
+                 OR (mm."capturedAt" = ${at}::timestamp AND f."id" < ${cursor.id})))
+        OR (mm."capturedAt" IS NULL AND ${at}::timestamp IS NULL AND f."id" < ${cursor.id})
+      )`;
+    }
+    return Prisma.sql`(
+      (mm."capturedAt" IS NOT NULL AND ${at}::timestamp IS NULL)
+      OR (mm."capturedAt" IS NOT NULL AND ${at}::timestamp IS NOT NULL
+          AND (mm."capturedAt" > ${at}::timestamp
+               OR (mm."capturedAt" = ${at}::timestamp AND f."id" > ${cursor.id})))
+      OR (mm."capturedAt" IS NULL AND ${at}::timestamp IS NULL AND f."id" > ${cursor.id})
+    )`;
   }
 
   /** Следующий день к 'YYYY-MM-DD' (для границы выборки: [день, следующий день)). */
