@@ -765,8 +765,6 @@
     background: var(--surface-2);
   }
   .map-host { position: absolute; inset: 0; }
-  /* Тепловой слой: canvas в своей панели Leaflet, едет вместе с тайлами */
-  .map-heat { position: absolute; left: 0; top: 0; }
   /* Миниатюра-кластер: кадр места и счётчик, если кадров больше одного */
   .map-cluster {
     border-radius: 10px;
