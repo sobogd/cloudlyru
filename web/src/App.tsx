@@ -1267,26 +1267,55 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
 
   const photoCount = dayRows.reduce((n, r) => n + r.count, 0);
 
-  /** Дни месяца, в которых есть снимки, от новых к старым — по ним ходит просмотр на краю дня. */
+  /** Дни месяца, в которых есть снимки, от новых к старым — по ним ходит просмотр. */
   const monthDays = (key: string) => (cacheRef.current.get(key) ?? []).map((r) => r.day);
-  /** Соседний день со снимками: внутри месяца, а на краю — в соседнем месяце. */
+
+  /** Ключ месяца, подрезанный по краям галереи (раньше 2000 и позже последнего снимка не ходим). */
+  const clipMonth = (key: string): string => {
+    let out = key;
+    if (bounds?.oldest && out < bounds.oldest) out = bounds.oldest;
+    if (bounds?.newest && out > bounds.newest) out = bounds.newest;
+    return out;
+  };
+
+  /**
+   * Ближайший день со снимками в направлении step (+1 — старее, −1 — новее). Просмотр НЕ
+   * ограничен месяцем: пустые месяцы пропускаем и идём дальше, месяцы догружаем пачкой, а
+   * останавливаемся только на краю галереи — на самом первом или самом последнем снимке.
+   */
   const neighborDay = async (day: string, step: number): Promise<string | null> => {
-    const days = monthDays(day.slice(0, 7));
+    const own = day.slice(0, 7);
+    // месяц самого дня мог быть ещё не загружен (например, экран восстановили после F5):
+    // без этого соседние дни того же месяца потерялись бы
+    if (!cacheRef.current.has(own)) {
+      try {
+        await ensureRange(own, own);
+      } catch {
+        return null;
+      }
+    }
+    const days = monthDays(own);
     const i = days.indexOf(day);
-    if (i >= 0) {
-      const inside = days[i + step];
-      if (inside) return inside;
+    if (i >= 0 && days[i + step]) return days[i + step];
+
+    // Дальше идём месяцами в сторону движения: пустые месяцы (паузы в съёмке) пропускаем.
+    const dir = step > 0 ? -1 : 1;
+    for (let key = shiftMonth(own, dir), hop = 0; hop < 240; hop++, key = shiftMonth(key, dir)) {
+      if (dir < 0 && bounds?.oldest && key < bounds.oldest) return null;
+      if (dir > 0 && bounds?.newest && key > bounds.newest) return null;
+      if (!cacheRef.current.has(key)) {
+        const from = clipMonth(dir < 0 ? shiftMonth(key, -(MONTH_CHUNK - 1)) : key);
+        const to = clipMonth(dir < 0 ? key : shiftMonth(key, MONTH_CHUNK - 1));
+        try {
+          await ensureRange(from, to);
+        } catch {
+          return null;
+        }
+      }
+      const list = monthDays(key);
+      if (list.length) return step > 0 ? list[0] : list[list.length - 1];
     }
-    const target = shiftMonth(day.slice(0, 7), step > 0 ? -1 : 1);
-    if ((step > 0 && bounds?.oldest && target < bounds.oldest) || (step < 0 && bounds?.newest && target > bounds.newest)) return null;
-    try {
-      await ensureRange(target, target);
-    } catch {
-      return null;
-    }
-    const next = monthDays(target);
-    if (!next.length) return null; // в соседнем месяце снимков нет — листать некуда
-    return step > 0 ? next[0] : next[next.length - 1];
+    return null;
   };
 
   /** Открыть день: страница просмотра — отдельная, поэтому день грузим целиком. */
