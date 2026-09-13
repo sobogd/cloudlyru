@@ -54,6 +54,12 @@ export const TIMELINE_STATUS_MAX = 500;
  * месяц; 12 месяцев — это ~365 строк, то есть всё равно меньше одной страницы ленты.
  */
 export const TIMELINE_DAYS_MONTHS_MAX = 12;
+/**
+ * Снимки с датой съёмки раньше этого года считаем битыми (сбитые часы камеры) и в календарь не
+ * пускаем. Иначе одна дата 1970 года тянет за собой полсотни пустых десятилетий листания:
+ * на живых данных между 2026 и 1970 лежат 527 пустых месяцев. В «Файлах» такие снимки остаются.
+ */
+export const TIMELINE_MIN_YEAR = 2000;
 /** Сколько байт читаем из начала объекта, прежде чем тянуть его целиком. */
 const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 /**
@@ -780,6 +786,9 @@ export class MediaService {
   async timelineMonths(userId: string): Promise<{ newest: string | null; oldest: string | null }> {
     const tree = await this.auth.subtreeIds(userId);
     if (!tree.length) return { newest: null, oldest: null };
+    // Нижняя граница — TIMELINE_MIN_YEAR: битые даты (1970 и прочие сбитые часы) в календаре
+    // не показываем, иначе листание уходит в пустые десятилетия.
+    const floor = `${TIMELINE_MIN_YEAR}-01-01 00:00:00`;
     const rows = await this.prisma.$queryRaw<Array<{ newest: string | null; oldest: string | null }>>(Prisma.sql`
       SELECT to_char(max(mm."capturedAt"), 'YYYY-MM') AS newest,
              to_char(min(mm."capturedAt"), 'YYYY-MM') AS oldest
@@ -789,7 +798,7 @@ export class MediaService {
       WHERE f."deletedAt" IS NULL
         AND f."zone" = ${ZONE_PHOTOS}
         AND f."folderId" = ANY(${tree})
-        AND mm."capturedAt" IS NOT NULL
+        AND mm."capturedAt" >= ${floor}::timestamp
     `);
     return { newest: rows[0]?.newest ?? null, oldest: rows[0]?.oldest ?? null };
   }

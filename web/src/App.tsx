@@ -1073,12 +1073,7 @@ function useHoldRepeat(action: () => void, enabled: boolean) {
 
   useEffect(() => stop, [stop]);
 
-  return {
-    onPointerDown: start,
-    onPointerUp: stop,
-    onPointerLeave: stop,
-    onPointerCancel: stop,
-  };
+  return { start, stop };
 }
 
 /**
@@ -1123,6 +1118,8 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
   const [loadErr, setLoadErr] = useState<string | null>(null);
   /** Месяц, который грузится прямо сейчас, и версия кэша (для перерисовки). */
   const [pending, setPending] = useState<string | null>(null);
+  /** Палец на стрелке: пока держат, месяцы только листаются — запрос уходит после отпускания. */
+  const [holding, setHolding] = useState(false);
   const [version, setVersion] = useState(0);
   const [viewLoading, setViewLoading] = useState(false);
 
@@ -1206,15 +1203,18 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
       .catch(() => undefined);
   }, []);
 
-  // Текущий месяц — сразу (если он ещё не в кэше), следом с запасом греем соседей.
+  // Месяц грузим, когда листание остановилось: пока палец на стрелке, экран только листается,
+  // а в сеть уходит один запрос — за тем месяцем, на котором отпустили. Иначе удержание на
+  // десяток лет превращалось бы в десятки запросов, которые всё равно не успевают прийти.
   useEffect(() => {
+    if (holding) return;
     void ensureChunk(month, 0).catch(() => undefined);
-  }, [month, ensureChunk]);
+  }, [month, holding, ensureChunk]);
   useEffect(() => {
-    if (!cacheRef.current.has(month)) return;
+    if (holding || !cacheRef.current.has(month)) return;
     void ensureChunk(shiftMonth(month, -1), -1).catch(() => undefined);
     void ensureChunk(shiftMonth(month, 1), 1).catch(() => undefined);
-  }, [month, version, ensureChunk]);
+  }, [month, holding, version, ensureChunk]);
 
   // Файл догрузился — перечитываем месяц (с задержкой: файлы идут пачкой, месяц нужен один раз).
   useEffect(() => {
@@ -1447,7 +1447,10 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           className="iconbtn"
           title="Предыдущий месяц (удерживайте — быстрее)"
           disabled={atOldest}
-          {...holdPrev}
+          onPointerDown={() => { holdPrev.start(); setHolding(true); }}
+          onPointerUp={() => { holdPrev.stop(); setHolding(false); }}
+          onPointerLeave={() => { holdPrev.stop(); setHolding(false); }}
+          onPointerCancel={() => { holdPrev.stop(); setHolding(false); }}
           onClick={(e) => { if (e.detail === 0) gotoMonth(-1); }}
         >◀️</button>
         <button className="caltitle" title="К последнему месяцу со снимками" onClick={() => { if (bounds?.newest) setMonth(bounds.newest); setView(null); }}>
@@ -1457,7 +1460,10 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
           className="iconbtn"
           title="Следующий месяц (удерживайте — быстрее)"
           disabled={atNewest}
-          {...holdNext}
+          onPointerDown={() => { holdNext.start(); setHolding(true); }}
+          onPointerUp={() => { holdNext.stop(); setHolding(false); }}
+          onPointerLeave={() => { holdNext.stop(); setHolding(false); }}
+          onPointerCancel={() => { holdNext.stop(); setHolding(false); }}
           onClick={(e) => { if (e.detail === 0) gotoMonth(1); }}
         >▶️</button>
       </div>
@@ -1471,7 +1477,7 @@ function Photos({ photoFolderId, up, uploadedAt }: { photoFolderId: string | nul
       </div>
 
       <div className="calmeta">
-        {pending === month && !dayRows.length
+        {!cacheRef.current.has(month) || (pending === month && !dayRows.length)
           ? 'Загружаю…'
           : dayRows.length
             ? `дней со снимками: ${dayRows.length} · всего фото: ${photoCount}`
