@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownToLine, ArrowLeft, ArrowRight, ImageOff, Info, LoaderCircle, Trash, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowLeft, ArrowRight, Film, Image as ImageIcon, Info, Trash, X } from 'lucide-react';
 import * as api from './api';
 
 /**
@@ -421,8 +421,10 @@ export default function MediaSection({ onOverlayChange }: {
         <div className="mscroll" ref={scrollRef} onScroll={onScroll}>
           {error && <div className="err" style={{ padding: '8px 4px' }}>{error}</div>}
           {total == null && !error && (
-            <div className="mempty">
-              <span className="spin" />
+            <div className="mskel">
+              {Array.from({ length: cols * Math.max(2, Math.ceil((viewport.h || 600) / ROW) + OVERSCAN) }).map((_, i) => (
+                <div className="mcell" key={i}><span className="mcell-skel" /></div>
+              ))}
             </div>
           )}
           {total === 0 && !error && (
@@ -522,7 +524,7 @@ function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => v
   }
   const ready = item.previewState === 'done' && !!item.sha256;
   const video = /^video\//.test(item.mime);
-  const processing = !ready && (item.jobState === 'pending' || item.jobState === 'processing');
+  const Icon = video ? Film : ImageIcon;
 
   if (!ready) {
     return (
@@ -531,12 +533,10 @@ function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => v
         className="mcell off"
         disabled
         onClick={onClick}
-        title={processing ? 'Превью обрабатывается' : 'Превью не собрано'}
-        aria-label={processing ? 'Превью обрабатывается' : 'Превью не собрано'}
+        title="Превью не собрано"
+        aria-label="Превью не собрано"
       >
-        <span className={'mcell-ico' + (processing ? ' spin' : '')}>
-          {processing ? <LoaderCircle size={16} /> : <ImageOff size={16} />}
-        </span>
+        <span className="mcell-ico"><Icon size={16} /></span>
       </button>
     );
   }
@@ -551,7 +551,7 @@ function Cell({ item, onClick }: { item: MediaItem | undefined; onClick: () => v
     >
       {!failed && <span className="mcell-skel" />}
       {failed ? (
-        <span className="mcell-ico"><ImageOff size={16} /></span>
+        <span className="mcell-ico"><Icon size={16} /></span>
       ) : (
         <img src={api.previewUrl(item.sha256!)} alt="" loading="lazy" decoding="async" draggable={false} onError={() => setFailed(true)} />
       )}
