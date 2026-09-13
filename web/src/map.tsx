@@ -20,10 +20,17 @@ import { patchUi, readUi } from './storage';
  * для открытого и соседних кадров.
  */
 
-/** Сторона клетки группировки, px: мельче — больше точек на экране, крупнее — меньше. */
-const CLUSTER_PX = 70;
-/** Запас вокруг вида: кадры чуть за краем ещё попадают в свои группы и не «мигают». */
-const CLUSTER_MARGIN = CLUSTER_PX;
+/**
+ * Сторона клетки группировки, px, по зуму. Издалека клетка крупная: иначе на карте мира
+ * висят сотни миниатюр и закрывают саму карту. Вблизи клетка мелкая, и точки расходятся
+ * до отдельных кадров.
+ */
+function clusterCellPx(zoom: number): number {
+  if (zoom <= 5) return 170; // мир и континенты — точка на регион
+  if (zoom <= 8) return 120; // страны
+  if (zoom <= 11) return 90; // города
+  return 70; // районы и ближе
+}
 /** Потолок одновременных миниатюр: это DOM-узлы с картинками, больше браузер не тянет. */
 const CLUSTER_MAX = 300;
 /** Сторона миниатюры-кластера: от одиночного кадра до плотной точки места. */
@@ -59,7 +66,13 @@ export default function MapSection({ onOverlayChange }: {
   const [total, setTotal] = useState(0);
   const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState('');
-  const [openIdx, setOpenIdx] = useState<number | null>(null);
+  /**
+   * Открытая группа: индексы её кадров в общем списке точек. Деталка листает только их —
+   * кликнул по площадке, значит и смотришь кадры этой площадки, а не всю библиотеку.
+   */
+  const [openGroup, setOpenGroup] = useState<number[] | null>(null);
+  /** Позиция внутри открытой группы. */
+  const [openAt, setOpenAt] = useState(0);
   /** Сколько кадров попадает в текущий вид: ноль — показываем подсказку «здесь кадров нет». */
   const [visibleCount, setVisibleCount] = useState(-1);
 
@@ -67,13 +80,14 @@ export default function MapSection({ onOverlayChange }: {
   const mapRef = useRef<L.Map | null>(null);
   const markerLayerRef = useRef<L.LayerGroup | null>(null);
   const pointsRef = useRef<api.MapPoint[]>([]);
+  const groupRef = useRef<number[] | null>(null);
   const markersRef = useRef<() => void>(() => {});
   /** Вид карты, сохранённый в прошлый раз: восстановим его вместо «показать всё». */
   const [savedView] = useState(() => readUi().map);
 
   useEffect(() => {
-    onOverlayChange?.(openIdx != null);
-  }, [openIdx, onOverlayChange]);
+    onOverlayChange?.(openGroup != null);
+  }, [openGroup, onOverlayChange]);
 
   // Точки всей ленты — одним запросом при входе на вкладку.
   useEffect(() => {
@@ -185,25 +199,25 @@ export default function MapSection({ onOverlayChange }: {
 
       const zoom = map.getZoom();
       const size = map.getSize();
+      const cell = clusterCellPx(zoom);
+      const margin = cell;
       const tl = map.getPixelBounds().min ?? L.point(0, 0);
-      const cells = new Map<string, { x: number; y: number; lat: number; lon: number; n: number; idx: number }>();
+      const cells = new Map<string, { lat: number; lon: number; n: number; ids: number[] }>();
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
         const abs = map.project([p.lat, p.lon], zoom);
         const x = abs.x - tl.x;
         const y = abs.y - tl.y;
-        if (x < -CLUSTER_MARGIN || y < -CLUSTER_MARGIN || x > size.x + CLUSTER_MARGIN || y > size.y + CLUSTER_MARGIN) continue;
-        const key = cellKey(Math.floor(abs.x / CLUSTER_PX), Math.floor(abs.y / CLUSTER_PX));
+        if (x < -margin || y < -margin || x > size.x + margin || y > size.y + margin) continue;
+        const key = cellKey(Math.floor(abs.x / cell), Math.floor(abs.y / cell));
         const c = cells.get(key);
         if (c) {
           c.n++;
-          c.x += abs.x;
-          c.y += abs.y;
           c.lat += p.lat;
           c.lon += p.lon;
+          c.ids.push(i);
         } else {
-          // idx — первый кадр клетки, а points идут от свежих: это самый новый кадр места
-          cells.set(key, { x: abs.x, y: abs.y, lat: p.lat, lon: p.lon, n: 1, idx: i });
+          cells.set(key, { lat: p.lat, lon: p.lon, n: 1, ids: [i] });
         }
       }
 
@@ -211,18 +225,25 @@ export default function MapSection({ onOverlayChange }: {
       const list = [...cells.values()].sort((a, b) => b.n - a.n).slice(0, CLUSTER_MAX);
       for (const c of list) {
         const side = clusterSide(c.n);
+        // ids идут в порядке ленты (points отсортированы от свежих): первым открываем
+        // самый новый кадр группы, дальше листание идёт только по этой группе
+        const group = c.ids;
         // Центр группы — среднее её кадров, а не первый попавшийся: точка стоит там,
         // где снимали, а не на краю клетки
         const icon = L.divIcon({
           className: 'map-cluster',
           html:
-            `<img src="${api.thumbUrl(pts[c.idx].entryId)}" alt="" loading="lazy" decoding="async">` +
+            `<img src="${api.thumbUrl(pts[group[0]].entryId)}" alt="" loading="lazy" decoding="async">` +
             (c.n > 1 ? `<i>${c.n}</i>` : ''),
           iconSize: [side, side],
           iconAnchor: [side / 2, side / 2],
         });
         const marker = L.marker([c.lat / c.n, c.lon / c.n], { icon, keyboard: false, riseOnHover: true });
-        marker.on('click', () => setOpenIdx(c.idx));
+        marker.on('click', () => {
+          groupRef.current = group;
+          setOpenGroup(group);
+          setOpenAt(0);
+        });
         layer.addLayer(marker);
       }
     };
@@ -274,12 +295,19 @@ export default function MapSection({ onOverlayChange }: {
   const pendingRef = useRef(new Set<string>());
   const [, bump] = useState(0);
 
+  /** Кадр открытой группы по её позиции: деталка работает с ней, а не со всей лентой. */
+  const groupPoint = (i: number) => {
+    const gi = groupRef.current?.[i];
+    return gi == null ? undefined : pointsRef.current[gi];
+  };
+
   const ensure = useCallback((start: number, end: number) => {
-    const pts = pointsRef.current;
+    const group = groupRef.current;
+    if (!group) return;
     const from = Math.max(0, start);
-    const to = Math.min(pts.length - 1, end);
+    const to = Math.min(group.length - 1, end);
     for (let i = from; i <= to; i++) {
-      const p = pts[i];
+      const p = pointsRef.current[group[i]];
       if (!p || itemsRef.current.has(p.entryId) || pendingRef.current.has(p.entryId)) continue;
       pendingRef.current.add(p.entryId);
       void api
@@ -303,16 +331,24 @@ export default function MapSection({ onOverlayChange }: {
   }, []);
 
   const getItem = useCallback((i: number) => {
-    const p = pointsRef.current[i];
+    const p = groupPoint(i);
     return p ? itemsRef.current.get(p.entryId) : undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Удаление кадра: точка уходит с карты, индексы дальше сдвигаются — как в ленте.
-  const handleDelete = useCallback((index: number) => {
-    const next = pointsRef.current.filter((_, i) => i !== index);
-    pointsRef.current = next;
-    setPoints(next);
-    setOpenIdx(next.length ? Math.min(index, next.length - 1) : null);
+  // Удаление кадра: точка уходит с карты, а индексы и в списке точек, и в открытой группе
+  // сдвигаются на единицу — как в ленте, иначе следующее листание открыло бы не тот кадр.
+  const handleDelete = useCallback((pos: number) => {
+    const group = groupRef.current;
+    const gi = group?.[pos];
+    if (!group || gi == null) return;
+    const nextPoints = pointsRef.current.filter((_, i) => i !== gi);
+    pointsRef.current = nextPoints;
+    setPoints(nextPoints);
+    const nextGroup = group.filter((_, i) => i !== pos).map((i) => (i > gi ? i - 1 : i));
+    groupRef.current = nextGroup.length ? nextGroup : null;
+    setOpenGroup(nextGroup.length ? nextGroup : null);
+    setOpenAt(Math.min(pos, Math.max(0, nextGroup.length - 1)));
   }, []);
 
   const count = points?.length ?? 0;
@@ -350,14 +386,17 @@ export default function MapSection({ onOverlayChange }: {
         )}
       </div>
 
-      {openIdx != null && points != null && points.length > 0 && (
+      {openGroup && openGroup.length > 0 && (
         <MediaViewer
-          total={points.length}
-          idx={openIdx}
+          total={openGroup.length}
+          idx={openAt}
           getItem={getItem}
           ensure={ensure}
-          onNavigate={setOpenIdx}
-          onClose={() => setOpenIdx(null)}
+          onNavigate={setOpenAt}
+          onClose={() => {
+            groupRef.current = null;
+            setOpenGroup(null);
+          }}
           onDelete={handleDelete}
         />
       )}
