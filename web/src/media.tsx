@@ -1132,7 +1132,7 @@ function MediaInfoPanel({ entryId, onClose }: { entryId: string; onClose: () => 
                   rel="noreferrer"
                   title="Открыть на карте"
                 >
-                  <MapPin size={14} /> {info.latitude.toFixed(6)}, {info.longitude.toFixed(6)}
+                  <MapPin size={17} /> {info.latitude.toFixed(6)}, {info.longitude.toFixed(6)}
                 </a>
               </span>
             </div>

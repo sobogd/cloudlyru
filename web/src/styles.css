@@ -654,8 +654,8 @@
   /* Шапка — без острова: просто дата и кнопки поверх кадра, у верхнего края.
      Крупнее остальных островов: это просмотр кадра, иконки и дата должны читаться сразу. */
   .mv-head {
-    --mv-icon: 22px;
-    --mv-fs: 16px;
+    --mv-icon: 26px;
+    --mv-fs: 18px;
     position: absolute;
     top: 0;
     left: 0;
@@ -742,21 +742,22 @@
     background: var(--island-solid);
     border-bottom: 1px solid var(--brd);
   }
-  .minfo-title { font-weight: 600; font-size: var(--island-fs); color: var(--fg); }
+  .minfo-title { font-weight: 600; font-size: 17px; color: var(--fg); }
+  .minfo-head .iconbtn svg { width: 24px; height: 24px; }
   .minfo-body { padding: 0 14px 24px; }
   .minfo-load { display: grid; place-items: center; padding: 48px 0; }
   .minfo-row {
     display: grid;
-    grid-template-columns: 118px 1fr;
+    grid-template-columns: 128px 1fr;
     gap: 10px;
     align-items: baseline;
-    padding: 9px 0;
+    padding: 12px 0;
     border-bottom: 1px solid var(--brd);
   }
   .minfo-row:last-child { border-bottom: 0; }
-  .minfo-k { color: var(--fg-3); font-size: 13px; }
-  .minfo-v { font-size: 13px; color: var(--fg); word-break: break-all; white-space: pre-wrap; }
-  .minfo-v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .minfo-k { color: var(--fg-3); font-size: 15px; }
+  .minfo-v { font-size: 16px; color: var(--fg); word-break: break-all; white-space: pre-wrap; }
+  .minfo-v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }
   .minfo-loc {
     display: inline-flex;
     align-items: center;
