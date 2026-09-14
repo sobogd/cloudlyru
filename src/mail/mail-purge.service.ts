@@ -1,9 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ImapFlow } from 'imapflow';
 import { PrismaService } from '../prisma/prisma.service';
 import { env } from '../config/env';
 import { badRequest } from '../common/errors';
 import { headerMessageId } from './mail-parse';
+import { LOCAL_PREFIX } from './mail-ingest.service';
 import { MailAccountsService, type MailAccountRow } from './mail-accounts.service';
 
 /**
@@ -29,8 +30,15 @@ import { MailAccountsService, type MailAccountRow } from './mail-accounts.servic
 /** Сколько попыток удалить копию делаем, прежде чем оставить письмо в покое навсегда. */
 const MAX_TRIES = 3;
 
-/** Письма, хранящиеся только у нас: их никогда не было на сервере, удалять нечего. */
-const LOCAL_ONLY_FOLDER = 'local:sent';
+/**
+ * Письма, хранящиеся только у нас: их никогда не было на сервере, удалять нечего.
+ *
+ * Условие именно по приставке, а не по одному значению `local:sent`: писем без серверной
+ * копии два вида — своя отправка и принятое нашим же сервером (`local:local`), и вторые
+ * раньше под предохранитель не попадали. При включённом автоудалении это означало бы
+ * попытки удалить письмо из папки, которой на сервере нет.
+ */
+const ON_SERVER_FOLDER = { not: { startsWith: LOCAL_PREFIX } } as const;
 
 /** Порции при разборе мусорки: по столько писем за один FETCH. */
 const TRASH_BATCH = 200;
@@ -94,8 +102,46 @@ interface CandidateRow {
 }
 
 @Injectable()
-export class MailPurgeService {
+export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MailPurgeService.name);
+  /** Проход по расписанию: пока автоудаление включено, владелец его уже подтвердил. */
+  private timer: NodeJS.Timeout | null = null;
+
+  onModuleInit(): void {
+    if (!env.MAIL_PURGE_ENABLED) return;
+    this.logger.log(
+      `автоудаление копий включено: проход каждые ${env.MAIL_PURGE_INTERVAL_SEC} с, по ${env.MAIL_PURGE_PER_RUN} писем за проход, ` +
+        `карантин ${env.MAIL_PURGE_QUARANTINE_HOURS} ч`,
+    );
+    // Первый проход — не сразу после запуска, а через интервал: перезапуск сервиса не должен
+    // означать немедленное удаление. Заодно синхронизация успевает догрузить свежую почту.
+    this.timer = setInterval(() => void this.scheduledPass(), env.MAIL_PURGE_INTERVAL_SEC * 1000);
+    this.timer.unref();
+  }
+
+  onModuleDestroy(): void {
+    if (this.timer) clearInterval(this.timer);
+  }
+
+  /**
+   * Проход по расписанию: подтверждение не спрашиваем — его дал владелец, включив автоудаление.
+   * Всё остальное как у ручного запуска: тот же отчёт, тот же предохранитель, тот же карантин.
+   */
+  private async scheduledPass(): Promise<void> {
+    const users = await this.prisma.user.findMany({ select: { id: true, login: true } });
+    for (const user of users) {
+      try {
+        const report = await this.run(user.id, { confirm: true });
+        if (report.purged || report.failed) {
+          this.logger.log(`автоудаление (${user.login}): удалено ${report.purged}, не получилось ${report.failed}`);
+        }
+      } catch (e) {
+        // Предохранитель или недоступный сервер — не повод ронять расписание: следующий
+        // проход попробует снова, а причина видна в логе.
+        this.logger.warn(`автоудаление (${user.login}) не прошло: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
 
   constructor(
     private readonly prisma: PrismaService,
@@ -145,7 +191,12 @@ export class MailPurgeService {
    * Ничего не меняет — это и есть «прогон на сухую».
    */
   async plan(userId: string, opts: { limit?: number } = {}): Promise<PurgePlan> {
-    const accounts = await this.prisma.mailAccount.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } });
+    // Аккаунты «своего сервера» пропускаем: почту принимаем мы сами, чужой копии, которую
+    // можно было бы убрать, у таких писем нет вовсе — подключаться некуда (imapHost пуст).
+    const accounts = await this.prisma.mailAccount.findMany({
+      where: { userId, imapHost: { not: '' } },
+      orderBy: { createdAt: 'asc' },
+    });
     const limit = this.limitOf(opts.limit);
     const cutoff = this.quarantineCutoff();
     const out: PurgePlanAccount[] = [];
@@ -157,22 +208,22 @@ export class MailPurgeService {
         this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null } }),
         this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, remoteDeletedAt: { not: null } } }),
         this.prisma.mailMessage.count({
-          where: { ...base, createdAt: { gte: cutoff }, folderPath: { not: LOCAL_ONLY_FOLDER } },
+          where: { ...base, createdAt: { gte: cutoff }, folderPath: ON_SERVER_FOLDER },
         }),
-        this.prisma.mailMessage.count({ where: { ...base, flagged: true, folderPath: { not: LOCAL_ONLY_FOLDER } } }),
-        this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, folderPath: LOCAL_ONLY_FOLDER } }),
+        this.prisma.mailMessage.count({ where: { ...base, flagged: true, folderPath: ON_SERVER_FOLDER } }),
+        this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, folderPath: { startsWith: LOCAL_PREFIX } } }),
         this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, remotePurgeTries: { gte: MAX_TRIES } } }),
         this.prisma.mailMessage.count({
           where: {
             ...base,
-            folderPath: { not: LOCAL_ONLY_FOLDER },
+            folderPath: ON_SERVER_FOLDER,
             OR: this.protectedDomains().map((d) => ({ fromAddr: { endsWith: `@${d}` } })),
           },
         }),
         this.prisma.mailMessage.findMany({
           where: {
             ...base,
-            folderPath: { not: LOCAL_ONLY_FOLDER },
+            folderPath: ON_SERVER_FOLDER,
             createdAt: { lt: cutoff },
             remotePurgeTries: { lt: MAX_TRIES },
             flagged: false,
@@ -320,7 +371,7 @@ export class MailPurgeService {
         accountId: account.id,
         deletedAt: null,
         remoteDeletedAt: null,
-        folderPath: { not: LOCAL_ONLY_FOLDER },
+        folderPath: ON_SERVER_FOLDER,
         createdAt: { lt: cutoff },
         remotePurgeTries: { lt: MAX_TRIES },
         flagged: false,
