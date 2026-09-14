@@ -423,7 +423,11 @@ model MailMessage {
   id             String    @id @default(uuid())
   userId         String
   accountId      String
-  box            String // 'inbox' | 'sent'
+  box            String // основная папка: 'inbox' | 'sent'
+  // Папки сверх основной. Одно и то же письмо бывает сразу в двух: отправленное себе
+  // (наша копия в «Исходящих» плюс пришедшая обратно) и две копии на сервере у iCloud
+  // (INBOX и Sent Messages). Строка при этом одна — иначе задваивались бы вложения и файл .eml.
+  alsoBoxes      String[] @default([])
   folderPath     String // папка источника: по ней и курсору письмо находится повторно
   uid            BigInt
   uidValidity    BigInt

@@ -3,6 +3,7 @@ import { ImapFlow } from 'imapflow';
 import { PrismaService } from '../prisma/prisma.service';
 import { decryptSecret, encryptSecret, mailCryptoReady } from './mail-crypto';
 import { verifySmtpAccess } from './mail-smtp';
+import { inBox } from './mail-scope';
 import { badRequest, conflict, notFound } from '../common/errors';
 
 /**
@@ -222,15 +223,16 @@ export class MailAccountsService {
     if (!accounts.length) return [];
 
     // Числа по нашим двум папкам (их всего две, поэтому два запроса, а не группировка по всем).
+    // Письмо, лежащее сразу в двух папках, считается в обеих — как и в ленте.
     const [inbox, sent] = await Promise.all([
       this.prisma.mailMessage.groupBy({
         by: ['accountId'],
-        where: { userId, box: 'inbox', deletedAt: null },
+        where: { userId, ...inBox('inbox'), deletedAt: null },
         _count: { _all: true },
       }),
       this.prisma.mailMessage.groupBy({
         by: ['accountId'],
-        where: { userId, box: 'sent', deletedAt: null },
+        where: { userId, ...inBox('sent'), deletedAt: null },
         _count: { _all: true },
       }),
     ]);

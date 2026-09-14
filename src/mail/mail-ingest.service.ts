@@ -27,6 +27,12 @@ export interface IngestInput {
   userId: string;
   account: MailAccountRow;
   box: MailBox;
+  /**
+   * Папки сверх основной, если письмо лежит сразу в двух. Заполняется, когда это известно
+   * уже при сохранении: у Gmail письмо себе лежит в одной папке All Mail с двумя метками
+   * (\Inbox и \Sent). Во всех остальных случаях вторая папка находится дедупом по Message-ID.
+   */
+  alsoBoxes?: MailBox[];
   /** Папка источника: письмо можно встретить в разных папках (спам → входящие). */
   folderPath: string;
   uid: number;
@@ -49,8 +55,12 @@ export const MAIL_BOX_FOLDER: Record<MailBox, string> = { inbox: 'Входящи
 /**
  * Псевдо-папка для писем, пришедших не по IMAP: наша отправка и приём своим сервером.
  * Курсоров у неё нет — это просто координата, чтобы строка письма была полной.
+ *
+ * Приставка общая для всех таких пометок (`local:sent` у отправки), по ней и отличаем
+ * «письмо пришло не из IMAP» от настоящей серверной папки.
  */
-export const LOCAL_FOLDER = 'local:local';
+export const LOCAL_PREFIX = 'local:';
+export const LOCAL_FOLDER = `${LOCAL_PREFIX}local`;
 
 /**
  * uid для писем, у которых нет серверного UID: стабильный и уникальный, выведенный из
@@ -138,6 +148,8 @@ export class MailIngestService {
       select: {
         id: true,
         deletedAt: true,
+        box: true,
+        alsoBoxes: true,
         folderPath: true,
         uid: true,
         uidValidity: true,
@@ -153,16 +165,26 @@ export class MailIngestService {
       if (existing.deletedAt) return 'trashed';
       // Письмо переехало между папками (спам → входящие, перенос метки в Gmail): обновляем
       // координаты, иначе следующий проход будет считать его новым в старой папке.
+      //
+      // Но не для писем, пришедших не по IMAP: у них координата — просто пометка «локальная»,
+      // и перезапись стёрла бы происхождение (у отправленной копии это `local:sent`). Письмо,
+      // отправленное себе, приходит обратно именно так — это не переезд, а вторая папка.
       const moved =
-        existing.folderPath !== input.folderPath ||
-        existing.uid !== uid ||
-        existing.uidValidity !== input.uidValidity;
+        !input.folderPath.startsWith(LOCAL_PREFIX) &&
+        (existing.folderPath !== input.folderPath ||
+          existing.uid !== uid ||
+          existing.uidValidity !== input.uidValidity);
+      // Папки, которых у письма ещё нет: вторая копия того же письма (отправленное себе,
+      // две копии у iCloud) — это то же письмо в другой папке, а не другое письмо.
+      const extraBoxes = [...new Set([input.box, ...(input.alsoBoxes ?? [])])].filter(
+        (b) => b !== existing.box && !existing.alsoBoxes.includes(b),
+      );
       // Прочитанность берём с сервера только в одну сторону: «там прочитано» — значит и у нас
       // прочитано; «там не прочитано» локальную отметку не снимает. Иначе письмо, прочитанное
       // в нашем интерфейсе (флаги на сервер мы пока не пишем), каждым проходом снова
       // становилось бы непрочитанным.
       const adoptSeen = input.seen && !existing.seen;
-      if (moved || adoptSeen) {
+      if (moved || adoptSeen || extraBoxes.length) {
         await this.prisma.mailMessage.update({
           where: { id: existing.id },
           data: {
@@ -176,6 +198,7 @@ export class MailIngestService {
                   ...(input.emailId ? { gmailMsgId: input.emailId } : {}),
                 }
               : {}),
+            ...(extraBoxes.length ? { alsoBoxes: { push: extraBoxes } } : {}),
             ...(adoptSeen ? { seen: true } : {}),
           },
         });
@@ -210,6 +233,7 @@ export class MailIngestService {
         userId: input.userId,
         accountId: input.account.id,
         box: input.box,
+        alsoBoxes: input.alsoBoxes ?? [],
         folderPath: input.folderPath,
         uid,
         uidValidity: input.uidValidity,

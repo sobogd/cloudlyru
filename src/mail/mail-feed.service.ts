@@ -5,6 +5,8 @@ import { notFound } from '../common/errors';
 import { S3Service } from '../s3/s3.service';
 import { parseMessage } from './mail-parse';
 import { htmlWithinLimit, sanitizeMailHtml, textToHtml } from './mail-html';
+import { inBox, inBoxSql } from './mail-scope';
+import type { MailBox } from './mail-accounts.service';
 
 /**
  * Чтение почты для интерфейса: две папки, бесконечная лента по смещению и индекс по месяцам.
@@ -79,7 +81,12 @@ export class MailFeedService {
    * и корпоративная в одной ленте — это каша, из которой непонятно, откуда письмо.
    */
   private where(userId: string, box: string, accountId?: string | null) {
-    return accountId ? { userId, box, accountId, deletedAt: null } : { userId, box, deletedAt: null };
+    return {
+      ...inBox(box as MailBox),
+      userId,
+      deletedAt: null,
+      ...(accountId ? { accountId } : {}),
+    };
   }
 
   /** Общее число писем в папке — по нему клиент считает высоту скролла. */
@@ -139,7 +146,7 @@ export class MailFeedService {
     const rows = await this.prisma.$queryRaw<Array<{ month: string; n: bigint | number }>>(Prisma.sql`
       SELECT to_char("sortAt", 'YYYY-MM') AS month, count(*) AS n
       FROM "MailMessage"
-      WHERE "userId" = ${userId} AND "box" = ${box} AND "deletedAt" IS NULL
+      WHERE "userId" = ${userId} AND ${inBoxSql(box as MailBox)} AND "deletedAt" IS NULL
         AND (${accountId ?? null}::text IS NULL OR "accountId" = ${accountId ?? null})
       GROUP BY 1
       ORDER BY 1 DESC
@@ -317,8 +324,8 @@ export class MailFeedService {
   /** Сколько непрочитанных — для значка раздела. */
   async unread(userId: string): Promise<{ inbox: number; sent: number }> {
     const [inbox, sent] = await Promise.all([
-      this.prisma.mailMessage.count({ where: { userId, box: 'inbox', deletedAt: null, seen: false } }),
-      this.prisma.mailMessage.count({ where: { userId, box: 'sent', deletedAt: null, seen: false } }),
+      this.prisma.mailMessage.count({ where: { userId, ...inBox('inbox'), deletedAt: null, seen: false } }),
+      this.prisma.mailMessage.count({ where: { userId, ...inBox('sent'), deletedAt: null, seen: false } }),
     ]);
     return { inbox, sent };
   }

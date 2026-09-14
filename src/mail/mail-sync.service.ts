@@ -3,7 +3,7 @@ import { ImapFlow, type FetchMessageObject, type FetchQueryObject } from 'imapfl
 import { PrismaService } from '../prisma/prisma.service';
 import { env } from '../config/env';
 import { mailCryptoReady } from './mail-crypto';
-import { MailAccountsService, type MailAccountRow, type MailSourceFolder } from './mail-accounts.service';
+import { MailAccountsService, type MailAccountRow, type MailBox, type MailSourceFolder } from './mail-accounts.service';
 import { MailIngestService, type IngestInput } from './mail-ingest.service';
 import type { MailCursor } from '@prisma/client';
 
@@ -425,6 +425,11 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       await this.finishBackfill(cursor.id);
       return 0;
     }
+    // Остаток истории в письмах, а не в датах: по одной границе понять, сколько ещё качать,
+    // невозможно, а вопрос «когда уже можно уходить с сервера» возникает каждый раз.
+    this.logger.log(
+      `${ctx.folderPath}: истории осталось ${missing.length} писем (граница ${walkBefore.toISOString().slice(0, 10)})`,
+    );
 
     const batch = missing.slice(-env.MAIL_BACKFILL_PER_PASS).reverse();
     let stored = 0;
@@ -490,6 +495,11 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     // у Gmail письма лежат вперемешку, поэтому там смотрим системную метку \Sent.
     const labels = msg.labels ?? new Set<string>();
     const sent = ctx.folderPath.toLowerCase().includes('sent') || labels.has('\\Sent') || flags.has('\\Sent');
+    // Письмо себе у Gmail лежит в All Mail одной копией с двумя метками сразу. Наша папка
+    // одна на письмо, поэтому вторую метку запоминаем как дополнительную папку — иначе такое
+    // письмо показывалось бы только в «Исходящих».
+    const alsoBoxes: MailBox[] =
+      sent && (labels.has('\\Inbox') || flags.has('\\Inbox')) ? ['inbox'] : [];
 
     const internal = msg.internalDate ? new Date(msg.internalDate) : new Date();
     return {
@@ -497,6 +507,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
         userId: ctx.account.userId,
         account: ctx.account,
         box: sent ? 'sent' : 'inbox',
+        alsoBoxes,
         folderPath: ctx.folderPath,
         uid: msg.uid,
         uidValidity: ctx.uidValidity,
