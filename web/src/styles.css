@@ -765,6 +765,26 @@
     background: var(--surface-2);
   }
   .map-host { position: absolute; inset: 0; }
+  /* Подпись авторов карты: политика tile.openstreetmap.org требует её видимой — за
+     спрятанную подпись сервер отдаёт «Access denied» вместо тайлов. z-index выше
+     маркеров Leaflet (pane 600), иначе миниатюры кадров её перекрывают. */
+  .map-attr {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    z-index: 700;
+    padding: 1px 6px;
+    border: 1px solid var(--island-brd);
+    border-radius: 6px;
+    background: var(--island);
+    font-size: 10px;
+    line-height: 1.5;
+    color: var(--fg-2);
+    text-decoration: none;
+    white-space: nowrap;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
   /* Миниатюра-кластер: кадр места и счётчик, если кадров больше одного */
   .map-cluster {
     border-radius: 10px;

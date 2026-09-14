@@ -158,11 +158,15 @@ export default function MapSection({ onOverlayChange }: {
       minZoom: 2,
       maxZoom: 19,
       worldCopyJump: true,
-      // Кнопок +/− и подписи OSM на карте нет: зум — колесом, щипком и двойным тапом,
-      // а весь служебный текст занимал место над нижним островом.
+      // Кнопок +/− на карте нет: зум — колесом, щипком и двойным тапом. Подпись авторов
+      // OSM рисуем свою (см. .map-attr в разметке): встроенный контрол Leaflet тянет
+      // собственные стили и лишний префикс «Leaflet», а прятать подпись нельзя — политика
+      // tile.openstreetmap.org требует её видимой, иначе тайлы блокируются.
       zoomControl: false,
       attributionControl: false,
     });
+    // Тайлы OSM отдаются только при валидном Referer и видимой подписи авторов: без Referer
+    // (его срезал заголовок Referrer-Policy: no-referrer) сервер отвечает «Access denied».
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
     markerLayerRef.current = L.layerGroup().addTo(map);
     mapRef.current = map;
@@ -359,6 +363,17 @@ export default function MapSection({ onOverlayChange }: {
       </div>
       <div className="mapbox">
         <div className="map-host" ref={hostRef} />
+        {/* Подпись авторов карты обязательна по политике OSM. Вверху справа, потому что
+            внизу — плашки-статусы, а на узком экране широкая плашка «показать все»
+            дотягивается до правого края. */}
+        <a
+          className="map-attr"
+          href="https://www.openstreetmap.org/copyright"
+          target="_blank"
+          rel="noreferrer"
+        >
+          © OpenStreetMap contributors
+        </a>
         {error && <div className="map-pill err">{error}</div>}
         {!error && points == null && <div className="map-pill">Загружаю метки…</div>}
         {!error && points != null && count === 0 && (
