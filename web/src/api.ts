@@ -651,7 +651,6 @@ export const cancelUnzip = (id: string) => request<UnzipJob>(`/unzip/${id}/cance
 // ===== почта: чистка сервера =====
 export interface MailPurgeExclusions {
   quarantined: number;
-  flagged: number;
   protectedSender: number;
   localOnly: number;
   failed: number;

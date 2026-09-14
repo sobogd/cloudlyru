@@ -63,7 +63,6 @@ function sleep(ms: number): Promise<void> {
 
 export interface PurgeExclusions {
   quarantined: number;
-  flagged: number;
   protectedSender: number;
   localOnly: number;
   failed: number;
@@ -276,10 +275,10 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
     let blocked: string | null = null;
 
     for (const account of accounts) {
-      const base = { accountId: account.id, deletedAt: null as null, remoteDeletedAt: null as null };
-      const [total, alreadyPurged, eligible, quarantined, flagged, localOnly, failed, protectedCount, rows] = await Promise.all([
-        this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null } }),
-        this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, remoteDeletedAt: { not: null } } }),
+      const base = { accountId: account.id, remoteDeletedAt: null as null };
+      const [total, alreadyPurged, eligible, quarantined, localOnly, failed, protectedCount, rows] = await Promise.all([
+        this.prisma.mailMessage.count({ where: { accountId: account.id } }),
+        this.prisma.mailMessage.count({ where: { accountId: account.id, remoteDeletedAt: { not: null } } }),
         // Сколько всего можно убрать: тот же отбор, что и для порции, но без ограничения.
         this.prisma.mailMessage.count({
           where: {
@@ -287,16 +286,14 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
             folderPath: ON_SERVER_FOLDER,
             createdAt: { lt: cutoff },
             remotePurgeTries: { lt: MAX_TRIES },
-            flagged: false,
             ...this.notProtectedFilter(),
           },
         }),
         this.prisma.mailMessage.count({
           where: { ...base, createdAt: { gte: cutoff }, folderPath: ON_SERVER_FOLDER },
         }),
-        this.prisma.mailMessage.count({ where: { ...base, flagged: true, folderPath: ON_SERVER_FOLDER } }),
-        this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, folderPath: { startsWith: LOCAL_PREFIX } } }),
-        this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, remotePurgeTries: { gte: MAX_TRIES } } }),
+        this.prisma.mailMessage.count({ where: { accountId: account.id, folderPath: { startsWith: LOCAL_PREFIX } } }),
+        this.prisma.mailMessage.count({ where: { accountId: account.id, remotePurgeTries: { gte: MAX_TRIES } } }),
         this.prisma.mailMessage.count({
           where: {
             ...base,
@@ -310,7 +307,6 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
             folderPath: ON_SERVER_FOLDER,
             createdAt: { lt: cutoff },
             remotePurgeTries: { lt: MAX_TRIES },
-            flagged: false,
             ...this.notProtectedFilter(),
           },
           orderBy: { createdAt: 'asc' },
@@ -348,7 +344,6 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
         newest: candidates.length ? candidates[candidates.length - 1].sortAt.toISOString() : null,
         excluded: {
           quarantined,
-          flagged,
           protectedSender: protectedCount,
           localOnly,
           failed,
@@ -444,18 +439,23 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
    * Удаление по одному аккаунту. Возвращает Message-ID удалённых писем — по ним потом
    * добиваем копии в мусорке.
    */
-  /** Кандидаты для прохода по расписанию: самая давняя порция из тех, что ещё на сервере. */
+  /**
+   * Кандидаты для прохода по расписанию: самая давняя порция из тех, что ещё на сервере.
+   *
+   * Берём все письма, которые у нас есть, — включая лежащие в нашей корзине и помеченные
+   * звёздочкой. Правило одно: есть у нас — у провайдера быть не должно. Единственное, что
+   * оставляет копию на месте, — непройденная проверка (нет байтов или не сошлись координаты):
+   * это не отбор, а защита от потери.
+   */
   private async scheduledCandidates(account: MailAccountRow, limit: number): Promise<CandidateRow[]> {
     const cutoff = this.quarantineCutoff();
     const rows = (await this.prisma.mailMessage.findMany({
       where: {
         accountId: account.id,
-        deletedAt: null,
         remoteDeletedAt: null,
         folderPath: ON_SERVER_FOLDER,
         ...(cutoff ? { createdAt: { lt: cutoff } } : {}),
         remotePurgeTries: { lt: MAX_TRIES },
-        flagged: false,
       },
       orderBy: { createdAt: 'asc' },
       take: limit,
@@ -471,12 +471,10 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
       where: {
         id: { in: ids },
         accountId: account.id,
-        deletedAt: null,
         remoteDeletedAt: null,
         folderPath: ON_SERVER_FOLDER,
         ...(cutoff ? { createdAt: { lt: cutoff } } : {}),
         remotePurgeTries: { lt: MAX_TRIES },
-        flagged: false,
       },
       select: CANDIDATE_FIELDS,
     })) as CandidateRow[];
@@ -586,9 +584,15 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
           else checked.push(row);
         }
         if (unchecked.length) {
+          // Считаем и это попыткой: письмо, которое проверку не проходит, не должно вечно
+          // висеть в очереди «можно убрать» — после трёх заходов оно честно попадает
+          // в «не удалось» с причиной.
           await this.prisma.mailMessage.updateMany({
             where: { id: { in: unchecked.map((u) => u.id) } },
-            data: { remotePurgeError: `копия у нас не подтверждена: ${unchecked[0].reason}` },
+            data: {
+              remotePurgeTries: { increment: 1 },
+              remotePurgeError: `копия у нас не подтверждена: ${unchecked[0].reason}`,
+            },
           });
           stat.errors.push(`${folderPath}: ${unchecked.length} писем не проверены — копию у провайдера не трогаем`);
           this.logger.warn(

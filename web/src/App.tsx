@@ -1421,10 +1421,10 @@ function MailPurgePanel({ hasAccounts }: { hasAccounts: boolean }) {
           {excluded && (
             <div className="copy">
               За проход убираем не больше {plan.perRun} писем на ящик — поэтому «можно убрать» это
-              очередь целиком, а не то, что уйдёт сейчас. Не подлежат удалению никогда: помеченные
-              звёздочкой — {excluded.flagged}, письма от провайдеров доступа (коды входа и оповещения) — {excluded.protectedSender},
-              наши собственные отправки — {excluded.localOnly}, свежие (карантин {plan.quarantineHours} ч) — {excluded.quarantined},
-              не удалось — {excluded.failed}. Уже убрано раньше — {excluded.alreadyPurged}.
+              очередь целиком, а не то, что уйдёт сейчас. Копия остаётся у провайдера только у тех
+              писем, которые не прошли проверку (нет байтов у нас или не сошлись координаты) — таких
+              {excluded.failed}; у наших собственных отправлений серверной копии нет вовсе — {excluded.localOnly};
+              свежие (карантин {plan.quarantineHours} ч) — {excluded.quarantined}. Уже убрано — {excluded.alreadyPurged}.
             </div>
           )}
           {plan.accounts[0]?.samples.length ? (
