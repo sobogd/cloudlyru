@@ -648,48 +648,6 @@ export const latestUnzip = (entryId: string) =>
   request<UnzipJob | null>(`/unzip?entryId=${encodeURIComponent(entryId)}`);
 export const cancelUnzip = (id: string) => request<UnzipJob>(`/unzip/${id}/cancel`, { method: 'POST' });
 
-// ===== почта: чистка сервера =====
-export interface MailPurgeExclusions {
-  quarantined: number;
-  protectedSender: number;
-  localOnly: number;
-  failed: number;
-  alreadyPurged: number;
-}
-export interface MailPurgePlanAccount {
-  accountId: string;
-  email: string;
-  total: number;
-  candidates: number;
-  eligible: number;
-  remaining: number;
-  oldest: string | null;
-  newest: string | null;
-  excluded: MailPurgeExclusions;
-  samples: Array<{ subject: string | null; from: string | null; receivedAt: string }>;
-}
-export interface MailPurgePlan {
-  dryRun: true;
-  enabled: boolean;
-  quarantineHours: number;
-  perRun: number;
-  accounts: MailPurgePlanAccount[];
-  blocked: string | null;
-}
-export interface MailPurgeReport {
-  enabled: boolean;
-  purged: number;
-  failed: number;
-  trashSwept: number;
-  accounts: Array<{ email: string; purged: number; failed: number; trashSwept: number; errors: string[] }>;
-}
-/** Отчёт по удалению копий с сервера: ничего не меняет. */
-export const mailPurgePlan = (limit?: number) =>
-  request<MailPurgePlan>(`/mail/purge/plan${limit ? `?limit=${limit}` : ''}`);
-/** Удалить копии с сервера. Без confirm ручка откажется работать. */
-export const mailPurgeRun = (body: { confirm: true; limit?: number }) =>
-  request<MailPurgeReport>('/mail/purge/run', { method: 'POST', body: JSON.stringify(body) });
-
 // ===== почта =====
 export interface MailAccountRow {
   id: string;
@@ -715,30 +673,6 @@ export interface MailStatusView {
   }>;
 }
 export const mailAccounts = () => request<MailAccountRow[]>('/mail/accounts');
-export const mailAddAccount = (body: {
-  kind: string;
-  email: string;
-  password?: string;
-  imapHost?: string;
-  smtpHost?: string;
-  smtpPort?: string;
-  smtpLogin?: string;
-  smtpPassword?: string;
-}) => request<MailAccountRow>('/mail/accounts', { method: 'POST', body: JSON.stringify(body) });
-export const mailPatchAccount = (
-  id: string,
-  body: {
-    enabled?: boolean;
-    password?: string;
-    kind?: string;
-    smtpHost?: string;
-    smtpPort?: string;
-    smtpLogin?: string;
-    smtpPassword?: string;
-  },
-) => request<MailAccountRow>(`/mail/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
-export const mailDeleteAccount = (id: string) =>
-  request<{ ok: boolean }>(`/mail/accounts/${id}`, { method: 'DELETE' });
 export const mailSync = () => request<{ ok: boolean; started: boolean }>('/mail/sync', { method: 'POST' });
 export const mailStatus = () => request<MailStatusView>('/mail/status');
 

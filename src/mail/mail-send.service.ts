@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import MailComposer from 'nodemailer/lib/mail-composer';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
+import { AuthService } from '../auth/auth.service';
 import { badRequest, notFound } from '../common/errors';
 import { MailAccountsService, type MailAccountRow } from './mail-accounts.service';
 import { MailIngestService, uidOfMessageId } from './mail-ingest.service';
@@ -57,6 +58,7 @@ export class MailSendService {
     private readonly accounts: MailAccountsService,
     private readonly ingest: MailIngestService,
     private readonly s3: S3Service,
+    private readonly auth: AuthService,
   ) {}
 
   /**
@@ -209,20 +211,18 @@ export class MailSendService {
   ): Promise<Array<{ filename: string; content: Buffer; contentType: string }>> {
     const ids = [...new Set(entryIds)].slice(0, MAX_ATTACHMENTS);
     if (!ids.length) return [];
-    const entries = await this.prisma.fileEntry.findMany({
-      where: { id: { in: ids }, deletedAt: null },
-      select: { id: true, name: true, asset: { select: { sha256: true, mime: true } } },
-    });
     const out: Array<{ filename: string; content: Buffer; contentType: string }> = [];
     let total = 0;
-    for (const entry of entries) {
-      // Проверку владельца делает вызывающий: сюда попадают id из письма, а письмо уже своё
+    for (const id of ids) {
+      // Свой ли это файл: чужой id (или удалённый) неотличим от несуществующего —
+      // иначе можно было бы приложить к письму файлы другого пользователя по подбору id.
+      const entry = await this.auth.ownEntry(userId, id);
+      if (!entry) throw notFound('attachment not found');
       const content = await this.s3.getObjectBytes(S3Service.assetKey(entry.asset.sha256));
       total += content.length;
       if (total > MAX_MESSAGE_BYTES) throw badRequest('вложения не помещаются в письмо', 'mail_too_large');
       out.push({ filename: entry.name, content, contentType: entry.asset.mime });
     }
-    void userId;
     return out;
   }
 
@@ -242,6 +242,7 @@ export class MailSendService {
         subject: true,
         fromName: true,
         fromAddr: true,
+        replyTo: true,
         toAddrs: true,
         ccAddrs: true,
         sortAt: true,
@@ -253,8 +254,9 @@ export class MailSendService {
 
     const self = message.account.email.toLowerCase();
     const baseSubject = (message.subject ?? '').replace(/^((re|fwd?|fw|ответ|пересл)\s*(\[\d+\])?\s*:\s*)+/i, '').trim();
-    const from = message.fromAddr ?? '';
-    const quoteHeader = `${new Date(message.sortAt).toLocaleString('ru-RU')}, ${message.fromName || from}:`;
+    // Отвечать нужно на Reply-To, а не на From: так просит отправитель (рассылки, поддержка).
+    const targetAddr = (message.replyTo || message.fromAddr || '').trim();
+    const quoteHeader = `${quoteDate(message.sortAt)}, ${message.fromName || message.fromAddr || ''}:`;
     const quoted = await this.quotedText(userId, id);
 
     if (mode === 'forward') {
@@ -269,16 +271,29 @@ export class MailSendService {
       };
     }
 
-    // «Ответить» — только отправителю; «ответить всем» — ещё и остальным получателям.
+    // «Ответить» — только отправителю (Reply-To, если есть); «ответить всем» — ещё и остальным
+    // получателям, при этом исходные копии остаются копиями, а не превращаются в основных.
     // Себя в списке быть не должно: иначе копия ответа придёт себе же.
-    const others = (mode === 'replyAll' ? [...message.toAddrs, ...message.ccAddrs] : [])
-      .map((a) => a.trim())
-      .filter((a) => a && a.toLowerCase() !== self);
-    const to = from && from.toLowerCase() !== self ? [from, ...others] : others;
+    const to: string[] = [];
+    const cc: string[] = [];
+    if (targetAddr && targetAddr.toLowerCase() !== self) to.push(targetAddr);
+    if (mode === 'replyAll') {
+      for (const a of message.toAddrs) {
+        const x = a.trim();
+        if (x && x.toLowerCase() !== self) to.push(x);
+      }
+      for (const a of message.ccAddrs) {
+        const x = a.trim();
+        if (x && x.toLowerCase() !== self) cc.push(x);
+      }
+    }
+    const uniq = (list: string[]) => [...new Set(list.map((s) => s.trim()).filter(Boolean))];
+    const toFinal = uniq(to);
+    const ccFinal = uniq(cc).filter((a) => !toFinal.some((t) => t.toLowerCase() === a.toLowerCase()));
     return {
       accountId: message.account.id,
-      to: [...new Set(to)].join(', '),
-      cc: '',
+      to: toFinal.join(', '),
+      cc: ccFinal.join(', '),
       subject: `Re: ${baseSubject}`.trim(),
       body: `\n\n${quoteHeader}\n${quoted.split('\n').map((l) => `> ${l}`).join('\n')}`,
       inReplyToId: message.id,
@@ -313,6 +328,17 @@ export function parseAddressList(raw: string): string[] {
       return (angle ? angle[1] : s).trim();
     })
     .filter((s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s));
+}
+
+/**
+ * Дата цитаты ответа. Формируем её сами в UTC, а не через `toLocaleString`:
+ * последний рендерит в таймзоне сервера, и у клиента в другой таймзоне цитата
+ * показывала бы неверное время.
+ */
+function quoteDate(at: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const d = new Date(at);
+  return `${pad(d.getUTCDate())}.${pad(d.getUTCMonth() + 1)}.${d.getUTCFullYear()}, ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
 }
 
 

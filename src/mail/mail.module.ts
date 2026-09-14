@@ -7,7 +7,6 @@ import { MailController } from './mail.controller';
 import { MailAccountsService } from './mail-accounts.service';
 import { MailFeedService } from './mail-feed.service';
 import { MailIngestService } from './mail-ingest.service';
-import { MailPurgeService } from './mail-purge.service';
 import { MailSendService } from './mail-send.service';
 import { MailSyncService } from './mail-sync.service';
 
@@ -26,8 +25,7 @@ import { MailSyncService } from './mail-sync.service';
     MailIngestService,
     MailSyncService,
     MailSendService,
-    MailPurgeService,
   ],
-  exports: [MailAccountsService, MailFeedService, MailSyncService, MailSendService, MailPurgeService],
+  exports: [MailAccountsService, MailFeedService, MailSyncService, MailSendService],
 })
 export class MailModule {}

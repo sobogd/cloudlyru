@@ -7,7 +7,6 @@ import {
   Flag,
   Forward,
   LoaderCircle,
-  MailOpen,
   Paperclip,
   PenSquare,
   RefreshCw,
@@ -151,14 +150,8 @@ export default function MailSection({
   const [scrub, setScrub] = useState<{ top: number; h: number; monthKey: string | undefined }>({ top: 0, h: 24, monthKey: undefined });
   const [scrubVisible, setScrubVisible] = useState(false);
   const [busy, setBusy] = useState(false);
-  /** Аккаунты — для выбора «откуда», фильтра ленты и ответа/пересылки. */
+  /** Аккаунты — для подписи «откуда письмо» и ответа/пересылки. */
   const [accounts, setAccounts] = useState<api.MailAccountRow[]>([]);
-  /**
-   * Фильтр по ящику: пусто — все письма вместе. Разделение появилось, когда к личным
-   * ящикам добавился рабочий: в общей ленте непонятно, откуда письмо, и рабочие коды
-   * подтверждения мешаются с личной почтой.
-   */
-  const [account, setAccount] = useState<string>(saved?.account ?? '');
   /** Открытая форма письма: null — закрыта, {} — новое, {...} — заготовка ответа или пересылки. */
   const [composer, setComposer] = useState<{ initial: Partial<MailDraft> | null } | null>(null);
 
@@ -188,36 +181,39 @@ export default function MailSection({
   /** Список писем выбранной папки: число и индекс по месяцам — одним заходом. */
   const loadCounters = useCallback(async () => {
     try {
-      const [n, m] = await Promise.all([api.mailCount(box, account), api.mailMonths(box, account)]);
+      const [n, m] = await Promise.all([api.mailCount(box), api.mailMonths(box)]);
       setTotal(n);
       totalRef.current = n;
       setMonths(m);
+      setError('');
       return n;
     } catch (e) {
-      setError((e as Error).message);
+      // Фоновый сбой (полл, возврат на вкладку) при уже показанном списке не пугает баннером:
+      // данные остаются, следующий проход перечитает. Баннер — только когда списка нет вовсе.
+      if (totalRef.current == null) setError((e as Error).message);
       return null;
     }
-  }, [box, account]);
+  }, [box]);
 
   useEffect(() => {
     api.mailAccounts().then(setAccounts).catch(() => undefined);
   }, []);
 
-  // Выбранную папку и ящик запоминаем сразу, не дожидаясь прокрутки: позицию внутри
+  // Выбранную папку запоминаем сразу, не дожидаясь прокрутки: позицию внутри
   // списка при этом не трогаем — её пишет persist при скролле.
   useEffect(() => {
     const cur = readUi().mail ?? {};
-    patchUi({ mail: { ...cur, box, account } });
-  }, [box, account]);
+    patchUi({ mail: { ...cur, box } });
+  }, [box]);
 
   useEffect(() => {
-    // Смена папки или ящика — другой список: старые строки не подходят по индексам.
+    // Смена папки — другой список: старые строки не подходят по индексам.
     setItems(new Map());
     setTotal(null);
     totalRef.current = null;
     restoredRef.current = false;
     void loadCounters();
-  }, [box, account, loadCounters]);
+  }, [box, loadCounters]);
 
   // Измеряем высоту окна прокрутки: от неё зависит, сколько строк просить.
   useLayoutEffect(() => {
@@ -255,7 +251,7 @@ export default function MailSection({
           const len = Math.min(FETCH_CHUNK, e - off + 1);
           const seq = ++seqRef.current;
           try {
-            const page = await api.mailRange(box, off, len, account);
+            const page = await api.mailRange(box, off, len);
             if (seq !== seqRef.current) return; // список успели перечитать — данные устарели
             setItems((prev) => {
               const next = new Map(prev);
@@ -268,7 +264,7 @@ export default function MailSection({
         }
       }
     },
-    [box, account],
+    [box],
   );
   const fetchRangeRef = useRef(fetchRange);
   fetchRangeRef.current = fetchRange;
@@ -334,9 +330,9 @@ export default function MailSection({
     const open = openIdRef.current;
     persistTimer.current = window.setTimeout(() => {
       persistTimer.current = null;
-      patchUi({ mail: { box, account, index, scrollTop: top, openId: open } });
+      patchUi({ mail: { box, index, scrollTop: top, openId: open } });
     }, 400);
-  }, [box, account]);
+  }, [box]);
 
   const showScrub = useCallback(() => {
     setScrubVisible(true);
@@ -420,22 +416,41 @@ export default function MailSection({
   // Новые письма приходят сами: пока раздел открыт, тихо перечитываем число и первые строки.
   useEffect(() => {
     const t = window.setInterval(async () => {
+      const prev = totalRef.current;
       const n = await loadCounters();
-      if (n != null && n !== totalRef.current) {
-        // число изменилось — письма сдвинулись: перечитываем видимый кусок целиком
+      if (n != null && n !== prev) {
+        const el = scrollRef.current;
+        // Новые письма встают сверху и сдвигают все индексы. Сдвигаем позицию скролла на
+        // число новых строк, чтобы под курсором остались те же письма, а не «прыгнули».
+        if (el && prev != null && n > prev) el.scrollTop += (n - prev) * ROW_H;
         setItems(new Map());
         itemsRef.current = new Map();
-        const el = scrollRef.current;
         if (el) void fetchRangeRef.current(Math.max(0, Math.floor(el.scrollTop / ROW_H) - OVERSCAN), Math.floor(el.scrollTop / ROW_H) + OVERSCAN + 20);
       }
     }, POLL_MS);
     return () => window.clearInterval(t);
   }, [loadCounters]);
 
+  /** Ждём конца серверного прохода синхронизации (или выходим по таймауту). */
+  const waitForSync = async () => {
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const s = await api.mailStatus();
+        if (!s.accounts.some((a) => a.status === 'syncing')) return;
+      } catch {
+        return;
+      }
+    }
+  };
+
   const refresh = async () => {
     setBusy(true);
     try {
       await api.mailSync();
+      // Проход асинхронный: сразу читать счётчики бессмысленно (они ещё старые). Ждём его
+      // конца, чтобы кнопка «Проверить» действительно показывала свежую почту.
+      await waitForSync();
       setItems(new Map());
       itemsRef.current = new Map();
       await loadCounters();
@@ -530,26 +545,6 @@ export default function MailSection({
         </button>
       </div>
 
-      {/* Фильтр по ящику: «Все» плюс по кнопке на аккаунт. Показываем только когда ящиков
-          больше одного — при одном это была бы лишняя строка. */}
-      {accounts.length > 1 && (
-        <div className="mailfilters">
-          <button className={'mailchip' + (account === '' ? ' active' : '')} onClick={() => setAccount('')}>
-            Все ящики
-          </button>
-          {accounts.map((a) => (
-            <button
-              key={a.id}
-              className={'mailchip ' + accountTone(a.id) + (account === a.id ? ' active' : '')}
-              onClick={() => setAccount(a.id)}
-              title={a.email}
-            >
-              {a.email}
-            </button>
-          ))}
-        </div>
-      )}
-
       <div className="mscroll-wrap">
         <div className="mscroll" ref={scrollRef} onScroll={onScroll}>
           {error && <div className="err" style={{ padding: '8px 4px' }}>{error}</div>}
@@ -579,11 +574,9 @@ export default function MailSection({
                       <span className="mailmain">
                         <span className="mailtop">
                           <span className="mailwho">{senderOf(row.item)}</span>
-                          {accounts.length > 1 && (
-                            <span className={'mailacc ' + accountTone(row.item.accountId)}>
-                              {accountTag(row.item.accountEmail, accounts)}
-                            </span>
-                          )}
+                          <span className={'mailacc ' + accountTone(row.item.accountId)}>
+                            {accountTag(row.item.accountEmail, accounts)}
+                          </span>
                           <span className="maildate">{listDate(row.item.sortAt)}</span>
                         </span>
                         <span className="mailsubj">{row.item.subject || '(без темы)'}</span>
@@ -661,6 +654,7 @@ export default function MailSection({
           prev={() => neighbour(-1)}
           next={() => neighbour(1)}
           onNav={(id) => setOpenId(id)}
+          keyboardActive={!composer}
         />
       )}
     </div>
@@ -689,6 +683,7 @@ export function MailViewer({
   onNav,
   onReply,
   renderFileDetail,
+  keyboardActive = true,
 }: {
   id: string;
   onClose: () => void;
@@ -699,12 +694,13 @@ export function MailViewer({
   next: () => string | null;
   onNav: (id: string) => void;
   renderFileDetail?: (entryId: string, onClose: () => void) => ReactNode;
+  /** Клавиши вьювера (стрелки, Escape) работают только когда он верхняя модалка. */
+  keyboardActive?: boolean;
 }) {
   /** Открытая деталка вложения: показывается вместо письма, «назад» возвращает к письму. */
   const [openEntry, setOpenEntry] = useState<string | null>(null);
   const [msg, setMsg] = useState<api.MailMessageView | null>(null);
   const [body, setBody] = useState<{ html: string; blockedRemote: number; kind: 'html' | 'text' } | null>(null);
-  const [images, setImages] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -713,7 +709,6 @@ export function MailViewer({
     let stopped = false;
     setMsg(null);
     setBody(null);
-    setImages(false);
     setError('');
     api
       .mailMessage(id)
@@ -735,17 +730,21 @@ export function MailViewer({
 
   useEffect(() => {
     let stopped = false;
+    // Картинки показываем сразу: отдельной кнопки «показать изображения» больше нет.
     api
-      .mailBody(id, images)
+      .mailBody(id, true)
       .then((b) => !stopped && setBody(b))
       .catch((e) => !stopped && setError((e as Error).message));
     return () => {
       stopped = true;
     };
-  }, [id, images]);
+  }, [id]);
 
   // Листание вверх/вниз по ленте: стрелки и клавиши, как в просмотрщике «Медиа».
   useEffect(() => {
+    // Пока поверх письма открыта форма ответа, клавиши вьювера не работают: иначе стрелки
+    // в textarea одновременно листали бы письмо внизу, а Escape закрывал бы не то окно.
+    if (!keyboardActive) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
       if (e.key === 'ArrowDown' || e.key === 'j') {
@@ -759,7 +758,7 @@ export function MailViewer({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [next, prev, onClose, onNav]);
+  }, [keyboardActive, next, prev, onClose, onNav]);
 
   const toggleFlag = async () => {
     if (!msg) return;
@@ -861,25 +860,18 @@ export function MailViewer({
               </div>
             </div>
 
-            {body && body.blockedRemote > 0 && !images && (
-              <div className="mailimages">
-                <button className="btn" onClick={() => setImages(true)}>
-                  <MailOpen size={16} /> показать картинки ({body.blockedRemote})
-                </button>
-                <span className="copy">Внешние картинки не загружены: по ним отправитель узнаёт, что письмо открыли</span>
-              </div>
-            )}
-
             <div className="mailbody">
               {!body && <div className="mv-load"><span className="spin" /></div>}
               {body && (
                 <iframe
                   className="mailframe"
                   title="Письмо"
-                  // allow-same-origin нужен, чтобы в теле работали наши же ссылки на вложения;
+                  // allow-same-origin нет намеренно: без него iframe получает непрозрачный origin
+                  // и не может тронуть cookie/локальное хранилище нашего домена, даже если сюда
+                  // когда-нибудь добавят allow-scripts. Вложения в теле — data:-URI (self-contained),
+                  // а внешние ссылки абсолютные, поэтому same-origin телу не нужен.
                   // allow-popups — чтобы переход по ссылке из письма открывал новую вкладку.
-                  // allow-scripts нет намеренно: разметка письма не должна исполняться.
-                  sandbox="allow-same-origin allow-popups"
+                  sandbox="allow-popups"
                   referrerPolicy="no-referrer"
                   srcDoc={body.html}
                 />
@@ -1016,6 +1008,15 @@ export function MailComposer({
   }, [accountId, to, cc, subject, text, attachments, draft?.inReplyToId]);
 
   useEffect(() => () => writeDraft(draftRef.current()), []);
+
+  // Escape закрывает форму (черновик сохраняется при размонтировании).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
   const send = async () => {
     setBusy(true);

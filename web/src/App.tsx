@@ -5,7 +5,7 @@ import {
   CircleAlert, CircleCheck, CircleX, Clock, Cloud, Copy, Eraser, FileText, Film, Folder,
   FolderOpen, Image as ImageIcon, ImagePlay, Images, Info, KeyRound, Link2, LoaderCircle, Lock,
   MailOpen, Map as MapIcon, Package,
-  Pause, Pencil, Play, Plus, RefreshCw, Scissors, Server, Settings as SettingsIcon, Trash, Upload,
+  Pause, Pencil, Play, RefreshCw, Scissors, Settings as SettingsIcon, Trash, Upload,
   UserRound, X,
 } from 'lucide-react';
 import { Mail as MailIcon } from 'lucide-react';
@@ -1153,29 +1153,13 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
 
 // ================= Почта: аккаунты =================
 /**
- * Почтовые аккаунты в настройках. Полноценный раздел «Почта» — отдельная вкладка; здесь
- * только то, без чего он не заработает: добавить аккаунт с паролем приложения, выключить
- * его, удалить и запустить проверку почты руками.
- *
- * Пароль уходит на сервер один раз, там проверяется живым подключением к IMAP и шифруется —
- * обратно в браузер он не возвращается никогда (в списке аккаунтов его нет).
+ * Почтовые аккаунты в настройках. Только чтение: аккаунты заведены на сервере один раз
+ * и из приложения не редактируются — здесь видно их статус и можно запустить проверку почты.
  */
 function MailAccountsPanel() {
   const [rows, setRows] = useState<api.MailAccountRow[]>([]);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({
-    kind: 'gmail',
-    email: '',
-    password: '',
-    imapHost: '',
-    smtpHost: '',
-    smtpPort: '',
-    smtpLogin: '',
-    smtpPassword: '',
-  });
-  const [open, setOpen] = useState(false);
 
   const load = async () => {
     try {
@@ -1190,52 +1174,6 @@ function MailAccountsPanel() {
     const t = setInterval(() => { void load(); }, syncing ? 3000 : 20000);
     return () => clearInterval(t);
   }, [syncing]);
-
-  const add = async () => {
-    setBusy(true);
-    setErr('');
-    try {
-      await api.mailAddAccount({
-        kind: form.kind,
-        email: form.email.trim(),
-        password: form.password,
-        ...(form.kind === 'imap' ? { imapHost: form.imapHost.trim(), smtpHost: form.smtpHost.trim() } : {}),
-        ...(form.kind === 'smtp'
-          ? {
-              smtpHost: form.smtpHost.trim(),
-              smtpPort: form.smtpPort.trim(),
-              smtpLogin: form.smtpLogin.trim(),
-              smtpPassword: form.smtpPassword,
-            }
-          : {}),
-      });
-      setForm({ ...form, email: '', password: '', imapHost: '', smtpHost: '', smtpPort: '', smtpLogin: '', smtpPassword: '' });
-      setOpen(false);
-      setNotice('Аккаунт добавлен, почта забирается');
-      await load();
-    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
-  };
-
-  /** Переезд аккаунта на свой сервер: приём делает Postfix, отправка идёт через релей. */
-  const migrate = async (r: api.MailAccountRow) => {
-    const smtpHost = prompt('SMTP-сервер для отправки (например smtp-relay.brevo.com)', 'smtp-relay.brevo.com');
-    if (!smtpHost) return;
-    const smtpLogin = prompt('SMTP-логин из панели релея (вида 1234567@smtp-brevo.com)');
-    if (!smtpLogin) return;
-    const smtpPassword = prompt('SMTP-ключ (xkeysib-…)');
-    if (!smtpPassword) return;
-    setBusy(true);
-    setErr('');
-    try {
-      await api.mailPatchAccount(r.id, { kind: 'smtp', smtpHost, smtpPort: '587', smtpLogin, smtpPassword });
-      setNotice(`${r.email} переведён на свой сервер: принимает Postfix, отправляет ${smtpHost}`);
-      await load();
-    } catch (e) {
-      setErr((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const statusText = (r: api.MailAccountRow) => {
     if (!r.enabled) return 'выключен';
@@ -1258,201 +1196,8 @@ function MailAccountsPanel() {
           <span className="icon"><MailIcon /></span>
           <span className="fname">{r.email}</span>
           <span className="meta">{r.counts.inbox} вх · {r.counts.sent} исх · {statusText(r)}</span>
-          <button
-            className="btn ghost"
-            title={r.enabled ? 'Выключить' : 'Включить'}
-            onClick={async () => { await api.mailPatchAccount(r.id, { enabled: !r.enabled }).catch((e) => setErr((e as Error).message)); await load(); }}
-          >{r.enabled ? <Pause size={16} /> : <Play size={16} />}</button>
-          {r.kind !== 'smtp' && (
-            <button className="btn ghost" title="Перевести на свой сервер (приём у нас, отправка через релей)" onClick={() => void migrate(r)}>
-              <Server size={16} />
-            </button>
-          )}
-          <button
-            className="btn ghost"
-            title="Удалить аккаунт"
-            onClick={async () => {
-              if (!confirm(`Удалить ${r.email}? Письма этого аккаунта уйдут из базы (вложения останутся в «Почте»).`)) return;
-              await api.mailDeleteAccount(r.id).catch((e) => setErr((e as Error).message));
-              await load();
-            }}
-          ><Ban size={16} /></button>
         </div>
       ))}
-      {!rows.length && !open && <div className="copy">Аккаунтов нет — добавь почтовый ящик, письма будут храниться здесь</div>}
-      <MailPurgePanel hasAccounts={rows.length > 0} />
-      {open ? (
-        <div className="panel" style={{ background: 'var(--surface-2)' }}>
-          <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}>
-            <option value="gmail">Gmail / Google Workspace</option>
-            <option value="icloud">iCloud Mail</option>
-            <option value="imap">Другой IMAP-сервер</option>
-            <option value="smtp">Свой сервер: приём у нас, отправка через релей</option>
-          </select>
-          <input placeholder="адрес почты" autoComplete="off" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
-          {form.kind !== 'smtp' && (
-            <input
-              placeholder="пароль приложения"
-              type="password"
-              autoComplete="new-password"
-              value={form.password}
-              onChange={(e) => setForm({ ...form, password: e.target.value })}
-            />
-          )}
-          {form.kind === 'imap' && (
-            <>
-              <input placeholder="IMAP-сервер (imap.example.com)" value={form.imapHost} onChange={(e) => setForm({ ...form, imapHost: e.target.value })} />
-              <input placeholder="SMTP-сервер (smtp.example.com)" value={form.smtpHost} onChange={(e) => setForm({ ...form, smtpHost: e.target.value })} />
-            </>
-          )}
-          {form.kind === 'smtp' && (
-            <>
-              {/* Приём делает наш Postfix — пароля ящика тут нет вовсе. Спрашиваем только
-                  релей для отправки; можно оставить пустым, тогда аккаунт только принимает. */}
-              <input placeholder="SMTP-сервер для отправки (smtp-relay.brevo.com)" value={form.smtpHost} onChange={(e) => setForm({ ...form, smtpHost: e.target.value })} />
-              <input placeholder="SMTP-порт (587)" value={form.smtpPort} onChange={(e) => setForm({ ...form, smtpPort: e.target.value })} />
-              <input placeholder="SMTP-логин (например 1234567@smtp-brevo.com)" value={form.smtpLogin} onChange={(e) => setForm({ ...form, smtpLogin: e.target.value })} />
-              <input
-                placeholder="SMTP-ключ (xkeysib-…)"
-                type="password"
-                autoComplete="new-password"
-                value={form.smtpPassword}
-                onChange={(e) => setForm({ ...form, smtpPassword: e.target.value })}
-              />
-              <div className="copy">
-                Приём писем настраивается на сервере (Postfix → приложение) и работает независимо от этих полей.
-                Пусто — аккаунт будет только принимать.
-              </div>
-            </>
-          )}
-          <div className="copy">
-            Нужен пароль приложения, а не обычный пароль: у Google — «Пароли приложений» (нужна 2FA),
-            у Apple — appleid.apple.com → Вход и безопасность. Пробелы и дефисы можно не убирать.
-          </div>
-          <div className="row">
-            <button className="btn" onClick={add} disabled={busy || !form.email || !form.password}>{busy ? 'Проверяем…' : 'Добавить'}</button>
-            <button className="btn ghost" onClick={() => { setOpen(false); setErr(''); }}><X size={16} /></button>
-          </div>
-        </div>
-      ) : (
-        <div className="row"><button className="btn" onClick={() => setOpen(true)}><Plus /> аккаунт</button></div>
-      )}
-    </div>
-  );
-}
-
-/**
- * Очистка сервера: удаление копий писем у провайдера после того, как они лежат у нас.
- *
- * Единственная необратимая операция в разделе, поэтому здесь всё построено на «сначала
- * посмотри»: сначала отчёт (сколько писем попадёт под удаление и почему остальные нет),
- * потом удаление с подтверждением, и отдельная кнопка «удалить одно письмо» — чтобы
- * проверить механику на живом ящике, не удаляя сразу сотни писем.
- */
-function MailPurgePanel({ hasAccounts }: { hasAccounts: boolean }) {
-  const [plan, setPlan] = useState<api.MailPurgePlan | null>(null);
-  const [report, setReport] = useState<api.MailPurgeReport | null>(null);
-  const [err, setErr] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  const loadPlan = async () => {
-    setBusy(true);
-    setErr('');
-    try {
-      setPlan(await api.mailPurgePlan());
-    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
-  };
-
-  const run = async (limit?: number) => {
-    const what = limit ? `${limit} письмо` : `до ${plan?.perRun ?? 200} писем`;
-    if (!confirm(`Удалить ${what} с сервера аккаунта безвозвратно?\n\nУ нас они останутся, но у провайдера копий больше не будет.`)) return;
-    setBusy(true);
-    setErr('');
-    try {
-      setReport(await api.mailPurgeRun({ confirm: true, ...(limit ? { limit } : {}) }));
-      setPlan(await api.mailPurgePlan());
-    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
-  };
-
-  const totalCandidates = plan?.accounts.reduce((s, a) => s + a.candidates, 0) ?? 0;
-  const excluded = plan?.accounts.reduce(
-    (acc, a) => ({
-      quarantined: acc.quarantined + a.excluded.quarantined,
-      flagged: acc.flagged + a.excluded.flagged,
-      protectedSender: acc.protectedSender + a.excluded.protectedSender,
-      alreadyPurged: acc.alreadyPurged + a.excluded.alreadyPurged,
-      failed: acc.failed + a.excluded.failed,
-      localOnly: acc.localOnly + a.excluded.localOnly,
-    }),
-    { quarantined: 0, flagged: 0, protectedSender: 0, alreadyPurged: 0, failed: 0, localOnly: 0 },
-  );
-
-  return (
-    <div className="panel" style={{ background: 'var(--surface-2)' }}>
-      <div className="row">
-        <strong>Очистка сервера</strong>
-        <button className="btn" onClick={() => void loadPlan()} disabled={busy || !hasAccounts}>
-          {busy ? <LoaderCircle className="spin" size={16} /> : 'Показать отчёт'}
-        </button>
-      </div>
-      <div className="copy">
-        Письма хранятся у нас; копии у Gmail и iCloud можно убрать. Операция необратимая,
-        поэтому сначала отчёт, потом удаление — и только порциями.
-      </div>
-      {plan && !plan.enabled && (
-        <div className="notice">Удаление выключено на сервере (MAIL_PURGE_ENABLED=false) — отчёт можно смотреть, удалять нельзя</div>
-      )}
-      {plan?.blocked && <div className="err">Предохранитель: {plan.blocked}</div>}
-      {plan && (
-        <>
-          {plan.accounts.map((a) => (
-            <div className="item" key={a.accountId} style={{ alignItems: 'flex-start' }}>
-              <span className="icon"><MailIcon /></span>
-              <span className="fname" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
-                <span>{a.email}</span>
-                <span className="meta" style={{ whiteSpace: 'normal' }}>
-                  всего {a.total} · уже убрано {a.excluded.alreadyPurged} · можно убрать {a.eligible} ·
-                  не подлежит удалению {a.remaining}
-                  {a.oldest && a.newest ? ` · письма с ${new Date(a.oldest).toLocaleDateString('ru-RU')} по ${new Date(a.newest).toLocaleDateString('ru-RU')}` : ''}
-                </span>
-              </span>
-            </div>
-          ))}
-          {excluded && (
-            <div className="copy">
-              За проход убираем не больше {plan.perRun} писем на ящик — поэтому «можно убрать» это
-              очередь целиком, а не то, что уйдёт сейчас. Копия остаётся у провайдера только у тех
-              писем, которые не прошли проверку (нет байтов у нас или не сошлись координаты) — таких
-              {excluded.failed}; у наших собственных отправлений серверной копии нет вовсе — {excluded.localOnly};
-              свежие (карантин {plan.quarantineHours} ч) — {excluded.quarantined}. Уже убрано — {excluded.alreadyPurged}.
-            </div>
-          )}
-          {plan.accounts[0]?.samples.length ? (
-            <div className="copy">
-              например: {plan.accounts[0].samples.map((s) => s.subject || '(без темы)').join(' · ')}
-            </div>
-          ) : null}
-          {hasAccounts && (
-            <div className="row">
-              <button className="btn danger" onClick={() => void run()} disabled={busy || !plan.enabled || Boolean(plan.blocked) || !totalCandidates}>
-                Удалить с сервера ({totalCandidates})
-              </button>
-              <button className="btn ghost" onClick={() => void run(1)} disabled={busy || !plan.enabled || !totalCandidates}>
-                одно письмо — проверить
-              </button>
-            </div>
-          )}
-        </>
-      )}
-      {report && (
-        <div className="notice">
-          удалено с сервера: {report.purged}
-          {report.trashSwept ? `, добито в мусорке: ${report.trashSwept}` : ''}
-          {report.failed ? `, не получилось: ${report.failed}` : ''}
-          {report.accounts.flatMap((a) => a.errors).slice(0, 2).map((e, i) => <div key={i} className="copy">{e}</div>)}
-        </div>
-      )}
-      {err && <div className="err">{err}</div>}
     </div>
   );
 }

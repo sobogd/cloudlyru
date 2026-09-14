@@ -74,21 +74,24 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
   private async purgeExpiredTrash(): Promise<void> {
     const cutoff = new Date(Date.now() - TRASH_RETENTION_MS);
     // Дешёвый предохранитель перед уборкой: purge() дополнительно сканирует все ассеты
-    // на осиротевшие, и гонять это каждые 6 часов на пустой корзине незачем
-    const [entries, folders] = await Promise.all([
+    // на осиротевшие, и гонять это каждые 6 часов на пустой корзине незачем. Письма — тоже
+    // часть корзины: без них в проверке корзина из одних писем не чистилась бы никогда.
+    const [entries, folders, messages] = await Promise.all([
       this.prisma.fileEntry.count({ where: { deletedAt: { lt: cutoff } } }),
       this.prisma.folder.count({ where: { deletedAt: { lt: cutoff } } }),
+      this.prisma.mailMessage.count({ where: { deletedAt: { lt: cutoff } } }),
     ]);
-    if (!entries && !folders) return;
+    if (!entries && !folders && !messages) return;
 
     const days = Math.round(TRASH_RETENTION_MS / DAY_MS);
     const users = await this.prisma.user.findMany({ select: { id: true } });
     for (const user of users) {
       try {
         const res = await this.trash.purge(user.id, days);
-        if (res.purgedEntries || res.purgedFolders) {
+        if (res.purgedEntries || res.purgedFolders || res.purgedMessages) {
           this.logger.log(
-            `корзина старше ${days} дней: удалено файлов ${res.purgedEntries}, папок ${res.purgedFolders}, объектов ${res.purgedAssets}`,
+            `корзина старше ${days} дней: удалено файлов ${res.purgedEntries}, папок ${res.purgedFolders}, ` +
+              `писем ${res.purgedMessages}, объектов ${res.purgedAssets}`,
           );
         }
       } catch (e) {

@@ -1,25 +1,24 @@
-import { Body, Controller, Delete, Get, Headers, Param, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { MailAccountsService } from './mail-accounts.service';
 import { MailFeedService } from './mail-feed.service';
 import { MailSyncService } from './mail-sync.service';
 import { env } from '../config/env';
 import { MailIngestService } from './mail-ingest.service';
-import { MailPurgeService } from './mail-purge.service';
 import { MailSendService } from './mail-send.service';
 import { S3Service } from '../s3/s3.service';
 import { sendObjectOr404 } from '../common/http-object';
 import { CurrentUser, Public, RateLimit, RequestUser, SessionOnly } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { badRequest } from '../common/errors';
+import { secretEquals } from './mail-crypto';
 
 /**
  * Ручки раздела «Почта».
  *
- * Управление аккаунтами — только веб-сессией (`SessionOnly`): там принимается пароль
- * приложения, и ApiToken устройства (WebDAV, клиент синхронизации) не должен уметь
- * ни добавить аккаунт, ни посмотреть список. Остальные ручки — обычные, читают почту
- * текущего пользователя.
+ * Аккаунты заведены один раз на сервере и из приложения не редактируются: тут только чтение
+ * списка, запуск проверки и работа с письмами. Управление аккаунтами (пароль приложения
+ * принимается только на сервере при первичной настройке) закрыто намеренно.
  *
  * Статические пути объявлены до параметрических: иначе `messages` уехало бы в `:id`.
  */
@@ -30,12 +29,11 @@ export class MailController {
     private readonly feed: MailFeedService,
     private readonly sync: MailSyncService,
     private readonly sender: MailSendService,
-    private readonly purge: MailPurgeService,
     private readonly ingestService: MailIngestService,
     private readonly s3: S3Service,
   ) {}
 
-  // ===== Аккаунты =====
+  // ===== Аккаунты (только чтение) =====
 
   /** Список аккаунтов со статусом синхронизации и числом писем. Паролей тут нет и быть не может. */
   @Get('accounts')
@@ -44,46 +42,9 @@ export class MailController {
     return this.accounts.list(user.id);
   }
 
-  /** Добавить аккаунт: пароль приложения проверяем живым подключением и сразу шифруем. */
-  @Post('accounts')
-  @SessionOnly()
-  @UseGuards(RateLimitGuard)
-  @RateLimit(20, 60_000)
-  addAccount(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
-    return this.accounts.create(user.id, {
-      kind: body.kind,
-      email: body.email,
-      password: body.password,
-      imapHost: body.imapHost,
-      smtpHost: body.smtpHost,
-    });
-  }
-
-  /** Включить/выключить аккаунт или сменить пароль приложения. */
-  @Patch('accounts/:id')
-  @SessionOnly()
-  @UseGuards(RateLimitGuard)
-  @RateLimit(20, 60_000)
-  patchAccount(@Param('id') id: string, @Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
-    return this.accounts.patch(user.id, id, {
-      enabled: body.enabled,
-      password: body.password,
-      kind: body.kind,
-      smtpHost: body.smtpHost,
-      smtpPort: body.smtpPort,
-      smtpLogin: body.smtpLogin,
-      smtpPassword: body.smtpPassword,
-    });
-  }
-
-  @Delete('accounts/:id')
-  @SessionOnly()
-  removeAccount(@Param('id') id: string, @CurrentUser() user: RequestUser) {
-    return this.accounts.remove(user.id, id);
-  }
-
   /** Забрать почту сейчас, не дожидаясь расписания. Проход асинхронный: ответ сразу. */
   @Post('sync')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(30, 60_000)
   async syncNow(@CurrentUser() user: RequestUser) {
@@ -95,6 +56,7 @@ export class MailController {
 
   /** Состояние раздела: сколько непрочитанных и есть ли аккаунты с ошибкой. */
   @Get('status')
+  @SessionOnly()
   async status(@CurrentUser() user: RequestUser) {
     const [unread, accounts] = await Promise.all([this.feed.unread(user.id), this.accounts.list(user.id)]);
     return {
@@ -131,7 +93,7 @@ export class MailController {
     @Res() res: Response,
   ): Promise<void> {
     const expected = env.MAIL_INBOUND_TOKEN;
-    if (!expected || token !== expected) {
+    if (!expected || !secretEquals(token ?? '', expected)) {
       res.status(403).json({ message: 'inbound is not configured or token is wrong' });
       return;
     }
@@ -153,43 +115,11 @@ export class MailController {
     }
     const result = await this.ingestService.ingestInbound(to, source);
     if (result === 'unknown-account') {
-      // Не 404: аккаунт может появиться в приложении через минуту, и тогда письмо доедет.
+      // Не 404: аккаунт могут завести на сервере позже, и тогда письмо доедет повторной доставкой.
       res.status(503).json({ message: `no mail account for ${to}` });
       return;
     }
     res.status(200).json({ ok: true, result });
-  }
-
-  // ===== Чистка сервера =====
-
-  /**
-   * Отчёт по удалению копий с сервера. Ничего не меняет — это прогон «на сухую», и он
-   * обязателен перед удалением: сначала видно, сколько писем попадёт под нож и почему
-   * остальные не попали.
-   */
-  @Get('purge/plan')
-  @SessionOnly()
-  @UseGuards(RateLimitGuard)
-  @RateLimit(30, 60_000)
-  purgePlan(@CurrentUser() user: RequestUser, @Query('limit') limit?: string) {
-    const n = Number(limit);
-    return this.purge.plan(user.id, Number.isFinite(n) && n > 0 ? { limit: n } : {});
-  }
-
-  /**
-   * Удалить копии с сервера. Без `confirm: true` ручка отказывается работать, а без
-   * MAIL_PURGE_ENABLED не делает ничего — удаление необратимо, и это последний порог.
-   */
-  @Post('purge/run')
-  @SessionOnly()
-  @UseGuards(RateLimitGuard)
-  @RateLimit(10, 60_000)
-  purgeRun(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
-    const n = Number(body.limit);
-    return this.purge.run(user.id, {
-      confirm: body.confirm === true,
-      ...(Number.isFinite(n) && n > 0 ? { limit: n } : {}),
-    });
   }
 
   // ===== Отправка =====
@@ -279,7 +209,8 @@ export class MailController {
     return this.feed.body(user.id, id, images === '1');
   }
 
-  /** Сырое письмо файлом: содержимое письма как оно пришло, ничего не потеряно. */  @Get('messages/:id/raw')
+  /** Сырое письмо файлом: содержимое письма как оно пришло, ничего не потеряно. */
+  @Get('messages/:id/raw')
   async raw(@Param('id') id: string, @CurrentUser() user: RequestUser, @Req() req: Request, @Res() res: Response) {
     const { key, name } = await this.feed.rawKey(user.id, id);
     await sendObjectOr404(req, res, this.s3, key, {

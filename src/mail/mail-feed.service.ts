@@ -22,8 +22,6 @@ import type { MailBox } from './mail-accounts.service';
 const PREVIEW_CHARS = 200;
 /** Потолок одного среза ленты. */
 export const MAIL_RANGE_MAX = 500;
-/** Потолок числа писем в ответе `get` (защита от письма с сотнями частей). */
-const ATTACHMENTS_MAX = 200;
 
 export interface MailListItem {
   id: string;
@@ -182,7 +180,6 @@ export class MailFeedService {
         account: { select: { email: true } },
         attachments: {
           orderBy: { partIndex: 'asc' },
-          take: ATTACHMENTS_MAX,
           select: {
             id: true,
             entryId: true,
