@@ -82,11 +82,20 @@ jobs:
           # без него отсутствующий секрет экспортировал пустое значение, и оно перебивало
           # то, что записано в .env (dotenv не перезаписывает уже заданные переменные).
           CONVERT_PHOTO_PARALLEL: ${{ secrets.CONVERT_PHOTO_PARALLEL || '2' }}
+          # Почта. Ключ шифрования паролей аккаунтов — обязательный секрет репозитория;
+          # без него раздел работает, но аккаунт добавить нельзя (форма скажет об этом).
+          MAIL_SECRET_KEY: ${{ secrets.MAIL_SECRET_KEY }}
+          # Синхронизация с серверами почты. `|| 'true'` — как у CONVERT_PHOTO_PARALLEL:
+          # без явного секрета берём рабочее значение, а не пустоту.
+          MAIL_SYNC_ENABLED: ${{ secrets.MAIL_SYNC_ENABLED || 'true' }}
+          # Удаление копий с сервера. НЕОБРАТИМО, поэтому по умолчанию выключено и
+          # включается только осознанным секретом репозитория.
+          MAIL_PURGE_ENABLED: ${{ secrets.MAIL_PURGE_ENABLED || 'false' }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL
+          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_PURGE_ENABLED
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -143,6 +152,17 @@ jobs:
             # heif-convert), видео и PDF идут по одному независимо от значения. Значение —
             # из секрета репозитория, если он задан, иначе 2 (сервер двухъядерный).
             CONVERT_PHOTO_PARALLEL=${CONVERT_PHOTO_PARALLEL:-2}
+
+            # ===== Почта =====
+            # Ключ шифрования паролей почтовых аккаунтов (AES-256-GCM). Сами app-пароли
+            # здесь не живут: их вводят в интерфейсе, и они ложатся в БД зашифрованными
+            # этим ключом. Секрет репозитория MAIL_SECRET_KEY.
+            MAIL_SECRET_KEY=$MAIL_SECRET_KEY
+            # Синхронизация по IMAP: выключенная — почта не ходит вообще.
+            MAIL_SYNC_ENABLED=${MAIL_SYNC_ENABLED:-true}
+            # Удаление копий с сервера после того, как письма сохранены у нас.
+            # НЕОБРАТИМО: включать только после проверенного восстановления из бэкапа.
+            MAIL_PURGE_ENABLED=${MAIL_PURGE_ENABLED:-false}
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

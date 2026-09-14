@@ -119,11 +119,21 @@ function load(): Env {
     const missing: string[] = [];
     if (!e.S3_FILES_ACCESS_KEY) missing.push('S3_FILES_ACCESS_KEY');
     if (!e.S3_FILES_SECRET_KEY) missing.push('S3_FILES_SECRET_KEY');
-    // Синхронизация без ключа означала бы пароли аккаунтов в открытом виде в БД, поэтому
-    // это отказ старта, а не предупреждение. При выключенной синхронизации ключ не нужен.
-    if (e.MAIL_SYNC_ENABLED && !e.MAIL_SECRET_KEY) missing.push('MAIL_SECRET_KEY');
     if (missing.length) {
       throw new Error(`[env] production требует: ${missing.join(', ')}`);
+    }
+    // Ключа почты в этом списке намеренно нет. Сначала здесь был отказ старта (пароли
+    // аккаунтов негде хранить — значит, работать нельзя), но у этого решения цена выше
+    // пользы: без ключа падал бы весь сервис, включая файлы и фото, из-за раздела, который
+    // сам по себе необязательный. Поэтому деградируем: синхронизация не запустится
+    // (MailSyncService это проверяет и пишет в лог), а форма добавления аккаунта честно
+    // скажет, чего не хватает.
+    if (e.MAIL_SYNC_ENABLED && !e.MAIL_SECRET_KEY) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[env] MAIL_SYNC_ENABLED=true, но MAIL_SECRET_KEY не задан: синхронизация почты не запустится, ' +
+          'аккаунты добавить нельзя. Задайте секрет репозитория MAIL_SECRET_KEY и перезапустите сервис.',
+      );
     }
   }
   return e;
