@@ -40,11 +40,19 @@ const MAX_TRIES = 3;
  */
 const ON_SERVER_FOLDER = { not: { startsWith: LOCAL_PREFIX } } as const;
 
+/** Пауза перед разбором мусорки: серверу нужно мгновение на отражение переноса. */
+const TRASH_SETTLE_MS = 3000;
+
 /** Порции при разборе мусорки: по столько писем за один FETCH. */
 const TRASH_BATCH = 200;
 
 /** Сколько примеров писем показывать в отчёте. */
 const SAMPLES = 5;
+
+/** Пауза в асинхронном коде: короткая, поэтому обычный таймер. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export interface PurgeExclusions {
   quarantined: number;
@@ -327,6 +335,9 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
         client = await this.openClient(account);
         const purgedIds = await this.purgeAccount(client, account, plan.perRun, stat);
         if (purgedIds.length) {
+          // Перенос в корзину отражается на сервере не мгновенно: без паузы уборка мусорки
+          // смотрит список, где письма ещё нет, и оно остаётся у провайдера до автоочистки.
+          await sleep(TRASH_SETTLE_MS);
           stat.trashSwept = await this.sweepTrash(client, purgedIds).catch((e) => {
             stat.errors.push(`мусорка: ${(e as Error).message}`);
             return 0;
@@ -412,9 +423,11 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
         }
         if (!usable.length) continue;
 
-        const deleted = await client.messageDelete(
+        const deleted = await this.removeFromFolder(
+          client,
+          account,
           usable.map((r) => Number(r.uid)),
-          { uid: true },
+          folderPath,
         );
         if (!deleted) throw new Error('сервер отказал в удалении');
 
@@ -456,6 +469,54 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Убрать письма из папки-источника. Способ зависит от сервера, и это не прихоть:
+   *
+   *   * Gmail не удаляет письма из «Всей почты» — команда проходит, флаг `\Deleted` молча
+   *     игнорируется, и письмо остаётся на месте. Штатный путь у него один: перенос в корзину
+   *     (проверено на живом ящике), откуда письмо добирает уборка мусорки.
+   *   * Остальные серверы (iCloud и обычный IMAP) понимают пометку с вычисткой.
+   *
+   * Если корзина не нашлась, Gmail всё равно пробуем убрать пометкой: пусть не сработает,
+   * но это лучше, чем не попробовать вовсе.
+   */
+  private async removeFromFolder(
+    client: ImapFlow,
+    account: MailAccountRow,
+    uids: number[],
+    folderPath: string,
+  ): Promise<boolean> {
+    if (!uids.length) return true;
+    if (this.isGmail(account)) {
+      const trash = await this.trashPath(client).catch(() => null);
+      if (trash && trash !== folderPath) {
+        const moved = await client.messageMove(uids, trash, { uid: true });
+        return moved !== false;
+      }
+    }
+    return await this.deleteMessages(client, uids);
+  }
+
+  /** Gmail узнаём и по виду аккаунта, и по хосту: вид мог остаться «другим IMAP-сервером». */
+  private isGmail(account: MailAccountRow): boolean {
+    return account.kind === 'gmail' || account.imapHost.toLowerCase().endsWith('gmail.com');
+  }
+
+  /**
+   * Удалить письма из открытой папки: пометить `\Deleted` и вычистить.
+   *
+   * Двумя шагами, а не одним `messageDelete`: в imapflow 2 он делает только EXPUNGE, а EXPUNGE
+   * уносит лишь то, что уже помечено `\Deleted`. Без пометки он не удаляет ничего, но отвечает
+   * успехом — и письмо остаётся на сервере, а у нас помечается удалённым. Проверка на живом
+   * ящике это и показала: Gmail ответил «успех», письмо осталось во «Всей почте».
+   */
+  private async deleteMessages(client: ImapFlow, uids: number[]): Promise<boolean> {
+    if (!uids.length) return true;
+    const marked = await client.messageFlagsAdd(uids, ['\\Deleted'], { uid: true });
+    if (!marked) return false;
+    return await client.messageDelete(uids, { uid: true });
+  }
+
+  /**
    * Добить удалённое в мусорке: без этого письмо месяц лежит в «Корзине» сервера, то есть
    * копия у провайдера остаётся — ровно то, от чего мы уходим.
    *
@@ -493,7 +554,7 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
         }
       }
       if (toDelete.length) {
-        const ok = await client.messageDelete(toDelete, { uid: true });
+        const ok = await this.deleteMessages(client, toDelete);
         if (ok) deleted += toDelete.length;
       }
     } finally {
