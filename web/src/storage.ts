@@ -20,6 +20,8 @@ export type UiState = {
    */
   mail?: {
     box?: 'inbox' | 'sent';
+    /** Выбранный ящик в ленте (id аккаунта); пусто — все вместе. */
+    account?: string;
     index?: number;
     scrollTop?: number;
     openId?: string | null;

@@ -776,10 +776,13 @@ export interface MailMonthBucket {
   count: number;
 }
 
-export const mailCount = (box: MailBoxId) => request<number>(`/mail/count?box=${box}`);
-export const mailRange = (box: MailBoxId, offset: number, limit: number) =>
-  request<MailListItem[]>(`/mail/range?box=${box}&offset=${offset}&limit=${limit}`);
-export const mailMonths = (box: MailBoxId) => request<MailMonthBucket[]>(`/mail/months?box=${box}`);
+/** `account` — id аккаунта, чтобы смотреть почту одного ящика (пусто — все сразу). */
+export const mailCount = (box: MailBoxId, account?: string | null) =>
+  request<number>(`/mail/count?box=${box}${account ? `&account=${account}` : ''}`);
+export const mailRange = (box: MailBoxId, offset: number, limit: number, account?: string | null) =>
+  request<MailListItem[]>(`/mail/range?box=${box}&offset=${offset}&limit=${limit}${account ? `&account=${account}` : ''}`);
+export const mailMonths = (box: MailBoxId, account?: string | null) =>
+  request<MailMonthBucket[]>(`/mail/months?box=${box}${account ? `&account=${account}` : ''}`);
 export const mailMessage = (id: string) => request<MailMessageView>(`/mail/messages/${id}`);
 /** Тело письма: `images` — пользователь разрешил внешние картинки. */
 export const mailBody = (id: string, images: boolean) =>

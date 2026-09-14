@@ -72,19 +72,29 @@ export class MailFeedService {
     private readonly s3: S3Service,
   ) {}
 
+  /**
+   * Условие выборки ленты: папка и, если задан, один аккаунт.
+   *
+   * Разделение по аккаунтам появилось после подключения рабочего ящика: личная почта
+   * и корпоративная в одной ленте — это каша, из которой непонятно, откуда письмо.
+   */
+  private where(userId: string, box: string, accountId?: string | null) {
+    return accountId ? { userId, box, accountId, deletedAt: null } : { userId, box, deletedAt: null };
+  }
+
   /** Общее число писем в папке — по нему клиент считает высоту скролла. */
-  async count(userId: string, box: string): Promise<number> {
-    return this.prisma.mailMessage.count({ where: { userId, box, deletedAt: null } });
+  async count(userId: string, box: string, accountId?: string | null): Promise<number> {
+    return this.prisma.mailMessage.count({ where: this.where(userId, box, accountId) });
   }
 
   /**
    * Срез ленты по абсолютному смещению. Порядок — от свежих к старым, ровно как в индексе.
    */
-  async range(userId: string, box: string, offset = 0, limit = 100): Promise<MailListItem[]> {
+  async range(userId: string, box: string, offset = 0, limit = 100, accountId?: string | null): Promise<MailListItem[]> {
     const take = Math.min(Math.max(Math.floor(limit) || 1, 1), MAIL_RANGE_MAX);
     const skip = Math.max(0, Math.floor(offset) || 0);
     const rows = await this.prisma.mailMessage.findMany({
-      where: { userId, box, deletedAt: null },
+      where: this.where(userId, box, accountId),
       orderBy: [{ sortAt: 'desc' }, { id: 'desc' }],
       skip,
       take,
@@ -125,11 +135,12 @@ export class MailFeedService {
    * Индекс по месяцам для подписи у ползунка: строка на месяц в порядке ленты.
    * Кумулятивным счётчиком клиент сопоставляет позицию скролла с месяцем без загрузки писем.
    */
-  async months(userId: string, box: string): Promise<Array<{ month: string; count: number }>> {
+  async months(userId: string, box: string, accountId?: string | null): Promise<Array<{ month: string; count: number }>> {
     const rows = await this.prisma.$queryRaw<Array<{ month: string; n: bigint | number }>>(Prisma.sql`
       SELECT to_char("sortAt", 'YYYY-MM') AS month, count(*) AS n
       FROM "MailMessage"
       WHERE "userId" = ${userId} AND "box" = ${box} AND "deletedAt" IS NULL
+        AND (${accountId ?? null}::text IS NULL OR "accountId" = ${accountId ?? null})
       GROUP BY 1
       ORDER BY 1 DESC
     `);

@@ -166,8 +166,8 @@ export class MailController {
   @Get('count')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
-  count(@CurrentUser() user: RequestUser, @Query('box') box?: string) {
-    return this.feed.count(user.id, boxOf(box));
+  count(@CurrentUser() user: RequestUser, @Query('box') box?: string, @Query('account') account?: string) {
+    return this.feed.count(user.id, boxOf(box), account || null);
   }
 
   /** Срез ленты по смещению: `offset` — позиция, `limit` — сколько взять. */
@@ -179,18 +179,25 @@ export class MailController {
     @Query('box') box?: string,
     @Query('offset') offset?: string,
     @Query('limit') limit?: string,
+    @Query('account') account?: string,
   ) {
     const off = Number(offset);
     const lim = Number(limit);
-    return this.feed.range(user.id, boxOf(box), Number.isFinite(off) ? off : 0, Number.isFinite(lim) ? lim : 100);
+    return this.feed.range(
+      user.id,
+      boxOf(box),
+      Number.isFinite(off) ? off : 0,
+      Number.isFinite(lim) ? lim : 100,
+      account || null,
+    );
   }
 
   /** Индекс по месяцам — подпись у ползунка и прыжок к месяцу. */
   @Get('months')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
-  months(@CurrentUser() user: RequestUser, @Query('box') box?: string) {
-    return this.feed.months(user.id, boxOf(box));
+  months(@CurrentUser() user: RequestUser, @Query('box') box?: string, @Query('account') account?: string) {
+    return this.feed.months(user.id, boxOf(box), account || null);
   }
 
   // ===== Письмо =====

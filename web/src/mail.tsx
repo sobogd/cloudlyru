@@ -131,8 +131,14 @@ export default function MailSection({
   const [scrub, setScrub] = useState<{ top: number; h: number; monthKey: string | undefined }>({ top: 0, h: 24, monthKey: undefined });
   const [scrubVisible, setScrubVisible] = useState(false);
   const [busy, setBusy] = useState(false);
-  /** Аккаунты — для выбора «откуда» и для ответа/пересылки. */
+  /** Аккаунты — для выбора «откуда», фильтра ленты и ответа/пересылки. */
   const [accounts, setAccounts] = useState<api.MailAccountRow[]>([]);
+  /**
+   * Фильтр по ящику: пусто — все письма вместе. Разделение появилось, когда к личным
+   * ящикам добавился рабочий: в общей ленте непонятно, откуда письмо, и рабочие коды
+   * подтверждения мешаются с личной почтой.
+   */
+  const [account, setAccount] = useState<string>(saved?.account ?? '');
   /** Открытая форма письма: null — закрыта, {} — новое, {...} — заготовка ответа или пересылки. */
   const [composer, setComposer] = useState<{ initial: Partial<MailDraft> | null } | null>(null);
 
@@ -162,7 +168,7 @@ export default function MailSection({
   /** Список писем выбранной папки: число и индекс по месяцам — одним заходом. */
   const loadCounters = useCallback(async () => {
     try {
-      const [n, m] = await Promise.all([api.mailCount(box), api.mailMonths(box)]);
+      const [n, m] = await Promise.all([api.mailCount(box, account), api.mailMonths(box, account)]);
       setTotal(n);
       totalRef.current = n;
       setMonths(m);
@@ -171,20 +177,27 @@ export default function MailSection({
       setError((e as Error).message);
       return null;
     }
-  }, [box]);
+  }, [box, account]);
 
   useEffect(() => {
     api.mailAccounts().then(setAccounts).catch(() => undefined);
   }, []);
 
+  // Выбранную папку и ящик запоминаем сразу, не дожидаясь прокрутки: позицию внутри
+  // списка при этом не трогаем — её пишет persist при скролле.
   useEffect(() => {
-    // Смена папки — другой список: старые строки не подходят по индексам.
+    const cur = readUi().mail ?? {};
+    patchUi({ mail: { ...cur, box, account } });
+  }, [box, account]);
+
+  useEffect(() => {
+    // Смена папки или ящика — другой список: старые строки не подходят по индексам.
     setItems(new Map());
     setTotal(null);
     totalRef.current = null;
     restoredRef.current = false;
     void loadCounters();
-  }, [box, loadCounters]);
+  }, [box, account, loadCounters]);
 
   // Измеряем высоту окна прокрутки: от неё зависит, сколько строк просить.
   useLayoutEffect(() => {
@@ -222,7 +235,7 @@ export default function MailSection({
           const len = Math.min(FETCH_CHUNK, e - off + 1);
           const seq = ++seqRef.current;
           try {
-            const page = await api.mailRange(box, off, len);
+            const page = await api.mailRange(box, off, len, account);
             if (seq !== seqRef.current) return; // список успели перечитать — данные устарели
             setItems((prev) => {
               const next = new Map(prev);
@@ -235,7 +248,7 @@ export default function MailSection({
         }
       }
     },
-    [box],
+    [box, account],
   );
   const fetchRangeRef = useRef(fetchRange);
   fetchRangeRef.current = fetchRange;
@@ -301,9 +314,9 @@ export default function MailSection({
     const open = openIdRef.current;
     persistTimer.current = window.setTimeout(() => {
       persistTimer.current = null;
-      patchUi({ mail: { box, index, scrollTop: top, openId: open } });
+      patchUi({ mail: { box, account, index, scrollTop: top, openId: open } });
     }, 400);
-  }, [box]);
+  }, [box, account]);
 
   const showScrub = useCallback(() => {
     setScrubVisible(true);
@@ -497,6 +510,26 @@ export default function MailSection({
         </button>
       </div>
 
+      {/* Фильтр по ящику: «Все» плюс по кнопке на аккаунт. Показываем только когда ящиков
+          больше одного — при одном это была бы лишняя строка. */}
+      {accounts.length > 1 && (
+        <div className="mailfilters">
+          <button className={'mailchip' + (account === '' ? ' active' : '')} onClick={() => setAccount('')}>
+            Все ящики
+          </button>
+          {accounts.map((a) => (
+            <button
+              key={a.id}
+              className={'mailchip' + (account === a.id ? ' active' : '')}
+              onClick={() => setAccount(a.id)}
+              title={a.email}
+            >
+              {a.email}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="mscroll-wrap">
         <div className="mscroll" ref={scrollRef} onScroll={onScroll}>
           {error && <div className="err" style={{ padding: '8px 4px' }}>{error}</div>}
@@ -526,6 +559,9 @@ export default function MailSection({
                       <span className="mailmain">
                         <span className="mailtop">
                           <span className="mailwho">{senderOf(row.item)}</span>
+                          {account === '' && accounts.length > 1 && (
+                            <span className="mailacc">{row.item.accountEmail}</span>
+                          )}
                           <span className="maildate">{listDate(row.item.sortAt)}</span>
                         </span>
                         <span className="mailsubj">{row.item.subject || '(без темы)'}</span>

@@ -922,6 +922,42 @@
   }
   .mailtab.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 
+  /* Полоска ящиков: горизонтальная прокрутка, чтобы длинные адреса не ломали вёрстку */
+  .mailfilters {
+    flex: none;
+    display: flex;
+    gap: 6px;
+    padding: 0 2px 6px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+  .mailfilters::-webkit-scrollbar { display: none; }
+  .mailchip {
+    flex: none;
+    padding: 4px 10px;
+    border: 1px solid var(--brd-2);
+    border-radius: 999px;
+    background: none;
+    color: var(--fg-3);
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .mailchip.active { background: var(--accent-soft); border-color: transparent; color: var(--accent); font-weight: 600; }
+  /* Ящик в строке письма: виден только когда лента показывает все ящики сразу */
+  .mailacc {
+    flex: none;
+    max-width: 42%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    color: var(--fg-3);
+    background: var(--surface-2);
+    border-radius: 6px;
+    padding: 1px 5px;
+  }
   .mailvirt { position: relative; width: 100%; }
   .mailskel { display: flex; flex-direction: column; gap: 6px; padding: 2px; }
   .mailrow {
