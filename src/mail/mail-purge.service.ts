@@ -102,6 +102,27 @@ export interface PurgeReport {
   accounts: Array<{ email: string; purged: number; failed: number; trashSwept: number; errors: string[] }>;
 }
 
+/** Итог по аккаунту за прогон: сколько убрали, сколько не вышло, что осталось в мусорке. */
+interface PurgeStat {
+  purged: number;
+  failed: number;
+  errors: string[];
+  trashSwept: number;
+}
+
+/** Поля, нужные и отбору, и проверке: их читаем всегда одинаково. */
+const CANDIDATE_FIELDS = {
+  id: true,
+  folderPath: true,
+  uid: true,
+  uidValidity: true,
+  messageId: true,
+  fromAddr: true,
+  hasAttachments: true,
+  rawAssetId: true,
+  size: true,
+} as const;
+
 interface CandidateRow {
   id: string;
   folderPath: string;
@@ -339,20 +360,14 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
     for (const accountPlan of plan.accounts) {
       if (!accountPlan.candidates) continue;
       const account = await this.accounts.require(userId, accountPlan.accountId);
-      const stat = { email: account.email, purged: 0, failed: 0, trashSwept: 0, errors: [] as string[] };
+      const stat: PurgeStat & { email: string } = { email: account.email, purged: 0, failed: 0, trashSwept: 0, errors: [] };
       let client: ImapFlow | null = null;
       try {
         client = await this.openClient(account);
-        const purgedIds = await this.purgeAccount(client, account, plan.perRun, stat);
-        if (purgedIds.length) {
-          // Перенос в корзину отражается на сервере не мгновенно: без паузы уборка мусорки
-          // смотрит список, где письма ещё нет, и оно остаётся у провайдера до автоочистки.
-          await sleep(TRASH_SETTLE_MS);
-          stat.trashSwept = await this.sweepTrash(client, purgedIds).catch((e) => {
-            stat.errors.push(`мусорка: ${(e as Error).message}`);
-            return 0;
-          });
-        }
+        const purgedIds = await this.purgeAccount(client, account, stat, () =>
+          this.scheduledCandidates(account, plan.perRun),
+        );
+        await this.sweepPurged(client, purgedIds, stat);
         report.purged += stat.purged;
         report.failed += stat.failed;
         report.trashSwept += stat.trashSwept;
@@ -380,12 +395,8 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
    * Удаление по одному аккаунту. Возвращает Message-ID удалённых писем — по ним потом
    * добиваем копии в мусорке.
    */
-  private async purgeAccount(
-    client: ImapFlow,
-    account: MailAccountRow,
-    limit: number,
-    stat: { purged: number; failed: number; errors: string[] },
-  ): Promise<string[]> {
+  /** Кандидаты для прохода по расписанию: самая давняя порция из тех, что ещё на сервере. */
+  private async scheduledCandidates(account: MailAccountRow, limit: number): Promise<CandidateRow[]> {
     const cutoff = this.quarantineCutoff();
     const rows = (await this.prisma.mailMessage.findMany({
       where: {
@@ -393,25 +404,97 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
         deletedAt: null,
         remoteDeletedAt: null,
         folderPath: ON_SERVER_FOLDER,
-        createdAt: { lt: cutoff },
+        ...(cutoff ? { createdAt: { lt: cutoff } } : {}),
         remotePurgeTries: { lt: MAX_TRIES },
         flagged: false,
       },
       orderBy: { createdAt: 'asc' },
       take: limit,
-      select: {
-        id: true,
-        folderPath: true,
-        uid: true,
-        uidValidity: true,
-        messageId: true,
-        fromAddr: true,
-        hasAttachments: true,
-        rawAssetId: true,
-        size: true,
-      },
+      select: CANDIDATE_FIELDS,
     })) as CandidateRow[];
-    const candidates = rows.filter((r) => !this.isProtected(r.fromAddr));
+    return rows.filter((r) => !this.isProtected(r.fromAddr));
+  }
+
+  /** Кандидаты по списку — для свежих писем, которые мы только что сохранили. */
+  private async candidatesByIds(account: MailAccountRow, ids: string[]): Promise<CandidateRow[]> {
+    const cutoff = this.quarantineCutoff();
+    const rows = (await this.prisma.mailMessage.findMany({
+      where: {
+        id: { in: ids },
+        accountId: account.id,
+        deletedAt: null,
+        remoteDeletedAt: null,
+        folderPath: ON_SERVER_FOLDER,
+        ...(cutoff ? { createdAt: { lt: cutoff } } : {}),
+        remotePurgeTries: { lt: MAX_TRIES },
+        flagged: false,
+      },
+      select: CANDIDATE_FIELDS,
+    })) as CandidateRow[];
+    return rows.filter((r) => !this.isProtected(r.fromAddr));
+  }
+
+  /**
+   * Убрать копии конкретных писем — сразу после того, как они сохранены.
+   *
+   * Расписание добирает всё, что осталось и что не получилось; но свежему письму ждать
+   * расписания незачем: оно уже лежит у нас целиком (это и проверяется перед удалением),
+   * значит копия у провайдера больше не нужна.
+   */
+  async purgeMessages(account: MailAccountRow, ids: string[]): Promise<{ purged: number; skipped: number }> {
+    const out = { purged: 0, skipped: 0 };
+    if (!env.MAIL_PURGE_ENABLED || !ids.length) return out;
+    // Аккаунт без IMAP (почту приносит наш сервер): серверных копий у таких писем нет.
+    if (!this.accounts.presetOf(account.kind).folders.length) return out;
+
+    const candidates = await this.candidatesByIds(account, ids);
+    out.skipped = ids.length - candidates.length;
+    if (!candidates.length) return out;
+
+    const stat: PurgeStat = { purged: 0, failed: 0, errors: [], trashSwept: 0 };
+    const client = await this.openClient(account);
+    try {
+      const purgedIds = await this.purgeAccount(client, account, stat, async () => candidates);
+      await this.sweepPurged(client, purgedIds, stat);
+    } finally {
+      try {
+        client.close();
+      } catch {
+        /* соединение могло закрыться само */
+      }
+    }
+    out.purged = stat.purged;
+    if (stat.purged || stat.trashSwept || stat.errors.length) {
+      this.logger.log(
+        `свежие письма ${account.email}: убрано копий ${stat.purged}, добито в мусорке ${stat.trashSwept}`,
+      );
+    }
+    for (const message of stat.errors) this.logger.warn(`${account.email}: ${message}`);
+    return out;
+  }
+
+  /**
+   * Добить в мусорке то, что только что убрали из папки.
+   *
+   * Перенос в корзину отражается на сервере не мгновенно: без паузы уборка смотрит список,
+   * где письма ещё нет, и копия остаётся у провайдера до его собственной автоочистки.
+   */
+  private async sweepPurged(client: ImapFlow, purgedIds: string[], stat: PurgeStat): Promise<void> {
+    if (!purgedIds.length) return;
+    await sleep(TRASH_SETTLE_MS);
+    stat.trashSwept += await this.sweepTrash(client, purgedIds).catch((e) => {
+      stat.errors.push(`мусорка: ${(e as Error).message}`);
+      return 0;
+    });
+  }
+
+  private async purgeAccount(
+    client: ImapFlow,
+    account: MailAccountRow,
+    stat: PurgeStat,
+    select: () => Promise<CandidateRow[]>,
+  ): Promise<string[]> {
+    const candidates = await select();
     if (!candidates.length) return [];
 
     // Группируем по папке: за один SELECT удаляем всё, что в ней лежит

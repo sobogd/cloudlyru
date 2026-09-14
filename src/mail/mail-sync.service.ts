@@ -5,6 +5,7 @@ import { env } from '../config/env';
 import { mailCryptoReady } from './mail-crypto';
 import { MailAccountsService, type MailAccountRow, type MailBox, type MailSourceFolder } from './mail-accounts.service';
 import { MailIngestService, type IngestInput } from './mail-ingest.service';
+import { MailPurgeService } from './mail-purge.service';
 import type { MailCursor } from '@prisma/client';
 
 /**
@@ -31,6 +32,13 @@ const SOURCE_QUERY: FetchQueryObject = {
   threadId: true,
   labels: true,
 };
+
+/** Координаты только что сохранённого письма: по ним находим строку и убираем серверную копию. */
+interface StoredRef {
+  folderPath: string;
+  uidValidity: bigint;
+  uid: number;
+}
 
 /** Задержка перед внеочередным проходом после события «появилось письмо», мс. */
 const WAKE_DEBOUNCE_MS = 3000;
@@ -82,6 +90,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly accounts: MailAccountsService,
     private readonly ingestService: MailIngestService,
+    private readonly purgeService: MailPurgeService,
   ) {}
 
   onModuleInit(): void {
@@ -183,7 +192,11 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
         const folders = await this.resolveFolders(client, preset.folders);
         for (const folder of folders) {
           try {
-            stored += await this.syncFolder(client, account, folder);
+            // Письма, сохранённые в этом проходе: их серверные копии убираем сразу, не ожидая
+            // расписания чистки. Ждём только новых писем — история идёт своим чередом.
+            const fresh: StoredRef[] = [];
+            stored += await this.syncFolder(client, account, folder, fresh);
+            if (fresh.length) await this.purgeFresh(account, fresh);
           } catch (e) {
             // Обрыв соединения — не ошибка папки: повторяем проход целиком (свежее
             // соединение), и только если и он не удался, показываем ошибку.
@@ -304,7 +317,12 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Одна папка источника: сначала новое, потом кусок истории. */
-  private async syncFolder(client: ImapFlow, account: MailAccountRow, folder: MailSourceFolder): Promise<number> {
+  private async syncFolder(
+    client: ImapFlow,
+    account: MailAccountRow,
+    folder: MailSourceFolder,
+    fresh: StoredRef[],
+  ): Promise<number> {
     const lock = await client.getMailboxLock(folder.path);
     let stored = 0;
     try {
@@ -351,7 +369,10 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
           if (!item) continue;
           try {
             const result = await this.ingestService.ingest(item.input);
-            if (result === 'stored' || result === 'attachments-repaired') stored += 1;
+            if (result === 'stored' || result === 'attachments-repaired') {
+              stored += 1;
+              fresh.push({ folderPath: ctx.folderPath, uidValidity: ctx.uidValidity, uid: Number(msg.uid) });
+            }
           } catch (e) {
             // Курсор двигаем и при ошибке: иначе одно «упрямое» письмо заставляло бы
             // перекачивать его на каждом проходе и никогда не пропускать дальше.
@@ -382,6 +403,39 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       lock.release();
     }
     return stored;
+  }
+
+  /**
+   * Убрать серверные копии только что сохранённых писем — сразу, а не проходом по расписанию.
+   *
+   * Отбор тот же самый, что у расписания (общий код в чистке): письмо проверяется поимённо —
+   * есть ли байты у нас и лежит ли по координатам на сервере именно оно. Не получилось убрать
+   * копию — не беда: письмо важнее уборки, и следующий проход чистки доберёт его сам.
+   */
+  private async purgeFresh(account: MailAccountRow, fresh: StoredRef[]): Promise<void> {
+    try {
+      const rows = await this.prisma.mailMessage.findMany({
+        where: {
+          OR: fresh.map((f) => ({
+            accountId: account.id,
+            folderPath: f.folderPath,
+            uidValidity: f.uidValidity,
+            uid: BigInt(f.uid),
+          })),
+        },
+        select: { id: true },
+      });
+      if (!rows.length) return;
+      const result = await this.purgeService.purgeMessages(
+        account,
+        rows.map((r) => r.id),
+      );
+      if (result.purged) this.logger.log(`${account.email}: свежих писем убрано с сервера — ${result.purged}`);
+    } catch (e) {
+      this.logger.warn(
+        `${account.email}: не удалось убрать копии свежих писем — ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 
   /**
