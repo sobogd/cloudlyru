@@ -48,7 +48,7 @@ const ON_SERVER_FOLDER = { not: { startsWith: LOCAL_PREFIX } } as const;
 const VERIFY_BYTES = 512 * 1024;
 
 /** Пауза перед разбором мусорки: серверу нужно мгновение на отражение переноса. */
-const TRASH_SETTLE_MS = 3000;
+const TRASH_SETTLE_MS = 5000;
 
 /** Порции при разборе мусорки: по столько писем за один FETCH. */
 const TRASH_BATCH = 200;
@@ -529,10 +529,18 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
   private async sweepPurged(client: ImapFlow, purgedIds: string[], stat: PurgeStat): Promise<void> {
     if (!purgedIds.length) return;
     await sleep(TRASH_SETTLE_MS);
-    stat.trashSwept += await this.sweepTrash(client, purgedIds).catch((e) => {
+    const swept = await this.sweepTrash(client, purgedIds).catch((e) => {
       stat.errors.push(`мусорка: ${(e as Error).message}`);
       return 0;
     });
+    stat.trashSwept += swept;
+    // Не всех нашли — значит сервер ещё не показал часть переноса в корзине. Одна повторная
+    // попытка: письмо, помеченное у нас убранным, больше в очередь не попадёт, и его копия
+    // иначе осталась бы в корзине провайдера до его собственной автоочистки (месяц).
+    if (swept < purgedIds.length) {
+      await sleep(TRASH_SETTLE_MS * 3);
+      stat.trashSwept += await this.sweepTrash(client, purgedIds).catch(() => 0);
+    }
   }
 
   private async purgeAccount(
