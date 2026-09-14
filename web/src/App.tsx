@@ -5,7 +5,7 @@ import {
   CircleAlert, CircleCheck, CircleX, Clock, Cloud, Copy, Eraser, FileText, Film, Folder,
   FolderOpen, Image as ImageIcon, ImagePlay, Images, Info, KeyRound, Link2, LoaderCircle, Lock,
   MailOpen, Map as MapIcon, Package,
-  Pause, Pencil, Play, Plus, RefreshCw, Scissors, Settings as SettingsIcon, Trash, Upload,
+  Pause, Pencil, Play, Plus, RefreshCw, Scissors, Server, Settings as SettingsIcon, Trash, Upload,
   UserRound, X,
 } from 'lucide-react';
 import { Mail as MailIcon } from 'lucide-react';
@@ -1216,6 +1216,27 @@ function MailAccountsPanel() {
     } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
   };
 
+  /** Переезд аккаунта на свой сервер: приём делает Postfix, отправка идёт через релей. */
+  const migrate = async (r: api.MailAccountRow) => {
+    const smtpHost = prompt('SMTP-сервер для отправки (например smtp-relay.brevo.com)', 'smtp-relay.brevo.com');
+    if (!smtpHost) return;
+    const smtpLogin = prompt('SMTP-логин из панели релея (вида 1234567@smtp-brevo.com)');
+    if (!smtpLogin) return;
+    const smtpPassword = prompt('SMTP-ключ (xkeysib-…)');
+    if (!smtpPassword) return;
+    setBusy(true);
+    setErr('');
+    try {
+      await api.mailPatchAccount(r.id, { kind: 'smtp', smtpHost, smtpPort: '587', smtpLogin, smtpPassword });
+      setNotice(`${r.email} переведён на свой сервер: принимает Postfix, отправляет ${smtpHost}`);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const statusText = (r: api.MailAccountRow) => {
     if (!r.enabled) return 'выключен';
     if (r.status === 'syncing') return 'забираем письма…';
@@ -1242,6 +1263,11 @@ function MailAccountsPanel() {
             title={r.enabled ? 'Выключить' : 'Включить'}
             onClick={async () => { await api.mailPatchAccount(r.id, { enabled: !r.enabled }).catch((e) => setErr((e as Error).message)); await load(); }}
           >{r.enabled ? <Pause size={16} /> : <Play size={16} />}</button>
+          {r.kind !== 'smtp' && (
+            <button className="btn ghost" title="Перевести на свой сервер (приём у нас, отправка через релей)" onClick={() => void migrate(r)}>
+              <Server size={16} />
+            </button>
+          )}
           <button
             className="btn ghost"
             title="Удалить аккаунт"

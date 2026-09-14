@@ -725,8 +725,18 @@ export const mailAddAccount = (body: {
   smtpLogin?: string;
   smtpPassword?: string;
 }) => request<MailAccountRow>('/mail/accounts', { method: 'POST', body: JSON.stringify(body) });
-export const mailPatchAccount = (id: string, body: { enabled?: boolean; password?: string }) =>
-  request<MailAccountRow>(`/mail/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
+export const mailPatchAccount = (
+  id: string,
+  body: {
+    enabled?: boolean;
+    password?: string;
+    kind?: string;
+    smtpHost?: string;
+    smtpPort?: string;
+    smtpLogin?: string;
+    smtpPassword?: string;
+  },
+) => request<MailAccountRow>(`/mail/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const mailDeleteAccount = (id: string) =>
   request<{ ok: boolean }>(`/mail/accounts/${id}`, { method: 'DELETE' });
 export const mailSync = () => request<{ ok: boolean; started: boolean }>('/mail/sync', { method: 'POST' });

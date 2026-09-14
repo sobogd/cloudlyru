@@ -65,7 +65,15 @@ export class MailController {
   @UseGuards(RateLimitGuard)
   @RateLimit(20, 60_000)
   patchAccount(@Param('id') id: string, @Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
-    return this.accounts.patch(user.id, id, { enabled: body.enabled, password: body.password });
+    return this.accounts.patch(user.id, id, {
+      enabled: body.enabled,
+      password: body.password,
+      kind: body.kind,
+      smtpHost: body.smtpHost,
+      smtpPort: body.smtpPort,
+      smtpLogin: body.smtpLogin,
+      smtpPassword: body.smtpPassword,
+    });
   }
 
   @Delete('accounts/:id')

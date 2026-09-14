@@ -377,20 +377,64 @@ export class MailAccountsService {
     return view.find((a) => a.id === created.id)!;
   }
 
-  /** Включение/выключение и смена пароля. Почта читается только у включённых аккаунтов. */
-  async patch(userId: string, id: string, body: { enabled?: unknown; password?: unknown }): Promise<MailAccountView> {
+  /**
+   * Правка аккаунта: включение, смена пароля и переезд на свой сервер.
+   *
+   * Переезд — это смена вида на «свой сервер» плюс креды релея для отправки. Он нужен,
+   * когда почта перестаёт ходить через чужой ящик: приём с этого момента делает наш Postfix,
+   * а отправка идёт через релей, и старый IMAP-пароль больше не нужен.
+   */
+  async patch(
+    userId: string,
+    id: string,
+    body: {
+      enabled?: unknown;
+      password?: unknown;
+      kind?: unknown;
+      smtpHost?: unknown;
+      smtpPort?: unknown;
+      smtpLogin?: unknown;
+      smtpPassword?: unknown;
+    },
+  ): Promise<MailAccountView> {
     const account = await this.require(userId, id);
     const data: {
       enabled?: boolean;
+      kind?: string;
+      imapHost?: string;
       secretEnc?: string;
       status?: string;
       statusError?: string | null;
+      smtpHost?: string;
       smtpPort?: number;
+      smtpLogin?: string;
+      smtpSecretEnc?: string;
     } = {};
 
     if (typeof body.enabled === 'boolean') data.enabled = body.enabled;
 
-    if (typeof body.password === 'string' && body.password.trim()) {
+    // Переезд на свой сервер: IMAP больше не нужен, папок у такого вида аккаунта нет
+    const wantedKind =
+      typeof body.kind === 'string' && body.kind in MAIL_PRESETS ? (body.kind as MailKind) : null;
+    if (wantedKind && wantedKind !== account.kind) data.kind = wantedKind;
+
+    // Креды релея: если заданы — проверяем живым подключением, как при добавлении
+    const smtpHost = typeof body.smtpHost === 'string' ? body.smtpHost.trim() : null;
+    const smtpPassword = typeof body.smtpPassword === 'string' ? this.normalizeSecret('smtp', body.smtpPassword) : null;
+    if (smtpHost && smtpPassword) {
+      const smtpPort = Number(body.smtpPort) || account.smtpPort || 587;
+      const smtpLogin = String(body.smtpLogin ?? '').trim() || smtpHost;
+      const smtp = await verifySmtpAccess({ smtpHost, smtpPort, login: smtpLogin, password: smtpPassword });
+      if (smtp.error) throw badRequest(`отправка через ${smtpHost} не работает: ${smtp.error}`, 'mail_smtp_login_failed');
+      data.smtpHost = smtpHost;
+      data.smtpPort = smtp.port;
+      data.smtpLogin = smtpLogin;
+      data.smtpSecretEnc = encryptSecret(smtpPassword);
+    }
+
+    // Пароль ящика проверяем только там, где почта всё ещё читается по IMAP
+    const kindAfter = data.kind ?? account.kind;
+    if (kindAfter !== 'smtp' && typeof body.password === 'string' && body.password.trim()) {
       this.assertCryptoReady();
       const password = this.normalizeSecret(account.kind, body.password);
       const error = await this.verifyAccess({
@@ -414,6 +458,12 @@ export class MailAccountsService {
       if (smtp.port !== account.smtpPort) data.smtpPort = smtp.port;
       data.secretEnc = encryptSecret(password);
       // сбрасываем прошлую ошибку: причина могла быть именно в пароле
+      data.status = 'idle';
+      data.statusError = null;
+    }
+    // Переезд на свой сервер: почта приходит не из IMAP, поэтому прошлые ошибки чтения
+    // к новому состоянию отношения не имеют и только пугали бы в интерфейсе
+    if (kindAfter === 'smtp' && account.kind !== 'smtp') {
       data.status = 'idle';
       data.statusError = null;
     }
