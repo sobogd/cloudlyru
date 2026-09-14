@@ -718,9 +718,12 @@ export const mailAccounts = () => request<MailAccountRow[]>('/mail/accounts');
 export const mailAddAccount = (body: {
   kind: string;
   email: string;
-  password: string;
+  password?: string;
   imapHost?: string;
   smtpHost?: string;
+  smtpPort?: string;
+  smtpLogin?: string;
+  smtpPassword?: string;
 }) => request<MailAccountRow>('/mail/accounts', { method: 'POST', body: JSON.stringify(body) });
 export const mailPatchAccount = (id: string, body: { enabled?: boolean; password?: string }) =>
   request<MailAccountRow>(`/mail/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(body) });

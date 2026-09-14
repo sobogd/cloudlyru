@@ -46,6 +46,21 @@ export interface IngestInput {
 /** Имена наших двух папок внутри системной «Почты». */
 export const MAIL_BOX_FOLDER: Record<MailBox, string> = { inbox: 'Входящие', sent: 'Исходящие' };
 
+/**
+ * Псевдо-папка для писем, пришедших не по IMAP: наша отправка и приём своим сервером.
+ * Курсоров у неё нет — это просто координата, чтобы строка письма была полной.
+ */
+export const LOCAL_FOLDER = 'local:local';
+
+/**
+ * uid для писем, у которых нет серверного UID: стабильный и уникальный, выведенный из
+ * Message-ID (или из содержимого, если заголовка нет). 48 бит — с запасом от коллизий
+ * и в пределах безопасного целого в JS: интерфейс хранения принимает uid обычным числом.
+ */
+export function uidOfMessageId(messageId: string): number {
+  return Number(BigInt('0x' + sha256Hex(messageId).slice(0, 12)));
+}
+
 /** Длинная строка MIME в БД не нужна: тип части — это ярлык для интерфейса. */
 const MAX_MIME = 120;
 
@@ -227,6 +242,38 @@ export class MailIngestService {
     await this.storeAttachments(input, created.id, sortAt, parsed.attachments);
 
     return 'stored';
+  }
+
+  /**
+   * Письмо, которое принёс наш собственный сервер (Postfix → pipe → эта ручка).
+   *
+   * Отличие от IMAP-пути только в координатах: у письма нет ни UID сервера, ни папки,
+   * поэтому uid берём из Message-ID, а вместо папки ставим пометку «локальная». Дедуп
+   * по Message-ID не даёт одному и тому же письму появиться дважды при повторе доставки.
+   */
+  async ingestInbound(recipient: string, source: Buffer): Promise<'stored' | 'duplicate' | 'unknown-account'> {
+    const email = String(recipient ?? '').trim().toLowerCase();
+    const account = await this.prisma.mailAccount.findFirst({ where: { email } });
+    // Аккаунт ещё не заведён в приложении: отвечаем «временно не можем», чтобы Postfix
+    // подержал письмо в очереди и повторил — терять его из-за настройки нельзя.
+    if (!account) return 'unknown-account';
+
+    const messageId = headerMessageId(source) ?? sha256Hex(source);
+    const result = await this.ingest({
+      userId: account.userId,
+      account,
+      box: 'inbox',
+      folderPath: LOCAL_FOLDER,
+      uid: uidOfMessageId(messageId),
+      uidValidity: 0n,
+      source,
+      seen: false,
+      flagged: false,
+      emailId: null,
+      threadId: null,
+      receivedAt: new Date(),
+    });
+    return result === 'skipped' || result === 'attachments-repaired' ? 'duplicate' : 'stored';
   }
 
   /** Добор вложений по уже сохранённому сырью (прошлый проход оборвался на середине). */

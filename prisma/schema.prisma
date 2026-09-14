@@ -378,6 +378,10 @@ model MailAccount {
   // app password, зашифрованный AES-256-GCM ключом MAIL_SECRET_KEY: это ключ ко всей
   // переписке, в открытом виде он не хранится и в логи не попадает.
   secretEnc   String
+  // Отправка может идти через другой сервис, чем приём (у Brevo логин и ключ свои,
+  // а не пароль ящика). Пусто — берём login/secretEnc: так живут Gmail и iCloud.
+  smtpLogin      String?
+  smtpSecretEnc  String?
   authKind    String    @default("password") // password | oauth2 (задел под Gmail API)
   enabled     Boolean   @default(true)
   status      String    @default("idle") // idle | syncing | error

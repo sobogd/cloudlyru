@@ -127,6 +127,9 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     try {
       const accounts = await this.prisma.mailAccount.findMany({ where: { enabled: true } });
       for (const account of accounts) {
+        // Аккаунт без IMAP (почту приносит наш сервер) в расписании не участвует:
+        // качать из него нечего, а соединение к пустому хосту — это ошибка в статусе.
+        if (!this.accounts.presetOf(account.kind).folders.length) continue;
         try {
           await this.syncAccount(account);
         } catch (e) {

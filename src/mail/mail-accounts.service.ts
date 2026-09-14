@@ -14,7 +14,7 @@ import { badRequest, conflict, notFound } from '../common/errors';
  * через пять минут в статусе синхронизации, где уже непонятно, пароль виноват или сеть.
  */
 
-export type MailKind = 'gmail' | 'icloud' | 'imap';
+export type MailKind = 'gmail' | 'icloud' | 'imap' | 'smtp';
 export type MailBox = 'inbox' | 'sent';
 
 /**
@@ -84,6 +84,21 @@ export const MAIL_PRESETS: Record<MailKind, MailKindPreset> = {
     ],
     stripSeparators: true,
   },
+  /**
+   * Почта на своём сервере: принимаем её мы сами (Postfix на нашем VPS отдаёт письмо
+   * в приложение), а отправляем через внешний релей — у Brevo своя репутация IP и DKIM.
+   * IMAP-папок у такого аккаунта нет вовсе, поэтому расписание его не трогает.
+   */
+  smtp: {
+    label: 'Свой сервер: приём у нас, отправка через релей',
+    imapHost: '',
+    imapPort: 993,
+    secure: true,
+    smtpHost: '',
+    smtpPort: 587,
+    folders: [],
+    stripSeparators: false,
+  },
   imap: {
     label: 'Другой IMAP-сервер',
     imapHost: '',
@@ -125,6 +140,8 @@ export interface MailAccountRow {
   smtpPort: number;
   login: string;
   secretEnc: string;
+  smtpLogin: string | null;
+  smtpSecretEnc: string | null;
   enabled: boolean;
 }
 
@@ -246,9 +263,29 @@ export class MailAccountsService {
     return { login: account.login, password: decryptSecret(account.secretEnc) };
   }
 
+  /**
+   * Креды отправки: у аккаунта со своим релеем они свои (Brevo), у остальных — те же,
+   * что для приёма. Пустой пароль означает «отправка не настроена».
+   */
+  smtpCredentials(account: MailAccountRow): { login: string; password: string } {
+    if (account.smtpLogin && account.smtpSecretEnc) {
+      return { login: account.smtpLogin, password: decryptSecret(account.smtpSecretEnc) };
+    }
+    return { login: account.login, password: decryptSecret(account.secretEnc) };
+  }
+
   async create(
     userId: string,
-    input: { kind?: unknown; email?: unknown; password?: unknown; imapHost?: unknown; smtpHost?: unknown },
+    input: {
+      kind?: unknown;
+      email?: unknown;
+      password?: unknown;
+      imapHost?: unknown;
+      smtpHost?: unknown;
+      smtpPort?: unknown;
+      smtpLogin?: unknown;
+      smtpPassword?: unknown;
+    },
   ): Promise<MailAccountView> {
     this.assertCryptoReady();
     const kind = String(input.kind ?? 'gmail') as MailKind;
@@ -256,21 +293,36 @@ export class MailAccountsService {
     const email = String(input.email ?? '').trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw badRequest('invalid email', 'mail_email_invalid');
 
+    // Свой сервер: приём делает Postfix, поэтому пароля ящика и IMAP-хоста не спрашиваем,
+    // а для отправки нужны отдельные креды релея (Brevo) — они не связаны с ящиком.
+    const inboundOnly = kind === 'smtp';
+
     const preset = MAIL_PRESETS[kind];
     const imapHost = kind === 'imap' ? String(input.imapHost ?? '').trim() : preset.imapHost;
-    const smtpHost = kind === 'imap' ? String(input.smtpHost ?? '').trim() : preset.smtpHost;
-    if (!imapHost) throw badRequest('imapHost is required for generic imap', 'mail_host_required');
-    if (!smtpHost) throw badRequest('smtpHost is required for generic imap', 'mail_host_required');
+    const smtpHost = kind === 'imap' || inboundOnly ? String(input.smtpHost ?? '').trim() : preset.smtpHost;
+    if (!inboundOnly && !imapHost) throw badRequest('imapHost is required for generic imap', 'mail_host_required');
+    // У своего сервера релей необязателен: приём работает и без возможности отправки.
+    if (kind === 'imap' && !smtpHost) throw badRequest('smtpHost is required for generic imap', 'mail_host_required');
 
     const password = this.normalizeSecret(kind, String(input.password ?? ''));
-    if (password.length < 8) {
+    if (!inboundOnly && password.length < 8) {
       throw badRequest('похоже на обычный пароль, а нужен пароль приложения', 'mail_password_too_short');
     }
 
     const existing = await this.prisma.mailAccount.findFirst({ where: { userId, email } });
     if (existing) throw conflict('такой аккаунт уже добавлен', 'mail_account_exists');
 
-    const error = await this.verifyAccess({
+    // Отправка через релей: свои логин и ключ, не связанные с ящиком
+    const smtpLogin = inboundOnly
+      ? String(input.smtpLogin ?? '').trim() || email
+      : email;
+    const smtpPassword = inboundOnly
+      ? this.normalizeSecret('smtp', String(input.smtpPassword ?? ''))
+      : password;
+
+    const error = inboundOnly
+      ? null
+      : await this.verifyAccess({
       host: imapHost,
       port: preset.imapPort,
       secure: preset.secure,
@@ -286,9 +338,21 @@ export class MailAccountsService {
     // «почта читается, а письма не уходят» выяснять при первом отправленном письме поздно.
     // Проверка заодно подбирает рабочий порт (465 или 587) — его и сохраняем: иначе отправка
     // потом стучалась бы в тот, который в этой сети не проходит.
-    const smtp = await verifySmtpAccess({ smtpHost, smtpPort: preset.smtpPort, login: email, password });
-    if (smtp.error) {
-      throw badRequest(`IMAP доступен, а отправка через ${smtpHost} нет: ${smtp.error}`, 'mail_smtp_login_failed');
+    // Отправку проверяем, если её настроили: у приёмного аккаунта релей может быть ещё
+    // не заведён, и это не повод отказывать в приёме.
+    const wantedPort = inboundOnly ? Number(input.smtpPort) || preset.smtpPort : preset.smtpPort;
+    let smtpPort = wantedPort;
+    if (smtpHost && (smtpPassword || !inboundOnly)) {
+      const smtp = await verifySmtpAccess({ smtpHost, smtpPort: wantedPort, login: smtpLogin, password: smtpPassword });
+      if (smtp.error) {
+        throw badRequest(
+          inboundOnly ? `отправка через ${smtpHost} не работает: ${smtp.error}` : `IMAP доступен, а отправка через ${smtpHost} нет: ${smtp.error}`,
+          'mail_smtp_login_failed',
+        );
+      }
+      smtpPort = smtp.port;
+    } else if (inboundOnly) {
+      this.logger.log(`аккаунт ${email}: приём своим сервером, отправка не настроена`);
     }
 
     const created = await this.prisma.mailAccount.create({
@@ -299,9 +363,12 @@ export class MailAccountsService {
         imapHost,
         imapPort: preset.imapPort,
         smtpHost,
-        smtpPort: smtp.port,
+        smtpPort,
         login: email,
-        secretEnc: encryptSecret(password),
+        // У приёмного аккаунта пароля ящика нет вовсе: ставим заглушку, чтобы колонка
+        // осталась непустой, а расшифровывать её никто не станет.
+        secretEnc: encryptSecret(password || 'inbound-only'),
+        ...(inboundOnly && smtpPassword ? { smtpLogin, smtpSecretEnc: encryptSecret(smtpPassword) } : {}),
         status: 'idle',
       },
     });

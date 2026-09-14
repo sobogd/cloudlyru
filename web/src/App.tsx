@@ -1165,7 +1165,16 @@ function MailAccountsPanel() {
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({ kind: 'gmail', email: '', password: '', imapHost: '', smtpHost: '' });
+  const [form, setForm] = useState({
+    kind: 'gmail',
+    email: '',
+    password: '',
+    imapHost: '',
+    smtpHost: '',
+    smtpPort: '',
+    smtpLogin: '',
+    smtpPassword: '',
+  });
   const [open, setOpen] = useState(false);
 
   const load = async () => {
@@ -1191,8 +1200,16 @@ function MailAccountsPanel() {
         email: form.email.trim(),
         password: form.password,
         ...(form.kind === 'imap' ? { imapHost: form.imapHost.trim(), smtpHost: form.smtpHost.trim() } : {}),
+        ...(form.kind === 'smtp'
+          ? {
+              smtpHost: form.smtpHost.trim(),
+              smtpPort: form.smtpPort.trim(),
+              smtpLogin: form.smtpLogin.trim(),
+              smtpPassword: form.smtpPassword,
+            }
+          : {}),
       });
-      setForm({ kind: form.kind, email: '', password: '', imapHost: '', smtpHost: '' });
+      setForm({ ...form, email: '', password: '', imapHost: '', smtpHost: '', smtpPort: '', smtpLogin: '', smtpPassword: '' });
       setOpen(false);
       setNotice('Аккаунт добавлен, почта забирается');
       await load();
@@ -1244,19 +1261,42 @@ function MailAccountsPanel() {
             <option value="gmail">Gmail / Google Workspace</option>
             <option value="icloud">iCloud Mail</option>
             <option value="imap">Другой IMAP-сервер</option>
+            <option value="smtp">Свой сервер: приём у нас, отправка через релей</option>
           </select>
           <input placeholder="адрес почты" autoComplete="off" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
-          <input
-            placeholder="пароль приложения"
-            type="password"
-            autoComplete="new-password"
-            value={form.password}
-            onChange={(e) => setForm({ ...form, password: e.target.value })}
-          />
+          {form.kind !== 'smtp' && (
+            <input
+              placeholder="пароль приложения"
+              type="password"
+              autoComplete="new-password"
+              value={form.password}
+              onChange={(e) => setForm({ ...form, password: e.target.value })}
+            />
+          )}
           {form.kind === 'imap' && (
             <>
               <input placeholder="IMAP-сервер (imap.example.com)" value={form.imapHost} onChange={(e) => setForm({ ...form, imapHost: e.target.value })} />
               <input placeholder="SMTP-сервер (smtp.example.com)" value={form.smtpHost} onChange={(e) => setForm({ ...form, smtpHost: e.target.value })} />
+            </>
+          )}
+          {form.kind === 'smtp' && (
+            <>
+              {/* Приём делает наш Postfix — пароля ящика тут нет вовсе. Спрашиваем только
+                  релей для отправки; можно оставить пустым, тогда аккаунт только принимает. */}
+              <input placeholder="SMTP-сервер для отправки (smtp-relay.brevo.com)" value={form.smtpHost} onChange={(e) => setForm({ ...form, smtpHost: e.target.value })} />
+              <input placeholder="SMTP-порт (587)" value={form.smtpPort} onChange={(e) => setForm({ ...form, smtpPort: e.target.value })} />
+              <input placeholder="SMTP-логин (например 1234567@smtp-brevo.com)" value={form.smtpLogin} onChange={(e) => setForm({ ...form, smtpLogin: e.target.value })} />
+              <input
+                placeholder="SMTP-ключ (xkeysib-…)"
+                type="password"
+                autoComplete="new-password"
+                value={form.smtpPassword}
+                onChange={(e) => setForm({ ...form, smtpPassword: e.target.value })}
+              />
+              <div className="copy">
+                Приём писем настраивается на сервере (Postfix → приложение) и работает независимо от этих полей.
+                Пусто — аккаунт будет только принимать.
+              </div>
             </>
           )}
           <div className="copy">

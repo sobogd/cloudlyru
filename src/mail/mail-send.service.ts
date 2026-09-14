@@ -4,9 +4,8 @@ import MailComposer from 'nodemailer/lib/mail-composer';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { badRequest, notFound } from '../common/errors';
-import { sha256Hex } from '../common/utils';
 import { MailAccountsService, type MailAccountRow } from './mail-accounts.service';
-import { MailIngestService } from './mail-ingest.service';
+import { MailIngestService, uidOfMessageId } from './mail-ingest.service';
 import { parseMessage } from './mail-parse';
 import { createSmtpTransport } from './mail-smtp';
 
@@ -149,9 +148,15 @@ export class MailSendService {
       );
     }
 
+    if (!account.smtpHost) {
+      throw badRequest('у этого аккаунта отправка не настроена: письма он только принимает', 'mail_send_not_configured');
+    }
+    const smtp = this.accounts.smtpCredentials(account);
     const transport = createSmtpTransport({
-      ...account,
-      password: this.accounts.credentials(account).password,
+      smtpHost: account.smtpHost,
+      smtpPort: account.smtpPort,
+      login: smtp.login,
+      password: smtp.password,
     });
     let accepted: string[] = [];
     let rejected: string[] = [];
@@ -310,13 +315,4 @@ export function parseAddressList(raw: string): string[] {
     .filter((s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s));
 }
 
-/**
- * uid для своей отправки: стабильный и уникальный, выведенный из Message-ID.
- *
- * 48 бит из хэша: этого хватает от коллизий, а значение остаётся в пределах безопасного
- * целого в JS — интерфейс хранения писем принимает uid обычным числом (таким его отдаёт
- * IMAP, где uid 32-битный).
- */
-export function uidOfMessageId(messageId: string): number {
-  return Number(BigInt('0x' + sha256Hex(messageId).slice(0, 12)));
-}
+

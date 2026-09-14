@@ -91,11 +91,14 @@ jobs:
           # Удаление копий с сервера. НЕОБРАТИМО, поэтому по умолчанию выключено и
           # включается только осознанным секретом репозитория.
           MAIL_PURGE_ENABLED: ${{ secrets.MAIL_PURGE_ENABLED || 'false' }}
+          # Токен ручки приёма почты от своего Postfix. Ручка без сессии, поэтому токен
+          # обязателен; снаружи путь ещё закрыт в nginx.
+          MAIL_INBOUND_TOKEN: ${{ secrets.MAIL_INBOUND_TOKEN }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_PURGE_ENABLED
+          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_PURGE_ENABLED,MAIL_INBOUND_TOKEN
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -163,6 +166,8 @@ jobs:
             # Удаление копий с сервера после того, как письма сохранены у нас.
             # НЕОБРАТИМО: включать только после проверенного восстановления из бэкапа.
             MAIL_PURGE_ENABLED=${MAIL_PURGE_ENABLED:-false}
+            # Токен приёма от своего SMTP-сервера (Postfix → приложение)
+            MAIL_INBOUND_TOKEN=$MAIL_INBOUND_TOKEN
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

@@ -1,13 +1,15 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { MailAccountsService } from './mail-accounts.service';
 import { MailFeedService } from './mail-feed.service';
 import { MailSyncService } from './mail-sync.service';
+import { env } from '../config/env';
+import { MailIngestService } from './mail-ingest.service';
 import { MailPurgeService } from './mail-purge.service';
 import { MailSendService } from './mail-send.service';
 import { S3Service } from '../s3/s3.service';
 import { sendObjectOr404 } from '../common/http-object';
-import { CurrentUser, RateLimit, RequestUser, SessionOnly } from '../common/decorators';
+import { CurrentUser, Public, RateLimit, RequestUser, SessionOnly } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { badRequest } from '../common/errors';
 
@@ -29,6 +31,7 @@ export class MailController {
     private readonly sync: MailSyncService,
     private readonly sender: MailSendService,
     private readonly purge: MailPurgeService,
+    private readonly ingestService: MailIngestService,
     private readonly s3: S3Service,
   ) {}
 
@@ -97,6 +100,56 @@ export class MailController {
         lastSyncAt: a.lastSyncAt,
       })),
     };
+  }
+
+  // ===== Приём от своего сервера =====
+
+  /**
+   * Письмо от нашего Postfix (pipe → сюда).
+   *
+   * Ручка без сессии: её дёргает не человек, а почтовый сервер на этой же машине.
+   * Защита — токен из MAIL_INBOUND_TOKEN и запрет этого пути в nginx: снаружи он
+   * недостижим, изнутри требует токен. Тело — само письмо (RFC822), целиком.
+   *
+   * Коды ответов выбраны по смыслу для Postfix: 200 — принято, 503 — «временно не можем»
+   * (письмо подержится в очереди и повторится), 400 — письмо не разобрать.
+   */
+  @Post('inbound')
+  @Public()
+  async inbound(
+    @Query('to') to: string,
+    @Headers('x-mail-inbound-token') token: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
+    const expected = env.MAIL_INBOUND_TOKEN;
+    if (!expected || token !== expected) {
+      res.status(403).json({ message: 'inbound is not configured or token is wrong' });
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of req) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > MAX_INBOUND_BYTES) {
+        res.status(413).json({ message: 'message too large' });
+        return;
+      }
+      chunks.push(buf);
+    }
+    const source = Buffer.concat(chunks);
+    if (!source.length) {
+      res.status(400).json({ message: 'empty message' });
+      return;
+    }
+    const result = await this.ingestService.ingestInbound(to, source);
+    if (result === 'unknown-account') {
+      // Не 404: аккаунт может появиться в приложении через минуту, и тогда письмо доедет.
+      res.status(503).json({ message: `no mail account for ${to}` });
+      return;
+    }
+    res.status(200).json({ ok: true, result });
   }
 
   // ===== Чистка сервера =====
@@ -271,6 +324,9 @@ export class MailController {
     return this.feed.attachment(user.id, id, attachmentId);
   }
 }
+
+/** Потолок размера принимаемого письма: у Gmail предел 25 МБ, у остальных меньше. */
+const MAX_INBOUND_BYTES = 64 * 1024 * 1024;
 
 /** Папка из строки запроса: у почты их две, любое другое значение — «Входящие». */
 function boxOf(raw?: string): string {
