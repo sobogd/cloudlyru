@@ -84,9 +84,18 @@ export class MailIngestService {
     return folder.id;
   }
 
-  /** Ключ письма для детерминированных имён вложений, когда чистое имя занято. */
+  /**
+   * Ключ письма для детерминированных имён вложений, когда чистое имя занято.
+   *
+   * Аккаунт в ключе обязателен. Папка «Почта/Входящие» — одна на пользователя для всех
+   * его ящиков, а X-GM-MSGID уникален только внутри ящика: одно и то же письмо, отправленное
+   * и на личный Gmail, и на рабочий, даёт одинаковые номера частей и одинаковые имена.
+   * Без аккаунта в ключе второе письмо упиралось в «file name already exists» и роняло
+   * весь проход синхронизации.
+   */
   private identityOf(input: IngestInput): string {
-    return input.emailId || `${input.account.id}:${input.folderPath}:${input.uidValidity}:${input.uid}`;
+    const own = input.emailId ?? `${input.folderPath}:${input.uidValidity}:${input.uid}`;
+    return `${input.account.id}:${own}`;
   }
 
   /**
@@ -326,14 +335,16 @@ export class MailIngestService {
       if (!linked) return existing.id;
     }
 
-    for (let i = 0; i < candidates.length; i++) {
+    // Приставка «-N» на случай, когда заняты оба осмысленных имени (например, тёзка лежит
+    // в корзине и слот имени всё равно занят). До этого был тупик: письмо попадало в историю
+    // и каждый проход умирал на нём же, не добирая остальную почту.
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const name = attempt < candidates.length ? candidates[attempt] : `${candidates[candidates.length - 1]}-${attempt - candidates.length + 2}`;
       try {
-        const entry = await this.files.createEntry(folderId, candidates[i], assetId, { userId });
+        const entry = await this.files.createEntry(folderId, name, assetId, { userId });
         return entry.id;
       } catch (e) {
-        // 409 — имя занято (в том числе записью из корзины): пробуем следующий вариант,
-        // на последнем варианте конфликт — уже настоящая ошибка, а не совпадение имён
-        if (i < candidates.length - 1 && e instanceof ApiError && e.getStatus() === 409) continue;
+        if (e instanceof ApiError && e.getStatus() === 409) continue;
         throw e;
       }
     }

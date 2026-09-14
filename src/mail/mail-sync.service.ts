@@ -346,8 +346,14 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
           if (BigInt(msg.uid) <= cursor.lastUid) continue;
           const item = this.messageOf(msg, ctx);
           if (!item) continue;
-          const result = await this.ingestService.ingest(item.input);
-          if (result === 'stored' || result === 'attachments-repaired') stored += 1;
+          try {
+            const result = await this.ingestService.ingest(item.input);
+            if (result === 'stored' || result === 'attachments-repaired') stored += 1;
+          } catch (e) {
+            // Курсор двигаем и при ошибке: иначе одно «упрямое» письмо заставляло бы
+            // перекачивать его на каждом проходе и никогда не пропускать дальше.
+            this.logger.warn(`${ctx.folderPath}: новое письмо ${msg.uid} не сохранено — ${(e as Error).message}`);
+          }
           // Курсор двигаем сразу за письмом: падение на следующем не заставит перекачивать
           // всё заново (у Gmail это ещё и лимит трафика на сутки).
           if (BigInt(msg.uid) > lastUid) {
@@ -419,6 +425,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
 
     const batch = missing.slice(-env.MAIL_BACKFILL_PER_PASS).reverse();
     let stored = 0;
+    let failed = 0;
     let oldest: Date | null = null;
 
     // Одной командой на всю порцию, а не по команде на письмо. Раньше здесь было 200
@@ -428,8 +435,17 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       if (budget <= 0) break;
       const item = this.messageOf(fetched, ctx);
       if (!item) continue;
-      const result = await this.ingestService.ingest(item.input);
-      if (result === 'stored' || result === 'attachments-repaired') stored += 1;
+      try {
+        const result = await this.ingestService.ingest(item.input);
+        if (result === 'stored' || result === 'attachments-repaired') stored += 1;
+      } catch (e) {
+        // Одно проблемное письмо не имеет права останавливать выгрузку: история дойдёт
+        // до него ещё раз (его UID остаётся в окне), а остальные письма поедут дальше.
+        // Раньше исключение убивало весь проход, и граница истории не двигалась вовсе —
+        // архив вставал намертво на одном письме.
+        failed += 1;
+        this.logger.warn(`${ctx.folderPath}: письмо ${fetched.uid} не сохранено — ${(e as Error).message}`);
+      }
       budget -= item.bytes;
       const received = item.input.receivedAt;
       if (!oldest || received < oldest) oldest = received;
@@ -442,6 +458,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
         data: { backfillFrom: new Date(oldest.getTime() + 24 * 60 * 60 * 1000), lastSeenAt: new Date() },
       });
     }
+    if (failed) this.logger.warn(`${ctx.folderPath}: за проход не сохранилось писем — ${failed}`);
     return stored;
   }
 
