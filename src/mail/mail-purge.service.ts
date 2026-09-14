@@ -3,6 +3,8 @@ import { ImapFlow } from 'imapflow';
 import { PrismaService } from '../prisma/prisma.service';
 import { env } from '../config/env';
 import { badRequest } from '../common/errors';
+import { S3Service } from '../s3/s3.service';
+import { sha256Hex } from '../common/utils';
 import { headerMessageId } from './mail-parse';
 import { LOCAL_PREFIX } from './mail-ingest.service';
 import { MailAccountsService, type MailAccountRow } from './mail-accounts.service';
@@ -39,6 +41,9 @@ const MAX_TRIES = 3;
  * попытки удалить письмо из папки, которой на сервере нет.
  */
 const ON_SERVER_FOLDER = { not: { startsWith: LOCAL_PREFIX } } as const;
+
+/** До какого размера письмо проверяем целиком (суммой байтов), а не только размером. */
+const VERIFY_BYTES = 512 * 1024;
 
 /** Пауза перед разбором мусорки: серверу нужно мгновение на отражение переноса. */
 const TRASH_SETTLE_MS = 3000;
@@ -107,6 +112,10 @@ interface CandidateRow {
   fromAddr: string | null;
   flagged: boolean;
   sortAt: Date;
+  /** Для проверки «письмо правда у нас»: вложения, сырьё и его размер. */
+  hasAttachments: boolean;
+  rawAssetId: string;
+  size: number;
 }
 
 @Injectable()
@@ -154,6 +163,7 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly accounts: MailAccountsService,
+    private readonly s3: S3Service,
   ) {}
 
   /** Открыть соединение с аккаунтом. Отдельным методом — чтобы подменять его в проверках. */
@@ -389,7 +399,17 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
       },
       orderBy: { createdAt: 'asc' },
       take: limit,
-      select: { id: true, folderPath: true, uid: true, uidValidity: true, messageId: true, fromAddr: true },
+      select: {
+        id: true,
+        folderPath: true,
+        uid: true,
+        uidValidity: true,
+        messageId: true,
+        fromAddr: true,
+        hasAttachments: true,
+        rawAssetId: true,
+        size: true,
+      },
     })) as CandidateRow[];
     const candidates = rows.filter((r) => !this.isProtected(r.fromAddr));
     if (!candidates.length) return [];
@@ -423,21 +443,87 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
         }
         if (!usable.length) continue;
 
+        // Проверка «письмо правда у нас» — обязательная и идёт перед каждым удалением.
+        // Карантин тут не нужен: он заменял собой именно эту проверку, а она точнее — смотрит
+        // на конкретное письмо, а не на то, сколько времени прошло.
+        const checked: CandidateRow[] = [];
+        const unchecked: Array<{ id: string; reason: string }> = [];
+        for (const row of usable) {
+          const reason = await this.verifyStored(row);
+          if (reason) unchecked.push({ id: row.id, reason });
+          else checked.push(row);
+        }
+        if (unchecked.length) {
+          await this.prisma.mailMessage.updateMany({
+            where: { id: { in: unchecked.map((u) => u.id) } },
+            data: { remotePurgeError: `копия у нас не подтверждена: ${unchecked[0].reason}` },
+          });
+          stat.errors.push(`${folderPath}: ${unchecked.length} писем не проверены — копию у провайдера не трогаем`);
+          this.logger.warn(
+            `${account.email}: не удаляю ${unchecked.length} писем из ${folderPath} — ${unchecked
+              .slice(0, 3)
+              .map((u) => u.reason)
+              .join('; ')}`,
+          );
+        }
+        if (!checked.length) continue;
+
+        // Вторая половина проверки: по нашим координатам на сервере должно лежать ИМЕННО это
+        // письмо. Если Message-ID не совпал, координаты устарели — по ним можно снести чужое
+        // письмо, и такое письмо мы не трогаем вовсе.
+        const byUid = new Map<number, CandidateRow>();
+        for (const row of checked) byUid.set(Number(row.uid), row);
+        const found = new Set<number>();
+        const matched: CandidateRow[] = [];
+        const wrong: Array<{ id: string; reason: string }> = [];
+        for await (const msg of client.fetch(
+          checked.map((r) => Number(r.uid)),
+          { uid: true, headers: ['message-id'] },
+          { uid: true },
+        )) {
+          const row = byUid.get(Number(msg.uid));
+          if (!row) continue;
+          found.add(Number(msg.uid));
+          const remoteId = msg.headers ? headerMessageId(msg.headers) : null;
+          if (remoteId && row.messageId && remoteId === row.messageId) matched.push(row);
+          else wrong.push({ id: row.id, reason: `по координатам на сервере другое письмо (${remoteId ?? 'без Message-ID'})` });
+        }
+        // Сервер не вернул письмо по нашим координатам — значит копии там уже нет: удалять
+        // нечего, но и «удалённым» оно становится честно.
+        const gone = checked.filter((r) => !found.has(Number(r.uid)));
+        if (gone.length) {
+          await this.prisma.mailMessage.updateMany({
+            where: { id: { in: gone.map((r) => r.id) } },
+            data: { remoteDeletedAt: new Date(), remotePurgeError: null },
+          });
+          stat.purged += gone.length;
+          this.logger.log(`${account.email}: копий уже нет в ${folderPath} — ${gone.length}`);
+        }
+        if (wrong.length) {
+          await this.prisma.mailMessage.updateMany({
+            where: { id: { in: wrong.map((w) => w.id) } },
+            data: { remotePurgeTries: { increment: 1 }, remotePurgeError: wrong[0].reason },
+          });
+          stat.errors.push(`${folderPath}: ${wrong.length} писем пропущено — координаты не совпали с сервером`);
+          this.logger.warn(`${account.email}: ${wrong.length} писем пропущено в ${folderPath} — ${wrong[0].reason}`);
+        }
+        if (!matched.length) continue;
+
         const deleted = await this.removeFromFolder(
           client,
           account,
-          usable.map((r) => Number(r.uid)),
+          matched.map((r) => Number(r.uid)),
           folderPath,
         );
         if (!deleted) throw new Error('сервер отказал в удалении');
 
-        const ids = usable.map((r) => r.id);
+        const ids = matched.map((r) => r.id);
         await this.prisma.mailMessage.updateMany({
           where: { id: { in: ids } },
           data: { remoteDeletedAt: new Date(), remotePurgeError: null },
         });
         stat.purged += ids.length;
-        purgedIds.push(...usable.map((r) => r.messageId).filter((m): m is string => Boolean(m)));
+        purgedIds.push(...matched.map((r) => r.messageId).filter((m): m is string => Boolean(m)));
         this.logger.log(`${account.email}: удалено из ${folderPath} — ${ids.length}`);
       } catch (e) {
         const message = (e instanceof Error ? e.message : String(e)).slice(0, 300);
@@ -465,6 +551,55 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
       const found = boxes.find((b) => b.path.toLowerCase() === name.toLowerCase());
       if (found) return found.path;
     }
+    return null;
+  }
+
+  /**
+   * Письмо действительно лежит у нас целиком? null — да, иначе причина отказа.
+   *
+   * Проверяем не «строчку в базе», а сами байты письма в хранилище: строка без содержимого —
+   * это ровно тот случай, ради которого удаление копии у провайдера необратимо. Сверяем
+   * размеры (записи, учёта и самого объекта) и, для небольших писем, контрольную сумму —
+   * объекты у нас адресуются по sha256, так что сумма и есть доказательство целостности.
+   *
+   * Вложения отдельно не проверяем: они лежат внутри сырого письма, и потеряться отдельно от
+   * него не могут. Но если в письме вложения есть, а частей у нас нет — значит разбор не
+   * доехал: такое письмо не удаляем, пока оно не разобрано.
+   */
+  private async verifyStored(row: CandidateRow): Promise<string | null> {
+    const asset = await this.prisma.asset.findUnique({
+      where: { id: row.rawAssetId },
+      select: { sha256: true, size: true },
+    });
+    if (!asset?.sha256) return 'сырьё письма не учтено';
+
+    const key = S3Service.assetKey(asset.sha256);
+    let stored = 0;
+    try {
+      stored = await this.s3.objectSize(key);
+    } catch (e) {
+      return `сырья нет в хранилище (${e instanceof Error ? e.message.slice(0, 60) : 'ошибка'})`;
+    }
+    if (!stored) return 'сырьё в хранилище пустое';
+    // Размер в учёте — BigInt (в хранилище бывают файлы больше двух гигабайт), размер письма —
+    // обычное число: сравниваем приведённым.
+    const known = Number(asset.size);
+    if (stored !== known) return `размер сырья не совпал: в учёте ${known}, в хранилище ${stored}`;
+    if (known !== row.size) return `размер письма не совпал: в письме ${row.size}, в учёте ${known}`;
+
+    if (row.hasAttachments) {
+      const parts = await this.prisma.mailAttachment.count({ where: { messageId: row.id } });
+      if (!parts) return 'вложения письма ещё не разобраны';
+    }
+
+    // Небольшие письма проверяем целиком: 512 КБ — это почти вся переписка, а сумма байтов
+    // доказывает, что объект именно тот, за который себя выдаёт.
+    if (stored <= VERIFY_BYTES) {
+      const bytes = await this.s3.getObjectBytes(key).catch(() => null);
+      if (!bytes) return 'сырьё не читается из хранилища';
+      if (sha256Hex(bytes) !== asset.sha256) return 'содержимое сырья не совпало с учётом';
+    }
+
     return null;
   }
 
