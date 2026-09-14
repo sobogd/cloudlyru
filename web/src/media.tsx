@@ -1089,8 +1089,16 @@ function Slide({
   zoom: ZoomState;
   onNat?: (s: { w: number; h: number }) => void;
 }) {
-  const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
+  /** Натуральный размер вместе с id кадра, по которому он измерен: слот может сменить кадр. */
+  const [nat, setNat] = useState<{ id: string; w: number; h: number } | null>(null);
   const [failed, setFailed] = useState(false);
+  const entryId = item?.entryId;
+
+  // Кадр в слоте сменился (удаление сдвигает индексы): ошибка прошлого кадра к новому
+  // не относится, иначе он так и останется «не открылось», даже не попробовав загрузиться.
+  useEffect(() => {
+    setFailed(false);
+  }, [entryId]);
 
   if (!item) {
     return (
@@ -1124,7 +1132,20 @@ function Slide({
   }
 
   const src = api.previewUrl(item.sha256, 1080);
-  const fit = nat ? fitGeom(stage.w, stage.h, nat.w, nat.h) : null;
+  /**
+   * Размер берём у загруженного кадра и помним, по какому именно кадру он измерен.
+   * Иначе при смене кадра в слоте (удаление сдвинуло индексы, на карте открылась другая
+   * точка) новый кадр рисовался бы в пропорциях предыдущего и сам бы не перемерялся:
+   * размер «уже есть», значит скрытая предзагрузка больше не запускается.
+   */
+  const fit = nat && nat.id === entryId ? fitGeom(stage.w, stage.h, nat.w, nat.h) : null;
+  const measure = (el: HTMLImageElement) => {
+    const w = el.naturalWidth;
+    const h = el.naturalHeight;
+    if (!w || !h || !entryId) return; // недогруженный кадр размером не считается
+    setNat((prev) => (prev && prev.id === entryId && prev.w === w && prev.h === h ? prev : { id: entryId, w, h }));
+    onNat?.({ w, h });
+  };
 
   return (
     <>
@@ -1139,11 +1160,7 @@ function Slide({
           src={src}
           alt=""
           style={{ display: 'none' }}
-          onLoad={(e) => {
-            const s = { w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight };
-            setNat(s);
-            onNat?.(s);
-          }}
+          onLoad={(e) => measure(e.currentTarget)}
           onError={() => setFailed(true)}
         />
       )}
@@ -1152,6 +1169,7 @@ function Slide({
           src={src}
           alt=""
           draggable={false}
+          onLoad={(e) => measure(e.currentTarget)}
           onError={() => setFailed(true)}
           style={{
             position: 'absolute',
