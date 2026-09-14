@@ -746,18 +746,20 @@ export function MediaViewer({
   );
 
   // Клавиатура: Esc — закрыть, ←/→ — листание (на десктопе вместо свайпа).
-  // Кадры лежат слева направо (transform translateX((i - pos) * 100%)), поэтому → это
-  // следующий кадр, а ← — предыдущий: как в списке, а не как «тянуть картинку».
+  // Правило просмотрщика: вправо = свежее, влево = раньше. Лента идёт от свежих
+  // (ORDER BY capturedAt DESC), поэтому свежий кадр лежит по меньшему индексу:
+  // ← отдаёт pos + 1, → отдаёт pos - 1. Тот же знак у свайпа, флика и колеса —
+  // менять клавиши в одиночку нельзя, иначе они разъедутся с жестами.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         close();
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        go(-1);
+        go(1);
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        go(1);
+        go(-1);
       }
     };
     document.addEventListener('keydown', onKey);
