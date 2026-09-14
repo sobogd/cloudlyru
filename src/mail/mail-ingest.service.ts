@@ -300,6 +300,60 @@ export class MailIngestService {
     return result === 'skipped' || result === 'attachments-repaired' ? 'duplicate' : 'stored';
   }
 
+  /**
+   * Добрать вложения письма, которое уже лежит у нас, по его же сырью.
+   *
+   * Штатный случай — обрыв прошлого прохода между строкой письма и частями: сырьё в хранилище
+   * уже есть, а вложений в дереве нет. Повторный разбор идемпотентен (имя файла выводится из
+   * письма), поэтому вызов безопасен и для письма, у которого всё на месте.
+   *
+   * Отдельный публичный вход нужен чистке сервера: она не удаляет копию письма, пока вложения
+   * не разобраны, и должна уметь этот разбор запустить, а не просто отказаться.
+   */
+  async repairMessage(userId: string, id: string): Promise<number> {
+    const row = await this.prisma.mailMessage.findFirst({
+      where: { id, userId },
+      select: {
+        id: true,
+        box: true,
+        folderPath: true,
+        uid: true,
+        uidValidity: true,
+        gmailMsgId: true,
+        receivedAt: true,
+        sortAt: true,
+        rawAssetId: true,
+        seen: true,
+        flagged: true,
+        account: true,
+      },
+    });
+    if (!row) return 0;
+    const account = row.account as MailAccountRow;
+    const before = await this.prisma.mailAttachment.count({ where: { messageId: row.id } });
+    await this.repairAttachments(
+      userId,
+      row.id,
+      row.rawAssetId,
+      row.sortAt,
+      {
+        userId,
+        account,
+        box: row.box as MailBox,
+        folderPath: row.folderPath,
+        uid: Number(row.uid),
+        uidValidity: row.uidValidity,
+        source: Buffer.alloc(0), // сырьё берём из хранилища, а не из письма
+        seen: row.seen,
+        flagged: row.flagged,
+        emailId: row.gmailMsgId,
+        threadId: null,
+        receivedAt: row.receivedAt,
+      },
+    );
+    return (await this.prisma.mailAttachment.count({ where: { messageId: row.id } })) - before;
+  }
+
   /** Добор вложений по уже сохранённому сырью (прошлый проход оборвался на середине). */
   private async repairAttachments(
     userId: string,

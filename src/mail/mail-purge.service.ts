@@ -9,6 +9,7 @@ import { sha256Hex } from '../common/utils';
 import { headerMessageId } from './mail-parse';
 import { LOCAL_PREFIX } from './mail-ingest.service';
 import { MailAccountsService, type MailAccountRow } from './mail-accounts.service';
+import { MailIngestService } from './mail-ingest.service';
 
 /**
  * Уборка копий с сервера аккаунта — единственная необратимая операция во всём разделе.
@@ -123,6 +124,7 @@ interface PurgeStat {
 /** Поля, нужные и отбору, и проверке: их читаем всегда одинаково. */
 const CANDIDATE_FIELDS = {
   id: true,
+  userId: true,
   folderPath: true,
   uid: true,
   uidValidity: true,
@@ -133,8 +135,16 @@ const CANDIDATE_FIELDS = {
   size: true,
 } as const;
 
+/** Что нужно отчёту: пара полей для примеров и подсчёта. Удалять по этим строкам нельзя. */
+interface PlanRow {
+  fromAddr: string | null;
+  subject: string | null;
+  sortAt: Date;
+}
+
 interface CandidateRow {
   id: string;
+  userId: string;
   folderPath: string;
   uid: bigint;
   uidValidity: bigint;
@@ -195,6 +205,7 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly accounts: MailAccountsService,
     private readonly s3: S3Service,
+    private readonly ingestService: MailIngestService,
   ) {}
 
   /** Открыть соединение с аккаунтом. Отдельным методом — чтобы подменять его в проверках. */
@@ -238,7 +249,10 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
   private notProtectedFilter(): Prisma.MailMessageWhereInput {
     const domains = this.protectedDomains();
     if (!domains.length) return {};
-    return { NOT: { OR: domains.map((d) => ({ fromAddr: { endsWith: `@${d}` } })) } };
+    // Две формы, как и в isProtected: и «кто-то@apple.com», и «developer@email.apple.com» —
+    // у Apple и Google оповещения идут именно с поддоменов.
+    const forms = domains.flatMap((d) => [{ fromAddr: { endsWith: `@${d}` } }, { fromAddr: { endsWith: `.${d}` } }]);
+    return { NOT: { OR: forms } };
   }
 
   private quarantineCutoff(): Date {
@@ -318,7 +332,7 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
       // Защищённых отправителей отсеиваем в памяти: их немного, а отдельный запрос на каждое
       // письмо был бы дороже. В счётчике отчёта их не приплюсовываем — он уже посчитан выше
       // по всему ящику, и сумма дала бы двойной учёт.
-      const candidates = (rows as CandidateRow[]).filter((r) => !this.isProtected(r.fromAddr));
+      const candidates = (rows as PlanRow[]).filter((r) => !this.isProtected(r.fromAddr));
       // Останется у провайдера навсегда — то, что не подлежит удалению вовсе, а не «остаток
       // очереди»: очередь как раз видна в eligible и уменьшается с каждым проходом.
       const remaining = Math.max(0, total - alreadyPurged - eligible);
@@ -706,8 +720,14 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
     if (known !== row.size) return `размер письма не совпал: в письме ${row.size}, в учёте ${known}`;
 
     if (row.hasAttachments) {
-      const parts = await this.prisma.mailAttachment.count({ where: { messageId: row.id } });
-      if (!parts) return 'вложения письма ещё не разобраны';
+      let parts = await this.prisma.mailAttachment.count({ where: { messageId: row.id } });
+      if (!parts) {
+        // Вложения лежат внутри сырого письма, которое у нас есть, поэтому это не потеря,
+        // а недоразобранное письмо: пробуем разобрать сейчас, а не отказываемся навсегда.
+        const added = await this.ingestService.repairMessage(row.userId, row.id).catch(() => 0);
+        parts = await this.prisma.mailAttachment.count({ where: { messageId: row.id } });
+        if (!parts) return `вложения письма не разобрались (добрано ${added})`;
+      }
     }
 
     // Небольшие письма проверяем целиком: 512 КБ — это почти вся переписка, а сумма байтов
