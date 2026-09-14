@@ -746,16 +746,18 @@ export function MediaViewer({
   );
 
   // Клавиатура: Esc — закрыть, ←/→ — листание (на десктопе вместо свайпа).
+  // Кадры лежат слева направо (transform translateX((i - pos) * 100%)), поэтому → это
+  // следующий кадр, а ← — предыдущий: как в списке, а не как «тянуть картинку».
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         close();
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        go(1);
+        go(-1);
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        go(-1);
+        go(1);
       }
     };
     document.addEventListener('keydown', onKey);
