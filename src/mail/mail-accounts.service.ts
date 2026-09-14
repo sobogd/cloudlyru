@@ -51,9 +51,15 @@ export interface MailKindPreset {
 
 /**
  * Пресеты провайдеров. У Gmail писем «по папкам» нет: есть одно хранилище и метки, поэтому
- * читаем `[Gmail]/All Mail` (в нём всё, кроме спама и корзины) и `[Gmail]/Spam` — спам
- * показываем во «Входящих», как и договаривались, отдельных папок у почты нет. Отправленные
- * отсекаем по системной метке `\Sent`, поэтому в All Mail отдельная папка не нужна.
+ * читаем `[Gmail]/All Mail` (в нём всё, кроме спама и корзины), `[Gmail]/Spam` и
+ * `[Gmail]/Trash` — и спам, и корзину показываем во «Входящих», как и договаривались,
+ * отдельных папок у почты нет. Отправленные отсекаем по системной метке `\Sent`, поэтому
+ * в All Mail отдельная папка не нужна.
+ *
+ * Корзину забираем не из любопытства: провайдеры удаляют её содержимое сами (Gmail — через
+ * 30 дней), и это единственное место, где письмо может исчезнуть без нашего участия.
+ * Черновики не забираем: неотправленный черновик — не письмо. Заметки Apple и Google тоже
+ * не трогаем, хотя они и видны по IMAP отдельными папками.
  */
 export const MAIL_PRESETS: Record<MailKind, MailKindPreset> = {
   gmail: {
@@ -67,6 +73,7 @@ export const MAIL_PRESETS: Record<MailKind, MailKindPreset> = {
       // All Mail — всё, кроме спама и корзины; отправленные внутри него отсекаем по метке \Sent
       { path: '[Gmail]/All Mail', specialUse: '\\All', box: 'inbox' },
       { path: '[Gmail]/Spam', specialUse: '\\Junk', box: 'inbox' },
+      { path: '[Gmail]/Trash', specialUse: '\\Trash', box: 'inbox' },
     ],
     stripSeparators: true,
   },
@@ -81,6 +88,7 @@ export const MAIL_PRESETS: Record<MailKind, MailKindPreset> = {
       // INBOX — единственное имя, которое в IMAP не локализуется и не переименовывается
       { path: 'INBOX', box: 'inbox' },
       { path: 'Junk', specialUse: '\\Junk', box: 'inbox' },
+      { path: 'Deleted Messages', specialUse: '\\Trash', box: 'inbox' },
       { path: 'Sent Messages', specialUse: '\\Sent', box: 'sent' },
     ],
     stripSeparators: true,
