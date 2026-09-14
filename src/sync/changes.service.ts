@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { currentDeviceId } from '../common/request-context';
+import { isHiddenZone } from '../common/zones';
 
 /** Цель события журнала: файл в дереве или папка. */
 export type ChangeTarget = 'entry' | 'folder';
@@ -59,6 +60,11 @@ export class ChangesService {
   constructor(private readonly prisma: PrismaService) {}
 
   async record(input: ChangeInput, tx?: Prisma.TransactionClient): Promise<void> {
+    // Скрытые зоны в журнал не попадают: клиенты синхронизации не видят папку «Почта»,
+    // и события про её записи были бы для них ссылками на несуществующее дерево.
+    // Единая точка: раньше такая проверка стояла бы в каждом вызывающем, и новая скрытая
+    // зона однажды просочилась бы в чей-то проход (вложения почты поехали бы на телефон).
+    if (isHiddenZone(input.zone)) return;
     const db = tx ?? this.prisma;
     await db.changeLog.create({
       data: {

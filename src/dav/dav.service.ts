@@ -12,7 +12,7 @@ import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
 import { ChangesService } from '../sync/changes.service';
 import { assertSafeName, randomToken } from '../common/utils';
-import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
+import { HIDDEN_ZONES, ZONE_PHOTOS, isHiddenZone, zoneOf } from '../common/zones';
 import { notFound } from '../common/errors';
 
 export class DavError extends Error {}
@@ -78,6 +78,9 @@ export class DavService {
       if (!f) return null;
       // системная медиатека «Фото» скрыта в WebDAV (как и в разделе «Файлы»)
       if (photoId && f.id === photoId) return null;
+      // скрытые зоны (папка «Почта» с вложениями писем) недостижимы и по прямому пути:
+      // в листинге их нет, но клиент мог бы угадать имя
+      if (isHiddenZone(f.zone)) return null;
       folderId = f.id;
     }
     return folderId;
@@ -111,14 +114,17 @@ export class DavService {
       const folderId = parts.length ? await this.folderByPath(userId, parts) : rootId;
       if (!folderId) throw notFound('path not found');
       const folder = await this.folderMeta(folderId);
-      if (!folder || folder.deletedAt) throw notFound('path not found');
+      if (!folder || folder.deletedAt || isHiddenZone(folder.zone)) throw notFound('path not found');
       const href = '/' + parts.join('/');
       responses.push({ href: href === '/' ? '/' : href, isCollection: true, name: folder.name, mtime: folder.updatedAt });
       if (depth !== '0') {
         const [folders, entries] = await Promise.all([
-          this.prisma.folder.findMany({ where: { parentId: folderId, deletedAt: null }, orderBy: { name: 'asc' } }),
+          this.prisma.folder.findMany({
+            where: { parentId: folderId, deletedAt: null, zone: { notIn: [...HIDDEN_ZONES] } },
+            orderBy: { name: 'asc' },
+          }),
           this.prisma.fileEntry.findMany({
-            where: { folderId, deletedAt: null },
+            where: { folderId, deletedAt: null, zone: { notIn: [...HIDDEN_ZONES] } },
             orderBy: { name: 'asc' },
             include: { asset: { select: { size: true, mime: true } } },
           }),
@@ -158,7 +164,7 @@ export class DavService {
     // неуправляемой (её нельзя переименовать, переместить или удалить)
     if (name === ROOT_FOLDER_NAME) throw new BadRequestException('reserved name');
     const parent = await this.prisma.folder.findUnique({ where: { id: parentId }, select: { zone: true } });
-    const zone = parent?.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    const zone = zoneOf(parent?.zone);
     await this.prisma.$transaction(async (tx) => {
       const created = await tx.folder.create({
         data: { parentId, name, zone },
@@ -186,7 +192,7 @@ export class DavService {
     const parentId = await this.folderByPath(userId, parts.slice(0, -1));
     if (!parentId) throw notFound('parent not found');
     const parent = await this.prisma.folder.findUnique({ where: { id: parentId }, select: { zone: true } });
-    const zone = parent?.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    const zone = zoneOf(parent?.zone);
     const name = decodeURIComponent(parts[parts.length - 1]);
     try {
       assertSafeName(name);

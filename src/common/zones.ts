@@ -3,12 +3,42 @@
 //          в раздел «Фото» (лента по месяцам) не попадает.
 // PHOTOS — поддерево системной папки «Фото»: фото/видео конвертируются (мастер + превью),
 //          попадают в таймлайн и альбомы.
+// MAIL   — поддерево системной папки «Почта»: вложения писем. Зона скрытая: её папки и
+//          записи не показываются в «Файлах», поиске, WebDAV и шаринге, и по ним не пишется
+//          журнал изменений — иначе клиенты синхронизации потащили бы к себе всю почту.
+//          Файл из этой зоны открывается только по ссылке от письма.
 export const ZONE_FILES = 'FILES';
 export const ZONE_PHOTOS = 'PHOTOS';
-export type Zone = typeof ZONE_FILES | typeof ZONE_PHOTOS;
+export const ZONE_MAIL = 'MAIL';
+export type Zone = typeof ZONE_FILES | typeof ZONE_PHOTOS | typeof ZONE_MAIL;
 
 /** Имя системной папки-медиатеки верхнего уровня (ребёнок корня пользователя). */
 export const PHOTO_FOLDER_NAME = 'Фото';
+
+/** Имя системной папки почты верхнего уровня: вложения писем, скрыта отовсюду. */
+export const MAIL_FOLDER_NAME = 'Почта';
+
+/**
+ * Зоны, которых не должно быть видно нигде, кроме их собственных ручек.
+ * Одним списком намеренно: фильтры в листингах, WebDAV, шаринге и журнале обязаны
+ * расходиться только вместе, иначе новая скрытая зона останется видна в одном из мест.
+ */
+export const HIDDEN_ZONES: readonly string[] = [ZONE_MAIL];
+
+/** Зона скрыта от листингов, WebDAV, журнала изменений и шаринга? */
+export function isHiddenZone(zone: string | null | undefined): boolean {
+  return zone !== null && zone !== undefined && HIDDEN_ZONES.includes(zone);
+}
+
+/**
+ * Зона новой папки или записи по зоне родителя. Раньше здесь был тернарник
+ * `parent.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES`, размноженный по всем местам
+ * создания, копирования и переноса. С появлением третьей зоны каждый такой тернарник
+ * молча превращал вложение письма в обычный файл — то есть вытаскивал его в «Файлы».
+ */
+export function zoneOf(parentZone: string | null | undefined): Zone {
+  return parentZone === ZONE_PHOTOS || parentZone === ZONE_MAIL ? parentZone : ZONE_FILES;
+}
 
 /**
  * Имя легаси-папки «Телефон» (общий на все телефоны корень зеркала). Сервер её больше

@@ -5,7 +5,7 @@
 
 /** Вкладки нижнего острова. `albums` остался в типе: экран «Альбомы» живёт в коде и может
     вернуться в навигацию одной строкой, а сохранённая вкладка не должна теряться. */
-export type Tab = 'files' | 'media' | 'map' | 'albums' | 'trash' | 'settings';
+export type Tab = 'files' | 'media' | 'map' | 'mail' | 'albums' | 'trash' | 'settings';
 
 export type UiState = {
   tab?: Tab;
@@ -13,6 +13,17 @@ export type UiState = {
   albums?: { openId?: string | null };
   /** Последний вид карты: центр и зум, чтобы вкладка открывалась там же, где её закрыли. */
   map?: { lat: number; lon: number; zoom: number };
+  /**
+   * Почта: папка, позиция ленты и открытое письмо. Храним индекс письма (как в «Медиа»),
+   * а не только scrollTop: при возврате в раздел список перечитывается, и индекс надёжнее
+   * «сырых» пикселей.
+   */
+  mail?: {
+    box?: 'inbox' | 'sent';
+    index?: number;
+    scrollTop?: number;
+    openId?: string | null;
+  };
   media?: {
     /** Индекс первого видимого элемента ленты «Медиа» (надёжнее, чем сырой scrollTop). */
     index?: number;

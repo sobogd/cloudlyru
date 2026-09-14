@@ -4,7 +4,7 @@ import { AuthService } from '../auth/auth.service';
 import { FilesService } from '../files/files.service';
 import { FoldersService } from '../folders/folders.service';
 import { ChangesService } from '../sync/changes.service';
-import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
+import { isHiddenZone, zoneOf } from '../common/zones';
 import { badRequest, notFound } from '../common/errors';
 
 export type ClipboardKind = 'file' | 'folder';
@@ -117,6 +117,9 @@ export class ClipboardService {
     const target = await this.prisma.folder.findUnique({ where: { id: folderId } });
     if (!target || target.deletedAt) throw notFound('folder not found');
     if (!(await this.auth.folderOwnedBy(userId, target.id))) throw notFound('folder not found');
+    // в скрытую зону («Почта») вставлять нечего: файл там остался бы без письма и не был
+    // бы виден ни в одном разделе
+    if (isHiddenZone(target.zone)) throw notFound('folder not found');
 
     if (view.kind === 'folder') {
       await this.folders.move(view.id, target.id, userId);
@@ -156,7 +159,7 @@ export class ClipboardService {
           folderId,
           assetId: entry.assetId,
           name,
-          zone: zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES,
+          zone: zoneOf(zone),
         },
         select: { id: true, name: true, folderId: true, zone: true },
       });

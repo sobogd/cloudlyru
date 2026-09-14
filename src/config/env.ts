@@ -65,6 +65,44 @@ const envSchema = z.object({
   // Оригинал нужен, чтобы пересобрать мастер с лучшими параметрами/метаданными:
   // сами метаданные (ICC, gain map, MPF, MakerNotes) после конвертации невосстановимы.
   KEEP_ORIGINALS: booleanish.default('true'),
+
+  // ===== Почта =====
+  // Ключ шифрования паролей почтовых аккаунтов (AES-256-GCM). Годится и hex на 64 символа
+  // (openssl rand -hex 32), и любая строка-парольная фраза — тогда ключ выводится sha256.
+  // Сами app-пароли в окружении не живут: их вводят в веб-интерфейсе, и они ложатся в БД
+  // зашифрованными этим ключом.
+  MAIL_SECRET_KEY: z.string().default(''),
+  MAIL_SYNC_ENABLED: booleanish.default('false'),
+  // Плановый проход по папкам, секунды: мгновенный приход даёт IDLE, а это — страховка
+  // на случай разорванного соединения и потерянных событий.
+  MAIL_SYNC_INTERVAL_SEC: z.coerce.number().int().positive().default(300),
+  // Нижняя граница истории, дни: старше не забираем вовсе. 0 — без ограничения (история
+  // идёт назад, пока она есть). Интерфейс живой сразу в любом случае: письма приходят
+  // от свежих к старым, поэтому первые экраны заполняются на первом же проходе.
+  MAIL_BACKFILL_DAYS: z.coerce.number().int().nonnegative().default(0),
+  // Сколько писем истории добирать за один проход. У Gmail лимит на скачивание по IMAP
+  // (порядка 2.5 ГБ в сутки на аккаунт), поэтому история идёт порциями, а не залпом.
+  MAIL_BACKFILL_PER_PASS: z.coerce.number().int().positive().default(200),
+  // Потолок трафика одного прохода, МБ: предохранитель от «одна папка на 40 ГБ».
+  MAIL_PASS_BUDGET_MB: z.coerce.number().positive().default(300),
+  // Удаление писем с сервера после того, как они сохранены у нас. Безвозвратно — включать
+  // только после проверенного восстановления из бэкапа.
+  MAIL_PURGE_ENABLED: booleanish.default('false'),
+  // Карантин между «сохранено у нас» и «удалено с сервера», часы (7 суток по умолчанию).
+  MAIL_PURGE_QUARANTINE_HOURS: z.coerce.number().int().positive().default(168),
+  // Сколько писем удалять за один прогон: порциями безопаснее — видно результат и можно
+  // остановиться, не разбирая последствия на всём ящике сразу.
+  MAIL_PURGE_PER_RUN: z.coerce.number().int().positive().default(200),
+  // Предохранитель: если под удаление попадает больше этой доли ящика (в процентах) и писем
+  // больше сотни, прогон отказывается работать. Защита от ошибки в отборе, а не от человека.
+  MAIL_PURGE_MAX_SHARE: z.coerce.number().positive().max(100).default(50),
+  // Адреса, письма от которых не удаляем никогда: коды входа, оповещения о безопасности,
+  // восстановление доступа. Потерять их — значит потерять доступ к самому аккаунту.
+  MAIL_PURGE_PROTECT_SENDERS: z
+    .string()
+    .default('accounts.google.com,google.com,apple.com,id.apple.com,icloud.com'),
+  // Сколько последних писем в папке-мусорке просматривать за прогон при добивании удалённого.
+  MAIL_PURGE_TRASH_SCAN: z.coerce.number().int().positive().default(2000),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -81,6 +119,9 @@ function load(): Env {
     const missing: string[] = [];
     if (!e.S3_FILES_ACCESS_KEY) missing.push('S3_FILES_ACCESS_KEY');
     if (!e.S3_FILES_SECRET_KEY) missing.push('S3_FILES_SECRET_KEY');
+    // Синхронизация без ключа означала бы пароли аккаунтов в открытом виде в БД, поэтому
+    // это отказ старта, а не предупреждение. При выключенной синхронизации ключ не нужен.
+    if (e.MAIL_SYNC_ENABLED && !e.MAIL_SECRET_KEY) missing.push('MAIL_SECRET_KEY');
     if (missing.length) {
       throw new Error(`[env] production требует: ${missing.join(', ')}`);
     }

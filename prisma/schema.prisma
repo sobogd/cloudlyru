@@ -22,9 +22,13 @@ model User {
   sessions      Session[]
   apiTokens     ApiToken[]
   shares        Share[]
+  mailAccounts  MailAccount[]
   rootFolderId  String? // корневая папка пользователя (создаётся при seed)
   photoFolderId String? // системная папка «Фото» (медиа-зона; создаётся при seed/lazy)
   phoneFolderId String? // системная папка «Телефон» (зеркало папок телефона; создаётся lazy)
+  // системная папка «Почта» (зона MAIL): вложения писем. Создаётся лениво при первом
+  // обращении почтового модуля и скрыта отовсюду, поэтому в `GET /auth/me` не отдаётся.
+  mailFolderId  String?
   // Буфер копирования/вырезания. В БД, а не в localStorage браузера: буфер должен быть
   // один на аккаунт — скопировал на телефоне, вставил на ноутбуке. Одна цель за раз.
   clipboardKind String? // 'file' | 'folder'
@@ -104,6 +108,9 @@ model FileEntry {
   folder     Folder      @relation(fields: [folderId], references: [id], onDelete: Cascade)
   asset      Asset       @relation(fields: [assetId], references: [id], onDelete: Restrict)
   albumItems AlbumItem[]
+  // обратная сторона MailAttachment.entryId: вложение письма — обычная запись дерева
+  // (в скрытой зоне MAIL), поэтому её содержимое дедуплицируется с файлами пользователя
+  mailAttachment MailAttachment?
 
   @@unique([folderId, name])
   @@index([folderId, deletedAt])
@@ -131,6 +138,9 @@ model Asset {
   entries       FileEntry[]
   media         MediaMeta?
   jobs          Job[]
+  // сырые .eml писем: объект в S3 тот же content-addressed files/<sha256>, а строка Asset
+  // нужна, чтобы объект был на учёте (иначе его снесёт deploy/scripts/sweep-orphans.mjs)
+  mailRaw       MailMessage[] @relation("MailRawAsset")
 
   @@index([previewState])
 }
@@ -348,4 +358,140 @@ model UnzipJob {
 
   @@index([state, createdAt])
   @@index([entryId])
+}
+
+// ===== Почта: аккаунты, курсоры синка, письма и вложения =====
+// Модель «две папки»: всё полученное (включая спам) — inbox, всё отправленное — sent.
+// Папок, меток и фильтров у почты нет намеренно, поэтому папок источника много,
+// а корзин у нас ровно две (см. MailCursor.box).
+
+model MailAccount {
+  id          String    @id @default(uuid())
+  userId      String
+  kind        String // 'gmail' | 'icloud' | 'imap' — от него зависят имена папок источника
+  email       String // адрес, которым подписываются письма и по которому идёт дедуп
+  imapHost    String
+  imapPort    Int       @default(993)
+  smtpHost    String
+  smtpPort    Int       @default(465)
+  login       String // логин IMAP/SMTP (у Gmail и iCloud совпадает с email, но это не гарантия)
+  // app password, зашифрованный AES-256-GCM ключом MAIL_SECRET_KEY: это ключ ко всей
+  // переписке, в открытом виде он не хранится и в логи не попадает.
+  secretEnc   String
+  authKind    String    @default("password") // password | oauth2 (задел под Gmail API)
+  enabled     Boolean   @default(true)
+  status      String    @default("idle") // idle | syncing | error
+  statusError String?
+  lastSyncAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cursors     MailCursor[]
+  messages    MailMessage[]
+
+  @@unique([userId, email])
+  @@index([userId])
+}
+
+// Курсор синхронизации по одной папке источника: пар (uidValidity, lastUid) достаточно для
+// инкремента, а `box` говорит, в какую из наших двух папок раскладывать письма отсюда.
+model MailCursor {
+  id           String      @id @default(uuid())
+  accountId    String
+  imapPath     String // 'INBOX', '[Gmail]/All Mail', 'Sent Messages', …
+  box          String // 'inbox' | 'sent'
+  uidValidity  BigInt // сменилась — папка пересинкивается целиком
+  lastUid      BigInt      @default(0)
+  // Бэкфилл идёт от свежих к старым (сначала 90 дней, глубина фоном), поэтому докуда
+  // дошли вглубь — это дата, а не uid.
+  backfillFrom DateTime?
+  backfillDone Boolean     @default(false)
+  lastSeenAt   DateTime?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  account      MailAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, imapPath])
+  @@index([accountId])
+}
+
+model MailMessage {
+  id             String    @id @default(uuid())
+  userId         String
+  accountId      String
+  box            String // 'inbox' | 'sent'
+  folderPath     String // папка источника: по ней и курсору письмо находится повторно
+  uid            BigInt
+  uidValidity    BigInt
+  // X-GM-MSGID — стабильный идентификатор письма у Gmail: он не меняется при переносе
+  // между папками, поэтому дедуп для Gmail идёт по нему, а не по uid.
+  gmailMsgId     String?
+  messageId      String? // Message-ID из заголовков
+  threadKey      String? // X-GM-THRID либо нормализованная тема для iCloud
+  subject        String?
+  fromName       String?
+  fromAddr       String?
+  toAddrs        String[]
+  ccAddrs        String[]
+  replyTo        String?
+  inReplyTo      String?
+  refs           String[] // References из заголовков — для сборки треда
+  sentAt         DateTime? // Date из заголовков (может врать и отсутствовать)
+  receivedAt     DateTime // INTERNALDATE — время прихода на сервер, ему и верим
+  // Ключ сортировки ленты: receivedAt для входящих, sentAt (иначе receivedAt) для исходящих.
+  // Отдельной колонкой, чтобы индекс ленты не зависел от выражения COALESCE.
+  sortAt         DateTime
+  size           Int
+  hasAttachments Boolean   @default(false)
+  seen           Boolean   @default(false)
+  flagged        Boolean   @default(false)
+  // Первые ~2 КБ текста: превью в списке рисуется без разбора .eml из S3.
+  bodyText       String?
+  rawAssetId     String // Asset сырого .eml (объект files/<sha256>)
+  // Удаление письма из веб-морды — soft (корзина общая с файлами); `remoteDeletedAt` — уже
+  // про источник, когда копию убрали с сервера аккаунта.
+  deletedAt       DateTime?
+  remoteDeletedAt DateTime?
+  // Сколько раз пытались убрать копию с сервера и чем кончилось. Нужно для разбора: без этих
+  // полей «письмо почему-то не удаляется» выяснять неоткуда, а молчаливые повторы бесконечны.
+  remotePurgeTries Int       @default(0)
+  remotePurgeError String?
+  createdAt      DateTime  @default(now())
+  account        MailAccount     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  rawAsset       Asset           @relation("MailRawAsset", fields: [rawAssetId], references: [id], onDelete: Restrict)
+  attachments    MailAttachment[]
+
+  // Идемпотентность повторного прохода по папке: то же письмо не заводится второй раз.
+  @@unique([accountId, folderPath, uidValidity, uid])
+  // Лента: свежие сверху; порядок совпадает с индексом (NULL в sortAt не бывает).
+  @@index([userId, box, sortAt(sort: Desc), id(sort: Desc)])
+  // Индекса по (accountId, gmailMsgId) здесь нет намеренно: в миграции он объявлен
+  // УНИКАЛЬНЫМ и частичным (WHERE gmailMsgId IS NOT NULL) — так дедуп защищён на уровне БД,
+  // а в схеме частичный уникальный индекс не выражается.
+  @@index([accountId, messageId])
+  @@index([deletedAt])
+}
+
+// Вложение письма = обычная запись дерева в скрытой зоне MAIL плюс связь с письмом.
+// Через `entryId` файл открывается деталкой (превью, размер, скачивание), через
+// `messageId` — обратный переход «файл → письмо».
+model MailAttachment {
+  id        String   @id @default(uuid())
+  messageId String
+  entryId   String   @unique
+  // Порядковый номер части в разобранном письме. Путь MIME ('1.2') тут не годится: разбор
+  // идёт через mailparser, который пути не отдаёт, а саму часть мы сохраняем в S3 — искать
+  // её повторно в .eml не нужно.
+  partIndex Int
+  filename  String // исходное имя из письма (запись дерева носит имя с приставкой даты)
+  mime      String
+  size      Int
+  contentId String? // Content-ID инлайн-картинки: по нему подменяется cid: в HTML письма
+  inline    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  message   MailMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  entry     FileEntry   @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, partIndex])
+  @@index([messageId])
 }

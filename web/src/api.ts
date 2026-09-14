@@ -31,7 +31,17 @@ export interface ShareInfo {
   hasPassword: boolean; expiresAt: string | null; createdAt: string;
 }
 export interface TrashItem { id: string; name: string; deletedAt: string; kind: 'folder' | 'file'; size?: number }
-export interface TrashView { folders: TrashItem[]; entries: TrashItem[] }
+export interface TrashMessage {
+  id: string;
+  kind: 'message';
+  subject: string | null;
+  from: string;
+  box: string;
+  sortAt: string;
+  deletedAt: string;
+  size: number;
+}
+export interface TrashView { folders: TrashItem[]; entries: TrashItem[]; messages: TrashMessage[] }
 
 // ===== auth =====
 export interface UserInfo {
@@ -75,8 +85,18 @@ export interface FileMedia {
   /** Полный набор извлечённых тегов: EXIF для фото, ffprobe для видео */
   raw?: Record<string, unknown> | null;
 }
+export interface FileMailOrigin {
+  id: string;
+  subject: string | null;
+  fromName: string | null;
+  fromAddr: string | null;
+  sortAt: string;
+  box: string;
+}
 export interface FileMeta {
   id: string; name: string; createdAt: string; folderId: string; zone: string; path: string;
+  /** Письмо, из которого пришёл файл (вложения почты); у обычных файлов — null. */
+  mail?: FileMailOrigin | null;
   size: number; mime: string; ext?: string; sha256: string;
   /** Число страниц PDF (есть после того, как очередь отрисовала превью страниц). */
   pageCount?: number;
@@ -627,3 +647,174 @@ export const unzipStatus = (id: string) => request<UnzipJob>(`/unzip/${id}`);
 export const latestUnzip = (entryId: string) =>
   request<UnzipJob | null>(`/unzip?entryId=${encodeURIComponent(entryId)}`);
 export const cancelUnzip = (id: string) => request<UnzipJob>(`/unzip/${id}/cancel`, { method: 'POST' });
+
+// ===== почта: чистка сервера =====
+export interface MailPurgeExclusions {
+  quarantined: number;
+  flagged: number;
+  protectedSender: number;
+  localOnly: number;
+  failed: number;
+  alreadyPurged: number;
+}
+export interface MailPurgePlanAccount {
+  accountId: string;
+  email: string;
+  total: number;
+  candidates: number;
+  remaining: number;
+  oldest: string | null;
+  newest: string | null;
+  excluded: MailPurgeExclusions;
+  samples: Array<{ subject: string | null; from: string | null; receivedAt: string }>;
+}
+export interface MailPurgePlan {
+  dryRun: true;
+  enabled: boolean;
+  quarantineHours: number;
+  perRun: number;
+  accounts: MailPurgePlanAccount[];
+  blocked: string | null;
+}
+export interface MailPurgeReport {
+  enabled: boolean;
+  purged: number;
+  failed: number;
+  trashSwept: number;
+  accounts: Array<{ email: string; purged: number; failed: number; trashSwept: number; errors: string[] }>;
+}
+/** Отчёт по удалению копий с сервера: ничего не меняет. */
+export const mailPurgePlan = (limit?: number) =>
+  request<MailPurgePlan>(`/mail/purge/plan${limit ? `?limit=${limit}` : ''}`);
+/** Удалить копии с сервера. Без confirm ручка откажется работать. */
+export const mailPurgeRun = (body: { confirm: true; limit?: number }) =>
+  request<MailPurgeReport>('/mail/purge/run', { method: 'POST', body: JSON.stringify(body) });
+
+// ===== почта =====
+export interface MailAccountRow {
+  id: string;
+  kind: string;
+  label: string;
+  email: string;
+  enabled: boolean;
+  status: string;
+  statusError: string | null;
+  lastSyncAt: string | null;
+  createdAt: string;
+  counts: { inbox: number; sent: number };
+}
+export interface MailStatusView {
+  unread: { inbox: number; sent: number };
+  accounts: Array<{
+    id: string;
+    email: string;
+    enabled: boolean;
+    status: string;
+    statusError: string | null;
+    lastSyncAt: string | null;
+  }>;
+}
+export const mailAccounts = () => request<MailAccountRow[]>('/mail/accounts');
+export const mailAddAccount = (body: {
+  kind: string;
+  email: string;
+  password: string;
+  imapHost?: string;
+  smtpHost?: string;
+}) => request<MailAccountRow>('/mail/accounts', { method: 'POST', body: JSON.stringify(body) });
+export const mailPatchAccount = (id: string, body: { enabled?: boolean; password?: string }) =>
+  request<MailAccountRow>(`/mail/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
+export const mailDeleteAccount = (id: string) =>
+  request<{ ok: boolean }>(`/mail/accounts/${id}`, { method: 'DELETE' });
+export const mailSync = () => request<{ ok: boolean; started: boolean }>('/mail/sync', { method: 'POST' });
+export const mailStatus = () => request<MailStatusView>('/mail/status');
+
+export type MailBoxId = 'inbox' | 'sent';
+
+export interface MailListItem {
+  id: string;
+  box: MailBoxId;
+  accountId: string;
+  accountEmail: string;
+  subject: string | null;
+  fromName: string | null;
+  fromAddr: string | null;
+  preview: string;
+  sortAt: string;
+  seen: boolean;
+  flagged: boolean;
+  hasAttachments: boolean;
+  size: number;
+}
+
+export interface MailAttachment {
+  id: string;
+  entryId: string;
+  filename: string;
+  name: string;
+  mime: string;
+  size: number;
+  inline: boolean;
+  contentId: string | null;
+}
+
+export interface MailMessageView extends Omit<MailListItem, 'preview'> {
+  toAddrs: string[];
+  ccAddrs: string[];
+  replyTo: string | null;
+  messageId: string | null;
+  inReplyTo: string | null;
+  refs: string[];
+  sentAt: string | null;
+  receivedAt: string;
+  bodyText: string | null;
+  attachments: MailAttachment[];
+}
+
+export interface MailMonthBucket {
+  month: string;
+  count: number;
+}
+
+export const mailCount = (box: MailBoxId) => request<number>(`/mail/count?box=${box}`);
+export const mailRange = (box: MailBoxId, offset: number, limit: number) =>
+  request<MailListItem[]>(`/mail/range?box=${box}&offset=${offset}&limit=${limit}`);
+export const mailMonths = (box: MailBoxId) => request<MailMonthBucket[]>(`/mail/months?box=${box}`);
+export const mailMessage = (id: string) => request<MailMessageView>(`/mail/messages/${id}`);
+/** Тело письма: `images` — пользователь разрешил внешние картинки. */
+export const mailBody = (id: string, images: boolean) =>
+  request<{ html: string; blockedRemote: number; kind: 'html' | 'text' }>(
+    `/mail/messages/${id}/body${images ? '?images=1' : ''}`,
+  );
+export const mailSetSeen = (id: string, seen: boolean) =>
+  request<{ ok: boolean; seen: boolean }>(`/mail/messages/${id}/seen`, { method: 'POST', body: JSON.stringify({ seen }) });
+export const mailSetFlagged = (id: string, flagged: boolean) =>
+  request<{ ok: boolean; flagged: boolean }>(`/mail/messages/${id}/flagged`, { method: 'POST', body: JSON.stringify({ flagged }) });
+export const mailDelete = (id: string) => request<{ ok: boolean }>(`/mail/messages/${id}`, { method: 'DELETE' });
+/** Отправить письмо: копия сразу появляется в «Исходящих». */
+export const mailSend = (body: {
+  accountId: string;
+  to: string;
+  cc?: string;
+  subject: string;
+  text: string;
+  inReplyToId?: string | null;
+  attachEntryIds?: string[];
+}) => request<{ id: string; messageId: string; accepted: string[]; rejected: string[] }>('/mail/send', {
+  method: 'POST',
+  body: JSON.stringify(body),
+});
+export interface MailReplyContext {
+  accountId: string;
+  to: string;
+  cc: string;
+  subject: string;
+  body: string;
+  inReplyToId: string | null;
+  attachments: Array<{ entryId: string; filename: string; size: number }>;
+}
+/** Заготовка ответа/пересылки: получатели, тема и цитата считаются на сервере. */
+export const mailReplyContext = (id: string, mode: 'reply' | 'replyAll' | 'forward') =>
+  request<MailReplyContext>(`/mail/messages/${id}/reply-context?mode=${mode}`);
+export const mailRestore = (id: string) =>
+  request<{ ok: boolean }>(`/mail/messages/${id}/restore`, { method: 'POST', body: JSON.stringify({}) });

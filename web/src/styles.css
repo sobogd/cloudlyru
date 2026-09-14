@@ -903,4 +903,177 @@
   .mv-metas::-webkit-scrollbar { display: none; }
   /* Пункты не сжимаются и не усекаются: строка уезжает вбок и прокручивается */
   .mv-metas > .mv-item { flex: none; }
+
+  /* ===== Почта =====
+     Лента писем устроена как лента «Медиа»: та же шапка-остров, тот же скрытый нативный
+     скроллбар и свой ползунок справа, то же виртуальное поле. Отличие — одна колонка
+     фиксированной высоты (ROW_H в mail.tsx = 76px): при «резиновой» строке виртуальный
+     скролл поехал бы, поэтому тема и превью обрезаются, а не переносятся. */
+  .mailhead { justify-content: space-between; gap: 8px; }
+  .mailtabs { display: flex; gap: 4px; }
+  .mailtab {
+    padding: 6px 12px;
+    border: 0;
+    border-radius: 999px;
+    background: none;
+    color: var(--fg-3);
+    font-size: var(--island-fs);
+    cursor: pointer;
+  }
+  .mailtab.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+  .mailvirt { position: relative; width: 100%; }
+  .mailskel { display: flex; flex-direction: column; gap: 6px; padding: 2px; }
+  .mailrow {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 76px;
+    will-change: transform;
+  }
+  .mailskel .mailrow, .mailskel > .mailrow { position: static; }
+
+  .mailitem {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    width: 100%;
+    height: 100%;
+    padding: 10px 12px;
+    border: 0;
+    border-bottom: 1px solid var(--brd-1);
+    border-radius: 0;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+  }
+  .mailitem:active { background: var(--surface-2); }
+  .mailava {
+    flex: none;
+    width: 30px;
+    height: 30px;
+    margin-top: 2px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--surface-3);
+    color: var(--fg-3);
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .mailitem.unread .mailava { background: var(--accent-soft); color: var(--accent); }
+  .mailmain { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .mailtop { display: flex; align-items: baseline; gap: 8px; }
+  .mailwho {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+    color: var(--fg-2);
+  }
+  .mailitem.unread .mailwho { color: var(--fg); font-weight: 600; }
+  .maildate { flex: none; font-size: 11px; color: var(--fg-3); }
+  .mailsubj {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+    color: var(--fg);
+  }
+  .mailitem.unread .mailsubj { font-weight: 600; }
+  .mailprev {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    color: var(--fg-3);
+  }
+  .mailmark { flex: none; display: flex; align-items: center; gap: 6px; color: var(--fg-3); }
+  .mailflag { color: var(--accent); }
+  /* Скелет строки: приглушённая плашка той же высоты — «письмо ещё едет» */
+  .mailrow-skel {
+    display: block;
+    height: 76px;
+    border-bottom: 1px solid var(--brd-1);
+    background: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2));
+    background-size: 200% 100%;
+    animation: mailPulse 1.4s ease-in-out infinite;
+  }
+  @keyframes mailPulse { from { background-position: 0% 0; } to { background-position: -200% 0; } }
+
+  /* ===== Просмотр письма ===== */
+  .mailread {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: calc(var(--island-h) + var(--side) * 2 + env(safe-area-inset-top)) 0 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .mailread > * {
+    width: 100%;
+    max-width: min(var(--col), calc(100% - 2 * var(--side)));
+    margin: 0 auto;
+  }
+  .mailhead-block { display: flex; flex-direction: column; gap: 6px; padding: 0 var(--side); }
+  .mailsubject { font-size: 18px; font-weight: 600; color: var(--fg); word-break: break-word; }
+  .mailaddr { display: flex; gap: 8px; font-size: 12px; color: var(--fg-3); }
+  .mailfrom { color: var(--fg-2); }
+  .mailaddr-k { flex: none; color: var(--fg-3); }
+  .mailaddr-v { min-width: 0; overflow-wrap: anywhere; }
+  .mailimages {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: flex-start;
+    padding: 10px 12px;
+    background: var(--surface-2);
+    border-radius: 12px;
+  }
+  .mailbody {
+    background: #fff;
+    border-radius: 12px;
+    overflow: hidden;
+    min-height: 120px;
+  }
+  /* Тёмная тема: тело письма всё равно белое — письма свёрстаны под белый фон, и инверсия
+     сделала бы половину из них нечитаемой. Рамка отделяет его от фона приложения. */
+  .mailframe {
+    display: block;
+    width: 100%;
+    min-height: 320px;
+    height: 60vh;
+    border: 0;
+    background: #fff;
+  }
+  /* Деталка вложения внутри окна письма: письмо «под» ней, назад — кнопкой в её шапке */
+  .mailinfile { padding-top: 0; }
+  /* Форма письма: поля как в почтовом клиенте — подпись слева, ввод на всю ширину */
+  .mailform {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 0 var(--side);
+    max-width: min(var(--col), calc(100% - 2 * var(--side)));
+    margin: 0 auto;
+    width: 100%;
+  }
+  .mailfield { display: flex; align-items: center; gap: 10px; }
+  .mailfield-k { flex: none; width: 62px; font-size: 12px; color: var(--fg-3); }
+  .mailfield input, .mailfield select { flex: 1; min-width: 0; }
+  .mailaddcc { align-self: flex-start; }
+  .mailtext { width: 100%; min-height: 220px; resize: vertical; font: inherit; line-height: 1.45; }
+  .mailfiles { display: flex; flex-direction: column; gap: 6px; }
+  .mailfiles-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--fg-3);
+    text-transform: lowercase;
+  }
 }

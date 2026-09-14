@@ -4,7 +4,7 @@ import * as argon2 from 'argon2';
 import { env } from '../config/env';
 import { PrismaService } from '../prisma/prisma.service';
 import { randomToken, sha256Hex, assertSafeName } from '../common/utils';
-import { PHOTO_FOLDER_NAME, ZONE_PHOTOS, mirrorFolderName } from '../common/zones';
+import { MAIL_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_MAIL, ZONE_PHOTOS, mirrorFolderName } from '../common/zones';
 import { AuditService } from '../audit/audit.service';
 import { ChangesService } from '../sync/changes.service';
 import { badRequest, notFound, unauthorized } from '../common/errors';
@@ -256,21 +256,21 @@ export class AuthService implements OnModuleInit {
   }
 
   /**
-   * Папки, которые нельзя удалять, переименовывать и переносить: корень пользователя, «Фото»
-   * и корни зеркал устройств. «Телефона» в списке больше нет: он превратился в легаси-папку,
-   * которую владелец вправе удалить. Собрано одним методом намеренно: пока гарды в Folders
-   * и Dav проверяли папки по отдельности, новую системную папку забывали защитить в одном
-   * из мест — и клиент терял адресацию.
+   * Папки, которые нельзя удалять, переименовывать и переносить: корень пользователя, «Фото»,
+   * «Почта» и корни зеркал устройств. «Телефона» в списке больше нет: он превратился в
+   * легаси-папку, которую владелец вправе удалить. Собрано одним методом намеренно: пока
+   * гарды в Folders и Dav проверяли папки по отдельности, новую системную папку забывали
+   * защитить в одном из мест — и клиент терял адресацию.
    */
   async protectedFolderIds(userId: string): Promise<Set<string>> {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { rootFolderId: true, photoFolderId: true },
+      select: { rootFolderId: true, photoFolderId: true, mailFolderId: true },
     });
     const ids = new Set<string>();
     if (user?.rootFolderId) ids.add(user.rootFolderId);
-    // «Фото» — только живая: удалённую системную папку незачем защищать от восстановления
-    const systemIds = [user?.photoFolderId].filter((id): id is string => Boolean(id));
+    // «Фото» и «Почта» — только живые: удалённую системную папку незачем защищать от восстановления
+    const systemIds = [user?.photoFolderId, user?.mailFolderId].filter((id): id is string => Boolean(id));
     if (systemIds.length) {
       const alive = await this.prisma.folder.findMany({
         where: { id: { in: systemIds }, deletedAt: null },
@@ -424,7 +424,41 @@ export class AuthService implements OnModuleInit {
     return photo.id;
   }
 
-  /** Проставить зону всему поддереву папки (BFS) — используется при «усыновлении» фото-корня. */
+  /**
+   * Системная папка «Почта» (скрытая зона MAIL) — корень для вложений писем. Создаётся
+   * лениво, как «Фото», но в отличие от неё не попадает в `GET /auth/me`: клиенту незачем
+   * знать про папку, которой он всё равно не увидит (она скрыта из листингов, WebDAV
+   * и журнала изменений). Имя «Почта» зарезервировано, поэтому «усыновить» пользовательскую
+   * папку с этим именем невозможно — иначе её файлы молча уехали бы в скрытую зону.
+   */
+  async mailFolderId(userId: string): Promise<string> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw unauthorized();
+    if (user.mailFolderId) {
+      const current = await this.prisma.folder.findUnique({ where: { id: user.mailFolderId } });
+      if (current && !current.deletedAt && current.zone === ZONE_MAIL) return current.id;
+    }
+    const rootId = await this.rootFolderId(userId);
+
+    let mail = await this.prisma.folder.findFirst({
+      where: { parentId: rootId, name: MAIL_FOLDER_NAME },
+    });
+    if (mail) {
+      mail = await this.prisma.folder.update({
+        where: { id: mail.id },
+        data: { zone: ZONE_MAIL, deletedAt: null },
+      });
+    } else {
+      mail = await this.prisma.folder.create({
+        data: { parentId: rootId, name: MAIL_FOLDER_NAME, zone: ZONE_MAIL },
+      });
+    }
+    await this.prisma.user.update({ where: { id: userId }, data: { mailFolderId: mail.id } });
+    await this.rezoneSubtree(mail.id, ZONE_MAIL);
+    return mail.id;
+  }
+
+  /** Проставить зону всему поддереву папки (BFS) — используется при «усыновлении» корня. */
   private async rezoneSubtree(rootFolderId: string, zone: string): Promise<void> {
     const all = [rootFolderId];
     let frontier = [rootFolderId];

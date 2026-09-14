@@ -16,7 +16,7 @@ import {
   STORAGE_HOST,
 } from '../config/env';
 import { assertSafeName, parseOptionalDate, randomToken } from '../common/utils';
-import { ZONE_PHOTOS } from '../common/zones';
+import { ZONE_PHOTOS, isHiddenZone } from '../common/zones';
 import { badRequest, conflict, notFound, payloadTooLarge, tooMany } from '../common/errors';
 
 /**
@@ -222,6 +222,9 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       const folder = await this.prisma.folder.findUnique({ where: { id: folderId } });
       if (!folder || folder.deletedAt) throw notFound('folder not found');
       if (!(await this.auth.folderOwnedBy(userId, folder.id))) throw notFound('folder not found');
+      // в «Почту» файлы кладёт только почтовый модуль: обычная загрузка туда разошлась бы
+      // с письмом (запись без MailAttachment) и осталась бы невидимой в обоих разделах
+      if (isHiddenZone(folder.zone)) throw notFound('folder not found');
       return folder.id;
     }
     return this.auth.rootFolderId(userId);

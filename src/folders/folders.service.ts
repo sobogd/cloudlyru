@@ -6,7 +6,7 @@ import { MediaService } from '../media/media.service';
 import { assertSafeName } from '../common/utils';
 import { QueueService } from '../queue/queue.service';
 import { ChangesService } from '../sync/changes.service';
-import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
+import { HIDDEN_ZONES, MAIL_FOLDER_NAME, ZONE_PHOTOS, isHiddenZone, zoneOf } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
 
 const isRoot = (f: { name: string }) => f.name === ROOT_FOLDER_NAME;
@@ -53,6 +53,10 @@ export class FoldersService {
     const folder = await this.prisma.folder.findUnique({ where: { id } });
     if (!folder || folder.deletedAt) throw notFound('folder not found');
     if (!(await this.auth.folderOwnedBy(userId, folder.id))) throw notFound('folder not found');
+    // Скрытые зоны (папка «Почта» с вложениями писем) недоступны через API папок: ни список,
+    // ни создание/копирование/перенос внутрь, ни мета. Одним гардом на входе, а не проверками
+    // в каждой ручке. Прямая ссылка на файл-вложение при этом работает — она идёт мимо папок.
+    if (isHiddenZone(folder.zone)) throw notFound('folder not found');
     return folder;
   }
 
@@ -65,15 +69,19 @@ export class FoldersService {
     const parent = await this.resolveAccessible(parentId, userId);
     const take = Math.min(Math.max(limit ?? CHILDREN_PAGE, 1), CHILDREN_PAGE_MAX);
     const nameFilter = after ? { gt: after } : {};
+    // Скрытые зоны (сейчас это «Почта») из листинга выпадают целиком: и папки, и записи,
+    // и те же фильтры стоят в подсчёте «есть ли ещё» — иначе hasMore считался бы по
+    // невидимым строкам и клиент вечно догружал пустые страницы.
+    const hidden = { notIn: [...HIDDEN_ZONES] };
     const [folders, entries] = await Promise.all([
       this.prisma.folder.findMany({
-        where: { parentId: parent.id, deletedAt: null, name: nameFilter },
+        where: { parentId: parent.id, deletedAt: null, name: nameFilter, zone: hidden },
         orderBy: { name: 'asc' },
         take,
         select: { id: true, name: true, createdAt: true, updatedAt: true },
       }),
       this.prisma.fileEntry.findMany({
-        where: { folderId: parent.id, deletedAt: null, name: nameFilter },
+        where: { folderId: parent.id, deletedAt: null, name: nameFilter, zone: hidden },
         orderBy: { name: 'asc' },
         take,
         select: {
@@ -94,10 +102,10 @@ export class FoldersService {
       entries.length === take ||
       (last !== null &&
         (await this.prisma.fileEntry.count({
-          where: { folderId: parent.id, deletedAt: null, name: { gt: last } },
+          where: { folderId: parent.id, deletedAt: null, name: { gt: last }, zone: hidden },
         })) +
           (await this.prisma.folder.count({
-            where: { parentId: parent.id, deletedAt: null, name: { gt: last } },
+            where: { parentId: parent.id, deletedAt: null, name: { gt: last }, zone: hidden },
           })) >
           0);
 
@@ -160,8 +168,9 @@ export class FoldersService {
     this.assertNotReservedName(name);
     const parent = await this.resolveAccessible(parentId, userId);
     await this.assertNameFree(parent.id, name);
-    // новые папки наследуют зону родителя: внутри «Фото» — медиа-зона, в остальном дереве — файлы
-    const zone = parent.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    // новые папки наследуют зону родителя: внутри «Фото» — медиа-зона, внутри «Почты» —
+    // скрытая зона вложений, в остальном дереве — файлы
+    const zone = zoneOf(parent.zone);
     try {
       return await this.prisma.$transaction(async (tx) => {
         const created = await tx.folder.create({
@@ -190,9 +199,13 @@ export class FoldersService {
   /**
    * Имя системного корня зарезервировано: папка с таким именем считается корнем
    * (`isRoot`), её нельзя ни переименовать, ни переместить, ни удалить через API.
+   * «Почта» зарезервирована по другой причине: это имя системной папки вложений, и
+   * пользовательская папка-тёзка при первом же обращении почтового модуля стала бы скрытой
+   * зоной MAIL — её файлы исчезли бы из «Файлов» и превратились бы во вложения писем.
    */
   private assertNotReservedName(name: string): void {
     if (name === ROOT_FOLDER_NAME) throw badRequest(`${ROOT_FOLDER_NAME} is a reserved name`);
+    if (name === MAIL_FOLDER_NAME) throw badRequest(`${MAIL_FOLDER_NAME} is a reserved name`);
   }
 
   /** Гонка на @@unique([parentId, name]) должна давать 409, а не 500 от Prisma. */
@@ -246,7 +259,7 @@ export class FoldersService {
         current = existing;
         continue;
       }
-      const zone = current.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+      const zone = zoneOf(current.zone);
       try {
         const created = await this.prisma.$transaction(async (tx) => {
           const row = await tx.folder.create({ data: { parentId: current.id, name, zone } });
@@ -343,7 +356,7 @@ export class FoldersService {
     if (subtree.includes(target.id)) throw badRequest('cannot move folder into its own subtree');
     await this.assertNameFree(target.id, folder.name, id);
 
-    const newZone = target.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    const newZone = zoneOf(target.zone);
     const moved = await this.prisma.$transaction(async (tx) => {
       const row = await tx.folder.update({
         where: { id },

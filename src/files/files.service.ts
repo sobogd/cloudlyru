@@ -10,7 +10,7 @@ import { QueueService } from '../queue/queue.service';
 import { safeInlineImageMime, sendObjectOr404 } from '../common/http-object';
 import { normalizeMime } from '../common/mime';
 import { assertSafeName, parseOptionalDate } from '../common/utils';
-import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
+import { ZONE_PHOTOS, isHiddenZone, zoneOf } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
 
 /** Снимок содержимого для журнала изменений: без него пришлось бы читать Asset лишний раз. */
@@ -102,6 +102,10 @@ export class FilesService {
    * Событие в журнал изменений по уже существующей записи. Владельца знать обязательно:
    * без него событие не попало бы ни одному клиенту, поэтому такой случай — это ошибка
    * в коде вызова, и мы о ней громко пишем в лог, а не молчим.
+   *
+   * Скрытые зоны (вложения писем) в журнал не пишутся вовсе: клиенты синхронизации получили
+   * бы события про папки, которых у них нет, и потащили бы к себе всю почту. Это не ошибка
+   * вызова, поэтому и предупреждения тут нет.
    */
   private async recordEntryChange(input: {
     userId?: string;
@@ -117,6 +121,7 @@ export class FilesService {
     /** Транзакция мутации: журнал должен писаться вместе с ней, а не после. */
     tx?: Prisma.TransactionClient;
   }): Promise<void> {
+    if (isHiddenZone(input.zone)) return;
     if (!input.userId) {
       this.logger.warn(
         `журнал изменений: неизвестен владелец дерева для файла «${input.name}» (${input.folderId}) — событие не записано`,
@@ -139,6 +144,15 @@ export class FilesService {
       },
       input.tx,
     );
+  }
+
+  /**
+   * Вложение письма живёт в скрытой зоне MAIL и меняется только вместе с письмом (через
+   * почтовый модуль). Прямая правка или удаление разорвали бы связь MailAttachment.entryId:
+   * письмо осталось бы без вложения, а корзина — с осиротевшим файлом.
+   */
+  private assertEntryMutable(entry: { zone: string; name: string }, action: string): void {
+    if (isHiddenZone(entry.zone)) throw badRequest(`cannot ${action} a mail attachment`);
   }
 
   /** Конфликт имени: корзина и занятое имя — разные ситуации, клиент реагирует по-разному. */
@@ -256,7 +270,7 @@ export class FilesService {
   ): Promise<{ id: string; deduped: boolean; zone: string; replaced: boolean }> {
     const folder = await this.ensureFolder(folderId);
     assertSafeName(name);
-    const zone = folder.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    const zone = zoneOf(folder.zone);
     const existing = await this.prisma.fileEntry.findFirst({ where: { folderId, name } });
     const snap = await this.assetSnapshot(assetId, opts.asset);
     const previousAssetId = existing?.assetId ?? null;
@@ -391,8 +405,12 @@ export class FilesService {
   async gcOrphanAsset(assetId: string): Promise<boolean> {
     const asset = await this.prisma.asset.findUnique({ where: { id: assetId }, select: { sha256: true, pageCount: true } });
     if (!asset) return false;
-    // строка удаляется только при отсутствии ссылок (двойная защита: условие в where + FK Restrict)
-    const res = await this.prisma.asset.deleteMany({ where: { id: assetId, entries: { none: {} } } });
+    // строка удаляется только при отсутствии ссылок (двойная защита: условие в where + FK Restrict).
+    // mailRaw: none — на ассет может ссылаться письмо (сырое .eml): у него нет записей дерева,
+    // и без этой проверки удаление упало бы на FK, а объект в S3 остался бы без строки.
+    const res = await this.prisma.asset.deleteMany({
+      where: { id: assetId, entries: { none: {} }, mailRaw: { none: {} } },
+    });
     if (res.count === 0) return false;
     // Объекты трогаем только если строки с таким sha не появилось снова: параллельный
     // дедуп-upload того же содержимого создаёт новый Asset с тем же ключом files/<sha>,
@@ -416,7 +434,17 @@ export class FilesService {
   async getEntryMeta(entryId: string, userId: string) {
     const entry = await this.prisma.fileEntry.findUnique({
       where: { id: entryId },
-      include: { asset: { include: { media: true } }, folder: true },
+      include: {
+        asset: { include: { media: true } },
+        folder: true,
+        // Вложение письма: деталка файла показывает, из какого письма он пришёл, и умеет
+        // провалиться в него. У обычных файлов связи нет, поэтому это просто null.
+        mailAttachment: {
+          select: {
+            message: { select: { id: true, subject: true, fromName: true, fromAddr: true, sortAt: true, box: true } },
+          },
+        },
+      },
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
     // чужой файл не должен отличаться от несуществующего (внутри ещё и ленивый EXIF/ffprobe)
@@ -451,6 +479,16 @@ export class FilesService {
       ext: entry.asset.ext ?? undefined,
       sha256: entry.asset.sha256,
       pageCount: entry.asset.pageCount ?? undefined,
+      mail: entry.mailAttachment
+        ? {
+            id: entry.mailAttachment.message.id,
+            subject: entry.mailAttachment.message.subject,
+            fromName: entry.mailAttachment.message.fromName,
+            fromAddr: entry.mailAttachment.message.fromAddr,
+            sortAt: entry.mailAttachment.message.sortAt,
+            box: entry.mailAttachment.message.box,
+          }
+        : null,
       media: m
         ? {
             capturedAt: m.capturedAt ? m.capturedAt.toISOString() : null,
@@ -619,6 +657,7 @@ export class FilesService {
   async softDelete(entryId: string, userId: string) {
     const owned = await this.auth.ownEntry(userId, entryId);
     if (!owned) throw notFound('file not found');
+    this.assertEntryMutable(owned, 'delete');
     await this.prisma.$transaction(async (tx) => {
       await tx.fileEntry.update({ where: { id: entryId }, data: { deletedAt: new Date() } });
       await this.changes.recordEntry(userId, entryId, 'delete', tx);
@@ -659,6 +698,7 @@ export class FilesService {
     });
     if (!entry || entry.deletedAt) throw notFound('file not found');
     if (!(await this.auth.folderOwnedBy(userId, entry.folderId))) throw notFound('file not found');
+    this.assertEntryMutable(entry, 'rename or move');
 
     const data: { folderId?: string; name?: string; zone?: string; clientMtime?: Date | null } = {};
     let op: 'update' | 'move' = 'update';
@@ -685,7 +725,7 @@ export class FilesService {
       });
       if (clash) throw this.nameConflict(clash.id, clash.deletedAt !== null, data.name ?? entry.name, true);
       data.folderId = target.id;
-      data.zone = target.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+      data.zone = zoneOf(target.zone);
       op = 'move';
     }
 

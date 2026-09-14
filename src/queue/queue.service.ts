@@ -16,7 +16,7 @@ import {
   parseIso6709,
   videoInstant,
 } from '../media/media.service';
-import { ZONE_FILES } from '../common/zones';
+import { ZONE_PHOTOS } from '../common/zones';
 import { CONVERT_MAX_BYTES, env } from '../config/env';
 
 const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 1 ГБ)
@@ -535,13 +535,16 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       else throw new Error('unknown kind');
 
       // Сырьё из S3 удаляем, только если это разрешено конфигом и ни одна живая копия
-      // не лежит в зоне «Файлы» — там файл должен оставаться оригиналом как есть.
+      // не лежит в зоне, где оригинал обязан оставаться как есть («Файлы» и скрытая
+      // «Почта» с вложениями писем); заменять оригинал производными можно только в «Фото».
       // keepRaw: производные не заменяют оригинал (анимация/PDF) — он обязан остаться.
       if (env.KEEP_ORIGINALS || res.keepRaw) {
         this.logger.log(`оригинал сохранён: ${tag}${res.keepRaw && !env.KEEP_ORIGINALS ? ' (нужен как есть)' : ''}`);
       } else {
         const filesRefs = await this.prisma.fileEntry.count({
-          where: { assetId: job.assetId, zone: ZONE_FILES, deletedAt: null },
+          // Любая зона, кроме «Фото»: в «Файлах» и в скрытой «Почте» (вложения писем)
+          // оригинал обязан остаться, иначе у вложения пропадут байты.
+          where: { assetId: job.assetId, zone: { not: ZONE_PHOTOS }, deletedAt: null },
         });
         if (filesRefs === 0) {
           await this.s3.deleteObject(S3Service.assetKey(job.sha256)).catch(() => undefined);

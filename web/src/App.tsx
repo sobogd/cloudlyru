@@ -4,13 +4,15 @@ import {
   ArrowDownToLine, ArrowLeft, ArrowUp, Ban, Check, ChevronLeft, ChevronRight,
   CircleAlert, CircleCheck, CircleX, Clock, Cloud, Copy, Eraser, FileText, Film, Folder,
   FolderOpen, Image as ImageIcon, ImagePlay, Images, Info, KeyRound, Link2, LoaderCircle, Lock,
-  Map as MapIcon, Package,
-  Pause, Pencil, Play, RefreshCw, Scissors, Settings as SettingsIcon, Trash, Upload,
+  MailOpen, Map as MapIcon, Package,
+  Pause, Pencil, Play, Plus, RefreshCw, Scissors, Settings as SettingsIcon, Trash, Upload,
   UserRound, X,
 } from 'lucide-react';
+import { Mail as MailIcon } from 'lucide-react';
 import * as api from './api';
 import MediaSection from './media';
 import MapSection from './map';
+import MailSection, { MailViewer } from './mail';
 import { clearUi, patchUi, readUi, type Tab } from './storage';
 import './styles.css';
 
@@ -18,6 +20,8 @@ import './styles.css';
     Settings импортируется как SettingsIcon: имя Settings занято локальным компонентом-экраном. */
 const NAV: Array<{ id: Tab; Icon: LucideIcon; label: string }> = [
   { id: 'files', Icon: Folder, label: 'Файлы' },
+  // «Почта» — второй по частоте раздел после файлов, поэтому сразу за ними
+  { id: 'mail', Icon: MailIcon, label: 'Почта' },
   { id: 'media', Icon: ImagePlay, label: 'Медиа' },
   { id: 'map', Icon: MapIcon, label: 'Карта' },
   { id: 'trash', Icon: Trash, label: 'Корзина' },
@@ -120,6 +124,12 @@ function Shell({ user, onLogout }: { user: api.UserInfo; onLogout: () => void })
             photoFolderId={user.photoFolderId}
             up={up}
             uploadedAt={uploadedAt}
+          />
+        )}
+        {tab === 'mail' && (
+          <MailSection
+            onOverlayChange={setNavHidden}
+            renderFileDetail={(entryId, onClose) => <FileDetail entryId={entryId} onBack={onClose} inOverlay />}
           />
         )}
         {tab === 'media' && <MediaSection onOverlayChange={setNavHidden} />}
@@ -609,6 +619,8 @@ function FileDetail({ entryId, onBack, onDeleted, inOverlay }: { entryId: string
   const [meta, setMeta] = useState<api.FileMeta | null>(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
+  /** Файл — вложение письма: показываем, из какого, и умеем в него провалиться. */
+  const [mailOpen, setMailOpen] = useState(false);
   const [job, setJob] = useState<api.UnzipJob | null>(null);
   /** Минимум ожидания на лоадере: на быстром ответе спиннер иначе мигал бы одно мгновение. */
   const [minDone, setMinDone] = useState(false);
@@ -737,6 +749,34 @@ function FileDetail({ entryId, onBack, onDeleted, inOverlay }: { entryId: string
           {job.state === 'done' && (
             <div className="copy">Папка создана рядом с архивом — вернись в «Файлы», она появится в списке</div>
           )}
+        </div>
+      )}
+      {/* Просмотр письма поверх деталки: из файла в письмо «внутри окна», без ухода в раздел */}
+      {mailOpen && meta?.mail && (
+        <MailViewer
+          id={meta.mail.id}
+          onClose={() => setMailOpen(false)}
+          prev={() => null}
+          next={() => null}
+          onNav={() => undefined}
+        />
+      )}
+      {/* Вложение письма: файл живёт в скрытой папке «Почта» и сам по себе ниоткуда не виден,
+          поэтому путь к письму — прямо здесь, до метаданных. */}
+      {ready && meta?.mail && (
+        <div className="panel" style={{ margin: '10px 2px' }}>
+          <div className="row">
+            <span className="icon"><MailIcon /></span>
+            <strong className="fname">{meta.mail.subject || '(без темы)'}</strong>
+            <button className="btn" onClick={() => setMailOpen(true)}>
+              <MailOpen size={16} /> открыть письмо
+            </button>
+          </div>
+          <div className="copy">
+            {[meta.mail.fromName || meta.mail.fromAddr, new Date(meta.mail.sortAt).toLocaleString('ru-RU')]
+              .filter(Boolean)
+              .join(' · ')}
+          </div>
         </div>
       )}
       {/* Пока деталка не готова — только лоадер: тела ещё нет, показывать нечего. */}
@@ -1106,6 +1146,244 @@ function Settings({ login, onLogout }: { login: string; onLogout: () => void }) 
         {!tokens.length && <div className="copy">Токенов нет — нужен для Finder/WebDAV</div>}
       </div>
       <QueuePanel onErrors={() => setView('queue-errors')} />
+      <MailAccountsPanel />
+    </div>
+  );
+}
+
+// ================= Почта: аккаунты =================
+/**
+ * Почтовые аккаунты в настройках. Полноценный раздел «Почта» — отдельная вкладка; здесь
+ * только то, без чего он не заработает: добавить аккаунт с паролем приложения, выключить
+ * его, удалить и запустить проверку почты руками.
+ *
+ * Пароль уходит на сервер один раз, там проверяется живым подключением к IMAP и шифруется —
+ * обратно в браузер он не возвращается никогда (в списке аккаунтов его нет).
+ */
+function MailAccountsPanel() {
+  const [rows, setRows] = useState<api.MailAccountRow[]>([]);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({ kind: 'gmail', email: '', password: '', imapHost: '', smtpHost: '' });
+  const [open, setOpen] = useState(false);
+
+  const load = async () => {
+    try {
+      setRows(await api.mailAccounts());
+      setErr('');
+    } catch (e) { setErr((e as Error).message); }
+  };
+  useEffect(() => { void load(); }, []);
+  // Пока идёт синхронизация — обновляем статус чаще: видно, что почта действительно едет.
+  const syncing = rows.some((r) => r.status === 'syncing');
+  useEffect(() => {
+    const t = setInterval(() => { void load(); }, syncing ? 3000 : 20000);
+    return () => clearInterval(t);
+  }, [syncing]);
+
+  const add = async () => {
+    setBusy(true);
+    setErr('');
+    try {
+      await api.mailAddAccount({
+        kind: form.kind,
+        email: form.email.trim(),
+        password: form.password,
+        ...(form.kind === 'imap' ? { imapHost: form.imapHost.trim(), smtpHost: form.smtpHost.trim() } : {}),
+      });
+      setForm({ kind: form.kind, email: '', password: '', imapHost: '', smtpHost: '' });
+      setOpen(false);
+      setNotice('Аккаунт добавлен, почта забирается');
+      await load();
+    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+
+  const statusText = (r: api.MailAccountRow) => {
+    if (!r.enabled) return 'выключен';
+    if (r.status === 'syncing') return 'забираем письма…';
+    if (r.status === 'error') return r.statusError || 'ошибка';
+    if (!r.lastSyncAt) return 'ещё не проверялся';
+    return `проверен ${new Date(r.lastSyncAt).toLocaleString()}`;
+  };
+
+  return (
+    <div className="panel">
+      <div className="row">
+        <strong>Почта</strong>
+        <button className="btn" onClick={async () => { try { await api.mailSync(); setNotice('Проверка запущена'); } catch (e) { setErr((e as Error).message); } }}>Проверить</button>
+      </div>
+      {notice && <div className="copy">{notice}</div>}
+      {err && <div className="err">{err}</div>}
+      {rows.map((r) => (
+        <div className="item" key={r.id}>
+          <span className="icon"><MailIcon /></span>
+          <span className="fname">{r.email}</span>
+          <span className="meta">{r.counts.inbox} вх · {r.counts.sent} исх · {statusText(r)}</span>
+          <button
+            className="btn ghost"
+            title={r.enabled ? 'Выключить' : 'Включить'}
+            onClick={async () => { await api.mailPatchAccount(r.id, { enabled: !r.enabled }).catch((e) => setErr((e as Error).message)); await load(); }}
+          >{r.enabled ? <Pause size={16} /> : <Play size={16} />}</button>
+          <button
+            className="btn ghost"
+            title="Удалить аккаунт"
+            onClick={async () => {
+              if (!confirm(`Удалить ${r.email}? Письма этого аккаунта уйдут из базы (вложения останутся в «Почте»).`)) return;
+              await api.mailDeleteAccount(r.id).catch((e) => setErr((e as Error).message));
+              await load();
+            }}
+          ><Ban size={16} /></button>
+        </div>
+      ))}
+      {!rows.length && !open && <div className="copy">Аккаунтов нет — добавь почтовый ящик, письма будут храниться здесь</div>}
+      <MailPurgePanel hasAccounts={rows.length > 0} />
+      {open ? (
+        <div className="panel" style={{ background: 'var(--surface-2)' }}>
+          <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}>
+            <option value="gmail">Gmail / Google Workspace</option>
+            <option value="icloud">iCloud Mail</option>
+            <option value="imap">Другой IMAP-сервер</option>
+          </select>
+          <input placeholder="адрес почты" autoComplete="off" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+          <input
+            placeholder="пароль приложения"
+            type="password"
+            autoComplete="new-password"
+            value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })}
+          />
+          {form.kind === 'imap' && (
+            <>
+              <input placeholder="IMAP-сервер (imap.example.com)" value={form.imapHost} onChange={(e) => setForm({ ...form, imapHost: e.target.value })} />
+              <input placeholder="SMTP-сервер (smtp.example.com)" value={form.smtpHost} onChange={(e) => setForm({ ...form, smtpHost: e.target.value })} />
+            </>
+          )}
+          <div className="copy">
+            Нужен пароль приложения, а не обычный пароль: у Google — «Пароли приложений» (нужна 2FA),
+            у Apple — appleid.apple.com → Вход и безопасность. Пробелы и дефисы можно не убирать.
+          </div>
+          <div className="row">
+            <button className="btn" onClick={add} disabled={busy || !form.email || !form.password}>{busy ? 'Проверяем…' : 'Добавить'}</button>
+            <button className="btn ghost" onClick={() => { setOpen(false); setErr(''); }}><X size={16} /></button>
+          </div>
+        </div>
+      ) : (
+        <div className="row"><button className="btn" onClick={() => setOpen(true)}><Plus /> аккаунт</button></div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Очистка сервера: удаление копий писем у провайдера после того, как они лежат у нас.
+ *
+ * Единственная необратимая операция в разделе, поэтому здесь всё построено на «сначала
+ * посмотри»: сначала отчёт (сколько писем попадёт под удаление и почему остальные нет),
+ * потом удаление с подтверждением, и отдельная кнопка «удалить одно письмо» — чтобы
+ * проверить механику на живом ящике, не удаляя сразу сотни писем.
+ */
+function MailPurgePanel({ hasAccounts }: { hasAccounts: boolean }) {
+  const [plan, setPlan] = useState<api.MailPurgePlan | null>(null);
+  const [report, setReport] = useState<api.MailPurgeReport | null>(null);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const loadPlan = async () => {
+    setBusy(true);
+    setErr('');
+    try {
+      setPlan(await api.mailPurgePlan());
+    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+
+  const run = async (limit?: number) => {
+    const what = limit ? `${limit} письмо` : `до ${plan?.perRun ?? 200} писем`;
+    if (!confirm(`Удалить ${what} с сервера аккаунта безвозвратно?\n\nУ нас они останутся, но у провайдера копий больше не будет.`)) return;
+    setBusy(true);
+    setErr('');
+    try {
+      setReport(await api.mailPurgeRun({ confirm: true, ...(limit ? { limit } : {}) }));
+      setPlan(await api.mailPurgePlan());
+    } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+
+  const totalCandidates = plan?.accounts.reduce((s, a) => s + a.candidates, 0) ?? 0;
+  const excluded = plan?.accounts.reduce(
+    (acc, a) => ({
+      quarantined: acc.quarantined + a.excluded.quarantined,
+      flagged: acc.flagged + a.excluded.flagged,
+      protectedSender: acc.protectedSender + a.excluded.protectedSender,
+      alreadyPurged: acc.alreadyPurged + a.excluded.alreadyPurged,
+      failed: acc.failed + a.excluded.failed,
+      localOnly: acc.localOnly + a.excluded.localOnly,
+    }),
+    { quarantined: 0, flagged: 0, protectedSender: 0, alreadyPurged: 0, failed: 0, localOnly: 0 },
+  );
+
+  return (
+    <div className="panel" style={{ background: 'var(--surface-2)' }}>
+      <div className="row">
+        <strong>Очистка сервера</strong>
+        <button className="btn" onClick={() => void loadPlan()} disabled={busy || !hasAccounts}>
+          {busy ? <LoaderCircle className="spin" size={16} /> : 'Показать отчёт'}
+        </button>
+      </div>
+      <div className="copy">
+        Письма хранятся у нас; копии у Gmail и iCloud можно убрать. Операция необратимая,
+        поэтому сначала отчёт, потом удаление — и только порциями.
+      </div>
+      {plan && !plan.enabled && (
+        <div className="notice">Удаление выключено на сервере (MAIL_PURGE_ENABLED=false) — отчёт можно смотреть, удалять нельзя</div>
+      )}
+      {plan?.blocked && <div className="err">Предохранитель: {plan.blocked}</div>}
+      {plan && (
+        <>
+          {plan.accounts.map((a) => (
+            <div className="item" key={a.accountId} style={{ alignItems: 'flex-start' }}>
+              <span className="icon"><MailIcon /></span>
+              <span className="fname" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+                <span>{a.email}</span>
+                <span className="meta" style={{ whiteSpace: 'normal' }}>
+                  всего {a.total} · под удаление {a.candidates} · останется {a.remaining}
+                  {a.oldest && a.newest ? ` · письма с ${new Date(a.oldest).toLocaleDateString('ru-RU')} по ${new Date(a.newest).toLocaleDateString('ru-RU')}` : ''}
+                </span>
+              </span>
+            </div>
+          ))}
+          {excluded && (
+            <div className="copy">
+              не попадут под удаление: свежие (карантин {plan.quarantineHours} ч) — {excluded.quarantined},
+              помеченные звёздочкой — {excluded.flagged}, от провайдеров доступа — {excluded.protectedSender},
+              уже убраны — {excluded.alreadyPurged}, не удалось {excluded.failed}, наши отправки — {excluded.localOnly}
+            </div>
+          )}
+          {plan.accounts[0]?.samples.length ? (
+            <div className="copy">
+              например: {plan.accounts[0].samples.map((s) => s.subject || '(без темы)').join(' · ')}
+            </div>
+          ) : null}
+          {hasAccounts && (
+            <div className="row">
+              <button className="btn danger" onClick={() => void run()} disabled={busy || !plan.enabled || Boolean(plan.blocked) || !totalCandidates}>
+                Удалить с сервера ({totalCandidates})
+              </button>
+              <button className="btn ghost" onClick={() => void run(1)} disabled={busy || !plan.enabled || !totalCandidates}>
+                одно письмо — проверить
+              </button>
+            </div>
+          )}
+        </>
+      )}
+      {report && (
+        <div className="notice">
+          удалено с сервера: {report.purged}
+          {report.trashSwept ? `, добито в мусорке: ${report.trashSwept}` : ''}
+          {report.failed ? `, не получилось: ${report.failed}` : ''}
+          {report.accounts.flatMap((a) => a.errors).slice(0, 2).map((e, i) => <div key={i} className="copy">{e}</div>)}
+        </div>
+      )}
+      {err && <div className="err">{err}</div>}
     </div>
   );
 }
@@ -1336,17 +1614,25 @@ function TrashPage() {
   const [err, setErr] = useState('');
   const load = () => api.trash().then(setView).catch((e) => setErr((e as Error).message));
   useEffect(() => { void load(); }, []);
-  const restore = async (kind: 'folder' | 'file', id: string) => {
-    try { await api.restoreItem(kind, id); await load(); } catch (e) { setErr((e as Error).message); }
+  const restore = async (kind: 'folder' | 'file' | 'message', id: string) => {
+    try {
+      // Письма возвращает почтовый модуль: у них своя связь с вложениями, и восстанавливать
+      // их «как файл» нельзя — вернулось бы письмо без вложений.
+      if (kind === 'message') await api.mailRestore(id);
+      else await api.restoreItem(kind, id);
+      await load();
+    } catch (e) { setErr((e as Error).message); }
   };
   const purge = async () => {
-    if (!confirm('Очистить корзину полностью? Удалённые файлы и превью будут стёрты безвозвратно.')) return;
+    if (!confirm('Очистить корзину полностью? Удалённые письма, файлы и превью будут стёрты безвозвратно.')) return;
     try { await api.purgeTrash(); await load(); } catch (e) { setErr((e as Error).message); }
   };
   const items = [
     ...(view?.folders || []).map((t) => ({ ...t, kind: 'folder' as const })),
     ...(view?.entries || []).map((t) => ({ ...t, kind: 'file' as const })),
   ];
+  const messages = view?.messages || [];
+  const empty = !items.length && !messages.length;
   return (
     <div>
       <div className="row">
@@ -1363,8 +1649,28 @@ function TrashPage() {
             <button className="btn ghost" onClick={() => restore(t.kind, t.id)}>восстановить</button>
           </div>
         ))}
-        {!items.length && <div className="copy">Корзина пуста</div>}
+        {empty && <div className="copy">Корзина пуста</div>}
       </div>
+      {/* Письма — отдельной группой: у них нет ни папки, ни файла, а тема и отправитель
+          понятнее любого имени. Вложения приходят вместе с письмом, отдельными строками
+          они тут не показываются. */}
+      {messages.length > 0 && (
+        <div className="panel">
+          <div className="row"><strong>Письма</strong><span className="meta">{messages.length}</span></div>
+          {messages.map((m) => (
+            <div className="item" key={m.id}>
+              <span className="icon"><MailIcon /></span>
+              <span className="fname">{m.subject || '(без темы)'}</span>
+              <span className="meta">
+                {[m.from, m.box === 'sent' ? 'исходящее' : 'входящее', new Date(m.sortAt).toLocaleDateString('ru-RU')]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </span>
+              <button className="btn ghost" onClick={() => restore('message', m.id)}>восстановить</button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

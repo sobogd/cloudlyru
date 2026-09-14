@@ -10,7 +10,7 @@ import { MediaService } from '../media/media.service';
 import { QueueService } from '../queue/queue.service';
 import { env } from '../config/env';
 import { assertSafeName, randomToken, sha256Hex } from '../common/utils';
-import { ZONE_PHOTOS } from '../common/zones';
+import { HIDDEN_ZONES, ZONE_PHOTOS, isHiddenZone } from '../common/zones';
 import { badRequest, forbidden, notFound, tooMany, unauthorized } from '../common/errors';
 
 export type ShareKind = 'FOLDER' | 'FILE';
@@ -67,9 +67,12 @@ export class SharesService {
     if (kind === KIND.FILE) {
       const entry = await this.auth.ownEntry(userId, opts.targetId);
       if (!entry) throw notFound('file not found');
+      // вложение письма не шарится: ссылка выдала бы наружу содержимое переписки
+      if (isHiddenZone(entry.zone)) throw notFound('file not found');
     } else {
       const folder = await this.prisma.folder.findUnique({ where: { id: opts.targetId } });
       if (!folder || folder.deletedAt) throw notFound('folder not found');
+      if (isHiddenZone(folder.zone)) throw notFound('folder not found');
       if (!(await this.auth.folderOwnedBy(userId, folder.id))) throw notFound('folder not found');
     }
 
@@ -191,12 +194,12 @@ export class SharesService {
     if (!folder || folder.deletedAt) throw notFound('folder not found');
     const [folders, entries] = await Promise.all([
       this.prisma.folder.findMany({
-        where: { parentId: folder.id, deletedAt: null },
+        where: { parentId: folder.id, deletedAt: null, zone: { notIn: [...HIDDEN_ZONES] } },
         orderBy: { name: 'asc' },
         select: { id: true, name: true },
       }),
       this.prisma.fileEntry.findMany({
-        where: { folderId: folder.id, deletedAt: null },
+        where: { folderId: folder.id, deletedAt: null, zone: { notIn: [...HIDDEN_ZONES] } },
         orderBy: { name: 'asc' },
         select: { id: true, name: true, asset: { select: { size: true, mime: true } } },
       }),

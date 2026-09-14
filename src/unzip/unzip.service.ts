@@ -9,7 +9,7 @@ import { ChangesService } from '../sync/changes.service';
 import { IMAGE_MIMES, MediaService, VIDEO_MIMES } from '../media/media.service';
 import { RemoteZip, ZipEntryInfo, hashStream, mediaKey } from './s3-zip';
 import { assertSafeName } from '../common/utils';
-import { ZONE_FILES, ZONE_PHOTOS } from '../common/zones';
+import { ZONE_PHOTOS, zoneOf } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
 
 /** Файлы до этого размера распаковываются в память (один проход по S3). */
@@ -349,7 +349,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     const existing = await this.prisma.folder.findFirst({ where: { parentId, name: baseName, deletedAt: null } });
     if (existing) return existing.id;
     const parent = await this.prisma.folder.findUniqueOrThrow({ where: { id: parentId }, select: { zone: true } });
-    const zone = parent.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+    const zone = zoneOf(parent.zone);
     const created = await this.prisma.$transaction(async (tx) => {
       const row = await tx.folder.create({ data: { parentId, name: baseName, zone } });
       if (ownerId) {
@@ -419,7 +419,7 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       const parentId = await folderIdFor(segments.slice(0, -1));
       const name = segments[segments.length - 1];
       const parentZone = await this.prisma.folder.findUniqueOrThrow({ where: { id: parentId }, select: { zone: true } });
-      const zone = parentZone.zone === ZONE_PHOTOS ? ZONE_PHOTOS : ZONE_FILES;
+      const zone = zoneOf(parentZone.zone);
       const found = await this.prisma.folder.findFirst({ where: { parentId, name } });
       if (found?.deletedAt) {
         // уникальный индекс (parentId, name) включает и мягко удалённые: без явной проверки

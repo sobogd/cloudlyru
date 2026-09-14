@@ -8,6 +8,7 @@ import { AuthService } from '../auth/auth.service';
 import { AuditService } from '../audit/audit.service';
 import { ChangesService } from '../sync/changes.service';
 import { conflict } from '../common/errors';
+import { HIDDEN_ZONES } from '../common/zones';
 
 /** Разбиение на порции: бережём лимит параметров запроса (у Postgres это 65 535). */
 function chunksOf<T>(items: T[], size: number): T[][] {
@@ -44,7 +45,10 @@ export class TrashService {
       .map((f) => ({ id: f.id, name: f.name, deletedAt: f.deletedAt, kind: 'folder' as const }));
 
     const deletedEntries = await this.prisma.fileEntry.findMany({
-      where: { deletedAt: { not: null }, folderId: { in: tree } },
+      // Вложения удалённых писем в корзине не показываем отдельными файлами: они возвращаются
+      // вместе с письмом, а поодиночке в списке это были бы безымянные «2026-09-14_...pdf»
+      // без всякой связи с тем, откуда они взялись.
+      where: { deletedAt: { not: null }, folderId: { in: tree }, zone: { notIn: [...HIDDEN_ZONES] } },
       select: {
         id: true,
         name: true,
@@ -65,7 +69,35 @@ export class TrashService {
         folderId: e.folder.id,
       }));
 
-    return { folders, entries };
+    // Удалённые письма: своя группа в корзине — у них ни папки, ни файла, а тема и отправитель
+    // понятнее любого имени.
+    const deletedMessages = await this.prisma.mailMessage.findMany({
+      where: { userId, deletedAt: { not: null } },
+      select: {
+        id: true,
+        subject: true,
+        fromName: true,
+        fromAddr: true,
+        box: true,
+        sortAt: true,
+        deletedAt: true,
+        size: true,
+      },
+      orderBy: { deletedAt: 'desc' },
+      take: 1000,
+    });
+    const messages = deletedMessages.map((m) => ({
+      id: m.id,
+      kind: 'message' as const,
+      subject: m.subject,
+      from: m.fromName || m.fromAddr || '',
+      box: m.box,
+      sortAt: m.sortAt,
+      deletedAt: m.deletedAt,
+      size: m.size,
+    }));
+
+    return { folders, entries, messages };
   }
 
   async restore(type: 'folder' | 'file', id: string, userId: string) {
@@ -119,6 +151,15 @@ export class TrashService {
       },
       select: { id: true, name: true, parentId: true, zone: true },
     });
+    const deletedMessages = await this.prisma.mailMessage.findMany({
+      where: {
+        userId,
+        deletedAt: { not: null },
+        ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
+      },
+      select: { id: true },
+    });
+    const messageIds = deletedMessages.map((m) => m.id);
     const entryIds = deletedEntries.map((e) => e.id);
     const folderIds = deletedFolders.map((f) => f.id);
 
@@ -160,14 +201,22 @@ export class TrashService {
         }
         // onDelete: Cascade убирает и все FileEntry внутри удалённых папок
         if (folderIds.length) await tx.folder.deleteMany({ where: { id: { in: folderIds } } });
+        // Письма: MailAttachment уходит каскадом, а строки вложений уже удалены выше —
+        // как раз потому, что письмо мягко удаляется вместе с ними.
+        for (const chunk of chunksOf(messageIds, 1000)) {
+          await tx.mailMessage.deleteMany({ where: { id: { in: chunk } } });
+        }
       },
       { timeout: 120_000, maxWait: 15_000 },
     );
 
     // Осиротевшие ассеты: строку удаляем под условием «ссылок нет» (никакого FK-500 при гонке),
     // а объекты в S3 трогаем только после коммита и только у реально удалённых строк.
+    // `mailRaw: none` обязателен: сырьё письма (.eml) — тоже Asset, но записей дерева у него
+    // нет вовсе. Без этого условия чистка считала бы его осиротевшим, а удаление падало бы
+    // на внешнем ключе Restrict (и вся очистка корзины — вместе с ним).
     const orphans = await this.prisma.asset.findMany({
-      where: { entries: { none: {} } },
+      where: { entries: { none: {} }, mailRaw: { none: {} } },
       select: { id: true, sha256: true, pageCount: true },
     });
     let purgedAssets = 0;
@@ -175,7 +224,9 @@ export class TrashService {
     if (orphans.length) {
       const removed: Array<{ id: string; sha256: string; pageCount: number | null }> = [];
       for (const a of orphans) {
-        const res = await this.prisma.asset.deleteMany({ where: { id: a.id, entries: { none: {} } } });
+        const res = await this.prisma.asset.deleteMany({
+          where: { id: a.id, entries: { none: {} }, mailRaw: { none: {} } },
+        });
         if (res.count > 0) removed.push(a);
       }
       // Перед удалением объектов перепроверяем, что строки с этим содержимым не появились снова:
@@ -214,6 +265,7 @@ export class TrashService {
     await this.audit.log('trash.purge', {
       entries: entryIds.length,
       folders: folderIds.length,
+      messages: messageIds.length,
       assets: purgedAssets,
       olderThanDays: days ?? null,
     });
@@ -221,6 +273,7 @@ export class TrashService {
     return {
       purgedEntries: entryIds.length,
       purgedFolders: folderIds.length,
+      purgedMessages: messageIds.length,
       purgedAssets,
       ...(retryAssets ? { retryAssets } : {}),
     };

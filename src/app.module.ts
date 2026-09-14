@@ -19,6 +19,7 @@ import { UnzipModule } from './unzip/unzip.module';
 import { SyncModule } from './sync/sync.module';
 import { ReleaseModule } from './release/release.module';
 import { ClipboardModule } from './clipboard/clipboard.module';
+import { MailModule } from './mail/mail.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { ClipboardModule } from './clipboard/clipboard.module';
     SyncModule,
     ReleaseModule,
     ClipboardModule,
+    MailModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },
