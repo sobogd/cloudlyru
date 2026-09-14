@@ -1,5 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ImapFlow } from 'imapflow';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { env } from '../config/env';
 import { badRequest } from '../common/errors';
@@ -73,9 +74,18 @@ export interface PurgePlanAccount {
   email: string;
   /** Всего живых писем в аккаунте (без корзины). */
   total: number;
-  /** Сколько писем будет удалено этим прогоном (не больше MAIL_PURGE_PER_RUN). */
+  /**
+   * Сколько писем уберём вот этой порцией. Это НЕ «сколько можно убрать»: за проход берём
+   * не больше MAIL_PURGE_PER_RUN, поэтому цифра здесь маленькая даже когда убирать надо
+   * тысячи писем. Всего к удалению — `eligible`.
+   */
   candidates: number;
-  /** Сколько ещё останется после прогона. */
+  /** Сколько писем вообще можно убрать (без ограничения порции). */
+  eligible: number;
+  /**
+   * Сколько писем останется у провайдера навсегда: помеченные звёздочкой, письма от
+   * провайдеров доступа, наши собственные отправки, те, что не удалось убрать.
+   */
   remaining: number;
   oldest: string | null;
   newest: string | null;
@@ -221,6 +231,16 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
     return this.protectedDomains().some((domain) => addr === domain || addr.endsWith(`@${domain}`) || addr.endsWith(`.${domain}`));
   }
 
+  /**
+   * То же, что isProtected, но условием для базы: иначе порция за проход тратилась бы на
+   * письма, которые всё равно не удаляем (у Gmail таких сотни — коды входа, оповещения).
+   */
+  private notProtectedFilter(): Prisma.MailMessageWhereInput {
+    const domains = this.protectedDomains();
+    if (!domains.length) return {};
+    return { NOT: { OR: domains.map((d) => ({ fromAddr: { endsWith: `@${d}` } })) } };
+  }
+
   private quarantineCutoff(): Date {
     return new Date(Date.now() - env.MAIL_PURGE_QUARANTINE_HOURS * 60 * 60 * 1000);
   }
@@ -233,7 +253,7 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
     // Аккаунты «своего сервера» пропускаем: почту принимаем мы сами, чужой копии, которую
     // можно было бы убрать, у таких писем нет вовсе — подключаться некуда (imapHost пуст).
     const accounts = await this.prisma.mailAccount.findMany({
-      where: { userId, imapHost: { not: '' } },
+      where: { userId, kind: { not: 'smtp' }, imapHost: { not: '' } },
       orderBy: { createdAt: 'asc' },
     });
     const limit = this.limitOf(opts.limit);
@@ -243,9 +263,20 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
 
     for (const account of accounts) {
       const base = { accountId: account.id, deletedAt: null as null, remoteDeletedAt: null as null };
-      const [total, alreadyPurged, quarantined, flagged, localOnly, failed, protectedCount, rows] = await Promise.all([
+      const [total, alreadyPurged, eligible, quarantined, flagged, localOnly, failed, protectedCount, rows] = await Promise.all([
         this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null } }),
         this.prisma.mailMessage.count({ where: { accountId: account.id, deletedAt: null, remoteDeletedAt: { not: null } } }),
+        // Сколько всего можно убрать: тот же отбор, что и для порции, но без ограничения.
+        this.prisma.mailMessage.count({
+          where: {
+            ...base,
+            folderPath: ON_SERVER_FOLDER,
+            createdAt: { lt: cutoff },
+            remotePurgeTries: { lt: MAX_TRIES },
+            flagged: false,
+            ...this.notProtectedFilter(),
+          },
+        }),
         this.prisma.mailMessage.count({
           where: { ...base, createdAt: { gte: cutoff }, folderPath: ON_SERVER_FOLDER },
         }),
@@ -266,6 +297,7 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
             createdAt: { lt: cutoff },
             remotePurgeTries: { lt: MAX_TRIES },
             flagged: false,
+            ...this.notProtectedFilter(),
           },
           orderBy: { createdAt: 'asc' },
           take: limit,
@@ -287,13 +319,16 @@ export class MailPurgeService implements OnModuleInit, OnModuleDestroy {
       // письмо был бы дороже. В счётчике отчёта их не приплюсовываем — он уже посчитан выше
       // по всему ящику, и сумма дала бы двойной учёт.
       const candidates = (rows as CandidateRow[]).filter((r) => !this.isProtected(r.fromAddr));
-      const remaining = Math.max(0, total - alreadyPurged - candidates.length);
+      // Останется у провайдера навсегда — то, что не подлежит удалению вовсе, а не «остаток
+      // очереди»: очередь как раз видна в eligible и уменьшается с каждым проходом.
+      const remaining = Math.max(0, total - alreadyPurged - eligible);
 
       const accountPlan: PurgePlanAccount = {
         accountId: account.id,
         email: account.email,
         total,
         candidates: candidates.length,
+        eligible,
         remaining,
         oldest: candidates.length ? candidates[0].sortAt.toISOString() : null,
         newest: candidates.length ? candidates[candidates.length - 1].sortAt.toISOString() : null,

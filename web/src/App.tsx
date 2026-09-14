@@ -1411,7 +1411,8 @@ function MailPurgePanel({ hasAccounts }: { hasAccounts: boolean }) {
               <span className="fname" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
                 <span>{a.email}</span>
                 <span className="meta" style={{ whiteSpace: 'normal' }}>
-                  всего {a.total} · под удаление {a.candidates} · останется {a.remaining}
+                  всего {a.total} · уже убрано {a.excluded.alreadyPurged} · можно убрать {a.eligible} ·
+                  не подлежит удалению {a.remaining}
                   {a.oldest && a.newest ? ` · письма с ${new Date(a.oldest).toLocaleDateString('ru-RU')} по ${new Date(a.newest).toLocaleDateString('ru-RU')}` : ''}
                 </span>
               </span>
@@ -1419,9 +1420,11 @@ function MailPurgePanel({ hasAccounts }: { hasAccounts: boolean }) {
           ))}
           {excluded && (
             <div className="copy">
-              не попадут под удаление: свежие (карантин {plan.quarantineHours} ч) — {excluded.quarantined},
-              помеченные звёздочкой — {excluded.flagged}, от провайдеров доступа — {excluded.protectedSender},
-              уже убраны — {excluded.alreadyPurged}, не удалось {excluded.failed}, наши отправки — {excluded.localOnly}
+              За проход убираем не больше {plan.perRun} писем на ящик — поэтому «можно убрать» это
+              очередь целиком, а не то, что уйдёт сейчас. Не подлежат удалению никогда: помеченные
+              звёздочкой — {excluded.flagged}, письма от провайдеров доступа (коды входа и оповещения) — {excluded.protectedSender},
+              наши собственные отправки — {excluded.localOnly}, свежие (карантин {plan.quarantineHours} ч) — {excluded.quarantined},
+              не удалось — {excluded.failed}. Уже убрано раньше — {excluded.alreadyPurged}.
             </div>
           )}
           {plan.accounts[0]?.samples.length ? (

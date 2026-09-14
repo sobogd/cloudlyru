@@ -662,6 +662,7 @@ export interface MailPurgePlanAccount {
   email: string;
   total: number;
   candidates: number;
+  eligible: number;
   remaining: number;
   oldest: string | null;
   newest: string | null;
