@@ -167,18 +167,42 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       data: { status: 'syncing', statusError: null },
     });
 
-    const client = await this.connect(account);
-    const folders = await this.resolveFolders(client, preset.folders);
     let stored = 0;
     let failed: string | null = null;
-    for (const folder of folders) {
+
+    // Прогон с одним повтором: серверы почты (и особенно Gmail) рвут соединение посреди
+    // долгой выборки, и раньше это выглядело как «аккаунт сломан» до следующего прохода
+    // по расписанию — через пять минут. Данные не теряются: курсор двигается после каждого
+    // письма, поэтому продолжение с него ничего не перекачивает.
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        stored += await this.syncFolder(client, account, folder);
+        const client = await this.connect(account);
+        const folders = await this.resolveFolders(client, preset.folders);
+        for (const folder of folders) {
+          try {
+            stored += await this.syncFolder(client, account, folder);
+          } catch (e) {
+            // Обрыв соединения — не ошибка папки: повторяем проход целиком (свежее
+            // соединение), и только если и он не удался, показываем ошибку.
+            if (isConnectionError(e)) throw e;
+            // Одна недоступная папка (у iCloud «Junk» может отсутствовать) не должна ронять
+            // весь аккаунт: остальные папки синхронизируем, а причину показываем в статусе.
+            failed = (e instanceof Error ? e.message : String(e)).slice(0, 400);
+            this.logger.warn(`${account.email}, папка ${folder.path}: ${failed}`);
+          }
+        }
+        if (failed === null) break;
+        break;
       } catch (e) {
-        // Одна недоступная папка (у iCloud «Junk» может отсутствовать) не должна ронять
-        // весь аккаунт: остальные папки синхронизируем, а причину показываем в статусе.
-        failed = (e instanceof Error ? e.message : String(e)).slice(0, 400);
-        this.logger.warn(`${account.email}, папка ${folder.path}: ${failed}`);
+        const message = (e instanceof Error ? e.message : String(e)).slice(0, 400);
+        this.dropClient(account.id);
+        if (attempt === 1) {
+          this.logger.warn(`${account.email}: соединение оборвалось (${message}) — переподключаюсь и продолжаю`);
+          await sleep(RECONNECT_DELAY_MS);
+          continue;
+        }
+        failed = message;
+        this.logger.warn(`${account.email}: повтор не помог — ${message}`);
       }
     }
 
@@ -396,10 +420,12 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     const batch = missing.slice(-env.MAIL_BACKFILL_PER_PASS).reverse();
     let stored = 0;
     let oldest: Date | null = null;
-    for (const uid of batch) {
+
+    // Одной командой на всю порцию, а не по команде на письмо. Раньше здесь было 200
+    // отдельных UID FETCH за проход — Gmail на такое отвечает обрывом соединения
+    // («Connection not available» посреди прохода), и проход умирал, не добрав порцию.
+    for await (const fetched of client.fetch(batch, SOURCE_QUERY, { uid: true })) {
       if (budget <= 0) break;
-      const fetched = await client.fetchOne(String(uid), SOURCE_QUERY, { uid: true });
-      if (!fetched) continue;
       const item = this.messageOf(fetched, ctx);
       if (!item) continue;
       const result = await this.ingestService.ingest(item.input);
@@ -493,6 +519,22 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     }
     return existing;
   }
+}
+
+/** Пауза перед повторным подключением: серверу нужно отпустить прошлое соединение. */
+const RECONNECT_DELAY_MS = 5000;
+
+/**
+ * Похоже ли на обрыв соединения, а не на отказ по существу.
+ *
+ * Разница важна: обрыв лечится переподключением и повтором, а «папки нет» или «сервер
+ * отказал в удалении» повтором не лечится — на них мы просто показываем ошибку.
+ */
+function isConnectionError(e: unknown): boolean {
+  const text = (e instanceof Error ? `${e.name} ${e.message}` : String(e)).toLowerCase();
+  return /connection not available|connection closed|connection lost|not connected|econnreset|econnrefused|epipe|etimedout|socket hang up|timeout/.test(
+    text,
+  );
 }
 
 function sleep(ms: number): Promise<void> {
