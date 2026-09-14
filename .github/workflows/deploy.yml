@@ -160,8 +160,8 @@ jobs:
             MAIL_SECRET_KEY=$MAIL_SECRET_KEY
             # Синхронизация по IMAP: выключенная — почта не ходит вообще.
             MAIL_SYNC_ENABLED=${MAIL_SYNC_ENABLED:-true}
-            # Плановый проход, секунды: 30 с — новые письма видны почти сразу
-            MAIL_SYNC_INTERVAL_SEC=30
+            # Плановый проход, секунды
+            MAIL_SYNC_INTERVAL_SEC=120
             # Токен приёма от своего SMTP-сервера (Postfix → приложение)
             MAIL_INBOUND_TOKEN=$MAIL_INBOUND_TOKEN
             EOF

@@ -444,24 +444,18 @@ export default function MailSection({
     }
   };
 
-  /** Перечитать ленту из БД: сбросить кэш, счётчики и видимые строки. */
-  const reloadFeed = async () => {
-    setItems(new Map());
-    itemsRef.current = new Map();
-    await loadCounters();
-    const el = scrollRef.current;
-    if (el) void fetchRangeRef.current(0, OVERSCAN + 20);
-  };
-
   const refresh = async () => {
     setBusy(true);
     try {
-      // Проверку почты запускаем в фоне, не ждём её: IMAP-проход — это секунды, а кнопка
-      // должна отвечать сразу, перечитывая то, что уже лежит в БД.
-      void api.mailSync().catch(() => {});
-      await reloadFeed();
-      // Свежую почту подхватим ещё раз, когда фоновый проход закончится.
-      void waitForSync().then(() => reloadFeed()).catch(() => {});
+      await api.mailSync();
+      // Проход асинхронный: сразу читать счётчики бессмысленно (они ещё старые). Ждём его
+      // конца, чтобы кнопка «Проверить» действительно показывала свежую почту.
+      await waitForSync();
+      setItems(new Map());
+      itemsRef.current = new Map();
+      await loadCounters();
+      const el = scrollRef.current;
+      if (el) void fetchRangeRef.current(0, OVERSCAN + 20);
     } catch (e) {
       setError((e as Error).message);
     } finally {
