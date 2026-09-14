@@ -99,6 +99,9 @@ jobs:
           MAIL_PURGE_INTERVAL_SEC: ${{ secrets.MAIL_PURGE_INTERVAL_SEC || '3600' }}
           # Предел доли ящика, уходящей под удаление за один отбор.
           MAIL_PURGE_MAX_SHARE: ${{ secrets.MAIL_PURGE_MAX_SHARE || '90' }}
+          # Адреса, письма от которых не удаляем никогда (через запятую). Пусто — не защищаем
+          # никого: письма провайдеров у нас уже есть целиком.
+          MAIL_PURGE_PROTECT_SENDERS: ${{ secrets.MAIL_PURGE_PROTECT_SENDERS || '' }}
           # Токен ручки приёма почты от своего Postfix. Ручка без сессии, поэтому токен
           # обязателен; снаружи путь ещё закрыт в nginx.
           MAIL_INBOUND_TOKEN: ${{ secrets.MAIL_INBOUND_TOKEN }}
@@ -106,7 +109,7 @@ jobs:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_PURGE_ENABLED,MAIL_PURGE_QUARANTINE_HOURS,MAIL_PURGE_PER_RUN,MAIL_PURGE_INTERVAL_SEC,MAIL_PURGE_MAX_SHARE,MAIL_INBOUND_TOKEN
+          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_PURGE_ENABLED,MAIL_PURGE_QUARANTINE_HOURS,MAIL_PURGE_PER_RUN,MAIL_PURGE_INTERVAL_SEC,MAIL_PURGE_MAX_SHARE,MAIL_PURGE_PROTECT_SENDERS,MAIL_INBOUND_TOKEN
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -183,6 +186,8 @@ jobs:
             MAIL_PURGE_INTERVAL_SEC=${MAIL_PURGE_INTERVAL_SEC:-3600}
             # Предел доли ящика за один отбор: защита от ошибки в отборе, а не от человека.
             MAIL_PURGE_MAX_SHARE=${MAIL_PURGE_MAX_SHARE:-90}
+            # Кого не удаляем никогда (пусто — никого).
+            MAIL_PURGE_PROTECT_SENDERS=${MAIL_PURGE_PROTECT_SENDERS:-}
             # Токен приёма от своего SMTP-сервера (Postfix → приложение)
             MAIL_INBOUND_TOKEN=$MAIL_INBOUND_TOKEN
             EOF
