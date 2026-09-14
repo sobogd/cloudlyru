@@ -38,6 +38,26 @@ const WAKE_DEBOUNCE_MS = 3000;
 /** Пауза между письмами внутри прохода: письма идут потоком, сервер этого не любит. */
 const PER_MESSAGE_DELAY_MS = 60;
 
+/**
+ * Сколько писем забирать «с хвоста», когда курсор отстал (первый проход после подключения
+ * ящика или долгая пауза). Дальше за новыми письмами следит уже обычная догрузка.
+ */
+const TAIL_ON_CATCHUP = 50n;
+
+/**
+ * Насколько курсор вправе отставать, прежде чем мы перестанем идти по истории вперёд.
+ *
+ * Это исправление настоящей ошибки: на новом курсоре lastUid = 0, и «догрузка нового»
+ * превращалась в UID FETCH 1:* — обход ящика от САМЫХ СТАРЫХ писем к новым. Свежая почта
+ * стояла в конце этой очереди, то есть ждала, пока переберём весь ящик (часы, а с лимитом
+ * Gmail на IMAP — сутки). Теперь история — дело бэкфилла (он идёт от свежих к старым),
+ * а догрузка занимается только новым.
+ */
+const CATCHUP_GAP = 1000n;
+
+/** Потолок трафика на догрузку нового за проход: остальное должно остаться истории. */
+const INCREMENTAL_BUDGET_BYTES = 50 * 1024 * 1024;
+
 /** Контекст письма внутри папки: то, чего нет в ответе сервера, но нужно при сохранении. */
 interface FolderContext {
   account: MailAccountRow;
@@ -266,7 +286,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       const ctx: FolderContext = { account, folderPath: folder.path, uidValidity: BigInt(mailbox.uidValidity) };
       const cursor = await this.cursorFor(account.id, folder, ctx.uidValidity);
 
-      let budget = env.MAIL_PASS_BUDGET_MB * 1024 * 1024;
+      const passBudget = env.MAIL_PASS_BUDGET_MB * 1024 * 1024;
 
       // 1. Новое. UIDNEXT — следующий свободный UID: если он не больше lastUid+1, нового нет,
       //    и запрос можно не делать вовсе. Проверка нужна не для экономии: «*» в IMAP — это
@@ -274,8 +294,29 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       //    последнее письмо (диапазон разворачивается), и мы качали бы его каждый проход.
       const status = await client.status(folder.path, { uidNext: true, messages: true });
       const uidNext = BigInt(status.uidNext ?? 1);
-      const from = cursor.lastUid + 1n;
+      const maxUid = uidNext > 0n ? uidNext - 1n : 0n;
+
+      // Курсор отстал настолько, что догонять историю «вперёд» бессмысленно: свежая почта
+      // ждала бы в конце очереди. Переставляем его к хвосту и забираем только хвост —
+      // остальное доберёт бэкфилл, который идёт от свежих к старым.
       let lastUid = cursor.lastUid;
+      if (maxUid - lastUid > CATCHUP_GAP) {
+        const tailFrom = maxUid > TAIL_ON_CATCHUP ? maxUid - TAIL_ON_CATCHUP + 1n : 1n;
+        this.logger.log(
+          `${folder.path}: курсор отстал на ${maxUid - lastUid} писем — забираю хвост с ${tailFrom}, историю доберёт бэкфилл`,
+        );
+        lastUid = tailFrom - 1n;
+        await this.prisma.mailCursor.update({
+          where: { id: cursor.id },
+          data: { lastUid, lastSeenAt: new Date() },
+        });
+      }
+
+      const from = lastUid + 1n;
+      // Догрузка нового — своя небольшая доля трафика: раньше она съедала бюджет целиком,
+      // и история не двигалась вовсе.
+      const incrementalCap = Math.min(passBudget, INCREMENTAL_BUDGET_BYTES);
+      let spent = 0;
       if (uidNext > from) {
         for await (const msg of client.fetch(`${from}:*`, SOURCE_QUERY, { uid: true })) {
           if (BigInt(msg.uid) <= cursor.lastUid) continue;
@@ -292,15 +333,17 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
               data: { lastUid, lastSeenAt: new Date() },
             });
           }
-          budget -= item.bytes;
-          if (budget <= 0) break;
+          spent += item.bytes;
+          if (spent >= incrementalCap) break;
           await sleep(PER_MESSAGE_DELAY_MS);
         }
       }
 
-      // 2. История: порция за проход, от свежих к старым.
-      if (budget > 0 && !cursor.backfillDone) {
-        stored += await this.backfill(client, ctx, cursor, budget);
+      // 2. История: порция за проход, от свежих к старым. Ей достаётся весь остаток
+      // бюджета прохода — история и есть основная работа, пока она не добрана.
+      const leftForHistory = passBudget - spent;
+      if (leftForHistory > 0 && !cursor.backfillDone) {
+        stored += await this.backfill(client, ctx, cursor, leftForHistory);
       }
     } finally {
       lock.release();
