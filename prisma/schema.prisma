@@ -503,3 +503,15 @@ model MailAttachment {
   @@unique([messageId, partIndex])
   @@index([messageId])
 }
+
+// Логотип отправителя: favicon домена, вытащенный сервером и закэшированный в БД.
+// Фетч — только с сервера (клиент наружу не ходит), поэтому логотипы приватны, а не
+// трекинг через сторонний сервис. bytes = null — у домена favicon нет (или не картинка);
+// triedAt хранит последнюю попытку, чтобы не дёргать один и тот же домен на каждое письмо.
+model SenderFavicon {
+  domain    String   @id
+  bytes     Bytes? // favicon; null — не нашёлся
+  mime      String?
+  triedAt   DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

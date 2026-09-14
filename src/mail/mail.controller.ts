@@ -4,6 +4,7 @@ import { MailAccountsService } from './mail-accounts.service';
 import { MailFeedService } from './mail-feed.service';
 import { MailSyncService } from './mail-sync.service';
 import { env } from '../config/env';
+import { MailFaviconService } from './mail-favicon.service';
 import { MailIngestService } from './mail-ingest.service';
 import { MailSendService } from './mail-send.service';
 import { S3Service } from '../s3/s3.service';
@@ -30,6 +31,7 @@ export class MailController {
     private readonly sync: MailSyncService,
     private readonly sender: MailSendService,
     private readonly ingestService: MailIngestService,
+    private readonly faviconService: MailFaviconService,
     private readonly s3: S3Service,
   ) {}
 
@@ -218,6 +220,22 @@ export class MailController {
       disposition: 'attachment',
       filename: name,
     });
+  }
+
+  /** Логотип отправителя (favicon домена): сервер тянет и кэширует, клиент наружу не ходит. */
+  @Get('favicon')
+  @SessionOnly()
+  @UseGuards(RateLimitGuard)
+  @RateLimit(1200, 60_000)
+  async favicon(@Query('domain') domain: string, @Res() res: Response) {
+    const fav = await this.faviconService.get(domain);
+    if (!fav) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader('Content-Type', fav.mime);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(fav.bytes);
   }
 
   @Post('messages/:id/seen')

@@ -73,6 +73,9 @@ export const fileUrl = (id: string) => `${BASE}/files/${id}/content`;
 /** Показ файла на странице (миниатюры альбомов): сервис отдаёт только безопасные картинки. */
 export const fileInlineUrl = (id: string) => `${BASE}/files/${id}/inline`;
 
+/** Логотип отправителя: favicon домена (сервер тянет и кэширует). */
+export const faviconUrl = (domain: string) => `${BASE}/mail/favicon?domain=${encodeURIComponent(domain)}`;
+
 // ===== метаданные для деталок =====
 export interface FileMedia {
   capturedAt: string | null;

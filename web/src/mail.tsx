@@ -119,10 +119,27 @@ function senderOf(item: Item): string {
   return item.fromName || item.fromAddr || 'без отправителя';
 }
 
-/** Первая буква для аватара-кружка: у писем без отправителя — знак вопроса. */
-function initialOf(item: Item): string {
-  const s = senderOf(item).trim();
-  return s ? s[0].toUpperCase() : '?';
+/** Домен отправителя для логотипа: `support@kino.watch` → `kino.watch`. */
+function domainOf(fromAddr: string | null): string | null {
+  if (!fromAddr) return null;
+  const i = fromAddr.lastIndexOf('@');
+  if (i <= 0 || i === fromAddr.length - 1) return null;
+  return fromAddr.slice(i + 1).toLowerCase();
+}
+
+/**
+ * Аватар отправителя: favicon домена, при отсутствии/ошибке — кружок с буквой.
+ * favicon грузит сервер (см. /mail/favicon), поэтому сюда приходит уже готовый URL.
+ */
+function SenderAvatar({ name, addr }: { name: string | null; addr: string | null }) {
+  const domain = domainOf(addr);
+  const [failed, setFailed] = useState(false);
+  const initial = (name || addr || 'без отправителя').trim();
+  const letter = initial ? initial[0].toUpperCase() : '?';
+  if (!domain || failed) {
+    return <span className="mailava" aria-hidden>{letter}</span>;
+  }
+  return <img className="mailava mailfav" src={api.faviconUrl(domain)} alt="" onError={() => setFailed(true)} />;
 }
 
 export default function MailSection({
@@ -570,7 +587,7 @@ export default function MailSection({
                 <div className="mailrow" key={row.index} style={{ transform: `translateY(${row.y}px)` }}>
                   {row.item ? (
                     <button className={'mailitem' + (row.item.seen ? '' : ' unread')} onClick={() => setOpenId(row.item!.id)}>
-                      <span className="mailava" aria-hidden>{initialOf(row.item)}</span>
+                      <SenderAvatar name={row.item.fromName} addr={row.item.fromAddr} />
                       <span className="mailmain">
                         <span className="mailtop">
                           <span className="mailwho">{senderOf(row.item)}</span>
@@ -851,7 +868,8 @@ export function MailViewer({
           <>
             <div className="mailhead-block">
               <div className="mailsubject">{msg.subject || '(без темы)'}</div>
-              <div className="mailaddr">
+              <div className="mailaddr mailfromrow">
+                <SenderAvatar name={msg.fromName} addr={msg.fromAddr} />
                 <span className="mailfrom">{msg.fromName || msg.fromAddr || 'без отправителя'}</span>
                 {msg.fromName && msg.fromAddr && <span className="mailaddr-v">&lt;{msg.fromAddr}&gt;</span>}
               </div>
