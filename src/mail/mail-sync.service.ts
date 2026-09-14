@@ -196,7 +196,10 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
             // никакого расписания. Ждём только новых писем — история идёт своим чередом.
             const fresh: StoredRef[] = [];
             stored += await this.syncFolder(client, account, folder, fresh);
-            if (fresh.length) await this.purgeFresh(account, fresh);
+            // Не ждём чистку: у неё свои соединение и паузы (перенос в мусорку отражается не
+            // мгновенно), и блокировать ими проход/кнопку «Обновить» нельзя — письмо уже у нас,
+            // а копия уйдёт в фоне. Ошибка не теряет письмо: его доберёт догоняющий проход.
+            if (fresh.length) void this.purgeFresh(account, fresh);
           } catch (e) {
             // Обрыв соединения — не ошибка папки: повторяем проход целиком (свежее
             // соединение), и только если и он не удался, показываем ошибку.
