@@ -284,9 +284,11 @@ export class MailAccountsService {
     }
     // Отправку проверяем отдельно: SMTP и IMAP — разные серверы и разные разрешения, и
     // «почта читается, а письма не уходят» выяснять при первом отправленном письме поздно.
-    const smtpError = await verifySmtpAccess({ smtpHost, smtpPort: preset.smtpPort, login: email, password });
-    if (smtpError) {
-      throw badRequest(`IMAP доступен, а отправка через ${smtpHost} нет: ${smtpError}`, 'mail_smtp_login_failed');
+    // Проверка заодно подбирает рабочий порт (465 или 587) — его и сохраняем: иначе отправка
+    // потом стучалась бы в тот, который в этой сети не проходит.
+    const smtp = await verifySmtpAccess({ smtpHost, smtpPort: preset.smtpPort, login: email, password });
+    if (smtp.error) {
+      throw badRequest(`IMAP доступен, а отправка через ${smtpHost} нет: ${smtp.error}`, 'mail_smtp_login_failed');
     }
 
     const created = await this.prisma.mailAccount.create({
@@ -297,7 +299,7 @@ export class MailAccountsService {
         imapHost,
         imapPort: preset.imapPort,
         smtpHost,
-        smtpPort: preset.smtpPort,
+        smtpPort: smtp.port,
         login: email,
         secretEnc: encryptSecret(password),
         status: 'idle',
@@ -311,7 +313,13 @@ export class MailAccountsService {
   /** Включение/выключение и смена пароля. Почта читается только у включённых аккаунтов. */
   async patch(userId: string, id: string, body: { enabled?: unknown; password?: unknown }): Promise<MailAccountView> {
     const account = await this.require(userId, id);
-    const data: { enabled?: boolean; secretEnc?: string; status?: string; statusError?: string | null } = {};
+    const data: {
+      enabled?: boolean;
+      secretEnc?: string;
+      status?: string;
+      statusError?: string | null;
+      smtpPort?: number;
+    } = {};
 
     if (typeof body.enabled === 'boolean') data.enabled = body.enabled;
 
@@ -326,15 +334,17 @@ export class MailAccountsService {
         password,
       });
       if (error) throw badRequest(`не удалось войти в ${account.imapHost}: ${error}`, 'mail_login_failed');
-      const smtpError = await verifySmtpAccess({
+      const smtp = await verifySmtpAccess({
         smtpHost: account.smtpHost,
         smtpPort: account.smtpPort,
         login: account.login,
         password,
       });
-      if (smtpError) {
-        throw badRequest(`IMAP доступен, а отправка через ${account.smtpHost} нет: ${smtpError}`, 'mail_smtp_login_failed');
+      if (smtp.error) {
+        throw badRequest(`IMAP доступен, а отправка через ${account.smtpHost} нет: ${smtp.error}`, 'mail_smtp_login_failed');
       }
+      // рабочий порт мог оказаться другим (465 против 587) — сохраняем его
+      if (smtp.port !== account.smtpPort) data.smtpPort = smtp.port;
       data.secretEnc = encryptSecret(password);
       // сбрасываем прошлую ошибку: причина могла быть именно в пароле
       data.status = 'idle';

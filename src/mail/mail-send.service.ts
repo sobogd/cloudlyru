@@ -149,7 +149,10 @@ export class MailSendService {
       );
     }
 
-    const transport = createSmtpTransport({ ...account, password: this.accounts.credentials(account).password });
+    const transport = createSmtpTransport({
+      ...account,
+      password: this.accounts.credentials(account).password,
+    });
     let accepted: string[] = [];
     let rejected: string[] = [];
     try {
