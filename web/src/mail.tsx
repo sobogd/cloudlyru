@@ -574,6 +574,11 @@ export default function MailSection({
                       <span className="mailmain">
                         <span className="mailtop">
                           <span className="mailwho">{senderOf(row.item)}</span>
+                          {row.item.threadCount > 1 && (
+                            <span className="mailthread" title={`${row.item.threadCount} писем в цепочке`}>
+                              {row.item.threadCount}
+                            </span>
+                          )}
                           <span className={'mailacc ' + accountTone(row.item.accountId)}>
                             {accountTag(row.item.accountEmail, accounts)}
                           </span>

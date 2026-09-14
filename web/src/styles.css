@@ -1032,6 +1032,19 @@
   }
   .mailitem.unread .mailwho { color: var(--fg); font-weight: 600; }
   .maildate { flex: none; font-size: 11px; color: var(--fg-3); }
+  .mailthread {
+    flex: none;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    display: inline-grid;
+    place-items: center;
+    border-radius: 9px;
+    background: var(--surface-3);
+    color: var(--fg-3);
+    font-size: 11px;
+    font-weight: 600;
+  }
   .mailsubj {
     overflow: hidden;
     text-overflow: ellipsis;

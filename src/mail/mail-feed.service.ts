@@ -37,6 +37,8 @@ export interface MailListItem {
   flagged: boolean;
   hasAttachments: boolean;
   size: number;
+  /** Сколько писем в цепочке (1 — одиночное письмо). */
+  threadCount: number;
 }
 
 export interface MailAttachmentView {
@@ -72,58 +74,91 @@ export class MailFeedService {
     private readonly s3: S3Service,
   ) {}
 
-  /**
-   * Условие выборки ленты: папка и, если задан, один аккаунт.
-   *
-   * Разделение по аккаунтам появилось после подключения рабочего ящика: личная почта
-   * и корпоративная в одной ленте — это каша, из которой непонятно, откуда письмо.
-   */
-  private where(userId: string, box: string, accountId?: string | null) {
-    return {
-      ...inBox(box as MailBox),
-      userId,
-      deletedAt: null,
-      ...(accountId ? { accountId } : {}),
-    };
-  }
-
-  /** Общее число писем в папке — по нему клиент считает высоту скролла. */
+  /** Общее число цепочек в папке — по нему клиент считает высоту скролла. */
   async count(userId: string, box: string, accountId?: string | null): Promise<number> {
-    return this.prisma.mailMessage.count({ where: this.where(userId, box, accountId) });
+    const rows = await this.prisma.$queryRaw<Array<{ n: number }>>(Prisma.sql`
+      SELECT count(*)::int AS n FROM (
+        SELECT 1
+        FROM "MailMessage"
+        WHERE "userId" = ${userId} AND "deletedAt" IS NULL AND ${inBoxSql(box as MailBox)}
+          AND (${accountId ?? null}::text IS NULL OR "accountId" = ${accountId ?? null})
+        GROUP BY COALESCE("threadKey", id)
+      ) g
+    `);
+    return Number(rows[0]?.n ?? 0);
   }
 
   /**
-   * Срез ленты по абсолютному смещению. Порядок — от свежих к старым, ровно как в индексе.
+   * Срез ленты по абсолютному смещению — но уже по цепочкам, а не по письмам.
+   *
+   * Каждая строка — самая свежая письмо цепочки (`row_number` внутри группы по threadKey),
+   * плюс сколько писем в цепочке. Письмо без threadKey — цепочка из одного письма, поэтому
+   * группируем по COALESCE(threadKey, id), чтобы одиночные письма не слиплись в одну кучу.
+   * Порядок — от свежих к старым, как и прежде.
    */
   async range(userId: string, box: string, offset = 0, limit = 100, accountId?: string | null): Promise<MailListItem[]> {
     const take = Math.min(Math.max(Math.floor(limit) || 1, 1), MAIL_RANGE_MAX);
     const skip = Math.max(0, Math.floor(offset) || 0);
-    const rows = await this.prisma.mailMessage.findMany({
-      where: this.where(userId, box, accountId),
-      orderBy: [{ sortAt: 'desc' }, { id: 'desc' }],
-      skip,
-      take,
-      select: {
-        id: true,
-        box: true,
-        accountId: true,
-        subject: true,
-        fromName: true,
-        fromAddr: true,
-        bodyText: true,
-        sortAt: true,
-        seen: true,
-        flagged: true,
-        hasAttachments: true,
-        size: true,
-        account: { select: { email: true } },
-      },
-    });
+    const acc = accountId ?? null;
+
+    const rows = await this.prisma.$queryRaw<
+      Array<{
+        id: string;
+        box: string;
+        accountId: string;
+        accountEmail: string;
+        subject: string | null;
+        fromName: string | null;
+        fromAddr: string | null;
+        bodyText: string | null;
+        sortAt: Date;
+        seen: boolean;
+        flagged: boolean;
+        hasAttachments: boolean;
+        size: number;
+        threadCount: number;
+      }>
+    >(Prisma.sql`
+      WITH base AS (
+        SELECT *
+        FROM "MailMessage"
+        WHERE "userId" = ${userId} AND "deletedAt" IS NULL AND ${inBoxSql(box as MailBox)}
+          AND (${acc}::text IS NULL OR "accountId" = ${acc})
+      ),
+      heads AS (
+        SELECT id FROM (
+          SELECT id,
+            row_number() OVER (
+              PARTITION BY COALESCE("threadKey", id)
+              ORDER BY "sortAt" DESC, id DESC
+            ) AS rn
+          FROM base
+        ) h
+        WHERE rn = 1
+      ),
+      grouped AS (
+        SELECT COALESCE("threadKey", id) AS grp, count(*)::int AS cnt
+        FROM base
+        GROUP BY 1
+      )
+      SELECT
+        m.id, m.box, m."accountId", m.subject, m."fromName", m."fromAddr",
+        m."bodyText", m."sortAt", m.seen, m.flagged, m."hasAttachments", m.size,
+        a.email AS "accountEmail",
+        g.cnt AS "threadCount"
+      FROM "MailMessage" m
+      JOIN "MailAccount" a ON a.id = m."accountId"
+      JOIN grouped g ON g.grp = COALESCE(m."threadKey", m.id)
+      WHERE m.id IN (SELECT id FROM heads)
+      ORDER BY m."sortAt" DESC, m.id DESC
+      LIMIT ${take} OFFSET ${skip}
+    `);
+
     return rows.map((r) => ({
       id: r.id,
       box: r.box,
       accountId: r.accountId,
-      accountEmail: r.account.email,
+      accountEmail: r.accountEmail,
       subject: r.subject,
       fromName: r.fromName,
       fromAddr: r.fromAddr,
@@ -133,19 +168,31 @@ export class MailFeedService {
       flagged: r.flagged,
       hasAttachments: r.hasAttachments,
       size: r.size,
+      threadCount: Number(r.threadCount),
     }));
   }
 
   /**
    * Индекс по месяцам для подписи у ползунка: строка на месяц в порядке ленты.
-   * Кумулятивным счётчиком клиент сопоставляет позицию скролла с месяцем без загрузки писем.
+   * Считаем по цепочкам (по их голове), чтобы высота скролла совпадала со списком.
    */
   async months(userId: string, box: string, accountId?: string | null): Promise<Array<{ month: string; count: number }>> {
     const rows = await this.prisma.$queryRaw<Array<{ month: string; n: bigint | number }>>(Prisma.sql`
-      SELECT to_char("sortAt", 'YYYY-MM') AS month, count(*) AS n
-      FROM "MailMessage"
-      WHERE "userId" = ${userId} AND ${inBoxSql(box as MailBox)} AND "deletedAt" IS NULL
-        AND (${accountId ?? null}::text IS NULL OR "accountId" = ${accountId ?? null})
+      WITH heads AS (
+        SELECT "sortAt" FROM (
+          SELECT "sortAt",
+            row_number() OVER (
+              PARTITION BY COALESCE("threadKey", id)
+              ORDER BY "sortAt" DESC, id DESC
+            ) AS rn
+          FROM "MailMessage"
+          WHERE "userId" = ${userId} AND ${inBoxSql(box as MailBox)} AND "deletedAt" IS NULL
+            AND (${accountId ?? null}::text IS NULL OR "accountId" = ${accountId ?? null})
+        ) h
+        WHERE rn = 1
+      )
+      SELECT to_char("sortAt", 'YYYY-MM') AS month, count(*)::int AS n
+      FROM heads
       GROUP BY 1
       ORDER BY 1 DESC
     `);
@@ -169,6 +216,7 @@ export class MailFeedService {
         messageId: true,
         inReplyTo: true,
         refs: true,
+        threadKey: true,
         sentAt: true,
         receivedAt: true,
         sortAt: true,
@@ -194,6 +242,10 @@ export class MailFeedService {
       },
     });
     if (!row) throw notFound('mail message not found');
+    // Сколько писем в цепочке этого письма — для бейджа при просмотре (1 — одиночное).
+    const threadCount = await this.prisma.mailMessage.count({
+      where: row.threadKey ? { userId, threadKey: row.threadKey, deletedAt: null } : { id: row.id },
+    });
     return {
       id: row.id,
       box: row.box,
@@ -216,6 +268,7 @@ export class MailFeedService {
       flagged: row.flagged,
       hasAttachments: row.hasAttachments,
       size: row.size,
+      threadCount,
       attachments: row.attachments.map((a) => ({
         id: a.id,
         entryId: a.entryId,

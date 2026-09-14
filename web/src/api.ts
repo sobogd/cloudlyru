@@ -692,6 +692,7 @@ export interface MailListItem {
   flagged: boolean;
   hasAttachments: boolean;
   size: number;
+  threadCount: number;
 }
 
 export interface MailAttachment {
