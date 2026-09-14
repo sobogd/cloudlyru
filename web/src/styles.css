@@ -64,6 +64,13 @@
   --accent-fg: #ffffff;
   --accent-2: #245ee0;                /* нажатое состояние */
   --accent-soft: #eaf1ff;             /* подложка ссылок, «пустых» кружков */
+  /* Оттенки тегов ящиков: различимы между собой, но не ярче акцента */
+  --tone-0-bg: #e7f0ff; --tone-0-fg: #1d4ed8;
+  --tone-1-bg: #e8f7ec; --tone-1-fg: #15803d;
+  --tone-2-bg: #fdeee6; --tone-2-fg: #c2410c;
+  --tone-3-bg: #f3e9fd; --tone-3-fg: #7c3aed;
+  --tone-4-bg: #e6f6f8; --tone-4-fg: #0e7490;
+  --tone-5-bg: #fdeaf1; --tone-5-fg: #be185d;
 
   --ok: #1f9d55;
   --warn: #b7791f;
@@ -94,6 +101,13 @@
     --accent-fg: #ffffff;
     --accent-2: #245ee0;
     --accent-soft: #1b2637;
+    /* В тёмной теме теги — приглушённая подложка и светлый текст того же оттенка */
+    --tone-0-bg: #1c2b4a; --tone-0-fg: #93b4ff;
+    --tone-1-bg: #17331f; --tone-1-fg: #86d9a3;
+    --tone-2-bg: #3a2418; --tone-2-fg: #f3ad7a;
+    --tone-3-bg: #2a2140; --tone-3-fg: #c4a8fb;
+    --tone-4-bg: #123037; --tone-4-fg: #7fd3e0;
+    --tone-5-bg: #3a1c2a; --tone-5-fg: #f59ac0;
 
     --ok: #2fae5f;
     --warn: #d9a343;
@@ -945,19 +959,26 @@
     white-space: nowrap;
   }
   .mailchip.active { background: var(--accent-soft); border-color: transparent; color: var(--accent); font-weight: 600; }
-  /* Ящик в строке письма: виден только когда лента показывает все ящики сразу */
+  /* Тег ящика в строке письма: короткая подпись и свой цвет на каждый ящик.
+     Цвет приглушённый: он помогает различить ящики, но не спорит с темой письма. */
   .mailacc {
     flex: none;
-    max-width: 42%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 10px;
-    color: var(--fg-3);
-    background: var(--surface-2);
+    font-weight: 600;
     border-radius: 6px;
-    padding: 1px 5px;
+    padding: 1px 6px;
+    background: var(--surface-3);
+    color: var(--fg-2);
   }
+  .tone-0 { background: var(--tone-0-bg); color: var(--tone-0-fg); }
+  .tone-1 { background: var(--tone-1-bg); color: var(--tone-1-fg); }
+  .tone-2 { background: var(--tone-2-bg); color: var(--tone-2-fg); }
+  .tone-3 { background: var(--tone-3-bg); color: var(--tone-3-fg); }
+  .tone-4 { background: var(--tone-4-bg); color: var(--tone-4-fg); }
+  .tone-5 { background: var(--tone-5-bg); color: var(--tone-5-fg); }
   .mailvirt { position: relative; width: 100%; }
   .mailskel { display: flex; flex-direction: column; gap: 6px; padding: 2px; }
   .mailrow {

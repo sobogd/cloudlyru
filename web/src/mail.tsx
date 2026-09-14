@@ -95,6 +95,26 @@ function findBucket(
   return undefined;
 }
 
+/**
+ * Короткая подпись ящика для тега: домен («gmail.com»), а если на домене несколько ящиков —
+ * полный адрес, иначе теги было бы не различить.
+ */
+function accountTag(email: string, all: api.MailAccountRow[]): string {
+  const domain = email.split('@')[1] ?? email;
+  const sameDomain = all.filter((a) => (a.email.split('@')[1] ?? '') === domain).length > 1;
+  return sameDomain ? email : domain;
+}
+
+/**
+ * Цвет тега — по самому ящику, а не по его месту в списке: ящики добавляются и удаляются,
+ * а письма не должны менять цвет от того, что рядом появился ещё один.
+ */
+function accountTone(accountId: string): string {
+  let hash = 0;
+  for (let i = 0; i < accountId.length; i++) hash = (hash * 31 + accountId.charCodeAt(i)) % 997;
+  return `tone-${hash % 6}`;
+}
+
 /** Кто отправитель: имя, иначе адрес. */
 function senderOf(item: Item): string {
   return item.fromName || item.fromAddr || 'без отправителя';
@@ -520,7 +540,7 @@ export default function MailSection({
           {accounts.map((a) => (
             <button
               key={a.id}
-              className={'mailchip' + (account === a.id ? ' active' : '')}
+              className={'mailchip ' + accountTone(a.id) + (account === a.id ? ' active' : '')}
               onClick={() => setAccount(a.id)}
               title={a.email}
             >
@@ -559,8 +579,10 @@ export default function MailSection({
                       <span className="mailmain">
                         <span className="mailtop">
                           <span className="mailwho">{senderOf(row.item)}</span>
-                          {account === '' && accounts.length > 1 && (
-                            <span className="mailacc">{row.item.accountEmail}</span>
+                          {accounts.length > 1 && (
+                            <span className={'mailacc ' + accountTone(row.item.accountId)}>
+                              {accountTag(row.item.accountEmail, accounts)}
+                            </span>
                           )}
                           <span className="maildate">{listDate(row.item.sortAt)}</span>
                         </span>
