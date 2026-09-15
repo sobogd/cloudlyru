@@ -510,12 +510,29 @@ class AlbumView {
 
 // ===== очередь превью =====
 
+/// Оценка срока по виду задачи (с сервера): медианная длительность задачи за последние
+/// часы и срок на остаток. null — статистики ещё нет, тогда оценку не показываем.
+class QueueEstimate {
+  final int? avgSec;
+  final int? etaSec;
+  final int samples;
+
+  QueueEstimate({this.avgSec, this.etaSec, this.samples = 0});
+
+  factory QueueEstimate.fromJson(Map<String, dynamic> j) => QueueEstimate(
+        avgSec: j.iN('avgSec'),
+        etaSec: j.iN('etaSec'),
+        samples: j.i('samples'),
+      );
+}
+
 class QueueStatus {
   final bool paused;
   final int remaining;
   final int processing;
   final int errors;
   final Map<String, int> remainingByKind;
+  final Map<String, QueueEstimate> estimates;
   final int? diskFree;
   final bool? diskLow;
 
@@ -525,6 +542,7 @@ class QueueStatus {
     required this.processing,
     required this.errors,
     required this.remainingByKind,
+    this.estimates = const {},
     this.diskFree,
     this.diskLow,
   });
@@ -536,6 +554,8 @@ class QueueStatus {
         errors: j.i('errors'),
         remainingByKind: (j.m('remainingByKind') ?? const {})
             .map((k, v) => MapEntry(k, toNum(v)?.toInt() ?? 0)),
+        estimates: (j.m('estimates') ?? const {}).map((k, v) =>
+            MapEntry(k, QueueEstimate.fromJson((v as Map).cast<String, dynamic>()))),
         diskFree: j.iN('diskFree'),
         diskLow: j.bN('diskLow'),
       );

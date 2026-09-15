@@ -14,6 +14,22 @@ import '../../util/format.dart';
 import '../../util/widgets.dart';
 import 'updater.dart';
 
+/// Срок на остаток очереди: точность до минут не нужна, поэтому секунды → минуты → часы → сутки.
+String? _eta(int? sec) {
+  if (sec == null || sec <= 0) return null;
+  if (sec < 90) return '$sec с';
+  if (sec < 5400) return '${(sec / 60).round()} мин';
+  if (sec < 48 * 3600) return '${(sec / 3600).round()} ч';
+  return '${(sec / 86400).round()} сут';
+}
+
+/// « (≈ 4 сут)» рядом с числом остатка: сервер считает срок по медиане длительности задач,
+/// и пока замеров нет — не показываем ничего.
+String _etaSuffix(QueueStatus q, String kind) {
+  final e = _eta(q.estimates[kind]?.etaSec);
+  return e == null ? '' : ' (≈ $e)';
+}
+
 String _group(int n) {
   final s = n.toString();
   final b = StringBuffer();
@@ -259,8 +275,9 @@ class _QueuePanelState extends ConsumerState<QueuePanel> {
                 style: const TextStyle(color: C.fg, fontSize: 14)),
             if (q.remaining > 0)
               Text(
-                'фото: ${_group(q.remainingByKind['photo'] ?? 0)} · видео: ${_group(q.remainingByKind['video'] ?? 0)}'
-                '${(q.remainingByKind['pdf'] ?? 0) > 0 ? ' · PDF: ${_group(q.remainingByKind['pdf']!)}' : ''}',
+                'фото: ${_group(q.remainingByKind['photo'] ?? 0)}${_etaSuffix(q, 'photo')}'
+                ' · видео: ${_group(q.remainingByKind['video'] ?? 0)}${_etaSuffix(q, 'video')}'
+                '${(q.remainingByKind['pdf'] ?? 0) > 0 ? ' · PDF: ${_group(q.remainingByKind['pdf']!)}${_etaSuffix(q, 'pdf')}' : ''}',
                 style: const TextStyle(color: C.fg3, fontSize: 12),
               ),
             Text(
