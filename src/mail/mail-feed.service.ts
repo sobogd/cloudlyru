@@ -195,7 +195,7 @@ export class MailFeedService {
     const orderBy = box === 'trash' ? Prisma.sql`"deletedAt" DESC, id DESC` : Prisma.sql`"sortAt" DESC, id DESC`;
     const rows = await this.prisma.$queryRaw<Array<{ month: string; n: bigint | number }>>(Prisma.sql`
       WITH heads AS (
-        SELECT ${timeCol} AS t FROM (
+        SELECT t FROM (
           SELECT ${timeCol} AS t,
             row_number() OVER (
               PARTITION BY COALESCE("threadKey", id)
