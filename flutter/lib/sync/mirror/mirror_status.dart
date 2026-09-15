@@ -78,7 +78,8 @@ class MirrorStatus {
   }
 
   /// Сколько процентов уходит у текущего файла.
-  int get currentPercent => currentTotal <= 0 ? 0 : (currentSent * 100) ~/ currentTotal;
+  int get currentPercent =>
+      currentTotal <= 0 ? 0 : (currentSent * 100) ~/ currentTotal;
 
   MirrorStatus copyWith({
     MirrorPhase? phase,
@@ -105,30 +106,31 @@ class MirrorStatus {
     int? blocked,
     String? blockedReason,
     bool clearBlockedReason = false,
-  }) =>
-      MirrorStatus(
-        phase: phase ?? this.phase,
-        currentName: clearCurrentName ? null : (currentName ?? this.currentName),
-        currentSent: currentSent ?? this.currentSent,
-        currentTotal: currentTotal ?? this.currentTotal,
-        passUploadedFiles: passUploadedFiles ?? this.passUploadedFiles,
-        passUploadedBytes: passUploadedBytes ?? this.passUploadedBytes,
-        passDownloaded: passDownloaded ?? this.passDownloaded,
-        passFailed: passFailed ?? this.passFailed,
-        inCloudFiles: inCloudFiles ?? this.inCloudFiles,
-        inCloudBytes: inCloudBytes ?? this.inCloudBytes,
-        localFiles: localFiles ?? this.localFiles,
-        localBytes: localBytes ?? this.localBytes,
-        waitingFiles: waitingFiles ?? this.waitingFiles,
-        waitingBytes: waitingBytes ?? this.waitingBytes,
-        startedAt: startedAt ?? this.startedAt,
-        finishedAt: finishedAt ?? this.finishedAt,
-        checkedAt: checkedAt ?? this.checkedAt,
-        lastText: lastText ?? this.lastText,
-        error: clearError ? null : (error ?? this.error),
-        blocked: blocked ?? this.blocked,
-        blockedReason: clearBlockedReason ? null : (blockedReason ?? this.blockedReason),
-      );
+  }) => MirrorStatus(
+    phase: phase ?? this.phase,
+    currentName: clearCurrentName ? null : (currentName ?? this.currentName),
+    currentSent: currentSent ?? this.currentSent,
+    currentTotal: currentTotal ?? this.currentTotal,
+    passUploadedFiles: passUploadedFiles ?? this.passUploadedFiles,
+    passUploadedBytes: passUploadedBytes ?? this.passUploadedBytes,
+    passDownloaded: passDownloaded ?? this.passDownloaded,
+    passFailed: passFailed ?? this.passFailed,
+    inCloudFiles: inCloudFiles ?? this.inCloudFiles,
+    inCloudBytes: inCloudBytes ?? this.inCloudBytes,
+    localFiles: localFiles ?? this.localFiles,
+    localBytes: localBytes ?? this.localBytes,
+    waitingFiles: waitingFiles ?? this.waitingFiles,
+    waitingBytes: waitingBytes ?? this.waitingBytes,
+    startedAt: startedAt ?? this.startedAt,
+    finishedAt: finishedAt ?? this.finishedAt,
+    checkedAt: checkedAt ?? this.checkedAt,
+    lastText: lastText ?? this.lastText,
+    error: clearError ? null : (error ?? this.error),
+    blocked: blocked ?? this.blocked,
+    blockedReason: clearBlockedReason
+        ? null
+        : (blockedReason ?? this.blockedReason),
+  );
 }
 
 enum MirrorPhase {

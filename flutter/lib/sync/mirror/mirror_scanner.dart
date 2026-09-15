@@ -77,15 +77,17 @@ class MirrorScanner {
           if (child is! File) continue;
           if (MediaRules.isHidden(name) || MediaRules.isJunk(name)) continue;
           final stat = await child.stat();
-          gathered.add(_Gathered(
-            path: child.path,
-            name: name,
-            dir: dir,
-            relDir: relDir,
-            root: root,
-            size: stat.size,
-            mtime: stat.modified.millisecondsSinceEpoch,
-          ));
+          gathered.add(
+            _Gathered(
+              path: child.path,
+              name: name,
+              dir: dir,
+              relDir: relDir,
+              root: root,
+              size: stat.size,
+              mtime: stat.modified.millisecondsSinceEpoch,
+            ),
+          );
           if (gathered.length >= hardMax) {
             capped = true;
             break;
@@ -97,20 +99,25 @@ class MirrorScanner {
     final files = <LocalFile>[];
     for (var start = 0; start < gathered.length; start += inodeBatch) {
       if (cancelled()) break;
-      final chunk = gathered.sublist(start, math.min(start + inodeBatch, gathered.length));
+      final chunk = gathered.sublist(
+        start,
+        math.min(start + inodeBatch, gathered.length),
+      );
       final inodes = await _native.inodes([for (final g in chunk) g.path]);
       for (var i = 0; i < chunk.length; i++) {
         final g = chunk[i];
-        files.add(LocalFile(
-          path: g.path,
-          name: g.name,
-          dir: g.dir,
-          relDir: g.relDir,
-          root: g.root,
-          size: g.size,
-          mtime: g.mtime,
-          inode: i < inodes.length ? inodes[i] : 0,
-        ));
+        files.add(
+          LocalFile(
+            path: g.path,
+            name: g.name,
+            dir: g.dir,
+            relDir: g.relDir,
+            root: g.root,
+            size: g.size,
+            mtime: g.mtime,
+            inode: i < inodes.length ? inodes[i] : 0,
+          ),
+        );
       }
     }
 

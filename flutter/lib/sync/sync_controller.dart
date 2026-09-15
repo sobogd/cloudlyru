@@ -558,12 +558,22 @@ class SyncController extends ChangeNotifier {
     activity = 'сверяю…';
     notifyListeners();
     try {
-      return await e.pass(
+      final report = await e.pass(
         onProgress: (m) {
           activity = m;
           notifyListeners();
         },
       );
+      // Токен устройства отозвали (в вебе или на другом устройстве): пока он лежит в клиенте,
+      // каждый проход будет упираться в 401. Признаём его негодным, чтобы ближайшая проверка
+      // выпустила новый и синхронизация вернулась сама, без переустановки приложения.
+      final error = report.error;
+      if (error != null && error.contains('токен отозван')) {
+        _api = null;
+        tokenError = 'токен устройства отозван — нужен новый';
+        debugPrint('cloudly-sync: $tokenError');
+      }
+      return report;
     } catch (err) {
       return MirrorReport()..error = '$err';
     } finally {

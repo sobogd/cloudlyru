@@ -58,7 +58,8 @@ abstract final class MirrorRules {
   /// Файл устоялся: с последнего изменения прошло больше окна стабильности. Дата из будущего
   /// (кривые часы устройства, распакованный архив) тоже считается устоявшейся: писать файл
   /// «в будущем» нельзя, а вот застрять навсегда из-за такой даты он может.
-  static bool isStable(int mtime, int now) => mtime > now || mtime <= now - stableMs;
+  static bool isStable(int mtime, int now) =>
+      mtime > now || mtime <= now - stableMs;
 
   /// Удаления допустимы только по полному и читаемому снимку: если папка не открылась или
   /// обход упёрся в предел, «файла нет» означает «мы его не увидели», а не «его удалили».
@@ -110,7 +111,12 @@ abstract final class MirrorRules {
     // «файла нет» означает «правило показа», а не «удалён». Иначе облачный `.nomedia` уезжал бы
     // в корзину на следующем же проходе после того, как его скачали.
     final lost = known.values
-        .where((row) => !byPath.containsKey(row.path) && scope(row.path) && !excluded(row.path))
+        .where(
+          (row) =>
+              !byPath.containsKey(row.path) &&
+              scope(row.path) &&
+              !excluded(row.path),
+        )
         .toList();
     final byInode = <int, MirrorRow>{};
     for (final row in lost) {
@@ -153,7 +159,9 @@ abstract final class MirrorRules {
 
     final gone = lost.where((row) => !renamedFrom.contains(row.path)).toList();
     final blocked =
-        gone.isNotEmpty && (!deletionsAllowed || (massDelete(gone.length, known.length) && !confirmed));
+        gone.isNotEmpty &&
+        (!deletionsAllowed ||
+            (massDelete(gone.length, known.length) && !confirmed));
     return MirrorPlan(
       unstable: unstable,
       uploads: uploads,
@@ -199,7 +207,8 @@ abstract final class MirrorRules {
   /// Так же поступает Google Drive — «конфликтующая копия» вместо тихой потери одной из версий.
   static String conflictName(String name, int at) {
     final t = DateTime.fromMillisecondsSinceEpoch(at);
-    final stamp = '${t.year.toString().padLeft(4, '0')}-'
+    final stamp =
+        '${t.year.toString().padLeft(4, '0')}-'
         '${t.month.toString().padLeft(2, '0')}-'
         '${t.day.toString().padLeft(2, '0')} '
         '${t.hour.toString().padLeft(2, '0')}.'

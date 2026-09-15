@@ -32,16 +32,22 @@ class LocalFile {
   final int mtime;
   final int inode;
 
-  LocalFile copyWith({String? path, String? dir, int? size, int? mtime, int? inode}) => LocalFile(
-        path: path ?? this.path,
-        name: name,
-        dir: dir ?? this.dir,
-        relDir: relDir,
-        root: root,
-        size: size ?? this.size,
-        mtime: mtime ?? this.mtime,
-        inode: inode ?? this.inode,
-      );
+  LocalFile copyWith({
+    String? path,
+    String? dir,
+    int? size,
+    int? mtime,
+    int? inode,
+  }) => LocalFile(
+    path: path ?? this.path,
+    name: name,
+    dir: dir ?? this.dir,
+    relDir: relDir,
+    root: root,
+    size: size ?? this.size,
+    mtime: mtime ?? this.mtime,
+    inode: inode ?? this.inode,
+  );
 }
 
 /// Папка телефона. Нужна, чтобы в облаке повторялась и пустая структура, а не только места
@@ -96,14 +102,14 @@ class MirrorRow {
   final String? sha256;
 
   MirrorRow copyWith({String? path, String? cloudFolderId}) => MirrorRow(
-        path: path ?? this.path,
-        cloudFolderId: cloudFolderId ?? this.cloudFolderId,
-        entryId: entryId,
-        inode: inode,
-        size: size,
-        mtime: mtime,
-        sha256: sha256,
-      );
+    path: path ?? this.path,
+    cloudFolderId: cloudFolderId ?? this.cloudFolderId,
+    entryId: entryId,
+    inode: inode,
+    size: size,
+    mtime: mtime,
+    sha256: sha256,
+  );
 }
 
 /// Незавершённая выгрузка: сессия на сервере и слепок файла, по которому она начата.

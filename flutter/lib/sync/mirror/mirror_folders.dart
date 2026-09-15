@@ -21,7 +21,11 @@ class MirrorFolders {
   final Map<String, String> _byLocalPath = {};
 
   /// Папка для относительного пути (`Download/Telegram`) внутри корня зеркала.
-  Future<String> ensure(String relDir, String localPath, String mirrorRootId) async {
+  Future<String> ensure(
+    String relDir,
+    String localPath,
+    String mirrorRootId,
+  ) async {
     final cached = _byLocalPath[localPath];
     if (cached != null) {
       await _store.registerDir(cached, localPath);

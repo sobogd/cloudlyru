@@ -7,6 +7,7 @@ import '../device/media_rules.dart';
 import '../device/native_fs.dart';
 import '../net/sync_api.dart';
 import '../queue/upload_plan.dart';
+import 'failure_streak.dart';
 import 'mirror_folders.dart';
 import 'mirror_models.dart';
 import 'mirror_rules.dart';
@@ -26,8 +27,13 @@ import 'mirror_rules.dart';
 /// а не догадка по неполному снимку (так же ведёт себя Google Drive). Страховка — корзина
 /// на сервере: 30 дней и восстановление.
 class MirrorPull {
-  MirrorPull(this._api, this._store, this._deviceId, this._onProgress, {NativeFs? native})
-      : _native = native ?? NativeFs();
+  MirrorPull(
+    this._api,
+    this._store,
+    this._deviceId,
+    this._onProgress, {
+    NativeFs? native,
+  }) : _native = native ?? NativeFs();
 
   final SyncApi _api;
   final MirrorStore _store;
@@ -52,6 +58,9 @@ class MirrorPull {
 
   /// Ошибка, после которой проход дальше не имеет смысла (нет сети, отозван токен).
   String? fatal;
+
+  /// Сбои скачивания подряд: без счётчика проход ждал бы таймаута на каждом файле.
+  final FailureStreak _downloads = FailureStreak();
 
   /// Догнать облако. Первый раз — полный проход и курсор на текущей голове журнала: сначала
   /// голова, потом содержимое. Изменения, случившиеся во время полного прохода, приедут
@@ -78,7 +87,9 @@ class MirrorPull {
         // Сервер ограничивает частоту: это «повтори позже», а не поломка. Курсор не двигаем —
         // следующий заход продолжит с того же места.
         if (e.status == 429 || e.status >= 500) return;
-        fatal = e.status == 401 ? 'токен отозван — войдите заново' : 'журнал изменений недоступен: ${e.message}';
+        fatal = e.status == 401
+            ? 'токен отозван — войдите заново'
+            : 'журнал изменений недоступен: ${e.message}';
         return;
       } catch (e) {
         fatal = 'журнал изменений недоступен: $e';
@@ -167,7 +178,11 @@ class MirrorPull {
   /// Одно изменение журнала.
   Future<void> _apply(CloudChange change) async {
     // своя же правка: локально она уже сделана тем проходом, который её отправил
-    if (_deviceId != null && change.deviceId != null && change.deviceId == _deviceId) return;
+    if (_deviceId != null &&
+        change.deviceId != null &&
+        change.deviceId == _deviceId) {
+      return;
+    }
     if (change.target == 'folder') {
       await _applyFolder(change);
     } else {
@@ -249,11 +264,16 @@ class MirrorPull {
     if (row != null && row.path != path) {
       final from = File(row.path);
       final to = File(path);
-      if (await from.exists() && !await to.exists() && await from.parent.exists()) {
+      if (await from.exists() &&
+          !await to.exists() &&
+          await from.parent.exists()) {
         await to.parent.create(recursive: true);
         try {
           await from.rename(path);
-          final moved = row.copyWith(path: path, cloudFolderId: folderId ?? row.cloudFolderId);
+          final moved = row.copyWith(
+            path: path,
+            cloudFolderId: folderId ?? row.cloudFolderId,
+          );
           await _store.moveFile(row.path, moved);
           row = moved;
           renamedLocal += 1;
@@ -266,7 +286,9 @@ class MirrorPull {
     }
 
     // содержимое облака — ровно то, что у нас уже есть: скачивать нечего
-    if (row != null && sha256 != null && row.sha256?.toLowerCase() == sha256.toLowerCase()) {
+    if (row != null &&
+        sha256 != null &&
+        row.sha256?.toLowerCase() == sha256.toLowerCase()) {
       return;
     }
 
@@ -284,24 +306,28 @@ class MirrorPull {
     final localMtime = stat.modified.millisecondsSinceEpoch;
 
     // локальный файл не менялся с прошлой сверки — облако новее, скачиваем
-    final localUntouched = row != null && row.size == localSize && row.mtime == localMtime;
+    final localUntouched =
+        row != null && row.size == localSize && row.mtime == localMtime;
     // файла нет в известных (строка потеряна или файл появился до включения зеркала):
     // содержимое совпадает по размеру и дате устройства-источника — значит это он и есть
-    final adopted = row == null &&
+    final adopted =
+        row == null &&
         clientMtime != null &&
         clientMtime > 0 &&
         localSize == size &&
         localMtime == clientMtime;
     if (adopted) {
-      await _store.putFile(MirrorRow(
-        path: path,
-        cloudFolderId: folderId ?? '',
-        entryId: entryId,
-        inode: await _native.inode(path),
-        size: localSize,
-        mtime: localMtime,
-        sha256: sha256,
-      ));
+      await _store.putFile(
+        MirrorRow(
+          path: path,
+          cloudFolderId: folderId ?? '',
+          entryId: entryId,
+          inode: await _native.inode(path),
+          size: localSize,
+          mtime: localMtime,
+          sha256: sha256,
+        ),
+      );
       return;
     }
     if (localUntouched) {
@@ -359,7 +385,8 @@ class MirrorPull {
     final file = File(row.path);
     if (await file.exists()) {
       final stat = await file.stat();
-      final edited = stat.size != row.size ||
+      final edited =
+          stat.size != row.size ||
           stat.modified.millisecondsSinceEpoch != row.mtime;
       if (edited) {
         if (await _saveConflictCopy(file)) conflicts += 1;
@@ -378,11 +405,16 @@ class MirrorPull {
     final dir = file.parent;
     Set<String> taken;
     try {
-      taken = (await dir.list().toList()).map((e) => p.basename(e.path)).toSet();
+      taken = (await dir.list().toList())
+          .map((e) => p.basename(e.path))
+          .toSet();
     } catch (_) {
       return false;
     }
-    final base = MirrorRules.conflictName(p.basename(file.path), DateTime.now().millisecondsSinceEpoch);
+    final base = MirrorRules.conflictName(
+      p.basename(file.path),
+      DateTime.now().millisecondsSinceEpoch,
+    );
     var name = base;
     var counter = 1;
     while (taken.contains(name) && counter < 100) {
@@ -421,30 +453,42 @@ class MirrorPull {
         } catch (_) {}
       }
       final stat = await dest.stat();
-      await _store.putFile(MirrorRow(
-        path: dest.path,
-        cloudFolderId: folderId ?? '',
-        entryId: entryId,
-        inode: await _native.inode(dest.path),
-        size: stat.size,
-        mtime: stat.modified.millisecondsSinceEpoch,
-        sha256: sha256,
-      ));
+      await _store.putFile(
+        MirrorRow(
+          path: dest.path,
+          cloudFolderId: folderId ?? '',
+          entryId: entryId,
+          inode: await _native.inode(dest.path),
+          size: stat.size,
+          mtime: stat.modified.millisecondsSinceEpoch,
+          sha256: sha256,
+        ),
+      );
       downloaded += 1;
+      _downloads.success();
       _onProgress('скачано: ${p.basename(dest.path)}');
       return true;
     } catch (e) {
       failed += 1;
+      // Сеть легла или токен отозван: продолжать бессмысленно — каждый следующий файл
+      // стоил бы ещё одного таймаута
+      if (_downloads.failure(e)) {
+        fatal = _downloads.reason;
+        return false;
+      }
       // Самая частая причина отказа файловой системы — имя: сервер разрешает символы и длину,
       // которых на телефоне (особенно на карте памяти) не бывает
       final name = p.basename(dest.path);
-      final nameProblem = name.length > 255 ||
+      final nameProblem =
+          name.length > 255 ||
           name.contains(RegExp(r'[\\:*?"<>|]')) ||
           name.endsWith('.') ||
           name.endsWith(' ');
-      _onProgress(nameProblem
-          ? 'не скачалось «$name»: такое имя недопустимо на телефоне — переименуйте в облаке'
-          : 'не скачалось $name: $e');
+      _onProgress(
+        nameProblem
+            ? 'не скачалось «$name»: такое имя недопустимо на телефоне — переименуйте в облаке'
+            : 'не скачалось $name: $e',
+      );
       return false;
     }
   }

@@ -19,6 +19,21 @@ class SyncApiException implements Exception {
   String toString() => message;
 }
 
+/// Прямой путь до хранилища не работает: presigned-ссылка не отвечает (сеть, VPN,
+/// блокировщик) или сервер их вовсе не выдаёт.
+///
+/// Наследник [IOException] намеренно: для вызывающих это «попробовать иначе» (релеем через
+/// сервер), а не «сервер сказал „нет“, повторять бессмысленно». Смешать эти случаи нельзя —
+/// иначе либо лишний релей на каждую ошибку, либо вечное упрямство с мёртвым хостом.
+class SyncDirectUnavailable implements IOException {
+  const SyncDirectUnavailable(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 /// Запись в облаке в том виде, в каком её видит зеркало.
 class RemoteEntry {
   const RemoteEntry({
@@ -393,8 +408,23 @@ class SyncApi {
     );
   }
 
-  Future<String> partUrl(String uploadId, int part) async =>
-      '${_m(await _req('/uploads/$uploadId/url/$part'))['url'] ?? ''}';
+  Future<String> partUrl(String uploadId, int part) async {
+    try {
+      final url =
+          '${_m(await _req('/uploads/$uploadId/url/$part'))['url'] ?? ''}';
+      if (url.isEmpty) {
+        throw const SyncDirectUnavailable('сервер не выдал ссылку на часть');
+      }
+      return url;
+    } on SyncApiException catch (e) {
+      if (e.status == 404 || e.status == 405) {
+        throw const SyncDirectUnavailable(
+          'сервер не поддерживает прямую загрузку',
+        );
+      }
+      rethrow;
+    }
+  }
 
   Future<void> registerPart(String uploadId, int part, String etag, int size) =>
       _req(
@@ -449,11 +479,13 @@ class SyncApi {
         ),
       );
       final etag = res.headers.value('etag');
-      if (etag == null || etag.isEmpty) throw Exception('$host не отдал ETag');
+      if (etag == null || etag.isEmpty) {
+        throw SyncDirectUnavailable('$host не отдал ETag');
+      }
       return etag.replaceAll('"', '');
     } on DioException catch (e) {
       // в сообщении должно быть видно, какой именно хост не отвечает
-      throw Exception('$host: ${e.message ?? 'ошибка сети'}');
+      throw SyncDirectUnavailable('$host: ${e.message ?? 'ошибка сети'}');
     }
   }
 

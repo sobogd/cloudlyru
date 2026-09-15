@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
+
 import '../data/mirror_store.dart';
 import '../device/native_fs.dart';
 import 'mirror_engine.dart';
@@ -21,7 +23,13 @@ import 'mirror_watcher.dart';
 /// Опрос прекращается, когда токена нет или сервер не отвечает: в Doze сеть всё равно спит,
 /// и долбить её каждые три секунды смысла нет — после ошибок пауза становится длинной.
 class MirrorLive {
-  MirrorLive(this._store, this._engine, this._status, this._watcher, this._native);
+  MirrorLive(
+    this._store,
+    this._engine,
+    this._status,
+    this._watcher,
+    this._native,
+  );
 
   final MirrorStore _store;
   final MirrorEngine _engine;
@@ -100,10 +108,12 @@ class MirrorLive {
 
       final head = await _engine.syncHead();
       _failures = 0;
-      _status.update((s) => s.copyWith(
-            checkedAt: DateTime.now().millisecondsSinceEpoch,
-            clearError: true,
-          ));
+      _status.update(
+        (s) => s.copyWith(
+          checkedAt: DateTime.now().millisecondsSinceEpoch,
+          clearError: true,
+        ),
+      );
       if (head > cursor) {
         await _engine.catchUpCloud(onProgress: onProgress);
       }
@@ -119,7 +129,14 @@ class MirrorLive {
   void bindWatcher() {
     _watcher.onPass = () {
       if (!hasToken()) return;
-      unawaited(_engine.pass(onProgress: onProgress));
+      // Проход запускается без ожидания ответа, поэтому падение внутри него стало бы
+      // необработанной ошибкой всего приложения — а сверка обязана ошибаться тихо
+      unawaited(
+        _engine.pass(onProgress: onProgress).catchError((Object e) {
+          debugPrint('cloudly-sync: проход по событию упал: $e');
+          return MirrorReport()..error = '$e';
+        }),
+      );
     };
   }
 

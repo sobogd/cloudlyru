@@ -12,6 +12,7 @@ import '../net/sync_api.dart';
 import '../queue/upload_plan.dart';
 import '../queue/uploader.dart';
 import '../section.dart';
+import 'failure_streak.dart';
 import 'mirror_folders.dart';
 import 'mirror_models.dart';
 import 'mirror_pull.dart';
@@ -327,9 +328,13 @@ class MirrorEngine {
     // останется стоять до следующего события файловой системы или до задания системы. Кнопки
     // «продолжить» в приложении нет намеренно — синхронизация обязана догонять себя сама.
     if (report.stopped) {
+      // Кончился бюджет — возвращаемся скоро, работа просто не влезла в отведённое время.
+      // Отказ сети или токена — ждём дольше: иначе проход будет запускаться каждые полминуты
+      // и снова упираться в те же таймауты, сжигая батарею.
+      final delayMs = report.error == null ? 30000 : 5 * 60 * 1000;
       await _store.setMeta(
         MirrorStore.keyRetryAt,
-        '${DateTime.now().millisecondsSinceEpoch + 30000}',
+        '${DateTime.now().millisecondsSinceEpoch + delayMs}',
       );
     }
     await _store.clearMeta(MirrorStore.keyConfirmed);
@@ -461,6 +466,10 @@ class MirrorEngine {
       await _store.clearMeta(MirrorStore.keyBlocked);
     }
 
+    // Сеть может отвалиться посреди прохода: без счётчика каждый следующий файл ждал бы
+    // таймаута, а проход молотил бы весь бюджет впустую (см. FailureStreak)
+    final streak = FailureStreak();
+
     // переименования первыми: выгрузка изменившегося файла пойдёт уже по новому пути
     for (final (row, file) in plan.renames) {
       if (_outOfTime(startedAt, budgetMs) || isCancelled()) {
@@ -483,9 +492,15 @@ class MirrorEngine {
         known[file.path] = moved;
         await _store.moveFile(row.path, moved);
         report.renamed += 1;
+        streak.success();
         onProgress('переименовано: ${file.name}');
-      } catch (_) {
+      } catch (e) {
         report.failed += 1;
+        if (streak.failure(e)) {
+          report.error = streak.reason;
+          report.stopped = true;
+          return;
+        }
       }
     }
 
@@ -509,9 +524,15 @@ class MirrorEngine {
           report: report,
           onProgress: onProgress,
         );
+        streak.success();
       } catch (e) {
         report.failed += 1;
         onProgress('не выгрузилось ${file.name}: $e');
+        if (streak.failure(e)) {
+          report.error = streak.reason;
+          report.stopped = true;
+          return;
+        }
       }
     }
 
@@ -547,9 +568,19 @@ class MirrorEngine {
           await _store.dropFile(row.path);
         } else {
           report.failed += 1;
+          if (streak.failure(e)) {
+            report.error = streak.reason;
+            report.stopped = true;
+            return;
+          }
         }
-      } catch (_) {
+      } catch (e) {
         report.failed += 1;
+        if (streak.failure(e)) {
+          report.error = streak.reason;
+          report.stopped = true;
+          return;
+        }
       }
     }
 
@@ -694,6 +725,27 @@ class MirrorEngine {
           progress: progress,
         );
       }
+    } on SyncDirectUnavailable catch (e) {
+      // Хранилище с этого телефона недоступно (сеть, VPN, блокировщик): льём через сервер.
+      // Иначе файл упирался бы в мёртвый хост в каждом проходе и не уехал бы никогда.
+      onProgress(
+        '${file.name}: хранилище недоступно (${e.message}) — лью через сервер',
+      );
+      final broken = await _store.uploadSession(file.path);
+      if (broken != null) {
+        await api.abort(broken.uploadId);
+        await _store.dropUploadSession(file.path);
+      }
+      result = await _startUpload(
+        api: api,
+        file: file,
+        folderId: folderId,
+        local: local,
+        sha: sha,
+        row: row,
+        progress: progress,
+        forceRelay: true,
+      );
     } on SyncApiException catch (e) {
       if (e.code == 'stale_version' ||
           e.code == 'conflict' ||
@@ -748,6 +800,7 @@ class MirrorEngine {
     required String sha,
     required MirrorRow? row,
     required void Function(int, int) progress,
+    bool forceRelay = false,
   }) => Uploader(api).upload(
     folderId: folderId,
     file: local,
@@ -767,6 +820,8 @@ class MirrorEngine {
       ),
     ),
     onProgress: progress,
+    // Хранилище с телефона недоступно: байты идут через сервер (см. SyncDirectUnavailable)
+    forceRelay: forceRelay,
     // телефон — источник истины: если файл с таким именем лежит в корзине облака, это наша
     // же удалённая версия, и место под именем надо занять, а не ждать очистки корзины
     replaceTrashed: true,
