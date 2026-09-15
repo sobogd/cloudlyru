@@ -452,26 +452,11 @@ export default function MailSection({
     return () => window.clearInterval(t);
   }, [loadCounters]);
 
-  /** Ждём конца серверного прохода синхронизации (или выходим по таймауту). */
-  const waitForSync = async () => {
-    for (let i = 0; i < 10; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      try {
-        const s = await api.mailStatus();
-        if (!s.accounts.some((a) => a.status === 'syncing')) return;
-      } catch {
-        return;
-      }
-    }
-  };
-
   const refresh = async () => {
     setBusy(true);
     try {
-      await api.mailSync();
-      // Проход асинхронный: сразу читать счётчики бессмысленно (они ещё старые). Ждём его
-      // конца, чтобы кнопка «Проверить» действительно показывала свежую почту.
-      await waitForSync();
+      // Ничего у сервера не просим: он держит IDLE, поэтому новое письмо уже в базе — кнопка
+      // просто перечитывает список. Заставлять проход по IMAP тут незачем, он есть в настройках.
       setItems(new Map());
       itemsRef.current = new Map();
       await loadCounters();
