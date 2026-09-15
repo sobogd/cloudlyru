@@ -692,7 +692,6 @@ export interface MailListItem {
   preview: string;
   sortAt: string;
   seen: boolean;
-  flagged: boolean;
   hasAttachments: boolean;
   size: number;
   threadCount: number;
@@ -742,8 +741,6 @@ export const mailBody = (id: string, images: boolean) =>
   );
 export const mailSetSeen = (id: string, seen: boolean) =>
   request<{ ok: boolean; seen: boolean }>(`/mail/messages/${id}/seen`, { method: 'POST', body: JSON.stringify({ seen }) });
-export const mailSetFlagged = (id: string, flagged: boolean) =>
-  request<{ ok: boolean; flagged: boolean }>(`/mail/messages/${id}/flagged`, { method: 'POST', body: JSON.stringify({ flagged }) });
 export const mailDelete = (id: string) => request<{ ok: boolean }>(`/mail/messages/${id}`, { method: 'DELETE' });
 /** Отправить письмо: копия сразу появляется в «Исходящих». */
 export const mailSend = (body: {

@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  ChevronDown,
-  ChevronUp,
   Download,
   FileSearch,
-  Flag,
   Forward,
   LoaderCircle,
   Paperclip,
@@ -12,7 +9,6 @@ import {
   RefreshCw,
   Reply,
   ReplyAll,
-  Star,
   Trash2,
   X,
 } from 'lucide-react';
@@ -65,9 +61,11 @@ function listDate(iso: string): string {
   return d.toLocaleDateString('ru-RU', opts);
 }
 
-/** Полная дата письма для шапки просмотра. */
+/** Полная дата письма для шапки просмотра: ДД.ММ.ГГ ЧЧ:ММ. */
 function fullDate(iso: string): string {
-  return new Date(iso).toLocaleString('ru-RU', { day: '2-digit', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const d = new Date(iso);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${p(d.getFullYear() % 100)} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 function fmtSize(bytes: number): string {
@@ -605,7 +603,6 @@ export default function MailSection({
                         <span className="mailprev">{row.item.preview || ' '}</span>
                       </span>
                       <span className="mailmark">
-                        {row.item.flagged && <Star size={13} className="mailflag" />}
                         {row.item.hasAttachments && <Paperclip size={13} />}
                       </span>
                     </button>
@@ -710,7 +707,7 @@ export function MailViewer({
   id: string;
   onClose: () => void;
   onReply?: (mode: 'reply' | 'replyAll' | 'forward', messageId: string) => void;
-  onChanged?: (patch: { seen?: boolean; flagged?: boolean }) => void;
+  onChanged?: (patch: { seen?: boolean }) => void;
   onDeleted?: () => void;
   prev: () => string | null;
   next: () => string | null;
@@ -782,14 +779,6 @@ export function MailViewer({
     return () => window.removeEventListener('keydown', onKey);
   }, [keyboardActive, next, prev, onClose, onNav]);
 
-  const toggleFlag = async () => {
-    if (!msg) return;
-    const flagged = !msg.flagged;
-    setMsg({ ...msg, flagged });
-    onChanged?.({ flagged });
-    await api.mailSetFlagged(msg.id, flagged).catch(() => undefined);
-  };
-
   const remove = async () => {
     if (!msg) return;
     if (!confirm('Удалить письмо? Оно уйдёт в корзину вместе с вложениями.')) return;
@@ -805,8 +794,6 @@ export function MailViewer({
   };
 
   const files = msg ? msg.attachments.filter((a) => !a.inline) : [];
-  const up = prev();
-  const down = next();
 
   // Вложение открыто своей деталкой: письмо остаётся «под» ней, возврат — кнопкой «назад».
   if (openEntry && renderFileDetail) {
@@ -824,12 +811,6 @@ export function MailViewer({
         <span className="mv-item mv-date" title="Дата письма">
           {msg ? fullDate(msg.sortAt) : ''}
         </span>
-        <button className="iconbtn" title="Предыдущее письмо" disabled={!up} onClick={() => up && onNav(up)}>
-          <ChevronUp size={18} />
-        </button>
-        <button className="iconbtn" title="Следующее письмо" disabled={!down} onClick={() => down && onNav(down)}>
-          <ChevronDown size={18} />
-        </button>
         {onReply && msg && (
           <>
             <button className="iconbtn" title="Ответить" onClick={() => onReply('reply', msg.id)}>
@@ -843,9 +824,6 @@ export function MailViewer({
             </button>
           </>
         )}
-        <button className="iconbtn" title={msg?.flagged ? 'Снять флажок' : 'Пометить'} onClick={() => void toggleFlag()}>
-          {msg?.flagged ? <Star size={18} className="mailflag" /> : <Flag size={18} />}
-        </button>
         {msg && (
           <a className="iconbtn" title="Скачать письмо файлом (.eml)" href={`/api/v1/mail/messages/${msg.id}/raw`} download>
             <Download size={18} />
