@@ -93,6 +93,66 @@
 - Композер: новое/ответ/пересылка (`reply-context` считает сервер), вложения, авто-черновик.
 - «Проверить почту» с ожиданием конца серверного прохода.
 
+## Синхронизация телефона (перенос из нативного клиента)
+
+Нативный синхронизатор (`android/`) перенесён в это же приложение: выбор папок разделов,
+очередь ручной выгрузки и двустороннее зеркало. Веб-часть приложения ходит веб-сессией
+(cookie), а синхронизация — **device-токеном** в `Authorization: Bearer`: корень зеркала
+сервер заводит именно устройству, веб-сессии он его не отдаёт вовсе.
+
+Токен выпускается один раз (`POST /auth/tokens` под сессией) и переиспользуется: новый токен —
+это новый корень зеркала, и после каждого входа-выхода в облаке появлялась бы ещё одна папка
+с тем же содержимым. Хранится он в `flutter_secure_storage`, отзывается при выходе из аккаунта.
+
+| Слой | Файлы | Откуда порт |
+|---|---|---|
+| Разделы, правила отбора | `lib/sync/section.dart`, `lib/sync/device/media_rules.dart` | `data/Section.kt`, `device/MediaRules.kt` |
+| Выбор папок | `lib/sync/data/selection.dart`, `data/selection_rules.dart`, `lib/sync/ui/folder_tree_screen.dart` | `data/Selection.kt`, `ui/FolderTreeScreen.kt` |
+| Чтение телефона | `lib/sync/device/device_files.dart`, `device/hasher.dart`, `lib/sync/ui/section_screen.dart` | `device/DeviceFiles.kt`, `device/Hasher.kt`, `ui/FileListScreen.kt` |
+| Мост к Android API | `flutter/android/.../SyncBridge.kt`, `lib/sync/device/native_fs.dart` | `ui/UiCommon.kt`, `mirror/MirrorWatcher.kt` |
+| Состояние | `lib/sync/data/queue_store.dart`, `data/mirror_store.dart`, `data/sync_prefs.dart` | `data/QueueStore.kt`, `mirror/MirrorStore.kt`, `data/Prefs.kt` |
+| Сеть | `lib/sync/net/sync_api.dart`, `net/device_token.dart` | `net/Api.kt`, `net/Dto.kt` |
+| Очередь | `lib/sync/queue/*`, `lib/sync/ui/queue_screen.dart` | `queue/*.kt`, `ui/QueueScreen.kt` |
+| Зеркало | `lib/sync/mirror/*`, `lib/sync/ui/mirror_card.dart` | `mirror/*.kt`, `ui/MirrorCard.kt` |
+| Сборка всего | `lib/sync/sync_controller.dart` (провайдер `syncControllerProvider`) | `App.kt` |
+| Фон | `lib/sync/background/*`, `flutter/android/.../SyncJobService.kt`, `SyncJobScheduler.kt`, `SyncBootReceiver.kt` | `mirror/MirrorScheduler.kt`, `MirrorJobService.kt`, `MirrorBootReceiver.kt` |
+
+Что остаётся нативным и почему: доступ ко всем файлам, тома памяти, номер файла в файловой
+системе и события файловой системы — в Dart для них API нет (`SyncBridge.kt`). Обход дерева,
+чтение и запись, хэш, сеть и вся логика сверки — на Dart.
+
+Файлы в системном выборе (`CloudlyDocumentsProvider`) и ответ на `GET_CONTENT` чужого
+приложения (`CloudlyPickerActivity`) в Flutter не переносятся: это `ContentProvider` и
+`Activity`, из Dart их не написать. Пока они остаются только в старом `android/`.
+
+### Фоновые проходы
+
+Мгновенный режим (`lib/sync/mirror/mirror_live.dart`) работает, пока жив процесс: опрос головы
+журнала раз в 3 с (в фоне приложения — раз в 30 с) и проход по событию файловой системы
+(`FileObserver` через мост). Страховка на случай, когда процесса нет, — периодическое задание
+системы: `JobScheduler`, id 4201, ровно 15 минут, `setPersisted(true)`, как в нативном клиенте.
+
+Задание поднимает **свой** движок Flutter (`SyncJobService.kt`) и ставит в него тот же мост,
+что и приложение. `workmanager` для этого не годится: в 0.10.x он создаёт движок внутри себя и
+регистрирует только плагины из `GeneratedPluginRegistrant` — своего канала для `NativeFs` там
+нет, а без номера файла переименование читалось бы как «удалил и залил заново».
+
+Фоновый проход тихо ничего не делает, если задание снято, нет токена устройства, автоматика
+выключена (`paused`) или приложение на экране (там работает мгновенный режим). Предохранители
+движка не ослаблены: подтверждение массового удаления из фона не выставляется.
+
+### Что нужно при первом запуске
+
+1. Выдать «доступ ко всем файлам» — без него не видно ни дерева, ни содержимого (кнопка в
+   «Настройках» → «Синхронизация»).
+2. Отметить папки разделов «Файлы» и «Фото»: выбор прежнего нативного приложения не читается —
+   он лежал в его собственных настройках, а Flutter пишет свой список.
+3. Убедиться, что не мешает старый токен устройства: корень зеркала заводится на каждый токен
+   (`<Имя устройства> - Файлы`), поэтому у прежнего клиента в облаке может остаться своя папка.
+   Отозвать ненужный токен можно в «Настройках» → «Токены приложений», после чего папку можно
+   удалить как обычную.
+
+
 ## Милестоуны
 
 1. **Фундамент**: scaffold, тёмная тема Material 3, Dio + порт `api.ts`, модели, токен-вход, Shell. → Приложение логинится и видит `/auth/me`.

@@ -5,6 +5,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../api/models.dart';
 import '../../providers.dart';
+import '../../sync/section.dart';
+import '../../sync/sync_controller.dart';
+import '../../sync/ui/folder_tree_screen.dart';
+import '../../sync/ui/mirror_card.dart';
+import '../../sync/ui/queue_screen.dart';
+import '../../sync/ui/section_screen.dart';
 import '../../theme.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
@@ -84,6 +90,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           ),
           const _TokensPanel(),
+          const _SyncPanel(),
           const UpdaterPanel(),
           QueuePanel(onErrors: () => setState(() => _view = 'queue-errors')),
           const _MailAccountsPanel(),
@@ -488,6 +495,253 @@ class _MailAccountsPanelState extends ConsumerState<_MailAccountsPanel> {
               )),
         ],
       ),
+    );
+  }
+}
+// ---------- синхронизация телефона с облаком ----------
+
+/// Группа «Синхронизация»: доступ к файлам, папки разделов, очередь и зеркало.
+///
+/// Всё, что делает синхронизатор, видно и настраивается здесь: отдельной вкладки у него нет —
+/// нижняя навигация остаётся той же, что и раньше, а разделы «Файлы»/«Фото» и очередь
+/// открываются строками отсюда.
+class _SyncPanel extends ConsumerStatefulWidget {
+  const _SyncPanel();
+
+  @override
+  ConsumerState<_SyncPanel> createState() => _SyncPanelState();
+}
+
+class _SyncPanelState extends ConsumerState<_SyncPanel> {
+  bool _busy = false;
+  String? _note;
+  (int, String)? _blocked;
+
+  SyncController get _sync => ref.read(syncControllerProvider);
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refreshBlocked());
+  }
+
+  /// Предохранитель от массового удаления живёт в базе зеркала: его значение меняет движок
+  /// по ходу прохода, поэтому читаем его, а не держим в поле с прошлого раза.
+  Future<void> _refreshBlocked() async {
+    final info = await _sync.blockedInfo();
+    if (mounted) setState(() => _blocked = info);
+  }
+
+  Future<void> _pass({bool confirm = false}) async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _note = null;
+    });
+    try {
+      if (confirm) {
+        // подтверждение снимает предохранитель ровно на один проход
+        await _sync.confirmDeletes();
+      } else {
+        final report = await _sync.mirrorPass();
+        final error = report?.error;
+        if (error != null && mounted) setState(() => _note = error);
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      await _refreshBlocked();
+    }
+  }
+
+  Future<void> _togglePaused(bool running) async {
+    await _sync.setPaused(!running);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _open(Widget screen) async {
+    await Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => screen));
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sync = ref.watch(syncControllerProvider);
+    final fileFolders = sync.selection?.count(Section.files) ?? 0;
+    final photoFolders = sync.selection?.count(Section.photos) ?? 0;
+    final granted = sync.access == SyncAccess.granted;
+
+    return Column(
+      children: [
+        Panel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Text(
+                    'Синхронизация',
+                    style: TextStyle(color: C.fg, fontWeight: FontWeight.w600),
+                  ),
+                  const Spacer(),
+                  Flexible(
+                    child: Text(
+                      sync.activity ?? phaseTitle(sync.mirrorStatus),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: C.fg3, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(
+                granted
+                    ? 'Выбранные папки телефона и папка устройства в облаке хранят одно и то же: '
+                          'файл, появившийся или изменившийся с любой стороны, доезжает до другой.'
+                    : 'Синхронизация не увидит телефон, пока нет доступа ко всем файлам.',
+                style: const TextStyle(color: C.fg3, fontSize: 12),
+              ),
+              if (sync.access == SyncAccess.unknown)
+                const Padding(
+                  padding: EdgeInsets.only(top: 6),
+                  child: Text(
+                    'проверяю доступ к файлам…',
+                    style: TextStyle(color: C.fg3, fontSize: 12),
+                  ),
+                ),
+              if (sync.access == SyncAccess.denied) ...[
+                const SizedBox(height: 8),
+                const Text(
+                  'Нужен доступ ко всем файлам: без него не видно ни дерева папок, ни содержимого. '
+                  'Выдаётся на системном экране — приложение личное, ставится APK-ом.',
+                  style: TextStyle(color: C.fg, fontSize: 12),
+                ),
+                const SizedBox(height: 8),
+                FilledButton(
+                  onPressed: () async {
+                    await _sync.requestAccess();
+                    // разрешение выдают в системном окне: проверяем его сразу, чтобы
+                    // подсказка исчезла без перезапуска приложения
+                    await _sync.recheckAccess();
+                  },
+                  child: const Text('Разрешить доступ ко всем файлам'),
+                ),
+              ],
+              const SizedBox(height: 4),
+              _row(
+                icon: Icons.folder_outlined,
+                title: 'Папки для файлов',
+                subtitle: fileFolders == 0
+                    ? 'не выбраны'
+                    : 'выбрано: $fileFolders',
+                enabled: granted,
+                onTap: () =>
+                    _open(const FolderTreeScreen(section: Section.files)),
+              ),
+              _row(
+                icon: Icons.photo_library_outlined,
+                title: 'Папки для фото и видео',
+                subtitle: photoFolders == 0
+                    ? 'не выбраны'
+                    : 'выбрано: $photoFolders',
+                enabled: granted,
+                onTap: () =>
+                    _open(const FolderTreeScreen(section: Section.photos)),
+              ),
+              _row(
+                icon: Icons.insert_drive_file_outlined,
+                title: 'Файлы на телефоне',
+                subtitle: 'что нашлось в выбранных папках',
+                enabled: granted && fileFolders > 0,
+                onTap: () => _open(const SectionScreen(section: Section.files)),
+              ),
+              _row(
+                icon: Icons.image_outlined,
+                title: 'Фото и видео на телефоне',
+                subtitle: 'что нашлось в выбранных папках',
+                enabled: granted && photoFolders > 0,
+                onTap: () =>
+                    _open(const SectionScreen(section: Section.photos)),
+              ),
+              _row(
+                icon: Icons.cloud_upload_outlined,
+                title: 'Очередь выгрузки',
+                subtitle: sync.waiting == 0
+                    ? 'нечего выгружать'
+                    : 'ждут запуска: ${sync.waiting}',
+                enabled: granted,
+                onTap: () => _open(const QueueScreen()),
+              ),
+              const Divider(height: 16),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: !sync.paused,
+                onChanged: granted ? (v) => unawaited(_togglePaused(v)) : null,
+                title: const Text(
+                  'Автоматические проходы',
+                  style: TextStyle(color: C.fg, fontSize: 14),
+                ),
+                subtitle: Text(
+                  sync.paused
+                      ? 'автоматика выключена: проходы не запускаются сами, «Сверить сейчас» работает'
+                      : 'мгновенный режим: изменение в папке или в облаке доезжает за секунды, '
+                            'пока приложение открыто',
+                  style: const TextStyle(color: C.fg3, fontSize: 12),
+                ),
+              ),
+              Text(
+                sync.watchedDirs > 0
+                    ? 'наблюдение за папками: ${sync.watchedDirs}'
+                    : 'наблюдение за папками не поставлено: изменения подхватит следующий проход',
+                style: const TextStyle(color: C.fg3, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+        MirrorCard(
+          status: sync.mirrorStatus,
+          activity: sync.activity,
+          busy: _busy,
+          blocked: _blocked,
+          onPass: granted && !sync.paused ? () => unawaited(_pass()) : null,
+          onConfirmDeletes: granted
+              ? () => unawaited(_pass(confirm: true))
+              : null,
+        ),
+        if (_note != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 6, 14, 0),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                _note!,
+                style: const TextStyle(color: C.danger, fontSize: 12),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _row({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required bool enabled,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      enabled: enabled,
+      leading: Icon(icon, color: C.fg3),
+      title: Text(title, style: const TextStyle(color: C.fg, fontSize: 14)),
+      subtitle: Text(
+        subtitle,
+        style: const TextStyle(color: C.fg3, fontSize: 12),
+      ),
+      trailing: const Icon(Icons.chevron_right, color: C.fg3),
+      onTap: enabled ? onTap : null,
     );
   }
 }
