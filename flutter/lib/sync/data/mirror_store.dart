@@ -67,9 +67,6 @@ class MirrorStore {
       // Своё соединение на каждый движок: в процессе живут два — приложение и фоновое задание.
       // С общим соединением закрытие базы в фоне ломало приложение («database closed»)
       singleInstance: false,
-      // Два соединения к одному файлу — это нормально для SQLite, но короткая
-      // параллельная запись может попасть в «database is locked». Пусть лучше подождёт
-      onConfigure: (db) => db.execute('PRAGMA busy_timeout = 5000'),
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE roots(
@@ -132,6 +129,7 @@ class MirrorStore {
         }
       },
     );
+    await _setBusyTimeout(db);
     return MirrorStore._(db);
   }
 
@@ -320,6 +318,15 @@ class MirrorStore {
     return rows.map(_row).toList();
   }
 
+  /// Все пары «папка облака ↔ путь на телефоне»: по ним ищется хвост из опустевших папок
+  /// (см. MirrorRules.emptyFolderCandidates).
+  Future<Map<String, String>> allDirs() async {
+    final rows = await _db.query('dirs', columns: ['cloud_id', 'local_path']);
+    return {
+      for (final r in rows) '${r['cloud_id']}': '${r['local_path']}',
+    };
+  }
+
   /// Папки поддерева: `cloudId` к `localPath`. Нужны при переименовании и удалении папки.
   Future<List<(String, String)>> dirsUnder(String localPath) async {
     final prefix = localPath.endsWith('/') ? localPath : '$localPath/';
@@ -408,4 +415,16 @@ class MirrorStore {
     mtime: (r['mtime'] as int?) ?? 0,
     sha256: r['sha256'] == null ? null : '${r['sha256']}',
   );
+}
+
+/// Два соединения к одному файлу (приложение и фоновое задание) — это нормально для SQLite,
+/// но короткая параллельная запись может попасть в «database is locked». Пусть лучше подождёт.
+///
+/// PRAGMA ставится запросом, а не через `onConfigure`: там sqflite выполняет её как execSQL,
+/// а Android такую строку не принимает и открытие базы падает целиком. Ошибка самой PRAGMA
+/// при этом не критична — без неё возможен редкий «database is locked».
+Future<void> _setBusyTimeout(Database db) async {
+  try {
+    await db.rawQuery('PRAGMA busy_timeout = 5000');
+  } catch (_) {}
 }

@@ -25,6 +25,9 @@ class MirrorReport {
   int downloaded = 0;
   int renamed = 0;
   int deletedInCloud = 0;
+
+  /// Пустые папки, убранные в облаке после переименований и удалений на телефоне.
+  int removedFolders = 0;
   int deletedOnPhone = 0;
   int conflicts = 0;
   int failed = 0;
@@ -41,12 +44,15 @@ class MirrorReport {
     final out = StringBuffer('выгружено: $uploaded, скачано: $downloaded');
     if (renamed > 0) out.write(', переименовано: $renamed');
     if (deletedInCloud > 0) out.write(', удалено в облаке: $deletedInCloud');
+    if (removedFolders > 0) out.write(', пустых папок убрано: $removedFolders');
     if (deletedOnPhone > 0) out.write(', удалено на телефоне: $deletedOnPhone');
     if (conflicts > 0) out.write(', конфликтов: $conflicts');
     if (failed > 0) out.write(', ошибок: $failed');
     if (unreadable > 0) out.write(', папок без доступа: $unreadable');
     if (capped) out.write(', обход неполный');
-    if (blockedDeletes > 0) out.write(', удаления приостановлены: $blockedDeletes');
+    if (blockedDeletes > 0) {
+      out.write(', удаления приостановлены: $blockedDeletes');
+    }
     if (stopped) out.write(', проход не закончен — продолжу в следующий раз');
     final err = error;
     if (err != null) out.write(' · $err');
@@ -78,8 +84,8 @@ class MirrorEngine {
     this._selection, {
     MirrorStatusHolder? status,
     NativeFs? native,
-  })  : _status = status ?? MirrorStatusHolder(),
-        _native = native ?? NativeFs();
+  }) : _status = status ?? MirrorStatusHolder(),
+       _native = native ?? NativeFs();
 
   final SyncApi Function() _api;
   final MirrorStore _store;
@@ -132,24 +138,26 @@ class MirrorEngine {
     final report = MirrorReport();
     final inCloud = await _store.inCloud();
     final local = await _store.localTotals();
-    _status.update((s) => s.copyWith(
-          phase: MirrorPhase.scan,
-          currentName: null,
-          clearCurrentName: true,
-          currentSent: 0,
-          currentTotal: 0,
-          passUploadedFiles: 0,
-          passUploadedBytes: 0,
-          passDownloaded: 0,
-          passFailed: 0,
-          blocked: 0,
-          clearError: true,
-          startedAt: startedAt,
-          inCloudFiles: inCloud.files,
-          inCloudBytes: inCloud.bytes,
-          localFiles: local.files,
-          localBytes: local.bytes,
-        ));
+    _status.update(
+      (s) => s.copyWith(
+        phase: MirrorPhase.scan,
+        currentName: null,
+        clearCurrentName: true,
+        currentSent: 0,
+        currentTotal: 0,
+        passUploadedFiles: 0,
+        passUploadedBytes: 0,
+        passDownloaded: 0,
+        passFailed: 0,
+        blocked: 0,
+        clearError: true,
+        startedAt: startedAt,
+        inCloudFiles: inCloud.files,
+        inCloudBytes: inCloud.bytes,
+        localFiles: local.files,
+        localBytes: local.bytes,
+      ),
+    );
 
     final SyncApi api;
     try {
@@ -166,7 +174,10 @@ class MirrorEngine {
     }
     final mirrorRootId = me.mirrorFolderId;
     if (mirrorRootId == null || mirrorRootId.isEmpty) {
-      return _finish(report..error = 'сервер не отдал корень зеркала — проверьте подключение');
+      return _finish(
+        report
+          ..error = 'сервер не отдал корень зеркала — проверьте подключение',
+      );
     }
     // Состояние зеркала принадлежит аккаунту И своему корню: строки `files` описывают записи
     // в конкретной папке облака. Сменили сервер или логин — строки прошлого аккаунта сделали бы
@@ -180,19 +191,23 @@ class MirrorEngine {
     final wasRoot = await _store.meta(MirrorStore.keyMirrorRoot);
     final wasDevice = await _store.meta(MirrorStore.keyDeviceId);
     final otherAccount = wasAccount != null && wasAccount != identity;
-    final otherRoot = wasRoot != null && wasRoot.isNotEmpty && wasRoot != mirrorRootId;
-    final otherDevice = wasDevice != null &&
+    final otherRoot =
+        wasRoot != null && wasRoot.isNotEmpty && wasRoot != mirrorRootId;
+    final otherDevice =
+        wasDevice != null &&
         wasDevice.isNotEmpty &&
         me.deviceId != null &&
         wasDevice != me.deviceId;
     if (otherAccount || otherRoot || otherDevice) {
       await _store.wipe();
-      _status.update((s) => s.copyWith(
-            inCloudFiles: 0,
-            inCloudBytes: 0,
-            waitingFiles: 0,
-            waitingBytes: 0,
-          ));
+      _status.update(
+        (s) => s.copyWith(
+          inCloudFiles: 0,
+          inCloudBytes: 0,
+          waitingFiles: 0,
+          waitingBytes: 0,
+        ),
+      );
     }
     await _store.setMeta(MirrorStore.keyAccount, identity);
     await _store.setMeta(MirrorStore.keyDeviceId, me.deviceId ?? '');
@@ -202,21 +217,33 @@ class MirrorEngine {
     final roots = SelectionRules.scanRoots(_selection.paths(Section.files));
     // папку сняли с выбора: пару убираем, а строки выгруженного остаются — вернуть выбор
     // можно без повторной заливки и без удаления в облаке
-    for (final gone in (await _store.roots()).keys.where((r) => !roots.contains(r))) {
+    for (final gone in (await _store.roots()).keys.where(
+      (r) => !roots.contains(r),
+    )) {
       await _store.dropRoot(gone);
     }
     for (final root in roots) {
       if (isCancelled()) return _finish(report..stopped = true);
       final name = p.basename(root);
       try {
-        await _store.putRoot(root, await folders.ensure(name, root, mirrorRootId), name);
+        await _store.putRoot(
+          root,
+          await folders.ensure(name, root, mirrorRootId),
+          name,
+        );
       } catch (e) {
         report.failed += 1;
       }
     }
 
     // 1) облако → телефон
-    final pull = MirrorPull(api, _store, me.deviceId, onProgress, native: _native);
+    final pull = MirrorPull(
+      api,
+      _store,
+      me.deviceId,
+      onProgress,
+      native: _native,
+    );
     if (roots.isNotEmpty) {
       _status.update((s) => s.copyWith(phase: MirrorPhase.cloud));
       onProgress('догоняю облако…');
@@ -271,11 +298,19 @@ class MirrorEngine {
         return report..error = 'нет связи с сервером: $e';
       }
       await _store.setMeta(MirrorStore.keyDeviceId, me.deviceId ?? '');
-      _status.update((s) => s.copyWith(
-            phase: MirrorPhase.cloud,
-            startedAt: DateTime.now().millisecondsSinceEpoch,
-          ));
-      final pull = MirrorPull(api, _store, me.deviceId, progress, native: _native);
+      _status.update(
+        (s) => s.copyWith(
+          phase: MirrorPhase.cloud,
+          startedAt: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+      final pull = MirrorPull(
+        api,
+        _store,
+        me.deviceId,
+        progress,
+        native: _native,
+      );
       await pull.catchUp();
       _fill(report, pull);
       report.error = pull.fatal;
@@ -297,26 +332,30 @@ class MirrorEngine {
     await _store.setMeta(MirrorStore.keyReport, report.text());
     final inCloud = await _store.inCloud();
     final waiting = await _store.waitingTotals();
-    _status.update((s) => s.copyWith(
-          phase: s.phase == MirrorPhase.paused ? MirrorPhase.paused : MirrorPhase.idle,
-          clearCurrentName: true,
-          currentSent: 0,
-          currentTotal: 0,
-          passUploadedFiles: report.uploaded,
-          passDownloaded: report.downloaded,
-          passFailed: report.failed,
-          inCloudFiles: inCloud.files,
-          inCloudBytes: inCloud.bytes,
-          waitingFiles: waiting.files,
-          waitingBytes: waiting.bytes,
-          finishedAt: report.finishedAt,
-          lastText: report.text(),
-          error: report.error,
-          clearError: report.error == null,
-          blocked: report.blockedDeletes,
-          blockedReason: report.blockedReason,
-          clearBlockedReason: report.blockedReason == null,
-        ));
+    _status.update(
+      (s) => s.copyWith(
+        phase: s.phase == MirrorPhase.paused
+            ? MirrorPhase.paused
+            : MirrorPhase.idle,
+        clearCurrentName: true,
+        currentSent: 0,
+        currentTotal: 0,
+        passUploadedFiles: report.uploaded,
+        passDownloaded: report.downloaded,
+        passFailed: report.failed,
+        inCloudFiles: inCloud.files,
+        inCloudBytes: inCloud.bytes,
+        waitingFiles: waiting.files,
+        waitingBytes: waiting.bytes,
+        finishedAt: report.finishedAt,
+        lastText: report.text(),
+        error: report.error,
+        clearError: report.error == null,
+        blocked: report.blockedDeletes,
+        blockedReason: report.blockedReason,
+        clearBlockedReason: report.blockedReason == null,
+      ),
+    );
     return report;
   }
 
@@ -349,11 +388,13 @@ class MirrorEngine {
     // сколько всего лежит в выбранных папках: от этого считается доля выгруженного
     final localBytes = snapshot.files.fold<int>(0, (sum, f) => sum + f.size);
     await _store.setLocalTotals(snapshot.files.length, localBytes);
-    _status.update((s) => s.copyWith(
-          phase: MirrorPhase.upload,
-          localFiles: snapshot.files.length,
-          localBytes: localBytes,
-        ));
+    _status.update(
+      (s) => s.copyWith(
+        phase: MirrorPhase.upload,
+        localFiles: snapshot.files.length,
+        localBytes: localBytes,
+      ),
+    );
 
     // структура в облаке повторяет структуру телефона, включая пустые папки
     for (final dir in snapshot.dirs) {
@@ -394,19 +435,24 @@ class MirrorEngine {
     }
     final waitingBytes = plan.uploads.fold<int>(0, (sum, f) => sum + f.size);
     await _store.setWaitingTotals(plan.uploads.length, waitingBytes);
-    _status.update((s) => s.copyWith(
-          waitingFiles: plan.uploads.length,
-          waitingBytes: waitingBytes,
-          blocked: plan.blockedCount,
-          localFiles: snapshot.files.length,
-          localBytes: localBytes,
-        ));
+    _status.update(
+      (s) => s.copyWith(
+        waitingFiles: plan.uploads.length,
+        waitingBytes: waitingBytes,
+        blocked: plan.blockedCount,
+        localFiles: snapshot.files.length,
+        localBytes: localBytes,
+      ),
+    );
 
     if (plan.blocked) {
       final reason = deletionsAllowed
           ? 'одним проходом пропало слишком много файлов'
           : 'часть папок не читается или обход неполный';
-      await _store.setMeta(MirrorStore.keyBlocked, '${plan.blockedCount}|$reason');
+      await _store.setMeta(
+        MirrorStore.keyBlocked,
+        '${plan.blockedCount}|$reason',
+      );
       report.blockedDeletes = plan.blockedCount;
       report.blockedReason = reason;
     } else {
@@ -468,7 +514,9 @@ class MirrorEngine {
     }
 
     if (plan.deletes.isNotEmpty) {
-      _status.update((s) => s.copyWith(phase: MirrorPhase.delete, clearCurrentName: true));
+      _status.update(
+        (s) => s.copyWith(phase: MirrorPhase.delete, clearCurrentName: true),
+      );
     }
     for (final row in plan.deletes) {
       if (_outOfTime(startedAt, budgetMs) || isCancelled()) {
@@ -480,10 +528,14 @@ class MirrorEngine {
         known.remove(row.path);
         await _store.dropFile(row.path);
         report.deletedInCloud += 1;
-        _status.update((s) => s.copyWith(
-              inCloudFiles: s.inCloudFiles > 0 ? s.inCloudFiles - 1 : 0,
-              inCloudBytes: s.inCloudBytes - row.size > 0 ? s.inCloudBytes - row.size : 0,
-            ));
+        _status.update(
+          (s) => s.copyWith(
+            inCloudFiles: s.inCloudFiles > 0 ? s.inCloudFiles - 1 : 0,
+            inCloudBytes: s.inCloudBytes - row.size > 0
+                ? s.inCloudBytes - row.size
+                : 0,
+          ),
+        );
         onProgress('удалено в облаке: ${p.basename(row.path)}');
       } on SyncApiException catch (e) {
         // 404 — записи в облаке уже нет: строку всё равно убираем, иначе будем пытаться
@@ -497,6 +549,70 @@ class MirrorEngine {
       } catch (_) {
         report.failed += 1;
       }
+    }
+
+    // Хвост после переименований и удалений: папки, которые завело зеркало и которых больше
+    // нет на телефоне. Убираем только пустые и только по полному снимку — папка с содержимым
+    // не тронется ни при каких условиях.
+    if (deletionsAllowed &&
+        !isCancelled() &&
+        !_outOfTime(startedAt, budgetMs)) {
+      await _sweepEmptyFolders(
+        api: api,
+        roots: roots,
+        snapshot: snapshot,
+        report: report,
+        onProgress: onProgress,
+        isCancelled: isCancelled,
+      );
+    }
+  }
+
+  /// Сколько пустых папок убираем за один проход. Папка уходит отдельным запросом, а после
+  /// переименования большого дерева кандидатов бывает сотни: остальное доедет следующим разом.
+  static const int _maxFolderSweep = 200;
+
+  /// Убрать в облаке опустевшие папки, оставшиеся от переименований и удалений на телефоне.
+  ///
+  /// Зеркало удаляет в облаке только файлы, поэтому папка, из которой файлы перенесли,
+  /// оставалась там навсегда. Здесь она уходит — но лишь при трёх условиях сразу: её завело
+  /// зеркало, на телефоне её больше нет и она внутри выбранных папок. Плюс на момент удаления
+  /// в ней должно быть пусто: если сверка ошиблась и содержимое осталось, папка останется тоже.
+  Future<void> _sweepEmptyFolders({
+    required SyncApi api,
+    required List<String> roots,
+    required LocalSnapshot snapshot,
+    required MirrorReport report,
+    required void Function(String) onProgress,
+    required bool Function() isCancelled,
+  }) async {
+    final rootIds = {for (final r in (await _store.roots()).values) r.cloudId};
+    final candidates = MirrorRules.emptyFolderCandidates(
+      dirs: await _store.allDirs(),
+      aliveLocally: {for (final d in snapshot.dirs) d.path},
+      roots: roots,
+      rootCloudIds: rootIds,
+    );
+    var removed = 0;
+    for (final localPath in candidates) {
+      if (removed >= _maxFolderSweep || isCancelled()) break;
+      final cloudId = (await _store.dirId(localPath)) ?? '';
+      if (cloudId.isEmpty) continue;
+      try {
+        final children = await api.children(cloudId);
+        if (children.entries.isNotEmpty || children.folderIds.isNotEmpty) {
+          continue;
+        }
+        await api.deleteFolder(cloudId);
+        await _store.dropDir(cloudId);
+        removed += 1;
+      } catch (_) {
+        // папку могли удалить в вебе или в неё что-то легло: следующий проход разберётся
+      }
+    }
+    if (removed > 0) {
+      report.removedFolders += removed;
+      onProgress('убрано пустых папок: $removed');
     }
   }
 
@@ -515,12 +631,14 @@ class MirrorEngine {
     final local = File(file.path);
     if (!await local.exists()) return;
     final row = known[file.path];
-    _status.update((s) => s.copyWith(
-          phase: MirrorPhase.upload,
-          currentName: file.name,
-          currentSent: 0,
-          currentTotal: file.size,
-        ));
+    _status.update(
+      (s) => s.copyWith(
+        phase: MirrorPhase.upload,
+        currentName: file.name,
+        currentSent: 0,
+        currentTotal: file.size,
+      ),
+    );
     final sha = await _hash(local);
     void progress(int sent, int total) {
       _status.update((s) => s.copyWith(currentSent: sent, currentTotal: total));
@@ -531,7 +649,8 @@ class MirrorEngine {
     // двухгигабайтное видео после каждой остановки нельзя, и прогресс не должен прыгать назад.
     // Хэш в слепке обязателен: если файл успели изменить, сессия не подходит.
     final session = await _store.uploadSession(file.path);
-    final resumable = session != null &&
+    final resumable =
+        session != null &&
         session.folderId == folderId &&
         session.size == file.size &&
         session.mtime == file.mtime &&
@@ -574,7 +693,9 @@ class MirrorEngine {
         );
       }
     } on SyncApiException catch (e) {
-      if (e.code == 'stale_version' || e.code == 'conflict' || e.code == 'in_trash') {
+      if (e.code == 'stale_version' ||
+          e.code == 'conflict' ||
+          e.code == 'in_trash') {
         await _resolveConflict(
           api: api,
           file: file,
@@ -605,12 +726,14 @@ class MirrorEngine {
     // выгрузка завершена: незавершённой сессии больше нет
     await _store.dropUploadSession(file.path);
     report.uploaded += 1;
-    _status.update((s) => s.copyWith(
-          passUploadedFiles: s.passUploadedFiles + 1,
-          passUploadedBytes: s.passUploadedBytes + file.size,
-          inCloudFiles: s.inCloudFiles + 1,
-          inCloudBytes: s.inCloudBytes + file.size,
-        ));
+    _status.update(
+      (s) => s.copyWith(
+        passUploadedFiles: s.passUploadedFiles + 1,
+        passUploadedBytes: s.passUploadedBytes + file.size,
+        inCloudFiles: s.inCloudFiles + 1,
+        inCloudBytes: s.inCloudBytes + file.size,
+      ),
+    );
     onProgress('выгружено: ${file.name}');
   }
 
@@ -623,28 +746,29 @@ class MirrorEngine {
     required String sha,
     required MirrorRow? row,
     required void Function(int, int) progress,
-  }) =>
-      Uploader(api).upload(
+  }) => Uploader(api).upload(
+    folderId: folderId,
+    file: local,
+    cloudName: file.name,
+    mime: MediaRules.mimeOf(file.name),
+    sha256: sha,
+    replace: row != null,
+    expectedSha256: row?.sha256,
+    onSession: (uploadId) => _store.putUploadSession(
+      UploadSessionRow(
+        path: file.path,
+        uploadId: uploadId,
         folderId: folderId,
-        file: local,
-        cloudName: file.name,
-        mime: MediaRules.mimeOf(file.name),
+        size: file.size,
+        mtime: file.mtime,
         sha256: sha,
-        replace: row != null,
-        expectedSha256: row?.sha256,
-        onSession: (uploadId) => _store.putUploadSession(UploadSessionRow(
-          path: file.path,
-          uploadId: uploadId,
-          folderId: folderId,
-          size: file.size,
-          mtime: file.mtime,
-          sha256: sha,
-        )),
-        onProgress: progress,
-        // телефон — источник истины: если файл с таким именем лежит в корзине облака, это наша
-        // же удалённая версия, и место под именем надо занять, а не ждать очистки корзины
-        replaceTrashed: true,
-      );
+      ),
+    ),
+    onProgress: progress,
+    // телефон — источник истины: если файл с таким именем лежит в корзине облака, это наша
+    // же удалённая версия, и место под именем надо занять, а не ждать очистки корзины
+    replaceTrashed: true,
+  );
 
   /// Конфликт версий. Локальное содержимое сохраняется копией с пометкой, а по каноническому
   /// имени скачивается версия облака — так не теряется ни одна из сторон.
@@ -669,7 +793,9 @@ class MirrorEngine {
     }
     if (remote == null) {
       report.failed += 1;
-      onProgress('конфликт по «${file.name}»: не удалось прочитать папку облака');
+      onProgress(
+        'конфликт по «${file.name}»: не удалось прочитать папку облака',
+      );
       return;
     }
     RemoteEntry? cloudEntry;
@@ -690,7 +816,10 @@ class MirrorEngine {
     }
     final taken = remote.map((e) => e.name).toSet();
     final copyName = UploadPlan.freeName(
-      MirrorRules.conflictName(file.name, DateTime.now().millisecondsSinceEpoch),
+      MirrorRules.conflictName(
+        file.name,
+        DateTime.now().millisecondsSinceEpoch,
+      ),
       taken,
     );
     try {
@@ -709,7 +838,9 @@ class MirrorEngine {
       return;
     }
     report.conflicts += 1;
-    onProgress('конфликт: «${file.name}» сохранён как «$copyName», по основному имени — версия облака');
+    onProgress(
+      'конфликт: «${file.name}» сохранён как «$copyName», по основному имени — версия облака',
+    );
     known.remove(file.path);
     await _store.dropFile(file.path);
     final ok = await pull.downloadInto(
@@ -730,7 +861,9 @@ class MirrorEngine {
   Future<String> _hash(File file) async {
     final stat = await file.stat();
     final cached = _hashCache[file.path];
-    if (cached != null && cached.$2 == stat.size && cached.$3 == stat.modified.millisecondsSinceEpoch) {
+    if (cached != null &&
+        cached.$2 == stat.size &&
+        cached.$3 == stat.modified.millisecondsSinceEpoch) {
       return cached.$1;
     }
     final sha = await Hasher.sha256(file);

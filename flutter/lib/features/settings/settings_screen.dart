@@ -705,21 +705,26 @@ class _SyncPanelState extends ConsumerState<_SyncPanel> {
                 value: !sync.paused,
                 onChanged: granted ? (v) => unawaited(_togglePaused(v)) : null,
                 title: const Text(
-                  'Автоматические проходы',
+                  'Синхронизировать сами, без кнопки',
                   style: TextStyle(color: C.fg, fontSize: 14),
                 ),
                 subtitle: Text(
                   sync.paused
-                      ? 'автоматика выключена: проходы не запускаются сами, «Сверить сейчас» работает'
-                      : 'мгновенный режим: изменение в папке или в облаке доезжает за секунды, '
-                            'пока приложение открыто',
+                      ? 'выключено: проходы не запускаются ни сами, ни в фоне — остаётся только '
+                            '«Сверить сейчас»'
+                      : 'включено (так и надо): изменение в папке или в облаке доезжает за секунды, '
+                            'пока приложение открыто, а в фоне срабатывает задание системы',
                   style: const TextStyle(color: C.fg3, fontSize: 12),
                 ),
               ),
               Text(
-                sync.watchedDirs > 0
+                !granted
+                    ? 'наблюдение за папками появится после доступа ко всем файлам'
+                    : fileFolders == 0
+                    ? 'наблюдение за папками: ни одной папки не выбрано'
+                    : sync.watchedDirs > 0
                     ? 'наблюдение за папками: ${sync.watchedDirs}'
-                    : 'наблюдение за папками не поставлено: изменения подхватит следующий проход',
+                    : 'наблюдение за папками не поставилось: изменения подхватит ближайший проход',
                 style: const TextStyle(color: C.fg3, fontSize: 12),
               ),
             ],
@@ -730,7 +735,7 @@ class _SyncPanelState extends ConsumerState<_SyncPanel> {
           activity: sync.activity,
           busy: _busy,
           blocked: _blocked,
-          onPass: granted && !sync.paused ? () => unawaited(_pass()) : null,
+          onPass: granted ? () => unawaited(_pass()) : null,
           onConfirmDeletes: granted
               ? () => unawaited(_pass(confirm: true))
               : null,

@@ -32,8 +32,8 @@ enum SyncAccess { unknown, granted, denied }
 /// веб-сессия его не получает вовсе (см. [ensureDeviceToken]).
 class SyncController extends ChangeNotifier {
   SyncController({NativeFs? native, DeviceTokenStore? tokens})
-      : native = native ?? NativeFs(),
-        _tokens = tokens ?? DeviceTokenStore() {
+    : native = native ?? NativeFs(),
+      _tokens = tokens ?? DeviceTokenStore() {
     _watcher = MirrorWatcher(this.native);
     _status = MirrorStatusHolder();
     _status.stream.listen((s) {
@@ -114,30 +114,45 @@ class SyncController extends ChangeNotifier {
       _prefs = await SharedPreferences.getInstance();
       syncPrefs = SyncPrefs(_prefs!);
       selection = Selection(_prefs!);
-      queueStore = await QueueStore.open();
-      mirrorStore = await MirrorStore.open();
+      // Доступ и метка устройства — до баз: если база почему-то не откроется, человек всё равно
+      // должен видеть, выдан ли доступ, а не «проверяю доступ к файлам…» навсегда
       deviceLabel = await native.deviceLabel();
-      access = await native.hasAllFilesAccess() ? SyncAccess.granted : SyncAccess.denied;
-      _paused = await mirrorStore!.meta(MirrorStore.keyPaused) == '1';
-      // после перезапуска ничего не может быть «в работе»: строки, застрявшие в RUNNING,
-      // возвращаем в ожидание, иначе кнопка «play» на них не появится уже никогда
-      await queueStore!.resetRunning();
+      access = await native.hasAllFilesAccess()
+          ? SyncAccess.granted
+          : SyncAccess.denied;
+
+      // Базы открываем по одной: поломка одной не должна отменять всё остальное. Так уже было —
+      // не открылась база, и вместе с ней «не поставилось» наблюдение и «не запускалось» зеркало
+      queueStore = await _openQueueStore();
+      mirrorStore = await _openMirrorStore();
+      _paused = await mirrorStore?.meta(MirrorStore.keyPaused) == '1';
 
       await _bindToken(sessionApi, login, epoch);
       // Проход зеркала, когда приложения нет на экране: задание живёт в системе, а не в этом
       // процессе (см. lib/sync/background/)
-      await BackgroundSync.register(serverUrl: sessionApi.serverUrl, login: login);
-
-      engine = MirrorEngine(
-        () => _requireApi(),
-        mirrorStore!,
-        selection!,
-        status: _status,
-        native: native,
+      await BackgroundSync.register(
+        serverUrl: sessionApi.serverUrl,
+        login: login,
       );
-      if (_api != null) {
-        uploads = UploadRunner(_api!, queueStore!);
-        final liveMode = MirrorLive(mirrorStore!, engine!, _status, _watcher, native);
+
+      final store = mirrorStore;
+      final sel = selection;
+      if (store != null && sel != null) {
+        engine = MirrorEngine(
+          () => _requireApi(),
+          store,
+          sel,
+          status: _status,
+          native: native,
+        );
+        // Что было в прошлый раз: без этого после перезапуска карточка говорит «зеркало ещё
+        // не запускалось», хотя проходы шли — в том числе в фоне
+        await _restoreLastState(store);
+      }
+      final queue = queueStore;
+      if (_api != null && queue != null && engine != null) {
+        uploads = UploadRunner(_api!, queue);
+        final liveMode = MirrorLive(store!, engine!, _status, _watcher, native);
         liveMode.hasToken = () => _api != null;
         liveMode.paused = () => _paused;
         liveMode.foreground = () => foreground;
@@ -147,9 +162,9 @@ class SyncController extends ChangeNotifier {
       }
 
       if (_api != null) await _rememberSystemFolders(_api!);
-      _status.update((s) => s.copyWith(
-            phase: _paused ? MirrorPhase.paused : s.phase,
-          ));
+      _status.update(
+        (s) => s.copyWith(phase: _paused ? MirrorPhase.paused : s.phase),
+      );
       await startWatching();
       await refreshQueue();
       notifyListeners();
@@ -157,6 +172,67 @@ class SyncController extends ChangeNotifier {
       debugPrint('cloudly-sync: старт синхронизации не удался: $e');
       activity = 'синхронизация недоступна: $e';
       notifyListeners();
+    }
+  }
+
+  /// База очереди: своя попытка и свой отчёт об ошибке — из-за неё одной синхронизация
+  /// не должна пропадать целиком.
+  Future<QueueStore?> _openQueueStore() async {
+    try {
+      final store = await QueueStore.open();
+      // после перезапуска ничего не может быть «в работе»: строки, застрявшие в RUNNING,
+      // возвращаем в ожидание, иначе кнопка «play» на них не появится уже никогда
+      await store.resetRunning();
+      return store;
+    } catch (e) {
+      debugPrint('cloudly-sync: база очереди не открылась: $e');
+      queueNote = 'база очереди не открылась: $e';
+      return null;
+    }
+  }
+
+  Future<MirrorStore?> _openMirrorStore() async {
+    try {
+      return await MirrorStore.open();
+    } catch (e) {
+      debugPrint('cloudly-sync: база зеркала не открылась: $e');
+      activity = 'база зеркала не открылась: $e';
+      return null;
+    }
+  }
+
+  /// Состояние зеркала из базы: итоги обхода, что уже в облаке, последний отчёт и
+  /// приостановленные удаления. Иначе после перезапуска приложение выглядит так, будто
+  /// синхронизация никогда не работала.
+  Future<void> _restoreLastState(MirrorStore store) async {
+    try {
+      final inCloud = await store.inCloud();
+      final local = await store.localTotals();
+      final waiting = await store.waitingTotals();
+      final report = await store.meta(MirrorStore.keyReport) ?? '';
+      final blockedRaw = await store.meta(MirrorStore.keyBlocked);
+      var blocked = 0;
+      String? blockedReason;
+      if (blockedRaw != null && blockedRaw.isNotEmpty) {
+        final parts = blockedRaw.split('|');
+        blocked = int.tryParse(parts.first) ?? 0;
+        if (parts.length > 1) blockedReason = parts.sublist(1).join('|');
+      }
+      _status.update(
+        (s) => s.copyWith(
+          inCloudFiles: inCloud.files,
+          inCloudBytes: inCloud.bytes,
+          localFiles: local.files,
+          localBytes: local.bytes,
+          waitingFiles: waiting.files,
+          waitingBytes: waiting.bytes,
+          lastText: report,
+          blocked: blocked,
+          blockedReason: blockedReason,
+        ),
+      );
+    } catch (e) {
+      debugPrint('cloudly-sync: состояние зеркала не прочитано: $e');
     }
   }
 
@@ -176,9 +252,16 @@ class SyncController extends ChangeNotifier {
       return false;
     }
     await _rememberSystemFolders(api);
-    uploads ??= UploadRunner(api, queueStore!);
+    final queue = queueStore;
+    if (queue != null) uploads ??= UploadRunner(api, queue);
     if (engine != null && live == null) {
-      final liveMode = MirrorLive(mirrorStore!, engine!, _status, _watcher, native);
+      final liveMode = MirrorLive(
+        mirrorStore!,
+        engine!,
+        _status,
+        _watcher,
+        native,
+      );
       liveMode.hasToken = () => _api != null;
       liveMode.paused = () => _paused;
       liveMode.foreground = () => foreground;
@@ -198,11 +281,17 @@ class SyncController extends ChangeNotifier {
     try {
       final me = await api.systemFolders();
       final mirror = me.mirrorFolderId;
-      if (mirror != null && mirror.isNotEmpty) await prefs.setMirrorFolderId(mirror);
+      if (mirror != null && mirror.isNotEmpty) {
+        await prefs.setMirrorFolderId(mirror);
+      }
       final photo = me.photoFolderId;
-      if (photo != null && photo.isNotEmpty) await prefs.setPhotoFolderId(photo);
+      if (photo != null && photo.isNotEmpty) {
+        await prefs.setPhotoFolderId(photo);
+      }
       final phone = me.phoneFolderId;
-      if (phone != null && phone.isNotEmpty) await prefs.setPhoneFolderId(phone);
+      if (phone != null && phone.isNotEmpty) {
+        await prefs.setPhoneFolderId(phone);
+      }
       notifyListeners();
     } catch (e) {
       // папки придут и позже — например, при наполнении очереди; ронять из-за них старт незачем
@@ -212,7 +301,11 @@ class SyncController extends ChangeNotifier {
 
   /// Токен устройства: свой у каждого устройства, поэтому корень зеркала в облаке не делится
   /// между телефонами.
-  Future<void> _bindToken(CloudlyApi sessionApi, String login, int epoch) async {
+  Future<void> _bindToken(
+    CloudlyApi sessionApi,
+    String login,
+    int epoch,
+  ) async {
     _sessionApi = sessionApi;
     _login = login;
     try {
@@ -239,7 +332,8 @@ class SyncController extends ChangeNotifier {
   /// живых токенов), поэтому его сообщение и показываем — но с подсказкой, что с этим делать.
   String _tokenProblem(Object e) {
     final text = 'токен устройства не выпущен: $e';
-    if (e is ApiException && (e.status == 400 || e.status == 401 || e.status == 403)) {
+    if (e is ApiException &&
+        (e.status == 400 || e.status == 401 || e.status == 403)) {
       return '$text · проверьте «Токены приложений»: ненужные лучше отозвать';
     }
     return text;
@@ -283,7 +377,9 @@ class SyncController extends ChangeNotifier {
     final api = _api;
     if (api == null) {
       final why = tokenError;
-      throw StateError(why == null ? 'нет токена устройства' : 'нет токена устройства: $why');
+      throw StateError(
+        why == null ? 'нет токена устройства' : 'нет токена устройства: $why',
+      );
     }
     return api;
   }
@@ -297,7 +393,9 @@ class SyncController extends ChangeNotifier {
 
   /// Проверить доступ после возвращения из системных настроек.
   Future<void> recheckAccess() async {
-    access = await native.hasAllFilesAccess() ? SyncAccess.granted : SyncAccess.denied;
+    access = await native.hasAllFilesAccess()
+        ? SyncAccess.granted
+        : SyncAccess.denied;
     if (access == SyncAccess.granted) {
       await startWatching();
       await refreshQueue();
@@ -330,7 +428,8 @@ class SyncController extends ChangeNotifier {
   Future<QueueBuildResult?> refreshQueue() async {
     final store = queueStore;
     final sel = selection;
-    if (store == null || sel == null) return null;
+    final prefs = syncPrefs;
+    if (store == null || sel == null || prefs == null) return null;
     // Токен мог не выпуститься при старте (сеть, лимит живых токенов): без повторной попытки
     // кнопка «Обновить» молча ничего бы не делала
     if (_api == null && !await ensureReady()) {
@@ -341,17 +440,13 @@ class SyncController extends ChangeNotifier {
     activity = 'прохожу папки…';
     notifyListeners();
     try {
-      final refresher = QueueRefresher(
-        () => _api,
-        syncPrefs!,
-        sel,
-        store,
-        files,
+      final refresher = QueueRefresher(() => _api, prefs, sel, store, files);
+      final result = await refresher.refresh(
+        onProgress: (m) {
+          activity = m;
+          notifyListeners();
+        },
       );
-      final result = await refresher.refresh(onProgress: (m) {
-        activity = m;
-        notifyListeners();
-      });
       queueNote = result.text();
       waiting = await store.waitingCount();
       return result;
@@ -365,7 +460,10 @@ class SyncController extends ChangeNotifier {
   }
 
   /// Выгрузить один файл из очереди: запускается вручную, кнопкой на строке.
-  Future<void> uploadItem(int itemId, {void Function(UploadProgress)? onProgress}) async {
+  Future<void> uploadItem(
+    int itemId, {
+    void Function(UploadProgress)? onProgress,
+  }) async {
     if (_api == null && !await ensureReady()) {
       queueNote = tokenError ?? 'нет токена устройства';
       notifyListeners();
@@ -398,10 +496,13 @@ class SyncController extends ChangeNotifier {
     activity = 'сверяю…';
     notifyListeners();
     try {
-      return await e.pass(manual: manual, onProgress: (m) {
-        activity = m;
-        notifyListeners();
-      });
+      return await e.pass(
+        manual: manual,
+        onProgress: (m) {
+          activity = m;
+          notifyListeners();
+        },
+      );
     } catch (err) {
       return MirrorReport()..error = '$err';
     } finally {
@@ -424,9 +525,9 @@ class SyncController extends ChangeNotifier {
     if (store == null) return;
     _paused = value;
     await store.setMeta(MirrorStore.keyPaused, value ? '1' : '0');
-    _status.update((s) => s.copyWith(
-          phase: value ? MirrorPhase.paused : MirrorPhase.idle,
-        ));
+    _status.update(
+      (s) => s.copyWith(phase: value ? MirrorPhase.paused : MirrorPhase.idle),
+    );
     if (!value) {
       await startWatching();
       unawaited(mirrorPass(manual: false));
@@ -439,7 +540,10 @@ class SyncController extends ChangeNotifier {
     final raw = await mirrorStore?.meta(MirrorStore.keyBlocked);
     if (raw == null || raw.isEmpty) return null;
     final parts = raw.split('|');
-    return (int.tryParse(parts.first) ?? 0, parts.length > 1 ? parts.sublist(1).join('|') : '');
+    return (
+      int.tryParse(parts.first) ?? 0,
+      parts.length > 1 ? parts.sublist(1).join('|') : '',
+    );
   }
 
   @override

@@ -415,4 +415,67 @@ void main() {
       expect(plan.deletes, isEmpty);
     });
   });
+
+  group('MirrorRules.emptyFolderCandidates', () {
+    test('папка, которой нет на телефоне, уходит в уборку', () {
+      final out = MirrorRules.emptyFolderCandidates(
+        dirs: {'cloud-old': '/s/Download/Старое имя'},
+        aliveLocally: {'/s/Download/Новое имя'},
+        roots: ['/s/Download'],
+        rootCloudIds: {'cloud-root'},
+      );
+      expect(out, ['/s/Download/Старое имя']);
+    });
+
+    test('корень зеркала не убирается никогда', () {
+      // корень — это адрес, по которому лежит всё зеркало: удалить его значит осиротить папку
+      final out = MirrorRules.emptyFolderCandidates(
+        dirs: {'cloud-root': '/s/Download'},
+        aliveLocally: const {},
+        roots: ['/s/Download'],
+        rootCloudIds: {'cloud-root'},
+      );
+      expect(out, isEmpty);
+    });
+
+    test('папка, которая на месте, не трогается', () {
+      final out = MirrorRules.emptyFolderCandidates(
+        dirs: {'cloud-a': '/s/Download/Отчёты'},
+        aliveLocally: {'/s/Download/Отчёты'},
+        roots: ['/s/Download'],
+        rootCloudIds: {'cloud-root'},
+      );
+      expect(out, isEmpty);
+    });
+
+    test('папка снятая с выбора не трогается', () {
+      // её нет в снимке только потому, что галочку сняли: удалять в облаке нечего
+      final out = MirrorRules.emptyFolderCandidates(
+        dirs: {'cloud-b': '/s/Pictures/Старое'},
+        aliveLocally: const {},
+        roots: ['/s/Download'],
+        rootCloudIds: const {},
+      );
+      expect(out, isEmpty);
+    });
+
+    test('глубокие папки идут первыми', () {
+      // тогда родитель, опустевший после удаления детей, уходит в том же проходе
+      final out = MirrorRules.emptyFolderCandidates(
+        dirs: {
+          'cloud-top': '/s/Download/Старое',
+          'cloud-deep': '/s/Download/Старое/Глубже',
+          'cloud-deeper': '/s/Download/Старое/Глубже/Ещё',
+        },
+        aliveLocally: const {},
+        roots: ['/s/Download'],
+        rootCloudIds: const {},
+      );
+      expect(out, [
+        '/s/Download/Старое/Глубже/Ещё',
+        '/s/Download/Старое/Глубже',
+        '/s/Download/Старое',
+      ]);
+    });
+  });
 }

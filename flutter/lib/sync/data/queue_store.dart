@@ -85,9 +85,6 @@ class QueueStore {
       // закрытие базы в фоне закрывало её и в приложении — «database closed» на первом же
       // обращении после прохода
       singleInstance: false,
-      // Два соединения к одному файлу — это нормально для SQLite, но короткая
-      // параллельная запись может попасть в «database is locked». Пусть лучше подождёт
-      onConfigure: (db) => db.execute('PRAGMA busy_timeout = 5000'),
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE uploaded(
@@ -137,6 +134,7 @@ class QueueStore {
         }
       },
     );
+    await _setBusyTimeout(db);
     return QueueStore._(db);
   }
 
@@ -430,4 +428,16 @@ class QueueStore {
     sha256: r['sha256'] == null ? null : '${r['sha256']}',
     createdAt: (r['created_at'] as int?) ?? 0,
   );
+}
+
+/// Два соединения к одному файлу (приложение и фоновое задание) — это нормально для SQLite,
+/// но короткая параллельная запись может попасть в «database is locked». Пусть лучше подождёт.
+///
+/// PRAGMA ставится запросом, а не через `onConfigure`: там sqflite выполняет её как execSQL,
+/// а Android такую строку не принимает и открытие базы падает целиком. Ошибка самой PRAGMA
+/// при этом не критична — без неё возможен редкий «database is locked».
+Future<void> _setBusyTimeout(Database db) async {
+  try {
+    await db.rawQuery('PRAGMA busy_timeout = 5000');
+  } catch (_) {}
 }

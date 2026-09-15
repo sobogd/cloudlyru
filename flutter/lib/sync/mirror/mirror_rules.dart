@@ -164,6 +164,37 @@ abstract final class MirrorRules {
     );
   }
 
+  /// Папки облака, которые опустели после переименования или удаления на телефоне.
+  ///
+  /// Зеркало удаляет в облаке только файлы: папка, из которой файлы перенесли, остаётся
+  /// навсегда — после переименования дерева в облаке копится хвост из пустых папок.
+  /// Их и отбираем здесь, по трём обязательным условиям:
+  ///   • папка заведена самим зеркалом (есть пара «папка облака ↔ путь на телефоне»);
+  ///   • на телефоне её больше нет — иначе она просто на месте;
+  ///   • она внутри выбранных сейчас папок: папку сняли с выбора — не наше дело.
+  ///
+  /// Корень зеркала не трогаем никогда: он и есть адрес, по которому всё лежит.
+  /// Порядок — от глубоких к поверхностным: тогда родитель, опустевший после удаления детей,
+  /// уходит в том же проходе, а не следующим.
+  ///
+  /// Проверка «в облаке пусто» сюда не входит: она требует запроса, и делается уже при удалении.
+  static List<String> emptyFolderCandidates({
+    required Map<String, String> dirs,
+    required Set<String> aliveLocally,
+    required Iterable<String> roots,
+    required Set<String> rootCloudIds,
+  }) {
+    final out = <String>[];
+    for (final entry in dirs.entries) {
+      if (rootCloudIds.contains(entry.key)) continue;
+      if (aliveLocally.contains(entry.value)) continue;
+      if (!underRoots(entry.value, roots)) continue;
+      out.add(entry.value);
+    }
+    out.sort((a, b) => b.length.compareTo(a.length));
+    return out;
+  }
+
   /// Имя конфликтной копии: содержимое обеих сторон сохраняется, никто не затирается молча.
   /// Так же поступает Google Drive — «конфликтующая копия» вместо тихой потери одной из версий.
   static String conflictName(String name, int at) {
