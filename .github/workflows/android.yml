@@ -1,12 +1,17 @@
 name: Android APK (build + publish)
 
-# Ручной прогон: собирает юнит-тесты, подписанный релиз и публикует его в релизный артефакт S3,
-# откуда сборку всегда отдаёт https://files.iq-factura.com/apk.
+# Ручной прогон: собирает релиз Flutter-клиента (flutter/), прогоняет тесты и публикует
+# подписанный APK в релизный артефакт S3, откуда сборку всегда отдаёт
+# https://files.iq-factura.com/apk.
 #
-# Автоматического запуска по push нет: пока APK публикуется напрямую
-# (`node --env-file=$HOME/work/.env scripts/publish-apk.mjs <apk>`), чтобы прогон не спотыкался
-# о запрет повторной публикации того же versionCode.
-# Ручной запуск: gh workflow run android.yml
+# Собирается именно Flutter-клиент: у него тот же applicationId ru.cloudly.sync и та же
+# подпись, что у старого нативного синхронизатора, поэтому он встаёт поверх него. Старый
+# клиент (android/) в CI больше не собирается и в релиз не попадает.
+#
+# Автоматического запуска по push нет: релиз — осознанное действие, перед ним нужно поднять
+# versionCode в flutter/pubspec.yaml (`version: 1.0.0+41`). Скрипт публикации не даёт положить
+# сборку с тем же или меньшим номером: телефон увидел бы её только руками, а не кнопкой
+# «Обновить». Ручной запуск: gh workflow run android.yml --repo sobogd/cloudlyru
 #
 # Секреты: ANDROID_KEYSTORE_BASE64 (файл ~/.cloudly-android-release.jks в base64),
 # ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD,
@@ -18,6 +23,11 @@ on:
 concurrency:
   group: cloudlyru-android
   cancel-in-progress: false
+
+env:
+  # Тот же Flutter, что у нас локально: новая stable может поменять Gradle/AGP и сломать
+  # сборку в самый неподходящий момент, а релиз должен собираться воспроизводимо.
+  FLUTTER_VERSION: 3.47.4
 
 jobs:
   apk:
@@ -32,11 +42,19 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: Android SDK (platform 35, build-tools 35)
+      - name: Android SDK (platform 36, build-tools 36)
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0"
           yes | sdkmanager --licenses > /dev/null || true
 
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # Подпись читает flutter/android/app/build.gradle.kts — путь ../../../android/keystore.properties,
+      # то есть файл старого клиента: ключ один и тот же, иначе APK не встанет поверх.
       - name: Ключ подписи из секретов
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -55,11 +73,12 @@ jobs:
           EOF
           chmod 600 android/keystore.properties
 
-      - name: Юнит-тесты и сборка релиза
-        working-directory: android
+      - name: Тесты и сборка релиза
+        working-directory: flutter
         run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease
+          flutter pub get
+          flutter test
+          flutter build apk --release
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
@@ -78,15 +97,15 @@ jobs:
           S3_FILES_FORCE_PATH_STYLE: 'true'
           S3_FILES_PREFIX: ''
           CLOUDLY_BASE_URL: https://files.iq-factura.com
-        run: node scripts/publish-apk.mjs android/app/build/outputs/apk/release/app-release.apk
+        run: node scripts/publish-apk.mjs flutter/build/app/outputs/apk/release/app-release.apk
 
       - name: Итог в summary
         if: always()
         run: |
           {
-            echo "### Android-клиент"
-            if [ -f android/app/build/outputs/apk/release/output-metadata.json ]; then
-              node -e "const m=require('./android/app/build/outputs/apk/release/output-metadata.json');const e=m.elements[0];console.log('- собрано: '+e.versionName+' (versionCode '+e.versionCode+')');"
+            echo "### Android-клиент (Flutter)"
+            if [ -f flutter/build/app/outputs/apk/release/output-metadata.json ]; then
+              node -e "const m=require('./flutter/build/app/outputs/apk/release/output-metadata.json');const e=m.elements[0];console.log('- собрано: '+e.versionName+' (versionCode '+e.versionCode+')');"
             else
               echo "- сборка не дошла до APK"
             fi

@@ -75,13 +75,23 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 (`release/android/cloudlyru-sync.apk`), рядом — `latest.json` с версией, размером и sha256:
 по нему приложение понимает, что вышло обновление (`GET /api/v1/app/android`).
 
-Публикация — push в `main` по `android/**` (workflow `.github/workflows/android.yml`), вручную
-нужен только поднятый `versionCode` в `android/app/build.gradle.kts`. Ручная публикация уже
-собранного APK:
+Публикация — ручной прогон workflow `.github/workflows/android.yml`: он собирает Flutter-клиент
+(`flutter/`), прогоняет тесты и заливает подписанный APK. Перед запуском поднять `versionCode` в
+`flutter/pubspec.yaml` (`version: 1.0.0+41`) — скрипт публикации не даёт положить сборку с тем же
+или меньшим номером, иначе телефон её как обновление не увидит:
+
+```bash
+gh workflow run android.yml --repo sobogd/cloudlyru
+```
+
+Старый нативный синхронизатор (`android/`) в CI больше не собирается: у Flutter-клиента тот же
+`applicationId` (`ru.cloudly.sync`) и та же подпись, поэтому он встаёт поверх него.
+
+Ручная публикация уже собранного APK:
 
 ```bash
 node --env-file=$HOME/work/.env scripts/publish-apk.mjs \
-  android/app/build/outputs/apk/release/app-release.apk     # --dry-run: только показать
+  flutter/build/app/outputs/apk/release/app-release.apk     # --dry-run: только показать
 ```
 
 Секреты репозитория для этой сборки: `ANDROID_KEYSTORE_BASE64` (файл
