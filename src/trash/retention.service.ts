@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/commo
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { TrashService } from './trash.service';
+import { MailFeedService } from '../mail/mail-feed.service';
 import { TRASH_RETENTION_MS } from '../config/env';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -41,6 +42,7 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly trash: TrashService,
+    private readonly mail: MailFeedService,
     private readonly audit: AuditService,
   ) {}
 
@@ -88,15 +90,21 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
     for (const user of users) {
       try {
         const res = await this.trash.purge(user.id, days);
-        if (res.purgedEntries || res.purgedFolders || res.purgedMessages) {
+        if (res.purgedEntries || res.purgedFolders) {
           this.logger.log(
-            `корзина старше ${days} дней: удалено файлов ${res.purgedEntries}, папок ${res.purgedFolders}, ` +
-              `писем ${res.purgedMessages}, объектов ${res.purgedAssets}`,
+            `корзина файлов старше ${days} дней: удалено файлов ${res.purgedEntries}, папок ${res.purgedFolders}, ` +
+              `объектов ${res.purgedAssets}`,
           );
         }
       } catch (e) {
         // уборка одного дерева не должна мешать остальным и следующей уборке
-        this.logger.warn(`purge корзины (${user.id}): ${e instanceof Error ? e.message : String(e)}`);
+        this.logger.warn(`purge корзины файлов (${user.id}): ${e instanceof Error ? e.message : String(e)}`);
+      }
+      try {
+        const res = await this.mail.purgeTrash(user.id, days);
+        if (res.purged) this.logger.log(`корзина почты старше ${days} дней: удалено писем ${res.purged}`);
+      } catch (e) {
+        this.logger.warn(`purge корзины почты (${user.id}): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }

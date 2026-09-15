@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   Download,
+  Eraser,
   FileSearch,
   Forward,
+  Inbox,
   LoaderCircle,
   Paperclip,
   PenSquare,
   RefreshCw,
   Reply,
   ReplyAll,
+  RotateCcw,
+  Send,
   Trash2,
   X,
 } from 'lucide-react';
@@ -154,7 +158,9 @@ export default function MailSection({
   renderFileDetail?: (entryId: string, onClose: () => void) => ReactNode;
 }) {
   const [saved] = useState(() => readUi().mail);
-  const [box, setBox] = useState<Box>(saved?.box === 'sent' ? 'sent' : 'inbox');
+  const [box, setBox] = useState<Box>(
+    saved?.box === 'sent' || saved?.box === 'trash' ? saved.box : 'inbox',
+  );
   const [total, setTotal] = useState<number | null>(null);
   const [months, setMonths] = useState<Array<{ month: string; count: number }> | null>(null);
   const [items, setItems] = useState<Map<number, Item>>(() => new Map());
@@ -478,6 +484,34 @@ export default function MailSection({
     }
   };
 
+  /** Очистить корзину почты: письма удаляются безвозвратно. */
+  const emptyTrash = async () => {
+    if (!confirm('Очистить корзину почты? Письма будут удалены безвозвратно.')) return;
+    setBusy(true);
+    try {
+      await api.mailPurgeTrash();
+      setOpenId(null);
+      setItems(new Map());
+      itemsRef.current = new Map();
+      await loadCounters();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Письмо изменило своё место (удалено/восстановлено/стёрто): перечитать текущую папку. */
+  const reloadList = useCallback(() => {
+    setOpenId(null);
+    setItems(new Map());
+    itemsRef.current = new Map();
+    void loadCounters().then(() => {
+      const el = scrollRef.current;
+      if (el) void fetchRangeRef.current(0, OVERSCAN + 20);
+    });
+  }, [loadCounters]);
+
   /** Кусок видимых строк: строка на письмо, высота фиксирована. */
   const rows = useMemo(() => {
     const out: Array<{ y: number; index: number; item?: Item }> = [];
@@ -541,23 +575,34 @@ export default function MailSection({
     <div className="media mail">
       <div className="mhead mailhead">
         <div className="mailtabs">
-          {(['inbox', 'sent'] as Box[]).map((b) => (
-            <button key={b} className={box === b ? 'mailtab active' : 'mailtab'} onClick={() => setBox(b)}>
-              {b === 'inbox' ? 'Входящие' : 'Исходящие'}
-            </button>
-          ))}
+          <button className={box === 'inbox' ? 'mailtab active' : 'mailtab'} title="Входящие" onClick={() => setBox('inbox')}>
+            <Inbox size={18} />
+          </button>
+          <button className={box === 'sent' ? 'mailtab active' : 'mailtab'} title="Исходящие" onClick={() => setBox('sent')}>
+            <Send size={18} />
+          </button>
+          <button className={box === 'trash' ? 'mailtab active' : 'mailtab'} title="Корзина" onClick={() => setBox('trash')}>
+            <Trash2 size={18} />
+          </button>
         </div>
-        <button className="iconbtn" title="Проверить почту" onClick={() => void refresh()} disabled={busy}>
-          {busy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}
-        </button>
-        <button
-          className="iconbtn"
-          title={accounts.length ? 'Написать письмо' : 'Сначала добавьте аккаунт в «Настройках»'}
-          disabled={!accounts.some((a) => a.enabled)}
-          onClick={() => setComposer({ initial: null })}
-        >
-          <PenSquare size={18} />
-        </button>
+        <div className="mailactions">
+          {box === 'trash' && total != null && total > 0 && (
+            <button className="iconbtn" title="Очистить корзину" onClick={() => void emptyTrash()}>
+              <Eraser size={18} />
+            </button>
+          )}
+          <button className="iconbtn" title="Проверить почту" onClick={() => void refresh()} disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}
+          </button>
+          <button
+            className="iconbtn"
+            title={accounts.length ? 'Написать письмо' : 'Сначала добавьте аккаунт в «Настройках»'}
+            disabled={!accounts.some((a) => a.enabled)}
+            onClick={() => setComposer({ initial: null })}
+          >
+            <PenSquare size={18} />
+          </button>
+        </div>
       </div>
 
       <div className="mscroll-wrap">
@@ -575,7 +620,9 @@ export default function MailSection({
               <span className="copy">
                 {box === 'inbox'
                   ? 'Входящих пока нет — письма появятся здесь сами'
-                  : 'Исходящих пока нет'}
+                  : box === 'sent'
+                    ? 'Исходящих пока нет'
+                    : 'Корзина пуста'}
               </span>
             </div>
           )}
@@ -653,6 +700,7 @@ export default function MailSection({
       {openId && (
         <MailViewer
           id={openId}
+          inTrash={box === 'trash'}
           onReply={(mode, messageId) => void openReply(mode, messageId)}
           renderFileDetail={renderFileDetail}
           onClose={() => {
@@ -661,15 +709,8 @@ export default function MailSection({
             if (el) persist(el.scrollTop);
           }}
           onChanged={(patch) => patchItem(openId, patch)}
-          onDeleted={() => {
-            setOpenId(null);
-            setItems(new Map());
-            itemsRef.current = new Map();
-            void loadCounters().then(() => {
-              const el = scrollRef.current;
-              if (el) void fetchRangeRef.current(0, OVERSCAN + 20);
-            });
-          }}
+          onDeleted={reloadList}
+          onRestored={reloadList}
           prev={() => neighbour(-1)}
           next={() => neighbour(1)}
           onNav={(id) => setOpenId(id)}
@@ -694,9 +735,11 @@ export default function MailSection({
  */
 export function MailViewer({
   id,
+  inTrash = false,
   onClose,
   onChanged,
   onDeleted,
+  onRestored,
   prev,
   next,
   onNav,
@@ -705,10 +748,13 @@ export function MailViewer({
   keyboardActive = true,
 }: {
   id: string;
+  /** Письмо открыто из корзины: вместо ответа/удаления — восстановить и стереть навсегда. */
+  inTrash?: boolean;
   onClose: () => void;
   onReply?: (mode: 'reply' | 'replyAll' | 'forward', messageId: string) => void;
   onChanged?: (patch: { seen?: boolean }) => void;
   onDeleted?: () => void;
+  onRestored?: () => void;
   prev: () => string | null;
   next: () => string | null;
   onNav: (id: string) => void;
@@ -781,10 +827,37 @@ export function MailViewer({
 
   const remove = async () => {
     if (!msg) return;
-    if (!confirm('Удалить письмо? Оно уйдёт в корзину вместе с вложениями.')) return;
+    if (!confirm('Удалить письмо? Оно уйдёт в корзину.')) return;
     setBusy(true);
     try {
       await api.mailDelete(msg.id);
+      onDeleted?.();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const restore = async () => {
+    if (!msg) return;
+    setBusy(true);
+    try {
+      await api.mailRestore(msg.id);
+      onRestored?.();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const purgeForever = async () => {
+    if (!msg) return;
+    if (!confirm('Удалить письмо навсегда? Вернуть его будет нельзя.')) return;
+    setBusy(true);
+    try {
+      await api.mailPurgeMessage(msg.id);
       onDeleted?.();
     } catch (e) {
       setError((e as Error).message);
@@ -811,7 +884,7 @@ export function MailViewer({
         <span className="mv-item mv-date" title="Дата письма">
           {msg ? fullDate(msg.sortAt) : ''}
         </span>
-        {onReply && msg && (
+        {!inTrash && onReply && msg && (
           <>
             <button className="iconbtn" title="Ответить" onClick={() => onReply('reply', msg.id)}>
               <Reply size={18} />
@@ -829,9 +902,20 @@ export function MailViewer({
             <Download size={18} />
           </a>
         )}
-        <button className="iconbtn" title="Удалить (в корзину)" disabled={busy || !msg} onClick={() => void remove()}>
-          <Trash2 size={18} />
-        </button>
+        {msg && inTrash ? (
+          <>
+            <button className="iconbtn" title="Восстановить" disabled={busy} onClick={() => void restore()}>
+              <RotateCcw size={18} />
+            </button>
+            <button className="iconbtn" title="Удалить навсегда" disabled={busy} onClick={() => void purgeForever()}>
+              <Trash2 size={18} />
+            </button>
+          </>
+        ) : (
+          <button className="iconbtn" title="Удалить (в корзину)" disabled={busy || !msg} onClick={() => void remove()}>
+            <Trash2 size={18} />
+          </button>
+        )}
         <button className="iconbtn" title="Закрыть" onClick={onClose}>
           <X size={18} />
         </button>

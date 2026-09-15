@@ -925,16 +925,19 @@
      скролл поехал бы, поэтому тема и превью обрезаются, а не переносятся. */
   .mailhead { justify-content: space-between; gap: 8px; }
   .mailtabs { display: flex; gap: 4px; }
+  .mailactions { display: flex; align-items: center; gap: 4px; }
   .mailtab {
-    padding: 6px 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 7px 9px;
     border: 0;
     border-radius: 999px;
     background: none;
     color: var(--fg-3);
-    font-size: var(--island-fs);
     cursor: pointer;
   }
-  .mailtab.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .mailtab.active { background: var(--accent-soft); color: var(--accent); }
 
   /* Полоска ящиков: горизонтальная прокрутка, чтобы длинные адреса не ломали вёрстку */
   .mailfilters {

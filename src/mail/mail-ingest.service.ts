@@ -49,8 +49,9 @@ export interface IngestInput {
   receivedAt: Date;
 }
 
-/** Имена наших двух папок внутри системной «Почты». */
-export const MAIL_BOX_FOLDER: Record<MailBox, string> = { inbox: 'Входящие', sent: 'Исходящие' };
+/** Имена наших двух папок внутри системной «Почты». `trash` сюда не ходит (это состояние
+ *  письма, а не папка источника), ключ оставлен только чтобы тип Record<MailBox, string> сходился. */
+export const MAIL_BOX_FOLDER: Record<MailBox, string> = { inbox: 'Входящие', sent: 'Исходящие', trash: 'Корзина' };
 
 /**
  * Псевдо-папка для писем, пришедших не по IMAP: наша отправка и приём своим сервером.

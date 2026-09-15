@@ -253,8 +253,9 @@ export class MailController {
   }
 
   /**
-   * В корзину. Письмо уходит в общую с файлами корзину вместе с вложениями, на сервере
-   * аккаунта ничего не меняется: синхронизация в этой фазе только читает.
+   * В корзину почты. Это отдельная от файлов корзина: письмо мягко удаляется (deletedAt),
+   * вложения при нём остаются и в файловой корзине не появляются. На сервере аккаунта
+   * ничего не меняется: синхронизация в этой фазе только читает.
    */
   @Delete('messages/:id')
   @UseGuards(RateLimitGuard)
@@ -263,12 +264,29 @@ export class MailController {
     return this.feed.deleteMessage(user.id, id);
   }
 
-  /** Вернуть письмо из корзины (вложения возвращаются вместе с ним). */
+  /** Вернуть письмо из корзины почты (вложения никуда не девались, письмо снова в ленте). */
   @Post('messages/:id/restore')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   restore(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     return this.feed.restoreMessage(user.id, id);
+  }
+
+  /** Удалить письмо навсегда: только из корзины, вместе с вложениями и сырым .eml. */
+  @Post('messages/:id/purge')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(300, 60_000)
+  purgeMessage(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.feed.purgeMessage(user.id, id);
+  }
+
+  /** Очистить корзину почты целиком (безвозвратно). */
+  @SessionOnly()
+  @Post('trash/purge')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(60, 60_000)
+  purgeTrash(@CurrentUser() user: RequestUser) {
+    return this.feed.purgeTrash(user.id);
   }
 
   /** Метаданные части письма: по ним клиент строит ссылку на файл (`/files/:entryId/...`). */
@@ -285,9 +303,9 @@ export class MailController {
 /** Потолок размера принимаемого письма: у Gmail предел 25 МБ, у остальных меньше. */
 const MAX_INBOUND_BYTES = 64 * 1024 * 1024;
 
-/** Папка из строки запроса: у почты их две, любое другое значение — «Входящие». */
+/** Папка из строки запроса: у почты их три, любое другое значение — ошибка. */
 function boxOf(raw?: string): string {
   if (raw === undefined || raw === '' || raw === 'inbox') return 'inbox';
-  if (raw === 'sent') return 'sent';
+  if (raw === 'sent' || raw === 'trash') return raw;
   throw badRequest('unknown mail box', 'mail_box_unknown');
 }

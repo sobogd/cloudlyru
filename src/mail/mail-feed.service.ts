@@ -23,6 +23,16 @@ const PREVIEW_CHARS = 200;
 /** Потолок одного среза ленты. */
 export const MAIL_RANGE_MAX = 500;
 
+/**
+ * Условие «письмо лежит в папке» для сырого SQL.
+ * Корзина почты — это не папка из box/alsoBoxes, а состояние `deletedAt`, поэтому у неё
+ * своё условие; обычные папки фильтруются и по принадлежности, и по «не в корзине».
+ */
+function boxConditionSql(box: MailBox): Prisma.Sql {
+  if (box === 'trash') return Prisma.sql`"deletedAt" IS NOT NULL`;
+  return Prisma.sql`"deletedAt" IS NULL AND ${inBoxSql(box)}`;
+}
+
 export interface MailListItem {
   id: string;
   box: string;
@@ -80,7 +90,7 @@ export class MailFeedService {
       SELECT count(*)::int AS n FROM (
         SELECT 1
         FROM "MailMessage"
-        WHERE "userId" = ${userId} AND "deletedAt" IS NULL AND ${inBoxSql(box as MailBox)}
+        WHERE "userId" = ${userId} AND ${boxConditionSql(box as MailBox)}
           AND (${accountId ?? null}::text IS NULL OR "accountId" = ${accountId ?? null})
         GROUP BY COALESCE("threadKey", id)
       ) g
@@ -100,6 +110,9 @@ export class MailFeedService {
     const take = Math.min(Math.max(Math.floor(limit) || 1, 1), MAIL_RANGE_MAX);
     const skip = Math.max(0, Math.floor(offset) || 0);
     const acc = accountId ?? null;
+    // Корзина сортируется по времени удаления, обычные папки — по дате письма.
+    const headOrder = box === 'trash' ? Prisma.sql`"deletedAt" DESC, id DESC` : Prisma.sql`"sortAt" DESC, id DESC`;
+    const listOrder = box === 'trash' ? Prisma.sql`m."deletedAt" DESC, m.id DESC` : Prisma.sql`m."sortAt" DESC, m.id DESC`;
 
     const rows = await this.prisma.$queryRaw<
       Array<{
@@ -122,7 +135,7 @@ export class MailFeedService {
       WITH base AS (
         SELECT *
         FROM "MailMessage"
-        WHERE "userId" = ${userId} AND "deletedAt" IS NULL AND ${inBoxSql(box as MailBox)}
+        WHERE "userId" = ${userId} AND ${boxConditionSql(box as MailBox)}
           AND (${acc}::text IS NULL OR "accountId" = ${acc})
       ),
       heads AS (
@@ -130,7 +143,7 @@ export class MailFeedService {
           SELECT id,
             row_number() OVER (
               PARTITION BY COALESCE("threadKey", id)
-              ORDER BY "sortAt" DESC, id DESC
+              ORDER BY ${headOrder}
             ) AS rn
           FROM base
         ) h
@@ -150,7 +163,7 @@ export class MailFeedService {
       JOIN "MailAccount" a ON a.id = m."accountId"
       JOIN grouped g ON g.grp = COALESCE(m."threadKey", m.id)
       WHERE m.id IN (SELECT id FROM heads)
-      ORDER BY m."sortAt" DESC, m.id DESC
+      ORDER BY ${listOrder}
       LIMIT ${take} OFFSET ${skip}
     `);
 
@@ -177,21 +190,24 @@ export class MailFeedService {
    * Считаем по цепочкам (по их голове), чтобы высота скролла совпадала со списком.
    */
   async months(userId: string, box: string, accountId?: string | null): Promise<Array<{ month: string; count: number }>> {
+    // В корзине индекс месяцев считается по времени удаления (совпадает с порядком ленты).
+    const timeCol = box === 'trash' ? Prisma.sql`"deletedAt"` : Prisma.sql`"sortAt"`;
+    const orderBy = box === 'trash' ? Prisma.sql`"deletedAt" DESC, id DESC` : Prisma.sql`"sortAt" DESC, id DESC`;
     const rows = await this.prisma.$queryRaw<Array<{ month: string; n: bigint | number }>>(Prisma.sql`
       WITH heads AS (
-        SELECT "sortAt" FROM (
-          SELECT "sortAt",
+        SELECT ${timeCol} AS t FROM (
+          SELECT ${timeCol} AS t,
             row_number() OVER (
               PARTITION BY COALESCE("threadKey", id)
-              ORDER BY "sortAt" DESC, id DESC
+              ORDER BY ${orderBy}
             ) AS rn
           FROM "MailMessage"
-          WHERE "userId" = ${userId} AND ${inBoxSql(box as MailBox)} AND "deletedAt" IS NULL
+          WHERE "userId" = ${userId} AND ${boxConditionSql(box as MailBox)}
             AND (${accountId ?? null}::text IS NULL OR "accountId" = ${accountId ?? null})
         ) h
         WHERE rn = 1
       )
-      SELECT to_char("sortAt", 'YYYY-MM') AS month, count(*)::int AS n
+      SELECT to_char(t, 'YYYY-MM') AS month, count(*)::int AS n
       FROM heads
       GROUP BY 1
       ORDER BY 1 DESC
@@ -199,10 +215,10 @@ export class MailFeedService {
     return rows.map((r) => ({ month: r.month, count: Number(r.n) }));
   }
 
-  /** Письмо целиком: заголовки, превью тела и список частей. */
+  /** Письмо целиком: заголовки, превью тела и список частей (доступно и из корзины). */
   async get(userId: string, id: string): Promise<MailMessageView> {
     const row = await this.prisma.mailMessage.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       select: {
         id: true,
         box: true,
@@ -292,7 +308,7 @@ export class MailFeedService {
    */
   async body(userId: string, id: string, allowRemote: boolean): Promise<{ html: string; blockedRemote: number; kind: 'html' | 'text' }> {
     const row = await this.prisma.mailMessage.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       select: { id: true, bodyText: true, rawAsset: { select: { sha256: true } } },
     });
     if (!row) throw notFound('mail message not found');
@@ -318,7 +334,7 @@ export class MailFeedService {
   /** Сырой .eml: ключ объекта для отдачи файлом (содержимое письма как оно пришло). */
   async rawKey(userId: string, id: string): Promise<{ key: string; name: string }> {
     const row = await this.prisma.mailMessage.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       select: { subject: true, rawAsset: { select: { sha256: true } } },
     });
     if (!row) throw notFound('mail message not found');
@@ -381,61 +397,85 @@ export class MailFeedService {
   }
 
   /**
-   * Удалить письмо: soft, вместе с его вложениями — в общую с файлами корзину.
-   *
-   * Вложения удаляются тем же моментом, а не отдельным правилом: файл без письма в скрытой
-   * папке не нужен никому, а после восстановления письма он возвращается на место. Прямые
-   * ручки файлов этого сделать не могут — они такие записи намеренно не трогают.
-   *
-   * Флаги на сервере аккаунта не меняются: синхронизация в этой фазе только читает.
+   * Удалить письмо: soft, в отдельную корзину почты. Вложения остаются при письме и в
+   * файловую корзину не попадают — это и есть «отдельная корзина для почты». На сервере
+   * аккаунта ничего не меняется: синхронизация в этой фазе только читает.
    */
   async deleteMessage(userId: string, id: string): Promise<{ ok: true }> {
-    const message = await this.prisma.mailMessage.findFirst({
+    const res = await this.prisma.mailMessage.updateMany({
       where: { id, userId, deletedAt: null },
-      select: { id: true, attachments: { select: { entryId: true } } },
+      data: { deletedAt: new Date() },
     });
-    if (!message) throw notFound('mail message not found');
-    await this.softDeleteMessages([message]);
+    if (!res.count) throw notFound('mail message not found');
     return { ok: true };
   }
 
-  /** Общий код удаления: письма плюс их вложения (одной транзакцией — не бывает половины). */
-  private async softDeleteMessages(messages: Array<{ id: string; attachments: Array<{ entryId: string }> }>): Promise<void> {
-    const at = new Date();
-    const entryIds = messages.flatMap((m) => m.attachments.map((a) => a.entryId));
-    await this.prisma.$transaction(async (tx) => {
-      await tx.mailMessage.updateMany({ where: { id: { in: messages.map((m) => m.id) } }, data: { deletedAt: at } });
-      if (entryIds.length) {
-        await tx.fileEntry.updateMany({ where: { id: { in: entryIds }, deletedAt: null }, data: { deletedAt: at } });
-      }
+  /** Вернуть письмо из корзины почты: вложения никуда не девались, письмо снова в ленте. */
+  async restoreMessage(userId: string, id: string): Promise<{ ok: true }> {
+    const res = await this.prisma.mailMessage.updateMany({
+      where: { id, userId, deletedAt: { not: null } },
+      data: { deletedAt: null },
     });
+    if (!res.count) throw notFound('mail message not found');
+    return { ok: true };
+  }
+
+  /** Удалить письмо навсегда: только из корзины, вместе с вложениями и сырым .eml. */
+  async purgeMessage(userId: string, id: string): Promise<{ ok: true; purged: number }> {
+    const purged = await this.hardDelete(userId, [id]);
+    if (!purged) throw notFound('mail message not found');
+    return { ok: true, purged };
+  }
+
+  /** Очистить корзину почты целиком (или только старше N дней — для уборки по расписанию). */
+  async purgeTrash(userId: string, olderThanDays?: number): Promise<{ purged: number }> {
+    const days = Number.isFinite(olderThanDays) ? Math.max(0, Number(olderThanDays)) : undefined;
+    const cutoff = days === undefined ? undefined : new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const rows = await this.prisma.mailMessage.findMany({
+      where: { userId, deletedAt: { not: null }, ...(cutoff ? { deletedAt: { lt: cutoff } } : {}) },
+      select: { id: true },
+    });
+    return { purged: await this.hardDelete(userId, rows.map((r) => r.id)) };
   }
 
   /**
-   * Вернуть письмо из корзины вместе с вложениями.
-   *
-   * Вложения возвращаем только те, что ушли вместе с письмом (в пределах секунды от его
-   * отметки): если файл удалили раньше отдельно, воскрешать его нельзя — иначе из корзины
-   * возвращалось бы то, чего пользователь не просил.
+   * Физическое удаление писем: сами письма, их вложения (записи дерева в скрытой зоне MAIL)
+   * и осиротевшие объекты S3 (сырьё .eml и содержимое вложений, если на них больше нет ссылок).
+   * Только письма из корзины: живое письмо этим путём не удалить.
    */
-  async restoreMessage(userId: string, id: string): Promise<{ ok: true }> {
-    const message = await this.prisma.mailMessage.findFirst({
-      where: { id, userId, deletedAt: { not: null } },
-      select: { id: true, deletedAt: true, attachments: { select: { entryId: true } } },
+  private async hardDelete(userId: string, ids: string[]): Promise<number> {
+    if (!ids.length) return 0;
+    const rows = await this.prisma.mailMessage.findMany({
+      where: { id: { in: ids }, userId, deletedAt: { not: null } },
+      select: {
+        id: true,
+        rawAsset: { select: { id: true, sha256: true } },
+        attachments: {
+          select: { entry: { select: { id: true, asset: { select: { id: true, sha256: true } } } } },
+        },
+      },
     });
-    if (!message) throw notFound('mail message not found');
-    const cutoff = new Date((message.deletedAt as Date).getTime() - 1000);
-    const entryIds = message.attachments.map((a) => a.entryId);
-    await this.prisma.$transaction(async (tx) => {
-      await tx.mailMessage.update({ where: { id }, data: { deletedAt: null } });
-      if (entryIds.length) {
-        await tx.fileEntry.updateMany({
-          where: { id: { in: entryIds }, deletedAt: { gte: cutoff } },
-          data: { deletedAt: null },
+    if (!rows.length) return 0;
+    const entryIds = rows.flatMap((r) => r.attachments.map((a) => a.entry.id));
+    const assets = rows.flatMap((r) => [r.rawAsset, ...r.attachments.map((a) => a.entry.asset)]);
+    await this.prisma.$transaction(
+      async (tx) => {
+        if (entryIds.length) await tx.fileEntry.deleteMany({ where: { id: { in: entryIds } } });
+        await tx.mailMessage.deleteMany({ where: { id: { in: rows.map((r) => r.id) } } });
+      },
+      { timeout: 120_000, maxWait: 15_000 },
+    );
+    // Объекты S3 чистим после коммита и только у реально осиротевших ассетов: на тот же sha
+    // может ссылаться обычный файл пользователя (дедуп), и его байты трогать нельзя.
+    for (const a of assets) {
+      const res = await this.prisma.asset.deleteMany({ where: { id: a.id, entries: { none: {} }, mailRaw: { none: {} } } });
+      if (res.count > 0) {
+        await this.s3.deleteObjects([S3Service.assetKey(a.sha256)]).catch((e: Error) => {
+          this.logger.warn(`S3 не удалил объект письма ${a.sha256}: ${e.message}`);
         });
       }
-    });
-    return { ok: true };
+    }
+    return rows.length;
   }
 }
 

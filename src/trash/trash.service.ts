@@ -69,35 +69,9 @@ export class TrashService {
         folderId: e.folder.id,
       }));
 
-    // Удалённые письма: своя группа в корзине — у них ни папки, ни файла, а тема и отправитель
-    // понятнее любого имени.
-    const deletedMessages = await this.prisma.mailMessage.findMany({
-      where: { userId, deletedAt: { not: null } },
-      select: {
-        id: true,
-        subject: true,
-        fromName: true,
-        fromAddr: true,
-        box: true,
-        sortAt: true,
-        deletedAt: true,
-        size: true,
-      },
-      orderBy: { deletedAt: 'desc' },
-      take: 1000,
-    });
-    const messages = deletedMessages.map((m) => ({
-      id: m.id,
-      kind: 'message' as const,
-      subject: m.subject,
-      from: m.fromName || m.fromAddr || '',
-      box: m.box,
-      sortAt: m.sortAt,
-      deletedAt: m.deletedAt,
-      size: m.size,
-    }));
-
-    return { folders, entries, messages };
+    // Письма тут не показываем: у почты своя отдельная корзина (раздел «Почта» → «Корзина»),
+    // и удаление письма в файловую корзину больше ничего не кладёт.
+    return { folders, entries };
   }
 
   async restore(type: 'folder' | 'file', id: string, userId: string) {
@@ -132,6 +106,9 @@ export class TrashService {
       where: {
         deletedAt: { not: null },
         folderId: { in: tree },
+        // Вложения писем (зона MAIL) живут своей корзиной в разделе «Почта» и сюда не попадают:
+        // иначе очистка файловой корзины ломала бы письма, чьи вложения ещё можно восстановить.
+        zone: { notIn: [...HIDDEN_ZONES] },
         ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
       },
       select: {
@@ -151,15 +128,6 @@ export class TrashService {
       },
       select: { id: true, name: true, parentId: true, zone: true },
     });
-    const deletedMessages = await this.prisma.mailMessage.findMany({
-      where: {
-        userId,
-        deletedAt: { not: null },
-        ...(cutoff ? { deletedAt: { lt: cutoff } } : {}),
-      },
-      select: { id: true },
-    });
-    const messageIds = deletedMessages.map((m) => m.id);
     const entryIds = deletedEntries.map((e) => e.id);
     const folderIds = deletedFolders.map((f) => f.id);
 
@@ -201,11 +169,6 @@ export class TrashService {
         }
         // onDelete: Cascade убирает и все FileEntry внутри удалённых папок
         if (folderIds.length) await tx.folder.deleteMany({ where: { id: { in: folderIds } } });
-        // Письма: MailAttachment уходит каскадом, а строки вложений уже удалены выше —
-        // как раз потому, что письмо мягко удаляется вместе с ними.
-        for (const chunk of chunksOf(messageIds, 1000)) {
-          await tx.mailMessage.deleteMany({ where: { id: { in: chunk } } });
-        }
       },
       { timeout: 120_000, maxWait: 15_000 },
     );
@@ -265,7 +228,6 @@ export class TrashService {
     await this.audit.log('trash.purge', {
       entries: entryIds.length,
       folders: folderIds.length,
-      messages: messageIds.length,
       assets: purgedAssets,
       olderThanDays: days ?? null,
     });
@@ -273,7 +235,6 @@ export class TrashService {
     return {
       purgedEntries: entryIds.length,
       purgedFolders: folderIds.length,
-      purgedMessages: messageIds.length,
       purgedAssets,
       ...(retryAssets ? { retryAssets } : {}),
     };

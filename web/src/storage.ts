@@ -19,7 +19,7 @@ export type UiState = {
    * «сырых» пикселей.
    */
   mail?: {
-    box?: 'inbox' | 'sent';
+    box?: 'inbox' | 'sent' | 'trash';
     /** Выбранный ящик в ленте (id аккаунта); пусто — все вместе. */
     account?: string;
     index?: number;

@@ -31,17 +31,8 @@ export interface ShareInfo {
   hasPassword: boolean; expiresAt: string | null; createdAt: string;
 }
 export interface TrashItem { id: string; name: string; deletedAt: string; kind: 'folder' | 'file'; size?: number }
-export interface TrashMessage {
-  id: string;
-  kind: 'message';
-  subject: string | null;
-  from: string;
-  box: string;
-  sortAt: string;
-  deletedAt: string;
-  size: number;
-}
-export interface TrashView { folders: TrashItem[]; entries: TrashItem[]; messages: TrashMessage[] }
+// Писем в общей корзине больше нет: у почты своя отдельная корзина.
+export interface TrashView { folders: TrashItem[]; entries: TrashItem[] }
 
 // ===== auth =====
 export interface UserInfo {
@@ -679,7 +670,7 @@ export const mailAccounts = () => request<MailAccountRow[]>('/mail/accounts');
 export const mailSync = () => request<{ ok: boolean; started: boolean }>('/mail/sync', { method: 'POST' });
 export const mailStatus = () => request<MailStatusView>('/mail/status');
 
-export type MailBoxId = 'inbox' | 'sent';
+export type MailBoxId = 'inbox' | 'sent' | 'trash';
 
 export interface MailListItem {
   id: string;
@@ -769,3 +760,9 @@ export const mailReplyContext = (id: string, mode: 'reply' | 'replyAll' | 'forwa
   request<MailReplyContext>(`/mail/messages/${id}/reply-context?mode=${mode}`);
 export const mailRestore = (id: string) =>
   request<{ ok: boolean }>(`/mail/messages/${id}/restore`, { method: 'POST', body: JSON.stringify({}) });
+/** Удалить письмо из корзины навсегда. */
+export const mailPurgeMessage = (id: string) =>
+  request<{ ok: boolean }>(`/mail/messages/${id}/purge`, { method: 'POST', body: JSON.stringify({}) });
+/** Очистить корзину почты целиком. */
+export const mailPurgeTrash = () =>
+  request<{ purged: number }>('/mail/trash/purge', { method: 'POST', body: JSON.stringify({}) });

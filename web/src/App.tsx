@@ -1428,25 +1428,21 @@ function TrashPage() {
   const [err, setErr] = useState('');
   const load = () => api.trash().then(setView).catch((e) => setErr((e as Error).message));
   useEffect(() => { void load(); }, []);
-  const restore = async (kind: 'folder' | 'file' | 'message', id: string) => {
+  const restore = async (kind: 'folder' | 'file', id: string) => {
     try {
-      // Письма возвращает почтовый модуль: у них своя связь с вложениями, и восстанавливать
-      // их «как файл» нельзя — вернулось бы письмо без вложений.
-      if (kind === 'message') await api.mailRestore(id);
-      else await api.restoreItem(kind, id);
+      await api.restoreItem(kind, id);
       await load();
     } catch (e) { setErr((e as Error).message); }
   };
   const purge = async () => {
-    if (!confirm('Очистить корзину полностью? Удалённые письма, файлы и превью будут стёрты безвозвратно.')) return;
+    if (!confirm('Очистить корзину полностью? Удалённые файлы и превью будут стёрты безвозвратно.')) return;
     try { await api.purgeTrash(); await load(); } catch (e) { setErr((e as Error).message); }
   };
   const items = [
     ...(view?.folders || []).map((t) => ({ ...t, kind: 'folder' as const })),
     ...(view?.entries || []).map((t) => ({ ...t, kind: 'file' as const })),
   ];
-  const messages = view?.messages || [];
-  const empty = !items.length && !messages.length;
+  const empty = !items.length;
   return (
     <div>
       <div className="row">
@@ -1465,26 +1461,6 @@ function TrashPage() {
         ))}
         {empty && <div className="copy">Корзина пуста</div>}
       </div>
-      {/* Письма — отдельной группой: у них нет ни папки, ни файла, а тема и отправитель
-          понятнее любого имени. Вложения приходят вместе с письмом, отдельными строками
-          они тут не показываются. */}
-      {messages.length > 0 && (
-        <div className="panel">
-          <div className="row"><strong>Письма</strong><span className="meta">{messages.length}</span></div>
-          {messages.map((m) => (
-            <div className="item" key={m.id}>
-              <span className="icon"><MailIcon /></span>
-              <span className="fname">{m.subject || '(без темы)'}</span>
-              <span className="meta">
-                {[m.from, m.box === 'sent' ? 'исходящее' : 'входящее', new Date(m.sortAt).toLocaleDateString('ru-RU')]
-                  .filter(Boolean)
-                  .join(' · ')}
-              </span>
-              <button className="btn ghost" onClick={() => restore('message', m.id)}>восстановить</button>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

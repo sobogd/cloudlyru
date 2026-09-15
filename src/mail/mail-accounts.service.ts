@@ -13,7 +13,9 @@ import { notFound } from '../common/errors';
  */
 
 export type MailKind = 'gmail' | 'icloud' | 'imap' | 'smtp';
-export type MailBox = 'inbox' | 'sent';
+// 'trash' — отдельная корзина почты: письмо лежит в ней, пока не удалено навсегда.
+// Это не физическая папка источника, а состояние deletedAt у записи.
+export type MailBox = 'inbox' | 'sent' | 'trash';
 
 /**
  * Папка источника: откуда читаем письма и в какую из наших двух корзин их класть.
