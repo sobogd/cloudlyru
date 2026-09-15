@@ -19,17 +19,35 @@ import {
 import { ZONE_PHOTOS } from '../common/zones';
 import { CONVERT_MAX_BYTES, env } from '../config/env';
 
-const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 1 ГБ)
+const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 3 ГБ)
+/** Кодек полноэкранного превью видео (см. videoEncodeArgs). */
+const VIDEO_CODEC = env.CONVERT_VIDEO_CODEC;
+/** Preset и CRF превью. Шкалы у кодеков разные: 26 у H.264 ≈ 36 у AV1 по видимому качеству. */
+const X264_PRESET = 'veryfast';
+const X264_CRF = 26;
+const AV1_CRF = 36;
+/** Выше этого fps превью не нужно: 50/60/120 к/с — это лишние кадры, то есть лишняя работа. */
+const PREVIEW_MAX_FPS = 30;
+/**
+ * HDR → SDR. 8-битный H.264 с BT.2020/PQ-источника выглядит выцветшим, поэтому кадр
+ * переводится в линейный свет, тонапмапится (hable) и возвращается в BT.709.
+ * Фильтры (zscale/tonemap) приходят с libzimg — проверено на проде: в сборке есть.
+ */
+const TONEMAP_SDR =
+  'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
+
 /**
  * Сколько ФОТО-задач считать одновременно. Фото упираются в ядра (AVIF-энкод и heif-convert),
  * поэтому на 2 ядрах смысл есть в 2 потоках, на 4 — в 3-4. Видео и PDF всегда идут по одному:
- * AV1-энкод забирает все ядра, и второй такой процесс лишь замедлил бы оба.
+ * видео занимает ядра целиком (H.264 упирается в декодер, AV1-ветка — в сам энкодер), и второй
+ * такой процесс лишь замедлил бы оба.
  */
 const PHOTO_PARALLEL = Math.min(Math.max(Number(env.CONVERT_PHOTO_PARALLEL ?? 1) || 1, 1), 8);
 /**
- * Пускать видео параллельно с фото. По умолчанию нет, и вот почему: AV1-энкод занимает все
- * ядра, и фото рядом с ним идут в разы медленнее (замер на проде: 3,4 с против 19,4 с).
- * Флаг имеет смысл на машине с большим числом ядер, где фото-слоты не съедают всё.
+ * Пускать видео параллельно с фото. По умолчанию нет: видео занимает ядра целиком (H.264
+ * упирается в декодер исходника, AV1-ветка — в сам энкодер), и фото рядом с ним идут в разы
+ * медленнее (замер на libaom: 3,4 с против 19,4 с). Флаг имеет смысл на машине с большим
+ * числом ядер, где фото-слоты не съедают всё.
  */
 const VIDEO_ALONGSIDE_PHOTOS = (env.CONVERT_VIDEO_ALONGSIDE_PHOTOS ?? 'false') === 'true';
 const MAX_ATTEMPTS = 3;
@@ -74,6 +92,10 @@ interface SourceProbe {
   colorSpace?: string;
   colorRange?: string;
   channels?: number;
+  /** Частота кадров источника: выше 30 в превью не нужна (см. PREVIEW_MAX_FPS). */
+  fps?: number;
+  /** Кодек аудиодорожки: AAC из исходника копируем, не перекодируя. */
+  audioCodec?: string;
   /** Теги контейнера: com.apple.quicktime.* (GPS, камера, дата) и creation_time. */
   tags?: Record<string, string>;
   /** 10 бит и/или HDR-трансфер: 8-битный выход потеряет точность (полосы/пересветы). */
@@ -106,8 +128,9 @@ interface JobRow {
 }
 
 /**
- * Группы задач в очереди. Фото и PDF дешёвые (секунды-минуты), видео — часы AV1 на все ядра,
- * поэтому у него отдельное правило: оно не идёт, пока в очереди есть фото.
+ * Группы задач в очереди. Фото и PDF дешёвые (секунды-минуты), видео — минуты и больше
+ * (4K-источник упирается в декодер, AV1-ветка — в энкодер), поэтому у него отдельное
+ * правило: оно не идёт, пока в очереди есть фото.
  */
 type JobGroup = 'photo' | 'pdf' | 'video';
 
@@ -423,7 +446,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         const pdf = await this.next('pdf');
         if (pdf) void this.process(pdf).catch((e) => this.logger.error(`process ${pdf.id}: ${(e as Error).message}`));
       }
-      // Видео — отдельное правило: AV1-энкод занимает все ядра, поэтому оно стартует только
+      // Видео — отдельное правило: энкод занимает ядра целиком, поэтому оно стартует только
       // когда фото-очередь разобрана. Иначе одно длинное видео растягивает превью всех фото.
       if (this.countActive('video') === 0 && (VIDEO_ALONGSIDE_PHOTOS || (await this.pendingPhotos()) === 0)) {
         const video = await this.next('video');
@@ -473,8 +496,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         if (at <= now) this.retryAfter.delete(id);
         else delayed.push(id);
       }
-      // Приоритет по виду задачи: фото (секунды на кадр) обгоняют видео (часы AV1), иначе одно
-      // длинное видео держало бы превью всех фото, залитых после него, — а их ждёт телефон.
+      // Приоритет по виду задачи: фото (секунды на кадр) обгоняют видео (минуты и больше),
+      // иначе одно длинное видео держало бы превью всех фото, залитых после него, — а их ждёт телефон.
       const baseWhere = { state: 'pending', ...(delayed.length ? { id: { notIn: delayed } } : {}) };
       const row = await tx.job.findFirst({
         where: { ...baseWhere, kind: group },
@@ -673,7 +696,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return animated ? { keepRaw: true } : {};
   }
 
-  // ============ Видео → постер 50×50 (список) + 1080 AV1 (полный экран) ============  // Полноразмерный AV1-мастер не собирается: оригинал и есть мастер. Это заодно снимает
+  // ============ Видео → постер 50×50 (список) + 1080 H.264/AV1 (полный экран) ============
+  // Полноразмерный мастер не собирается: оригинал и есть мастер. Это заодно снимает
   // проблему памяти — энкодер больше не держит 4K-кадры, из-за которых libaom падал
   // под ulimit -v ("Failed to initialize encoder: Memory allocation error").
 
@@ -702,10 +726,15 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
-    // 2) превью 1080 (AV1 libaom): 5 → 99%.
+    // 2) превью 1080: 5 → 99%.
     // Апскейл не делаем: ролики ниже 1080 остаются в своём разрешении (scale с ростом
     // только раздул бы битрейт без пользы).
-    const vf = src.height && src.height <= 1080 ? [] : ['-vf', 'scale=-2:1080'];
+    const filters: string[] = [];
+    if (!(src.height && src.height <= 1080)) filters.push('scale=-2:1080');
+    // HDR в 8-битном H.264 без тонапмапа выглядит выцветшим (AV1-ветка держит 10 бит и теги).
+    if (VIDEO_CODEC === 'h264' && src.hdr) filters.push(TONEMAP_SDR);
+    if (src.fps && src.fps > PREVIEW_MAX_FPS) filters.push(`fps=${PREVIEW_MAX_FPS}`);
+    const vf = filters.length ? ['-vf', filters.join(',')] : [];
     // -map_metadata 0 + use_metadata_tags: без них у превью creation_time = 0, а Apple
     // Keys (GPS, Make/Model, ContentIdentifier) не переносятся вообще — проверено на проде.
     try {
@@ -713,8 +742,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         'ffmpeg', '-y', '-i', rawPath,
         '-map_metadata', '0',
         '-map', '0:v:0', ...vf,
-        ...this.videoEncodeArgs(src, 36, true),
-        '-map', '0:a?', '-c:a', 'aac', '-b:a', this.audioBitrate(src, '128k'),
+        ...this.videoEncodeArgs(src),
+        '-map', '0:a?', ...this.audioArgs(src),
         '-movflags', '+faststart+use_metadata_tags',
         previewPath,
       ], 6 * 60 * 60 * 1000);
@@ -835,24 +864,49 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Аргументы кодирования AV1.
-   * allow10bit: для мастера сохраняем 10 бит и пробрасываем color-теги, если источник
-   * HDR/10-битный — иначе -pix_fmt yuv420p обрезает точность (полосы) и теряет HDR.
-   * Превью всегда 8-битное: так проход гарантированно проходит по памяти.
+   * Аргументы кодирования превью.
+   *
+   * По умолчанию H.264 (libx264 veryfast). Причина — замер на проде: libaom-av1 в good-режиме
+   * (`-cpu-used 8`) давал около кадра в секунду, и 18-секундный 4K50-ролик кодировался
+   * 12 минут; libx264 на нём же упирается в декодер исходника и заканчивает за полминуты
+   * (8.7 с на 5 с источника против ~200 с). Плюс H.264 играется везде, включая Safari и iOS
+   * без AV1, поэтому фолбэк `video-preview?src=original` нужен реже. Цена — файл примерно
+   * вдвое тяжелее AV1, для превью это не критично.
+   *
+   * CONVERT_VIDEO_CODEC=av1 возвращает AV1: там тот же libaom, но в realtime-режиме
+   * (замер: 15.7 с против ~200 с на том же ролике, то есть в разы быстрее good).
+   * Если на сервере появится сборка ffmpeg с libsvtav1 — он ещё быстрее, менять здесь строку.
+   *
+   * 10 бит и color-теги сохраняются только в AV1-ветке и только для HDR/10-битного источника:
+   * `-pix_fmt yuv420p` обрезал бы точность. H.264 в этой сборке 10 бит не умеет, поэтому
+   * HDR-источник там проходит через тонапмап (см. TONEMAP_SDR).
    */
-  private videoEncodeArgs(src: SourceProbe, crf: number, allow10bit: boolean): string[] {
-    const args = ['-c:v', 'libaom-av1', '-crf', String(crf), '-cpu-used', '8', '-row-mt', '1'];
-    if (allow10bit && src.hdr) {
-      args.push('-pix_fmt', 'yuv420p10le');
-      const c = (v?: string) => v && v !== 'unknown' && v !== 'unspecified';
-      if (c(src.colorPrimaries)) args.push('-color_primaries', src.colorPrimaries!);
-      if (c(src.colorTrc)) args.push('-color_trc', src.colorTrc!);
-      if (c(src.colorSpace)) args.push('-colorspace', src.colorSpace!);
-      if (c(src.colorRange)) args.push('-color_range', src.colorRange!);
-    } else {
-      args.push('-pix_fmt', 'yuv420p');
+  private videoEncodeArgs(src: SourceProbe): string[] {
+    if (VIDEO_CODEC === 'av1') {
+      const args = ['-c:v', 'libaom-av1', '-usage', 'realtime', '-crf', String(AV1_CRF), '-cpu-used', '8', '-row-mt', '1'];
+      if (src.hdr) {
+        args.push('-pix_fmt', 'yuv420p10le');
+        const c = (v?: string) => v && v !== 'unknown' && v !== 'unspecified';
+        if (c(src.colorPrimaries)) args.push('-color_primaries', src.colorPrimaries!);
+        if (c(src.colorTrc)) args.push('-color_trc', src.colorTrc!);
+        if (c(src.colorSpace)) args.push('-colorspace', src.colorSpace!);
+        if (c(src.colorRange)) args.push('-color_range', src.colorRange!);
+      } else {
+        args.push('-pix_fmt', 'yuv420p');
+      }
+      return args;
     }
-    return args;
+    return ['-c:v', 'libx264', '-preset', X264_PRESET, '-crf', String(X264_CRF), '-pix_fmt', 'yuv420p'];
+  }
+
+  /**
+   * Аудио превью: AAC из исходника копируем как есть — перекодирование ничего не добавляет,
+   * кроме потери качества и работы. Остальное (opus, mp3, pcm) идёт в AAC; битрейт зависит
+   * от каналов: 128k на шести каналах звучит плохо.
+   */
+  private audioArgs(src: SourceProbe): string[] {
+    if (src.audioCodec === 'aac') return ['-c:a', 'copy'];
+    return ['-c:a', 'aac', '-b:a', this.audioBitrate(src, '128k')];
   }
 
   /** AAC на 6 каналах при 128k звучит плохо — для многоканальных поднимаем битрейт. */
@@ -872,7 +926,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
           '-v', 'error',
           '-show_entries', 'format=duration',
           '-show_entries', 'format_tags',
-          '-show_entries', 'stream=codec_type,pix_fmt,color_primaries,color_transfer,color_space,color_range,channels,width,height',
+          '-show_entries', 'stream=codec_type,codec_name,pix_fmt,color_primaries,color_transfer,color_space,color_range,channels,width,height,r_frame_rate',
           '-of', 'json',
           file,
         ],
@@ -891,13 +945,20 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       if (v) {
         res.width = Number(v.width) || undefined;
         res.height = Number(v.height) || undefined;
+        // r_frame_rate приходит дробью ("50/1", "30000/1001") — по ней капнем fps превью
+        const rate = typeof v.r_frame_rate === 'string' ? v.r_frame_rate.split('/').map(Number) : [];
+        const fps = rate.length === 2 && rate[0] > 0 && rate[1] > 0 ? rate[0] / rate[1] : NaN;
+        if (Number.isFinite(fps)) res.fps = fps;
         res.pixFmt = typeof v.pix_fmt === 'string' ? v.pix_fmt : undefined;
         res.colorPrimaries = typeof v.color_primaries === 'string' ? v.color_primaries : undefined;
         res.colorTrc = typeof v.color_transfer === 'string' ? v.color_transfer : undefined;
         res.colorSpace = typeof v.color_space === 'string' ? v.color_space : undefined;
         res.colorRange = typeof v.color_range === 'string' ? v.color_range : undefined;
       }
-      if (a) res.channels = Number(a.channels) || undefined;
+      if (a) {
+        res.channels = Number(a.channels) || undefined;
+        res.audioCodec = typeof a.codec_name === 'string' ? a.codec_name : undefined;
+      }
       res.hdr =
         /10le|10be|p010/i.test(res.pixFmt ?? '') ||
         /smpte2084|arib-std-b67/i.test(res.colorTrc ?? '') ||

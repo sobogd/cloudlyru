@@ -558,7 +558,7 @@ export interface AlbumView extends AlbumInfo { items: Array<{ entryId: string; n
 export const previewUrl = (sha: string, w = 512) => `/api/v1/previews/${sha}?w=${w}`;
 /** Страница PDF: превью, отрисованное сервером (нумерация с единицы). */
 export const pdfPageUrl = (sha: string, page: number) => `/api/v1/previews/${sha}?page=${page}`;
-/** Превью видео (1080, AV1); original=true — сам файл: фолбэк для браузеров без AV1. */
+/** Превью видео (1080, H.264; у старых ассетов — AV1); original=true — сам файл: фолбэк для браузеров без AV1. */
 export const videoPreviewUrl = (sha: string, original = false) =>
   `/api/v1/video-preview/${sha}${original ? '?src=original' : ''}`;
 /** Миниатюра 50×50 для списка файлов (по id записи, sha256 в списке нет). */

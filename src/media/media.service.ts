@@ -171,7 +171,7 @@ export class MediaService {
   static videoPosterKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-poster.webp');
   }
-  /** Полноэкранное превью видео (1080, AV1). */
+  /** Полноэкранное превью видео (1080; H.264, у старых ассетов — AV1). */
   static video1080Key(sha256: string): string {
     return MediaService.viewKey(sha256, '-1080.mp4');
   }

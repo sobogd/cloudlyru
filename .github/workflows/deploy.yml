@@ -78,10 +78,10 @@ jobs:
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
           S3_FILES_SECRET_KEY: ${{ secrets.S3_FILES_SECRET_KEY }}
-          # Необязательный секрет: сколько фото конвертировать параллельно. `|| '2'` важен:
+          # Необязательный секрет: сколько фото конвертировать параллельно. `|| '3'` важен:
           # без него отсутствующий секрет экспортировал пустое значение, и оно перебивало
           # то, что записано в .env (dotenv не перезаписывает уже заданные переменные).
-          CONVERT_PHOTO_PARALLEL: ${{ secrets.CONVERT_PHOTO_PARALLEL || '2' }}
+          CONVERT_PHOTO_PARALLEL: ${{ secrets.CONVERT_PHOTO_PARALLEL || '3' }}
           # Почта. Ключ шифрования паролей аккаунтов — обязательный секрет репозитория;
           # без него раздел работает, но аккаунт добавить нельзя (форма скажет об этом).
           MAIL_SECRET_KEY: ${{ secrets.MAIL_SECRET_KEY }}
@@ -147,11 +147,14 @@ jobs:
             CONVERT_ENABLED=true
             # Оригинал — мастер: выключение молча удаляло бы сырьё после конвертации
             KEEP_ORIGINALS=true
-            CONVERT_MEM_MB=1536
+            CONVERT_MEM_MB=3072
+            # Кодек превью видео. h264 — libx264 veryfast: на 4 ядрах он упирается в декодер
+            # исходника и заканчивает ролик за секунды там, где libaom-av1 считал его минутами.
+            CONVERT_VIDEO_CODEC=h264
             # Сколько фото конвертировать параллельно: фото упираются в ядра (AVIF-энкод и
             # heif-convert), видео и PDF идут по одному независимо от значения. Значение —
-            # из секрета репозитория, если он задан, иначе 2 (сервер двухъядерный).
-            CONVERT_PHOTO_PARALLEL=${CONVERT_PHOTO_PARALLEL:-2}
+            # из секрета репозитория, если он задан, иначе 3 (на сервере 4 vCPU).
+            CONVERT_PHOTO_PARALLEL=${CONVERT_PHOTO_PARALLEL:-3}
 
             # ===== Почта =====
             # Ключ шифрования паролей почтовых аккаунтов (AES-256-GCM). Сами app-пароли

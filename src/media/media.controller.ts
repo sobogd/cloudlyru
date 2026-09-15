@@ -100,7 +100,7 @@ export class MediaController {
     return sent ? undefined : res.status(404).end();
   }
 
-  /** Превью видео для полного экрана: 1080 (AV1), фолбэк — легаси 720 или сам оригинал. */
+  /** Превью видео для полного экрана: 1080 (H.264, у старых ассетов — AV1), фолбэк — легаси 720 или сам оригинал. */
   @Get('video-preview/:sha')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
@@ -113,9 +113,10 @@ export class MediaController {
   ) {
     const asset = await this.ownAsset(sha, user);
     if (!asset) return res.status(404).end();
-    // ?src=original — фолбэк для браузеров без AV1 (Safari и iOS умеют его лишь частично,
-    // с 17.0 и не на всяком железе). Превью 1080 собирается в AV1, и без этого параметра
-    // такой браузер остался бы без картинки вовсе: производное есть, но не декодируется.
+    // ?src=original — фолбэк для браузеров, которым превью не по зубам: собирается оно сейчас
+    // в H.264 (играется везде), но у ассетов, пересобранных до этого, в S3 лежит AV1, а Safari
+    // и iOS умеют его лишь с 17.0 и не на всяком железе. Без этого параметра такой браузер
+    // остался бы без картинки вовсе: производное есть, но не декодируется.
     if (srcRaw === 'original') {
       if (!String(asset.mime).startsWith('video/')) return res.status(404).end();
       return sendObjectOr404(req, res, this.s3, S3Service.assetKey(sha), {
