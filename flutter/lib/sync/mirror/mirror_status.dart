@@ -68,7 +68,7 @@ class MirrorStatus {
   /// Почему удаления приостановлены: «пропало слишком много» или «папка не читается».
   final String? blockedReason;
 
-  bool get busy => phase != MirrorPhase.idle && phase != MirrorPhase.paused;
+  bool get busy => phase != MirrorPhase.idle;
 
   /// Доля выгруженного: от того, что лежит в выбранных папках.
   int get percent {
@@ -136,8 +136,7 @@ enum MirrorPhase {
   scan('обхожу папки'),
   cloud('облако'),
   upload('выгружаю'),
-  delete('убираю в облаке'),
-  paused('выключено');
+  delete('убираю в облаке');
 
   const MirrorPhase(this.label);
 

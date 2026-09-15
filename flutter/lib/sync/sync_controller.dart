@@ -92,9 +92,6 @@ class SyncController extends ChangeNotifier {
 
   bool get ready => _prefs != null;
 
-  bool get paused => _paused;
-  bool _paused = false;
-
   /// Нужно ли просить доступ ко всем файлам: без него не видно ни дерева, ни содержимого.
   bool get needsAccess => access == SyncAccess.denied;
 
@@ -125,7 +122,10 @@ class SyncController extends ChangeNotifier {
       // не открылась база, и вместе с ней «не поставилось» наблюдение и «не запускалось» зеркало
       queueStore = await _openQueueStore();
       mirrorStore = await _openMirrorStore();
-      _paused = await mirrorStore?.meta(MirrorStore.keyPaused) == '1';
+      // Выключателя синхронизации нет: она всегда включена — в этом её смысл. Флаг в базе
+      // мог остаться от прежних сборок, поэтому снимаем его, иначе синхронизация молчала бы
+      // без всякой возможности её вернуть.
+      await mirrorStore?.clearMeta(MirrorStore.keyPaused);
 
       await _bindToken(sessionApi, login, epoch);
       // Проход зеркала, когда приложения нет на экране: задание живёт в системе, а не в этом
@@ -154,7 +154,6 @@ class SyncController extends ChangeNotifier {
         uploads = UploadRunner(_api!, queue);
         final liveMode = MirrorLive(store!, engine!, _status, _watcher, native);
         liveMode.hasToken = () => _api != null;
-        liveMode.paused = () => _paused;
         liveMode.foreground = () => foreground;
         liveMode.bindWatcher();
         liveMode.start();
@@ -162,12 +161,9 @@ class SyncController extends ChangeNotifier {
       }
 
       if (_api != null) await _rememberSystemFolders(_api!);
-      _status.update(
-        (s) => s.copyWith(phase: _paused ? MirrorPhase.paused : s.phase),
-      );
-      await startWatching();
-      await refreshQueue();
       notifyListeners();
+      // Синхронизация не должна ждать, пока её попросят: проверяем себя сразу после старта
+      unawaited(checkAndResume());
     } catch (e) {
       debugPrint('cloudly-sync: старт синхронизации не удался: $e');
       activity = 'синхронизация недоступна: $e';
@@ -263,7 +259,6 @@ class SyncController extends ChangeNotifier {
         native,
       );
       liveMode.hasToken = () => _api != null;
-      liveMode.paused = () => _paused;
       liveMode.foreground = () => foreground;
       liveMode.bindWatcher();
       liveMode.start();
@@ -424,6 +419,73 @@ class SyncController extends ChangeNotifier {
   /// Число папок, взятых под наблюдение: 0 — система не дала, работает только периодика.
   int get watchedDirs => _watcher.watchedDirs;
 
+  /// Сколько ждём, прежде чем считать, что синхронизация встала. Проход зеркала ограничен
+  /// бюджетом времени, и если он не закончился сам, его надо догнать.
+  static const int _stalePassMs = 10 * 60 * 1000;
+
+  /// Сколько файлов очереди выгружаем за одну проверку: остальное — следующим заходом.
+  static const int _drainPerCheck = 20;
+
+  bool _resuming = false;
+
+  /// Проверить, что синхронизация идёт, и догнать её, если встала.
+  ///
+  /// Встать она может по-разному: кончился бюджет времени (выгрузка гигабайтов идёт часами),
+  /// пропала сеть, система прибила фоновое задание, отвалилось наблюдение за папками. Кнопки
+  /// «продолжить» в разделе нет намеренно, поэтому проверка делается сама — при старте
+  /// приложения и при каждом открытии раздела синхронизации.
+  Future<void> checkAndResume() async {
+    if (_resuming) return;
+    _resuming = true;
+    activity = 'проверяю, не встала ли синхронизация…';
+    notifyListeners();
+    try {
+      if (_api == null && !await ensureReady()) return;
+      await refreshQueue();
+      // наблюдение могло не встать при старте или отвалиться после перезагрузки системы
+      await startWatching();
+
+      final status = mirrorStatus;
+      final hasFolders = (selection?.paths(Section.files).isNotEmpty ?? false);
+      final finished = status.finishedAt;
+      final stale =
+          finished == 0 ||
+          DateTime.now().millisecondsSinceEpoch - finished > _stalePassMs;
+      if (hasFolders && !status.busy && (status.waitingFiles > 0 || stale)) {
+        await mirrorPass();
+      }
+      await _drainQueue();
+    } finally {
+      _resuming = false;
+      activity = null;
+      waiting = await queueStore?.waitingCount() ?? waiting;
+      notifyListeners();
+    }
+  }
+
+  /// Выгрузить ждущее из очереди — без кнопки. Очередь «Фото» наполняется сама, а кнопок
+  /// «начать» в разделе больше нет: если файл ждёт выгрузки, он должен уехать сам.
+  Future<void> _drainQueue() async {
+    final store = queueStore;
+    if (store == null || uploads == null) return;
+    // Каждую строку в этой проверке пробуем один раз: иначе упавший файл крутился бы вечно
+    final tried = <int>{};
+    for (var done = 0; done < _drainPerCheck; done++) {
+      QueueItem? next;
+      for (final item in await store.items()) {
+        if (tried.contains(item.id)) continue;
+        if (item.state == QueueState.pending ||
+            item.state == QueueState.failed) {
+          next = item;
+          break;
+        }
+      }
+      if (next == null) return;
+      tried.add(next.id);
+      await uploadItem(next.id);
+    }
+  }
+
   /// Наполнить очередь: пройти выбранные папки и поставить новое. Ничего не выгружает.
   Future<QueueBuildResult?> refreshQueue() async {
     final store = queueStore;
@@ -485,7 +547,7 @@ class SyncController extends ChangeNotifier {
   }
 
   /// Ручная сверка зеркала: работает и когда автоматика выключена.
-  Future<MirrorReport?> mirrorPass({bool manual = true}) async {
+  Future<MirrorReport?> mirrorPass() async {
     final e = engine;
     if (e == null) return null;
     // Сверить сейчас имеет смысл и после отказа выпустить токен: причина часто временная,
@@ -497,7 +559,6 @@ class SyncController extends ChangeNotifier {
     notifyListeners();
     try {
       return await e.pass(
-        manual: manual,
         onProgress: (m) {
           activity = m;
           notifyListeners();
@@ -517,22 +578,6 @@ class SyncController extends ChangeNotifier {
     if (store == null) return;
     await store.setMeta(MirrorStore.keyConfirmed, '1');
     await mirrorPass();
-  }
-
-  /// Включить или выключить автоматические проходы. Ручная сверка работает всегда.
-  Future<void> setPaused(bool value) async {
-    final store = mirrorStore;
-    if (store == null) return;
-    _paused = value;
-    await store.setMeta(MirrorStore.keyPaused, value ? '1' : '0');
-    _status.update(
-      (s) => s.copyWith(phase: value ? MirrorPhase.paused : MirrorPhase.idle),
-    );
-    if (!value) {
-      await startWatching();
-      unawaited(mirrorPass(manual: false));
-    }
-    notifyListeners();
   }
 
   /// Что удаления приостановлены и почему: «пропало слишком много» или «папка не читается».

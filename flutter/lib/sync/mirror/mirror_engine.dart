@@ -108,18 +108,13 @@ class MirrorEngine {
 
   /// @param budgetMs сколько можно работать за один проход. Фоновая работа ограничена системой,
   ///        а выгрузка гигабайтов идёт часами: остаток доедет следующим проходом.
-  /// @param manual ручная сверка из настроек: работает и когда автоматика выключена.
   Future<MirrorReport> pass({
     void Function(String)? onProgress,
     bool Function()? isCancelled,
     int budgetMs = defaultBudgetMs,
-    bool manual = false,
   }) async {
     final progress = onProgress ?? (String _) {};
     final cancelled = isCancelled ?? () => false;
-    if (!manual && await _store.meta(MirrorStore.keyPaused) == '1') {
-      return MirrorReport()..error = 'зеркало выключено';
-    }
     if (_busy) return MirrorReport()..error = 'проход уже идёт';
     _busy = true;
     try {
@@ -328,15 +323,22 @@ class MirrorEngine {
     // подтверждение массового удаления живёт ровно один проход: если проход до разбора
     // удалений не дошёл, флаг всё равно должен сгореть, иначе он сработает в следующем —
     // уже на другом наборе файлов
+    // Проход не докончен (бюджет времени или остановка): назначаем догон, иначе работа так и
+    // останется стоять до следующего события файловой системы или до задания системы. Кнопки
+    // «продолжить» в приложении нет намеренно — синхронизация обязана догонять себя сама.
+    if (report.stopped) {
+      await _store.setMeta(
+        MirrorStore.keyRetryAt,
+        '${DateTime.now().millisecondsSinceEpoch + 30000}',
+      );
+    }
     await _store.clearMeta(MirrorStore.keyConfirmed);
     await _store.setMeta(MirrorStore.keyReport, report.text());
     final inCloud = await _store.inCloud();
     final waiting = await _store.waitingTotals();
     _status.update(
       (s) => s.copyWith(
-        phase: s.phase == MirrorPhase.paused
-            ? MirrorPhase.paused
-            : MirrorPhase.idle,
+        phase: MirrorPhase.idle,
         clearCurrentName: true,
         currentSent: 0,
         currentTotal: 0,

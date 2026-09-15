@@ -46,9 +46,6 @@ class MirrorLive {
   /// Есть ли токен: без него опрашивать нечего и незачем.
   bool Function() hasToken = () => false;
 
-  /// Выключено ли зеркало пользователем: тогда ни опрос, ни проходы не запускаются.
-  bool Function() paused = () => false;
-
   /// Приложение на экране: тогда спрашиваем журнал часто, в фоне — редко.
   bool Function() foreground = () => true;
 
@@ -81,7 +78,7 @@ class MirrorLive {
     var next = foreground() ? pollMs : pollBackgroundMs;
     try {
       // «выключено» значит выключено: ни догона журнала, ни удалений из облака
-      if (paused() || !hasToken()) {
+      if (!hasToken()) {
         _schedule(next);
         return;
       }
@@ -121,7 +118,7 @@ class MirrorLive {
   /// Наблюдение за папками и проход по событию файловой системы.
   void bindWatcher() {
     _watcher.onPass = () {
-      if (paused() || !hasToken()) return;
+      if (!hasToken()) return;
       unawaited(_engine.pass(onProgress: onProgress));
     };
   }

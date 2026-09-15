@@ -85,11 +85,6 @@ Future<(bool, String)> _pass(bool Function() cancelled) async {
   final startedAt = DateTime.now().millisecondsSinceEpoch;
   try {
     mirrorStore = await MirrorStore.open();
-    // Автоматика выключена пользователем: ручная сверка из настроек при этом работает,
-    // а фон обязан молчать — иначе выключатель врал бы.
-    if (await mirrorStore.meta(MirrorStore.keyPaused) == '1') {
-      return (true, 'зеркало выключено: ничего не делаю');
-    }
     queueStore = await QueueStore.open();
 
     final selection = Selection(prefs);

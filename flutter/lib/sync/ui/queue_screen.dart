@@ -9,15 +9,18 @@ import '../../util/format.dart';
 import '../../util/widgets.dart';
 import '../data/queue_store.dart';
 import '../device/media_rules.dart';
+import '../mirror/mirror_status.dart';
 import '../queue/upload_runner.dart';
 import '../section.dart';
 import '../sync_controller.dart';
 
-/// Раздел «Очередь»: что нашлось нового и ждёт выгрузки.
+/// Раздел «Очередь»: что нашлось в выбранных папках и ждёт выгрузки, плюс короткая сводка
+/// о том, что синхронизатор делает прямо сейчас. Это единственный экран синхронизации.
 ///
-/// Запуск ручной и строго по одному файлу: пока идёт выгрузка, остальные кнопки неактивны.
-/// Автоматически ничего не уезжает — очередь только готовит работу, а решение остаётся
-/// за человеком (и за зеркалом, у которого свой проход).
+/// Кнопок «включить» и «сверить» здесь нет намеренно: зеркало работает само — и пока
+/// приложение открыто, и в фоне заданием системы. Ручным остаётся только запуск конкретного
+/// файла из очереди («Фото» выгружается по кнопке, как и раньше) и предохранитель от
+/// массового удаления: если движок его приостановил, подтверждение должно быть доступно.
 class QueueScreen extends ConsumerStatefulWidget {
   const QueueScreen({super.key});
 
@@ -30,8 +33,12 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
   Map<QueueState, int> _counts = const {};
   int _total = 0;
   bool _loading = true;
-  bool _rebuilding = false;
+  bool _checking = false;
   UploadProgress? _progress;
+
+  /// Сколько удалений в облаке движок приостановил и почему. Живёт в базе зеркала, поэтому
+  /// читается заново после каждого прохода, а не помнится с прошлого раза.
+  (int, String)? _blocked;
 
   SyncController get _sync => ref.read(syncControllerProvider);
 
@@ -39,6 +46,13 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
   void initState() {
     super.initState();
     unawaited(_reload());
+    unawaited(_refreshBlocked());
+    // При открытии раздела синхронизация проверяет себя сама: кнопок «сверить» и «включить»
+    // больше нет, а встать она может без спроса — кончился бюджет времени, оборвалась сеть,
+    // система прибила фоновое задание. Флаг ставим полем: первый кадр ещё не построен,
+    // и setState здесь не нужен.
+    _checking = true;
+    unawaited(_check(initial: true));
   }
 
   Future<void> _reload() async {
@@ -60,23 +74,42 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     });
   }
 
-  Future<void> _rebuild() async {
-    setState(() => _rebuilding = true);
+  Future<void> _refreshBlocked() async {
+    final info = await _sync.blockedInfo();
+    if (mounted) setState(() => _blocked = info);
+  }
+
+  /// «Проверить и догнать»: то же, что делает раздел при открытии, но по кнопке.
+  ///
+  /// Ядро само решает, что нужно: заново выпустить токен, обновить очередь, пересобрать
+  /// наблюдение за папками, прогнать зеркало и выгрузить ждущие файлы. Здесь остаётся
+  /// только показать, что проверка идёт, и перечитать список.
+  Future<void> _check({bool initial = false}) async {
+    if (_checking && !initial) return;
+    if (initial) {
+      _checking = true;
+    } else {
+      setState(() => _checking = true);
+    }
     try {
-      final result = await _sync.refreshQueue();
-      if (!mounted) return;
-      if (result == null) {
-        snack(context, _sync.queueNote ?? 'очередь не обновлена');
-      }
+      await _sync.checkAndResume();
     } finally {
-      if (mounted) setState(() => _rebuilding = false);
+      if (mounted) setState(() => _checking = false);
       await _reload();
+      await _refreshBlocked();
     }
   }
 
   Future<void> _clearFinished() async {
     await _sync.queueStore?.clearFinished();
     await _reload();
+  }
+
+  /// Подтверждение — ровно один проход: после него предохранитель снова на месте,
+  /// если файлы продолжают пропадать.
+  Future<void> _confirmDeletes() async {
+    await _sync.confirmDeletes();
+    await _refreshBlocked();
   }
 
   /// Выгрузка одного файла. Пока она идёт, состояние строки показываем по байтам, а не
@@ -111,6 +144,14 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     ref.listen(syncControllerProvider.select((c) => c.waiting), (prev, next) {
       if (prev != next) unawaited(_reload());
     });
+    // предохранитель ставит движок по ходу прохода: экран узнаёт об этом из состояния, а не
+    // из собственного опроса базы
+    ref.listen(syncControllerProvider.select((c) => c.mirrorStatus.blocked), (
+      prev,
+      next,
+    ) {
+      if (prev != next) unawaited(_refreshBlocked());
+    });
     final sync = ref.watch(syncControllerProvider);
 
     return Scaffold(
@@ -121,7 +162,7 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
           children: [
             const Text('Очередь', style: TextStyle(color: C.fg, fontSize: 17)),
             Text(
-              _waiting == 0 ? 'нечего выгружать' : 'ждут запуска: $_waiting',
+              _countsLine(short: true),
               style: const TextStyle(color: C.fg3, fontSize: 11),
             ),
           ],
@@ -134,8 +175,8 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
             child: const Text('Очистить готовые'),
           ),
           IconButton(
-            tooltip: 'Обновить очередь',
-            onPressed: _rebuilding ? null : () => unawaited(_rebuild()),
+            tooltip: 'Проверить и догнать',
+            onPressed: _checking ? null : () => unawaited(_check()),
             icon: const Icon(Icons.refresh, color: C.fg),
           ),
         ],
@@ -148,25 +189,18 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     if (sync.queueStore == null) {
       return _centered('Синхронизация не запущена: войдите в аккаунт');
     }
-    final note = sync.queueNote;
+    final status = sync.mirrorStatus;
+    // Пока ядро что-то делает (проверка, догон, выгрузка ждущих), запускать файл руками
+    // нечего: он уже в работе. Иначе две выгрузки одного файла пошли бы наперегонки.
+    final busy = _checking || (sync.activity?.isNotEmpty ?? false);
     return Stack(
       children: [
         Column(
           children: [
-            if (sync.activity != null || (note != null && note.isNotEmpty))
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    sync.activity ?? note!,
-                    style: const TextStyle(color: C.fg3, fontSize: 11),
-                  ),
-                ),
-              ),
+            _statusHeader(sync, status),
             if (_counts.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
@@ -175,6 +209,7 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
                   ),
                 ),
               ),
+            if (_blocked != null) _blockedNotice(_blocked!),
             if (_total > _items.length)
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
@@ -193,12 +228,14 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
                         ? _empty()
                         : ListView.builder(
                             itemCount: _items.length,
-                            itemBuilder: (context, i) => _row(_items[i]),
+                            itemBuilder: (context, i) => _row(_items[i], busy),
                           )),
             ),
           ],
         ),
-        if (_rebuilding || _progress != null)
+        // Тонкая полоска только на время проверки: она длится секунды и без неё непонятно,
+        // нажалась ли кнопка. У выгрузки признак свой — проценты в её строке.
+        if (_checking)
           const Align(
             alignment: Alignment.topCenter,
             child: LinearProgressIndicator(minHeight: 2),
@@ -207,7 +244,97 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     );
   }
 
-  String _countsLine() {
+  /// Шапка состояния: что происходит сейчас и чем закончился последний проход.
+  /// Обе строки — текст: считать на экране нечего, зеркало делает это само.
+  Widget _statusHeader(SyncController sync, MirrorStatus status) {
+    final last = status.lastText.isEmpty ? 'ещё не сверялось' : status.lastText;
+    return Panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'сейчас: ${_now(sync, status)}',
+            style: const TextStyle(color: C.fg, fontSize: 12),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'последний проход: $last',
+            maxLines: 4,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: C.fg3, fontSize: 11),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Выгружается само; play на строке — если хочешь поторопить.',
+            style: TextStyle(color: C.fg3, fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Что делает синхронизатор прямо сейчас. Прогресс — словами («— 45%»), а не полоской:
+  /// одна строка отвечает на вопрос «идёт или нет» без отдельного индикатора.
+  String _now(SyncController sync, MirrorStatus status) {
+    final activity = sync.activity;
+    if (activity != null && activity.isNotEmpty) return activity;
+    // Проверку при открытии раздела ядро может делать молча — тогда говорим об этом мы
+    if (_checking) return 'проверяю, не встала ли синхронизация…';
+    final name = status.currentName;
+    if (status.busy && name != null && name.isNotEmpty) {
+      final percent = status.currentPercent;
+      return '${_phaseText(status.phase)} «$name»'
+          '${percent > 0 ? ' — $percent%' : ''}';
+    }
+    return _phaseText(status.phase);
+  }
+
+  /// Предохранитель: удаления в облаке приостановлены. Он должен быть виден и сниматься
+  /// ровно по кнопке — молча удалять «слишком много пропавшего» движок не станет.
+  Widget _blockedNotice((int, String) blocked) {
+    final (count, reason) = blocked;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: C.surface,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: C.danger),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Удаления в облаке приостановлены: $count',
+              style: const TextStyle(color: C.fg, fontSize: 13),
+            ),
+            if (reason.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(reason, style: const TextStyle(color: C.fg3, fontSize: 11)),
+            ],
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: () => unawaited(_confirmDeletes()),
+              child: Text('Удалить эти $count в облаке'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Строка счётчиков: в шапке — коротко (ждут запуска и зеркало), в теле — по состояниям.
+  String _countsLine({bool short = false}) {
+    if (short) {
+      final mine = _waiting == 0
+          ? 'нечего выгружать'
+          : 'ждут запуска: $_waiting';
+      final mirror = _sync.mirrorStatus.waitingFiles;
+      return '$mine · зеркало: '
+          '${mirror == 0 ? 'всё выгружено' : 'ждёт выгрузки: $mirror'}';
+    }
     final parts = <String>[];
     for (final state in QueueState.values) {
       final n = _counts[state] ?? 0;
@@ -216,9 +343,10 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     return parts.join(' · ');
   }
 
-  Widget _row(QueueItem item) {
+  Widget _row(QueueItem item, bool busy) {
     final progress = _progress?.id == item.id ? _progress : null;
     final canStart =
+        !busy &&
         _progress == null &&
         (item.state == QueueState.pending || item.state == QueueState.failed);
     return Column(
@@ -281,7 +409,7 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
                   icon: const Icon(Icons.replay, color: C.fg3, size: 20),
                 ),
               IconButton(
-                tooltip: 'Выгрузить файл',
+                tooltip: 'Поторопить: выгрузить сейчас',
                 onPressed: canStart ? () => unawaited(_upload(item.id)) : null,
                 icon: const Icon(Icons.play_arrow, color: C.accent),
               ),
@@ -300,20 +428,21 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           const Text(
-            'Очередь пуста',
+            'Пока нечего выгружать: всё, что нашлось в выбранных папках, уже в облаке',
+            textAlign: TextAlign.center,
             style: TextStyle(color: C.fg, fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 6),
           const Text(
-            'Новое и изменённое в выбранных папках появится здесь само. '
-            'Папки выбираются в настройках.',
+            'Дальше синхронизация идёт сама: раздел при открытии проверяет, не встала ли она, '
+            'и догоняет пропущенное.',
             textAlign: TextAlign.center,
             style: TextStyle(color: C.fg3, fontSize: 12),
           ),
           const SizedBox(height: 16),
           FilledButton(
-            onPressed: _rebuilding ? null : () => unawaited(_rebuild()),
-            child: const Text('Обновить очередь'),
+            onPressed: _checking ? null : () => unawaited(_check()),
+            child: const Text('Проверить сейчас'),
           ),
         ],
       ),
@@ -341,5 +470,13 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     QueueState.done => 'выгружен',
     QueueState.skipped => 'уже в облаке',
     QueueState.failed => 'ошибка',
+  };
+
+  String _phaseText(MirrorPhase phase) => switch (phase) {
+    MirrorPhase.scan => 'обхожу папки',
+    MirrorPhase.cloud => 'сверяюсь с облаком',
+    MirrorPhase.upload => 'выгружаю',
+    MirrorPhase.delete => 'убираю удалённое',
+    MirrorPhase.idle => 'ждёт',
   };
 }
