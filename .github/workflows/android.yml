@@ -40,12 +40,18 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - uses: android-actions/setup-android@v3
-
+      # android-actions/setup-android тут больше не используется: на текущем образе раннера
+      # действие тянет устаревший пакет `tools`, не находит его и падает («Failed to find
+      # package 'tools'»). SDK в образе уже стоит — принимаем лицензии, нужные компоненты
+      # доставляем по возможности, а остальное Gradle добирает сам.
       - name: Android SDK (platform 36, build-tools 36)
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0"
-          yes | sdkmanager --licenses > /dev/null || true
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1)"
+          test -n "$SDKMANAGER" || { echo "нет sdkmanager в $SDK"; ls "$SDK"; exit 1; }
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" \
+            || echo "компоненты SDK не доустановились — собираем на том, что есть в образе"
 
       - uses: subosito/flutter-action@v2
         with:
