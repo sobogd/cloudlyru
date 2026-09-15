@@ -348,7 +348,7 @@ export class S3Service implements OnModuleDestroy {
     }
   }
 
-  /** Однократная PUT-запись объекта (для file-drop и мелких файлов ≤ 5 ГБ). */
+  /** Однократная PUT-запись объекта (для мелких файлов ≤ 5 ГБ). */
   async putObject(key: string, body: Buffer, contentType: string): Promise<void> {
     const cmd = new PutObjectCommand({
       Bucket: this.bucket,
