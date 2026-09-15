@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { execFileSync, spawn } from 'child_process';
-import { existsSync, mkdirSync, readdirSync, rmSync, statfsSync, statSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, rmSync, statfsSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import sharp from 'sharp';
@@ -42,6 +42,8 @@ const AV1_CRF = 36;
  * у одного упавшего видео так и осталось «ffmpeg version 7.0.2-static … built with gcc 8».
  */
 const FFMPEG = ['ffmpeg', '-hide_banner', '-loglevel', 'error'];
+/** Опции sharp для чтения исходника: анимация сохраняется, предупреждения декодера не валят задачу. */
+const SHARP_IN = { animated: true, failOn: 'truncated' } as const;
 /**
  * HDR → SDR. 8-битный H.264 с BT.2020/PQ-источника выглядит выцветшим, поэтому кадр
  * переводится в линейный свет, тонапмапится (hable) и возвращается в BT.709.
@@ -135,6 +137,25 @@ interface ConvertResult {
 function truncErr(msg: string): string {
   const s = String(msg ?? '');
   return s.length > MAX_ERROR_CHARS ? `${s.slice(0, MAX_ERROR_CHARS)}…` : s;
+}
+
+/**
+ * Человеческое объяснение известных постоянных сбоев. Приписывается в конец ошибки: UI
+ * показывает хвост строки (shortErr), поэтому объяснение должно быть последним, а полный
+ * текст инструмента остаётся в начале. Пользователю важно понимать, что файл не «завис»,
+ * а не читается, и что оригинал при этом цел и скачивается.
+ */
+function humanHint(msg: string): string | null {
+  if (/HEIF\/AVIF file: Invalid input|not an HEIF\/AVIF file|Too many auxiliary image/i.test(msg)) {
+    return 'HEIC не читается системным libheif 1.12 (внутри сетка тайлов, gain map и aux-картинки) — оригинал цел';
+  }
+  if (/VipsJpeg: Invalid SOS parameters/i.test(msg)) {
+    return 'в JPEG испорчено поле SOS (так его сохранил сторонний редактор) — оригинал цел';
+  }
+  if (/VipsJpeg: (Corrupt JPEG data|premature end)/i.test(msg)) {
+    return 'JPEG повреждён внутри — превью по нему не собрать';
+  }
+  return null;
 }
 
 interface JobRow {
@@ -639,8 +660,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         // Строка остаётся со статусом ошибки — её видно на странице ошибок и можно повторить.
         const why = transient ? `попытки исчерпаны (${attempts})` : 'ошибка не временная — повтор не поможет';
         this.retryAfter.delete(job.id);
-        this.logger.warn(`✗ ${tag} за ${took()}: ${msg.slice(0, 200)} — ${why}`);
-        await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } }).catch(() => undefined);
+        const hint = humanHint(msg);
+        this.logger.warn(`✗ ${tag} за ${took()}: ${msg.slice(0, 200)} — ${why}${hint ? ` (${hint})` : ''}`);
+        // Причину кладём и на ассет: состояние превью остаётся 'none' (файл должен оставаться
+        // и в ошибках, и в пересчёте — libheif однажды обновится), но объяснение сохраняется.
+        if (hint) await this.setPreviewState(job.assetId, 'none', hint);
+        await this.prisma.job
+          .update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(hint ? `${msg} — ${hint}` : msg), finishedAt: new Date() } })
+          .catch(() => undefined);
       }
     } finally {
       this.active.delete(job.id);
@@ -723,27 +750,30 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const sha = job.sha256;
     let base: any; // sharp pipeline (источник пикселей)
     let decodedPath = rawPath;
-    if (/^image\/(heic|heif)/.test(job.mime)) {
+    // Формат определяем по сигнатуре файла, а не по mime: mime заявляет клиент при загрузке,
+    // и он врёт (в библиотеке 18 файлов пришли как image/heic, а внутри JPEG — проверено).
+    const sniffed = this.sniffImage(rawPath);
+    if (sniffed === 'heic' || sniffed === 'avif') {
       // HEIC/HEIF: декодируем libheif'ом напрямую (sharp prebuilt умеет только AVIF:
       // format.heif.input.fileSuffix = ['.avif']). heif-convert отдаёт 8-битный PNG,
       // поэтому превью из 10-битных HDR-HEIC получаются SDR — оригинал при этом цел.
+      //
+      // Повтора «перекачать и попробовать снова» здесь нет намеренно: он был и оказался
+      // бесполезен — файл после перекачки побайтово тот же (проверено cmp), ошибка та же,
+      // а скачивание до 11 МБ дублировалось на каждом из 384 нечитаемых HEIC.
       const png = join(tmpdir(), `clq-${job.id}.png`);
-      try {
-        await this.run(job.id, ['heif-convert', rawPath, png], 120000);
-      } catch {
-        // повтор: возможно файл был недокачан — перекачиваем и пробуем ещё раз
-        rmSync(rawPath, { force: true });
-        await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
-        await this.run(job.id, ['heif-convert', rawPath, png], 120000);
-      }
-      base = sharp(png, { animated: true }).rotate();
+      await this.run(job.id, ['heif-convert', rawPath, png], 120000);
+      base = sharp(png, SHARP_IN).rotate();
       decodedPath = png;
     } else {
-      // animated: true — чтобы многостраничные GIF/WebP не превратились в статику (см. ниже)
-      base = sharp(rawPath, { animated: true }).rotate();
+      // animated: true — чтобы многостраничные GIF/WebP не превратились в статику (см. ниже).
+      // failOn: 'truncated' — не валить превью на предупреждениях libvips: imagemagick-подобная
+      // строгость отбрасывала 90 JPEG с испорченным полем SOS, которые другие декодеры
+      // (и ffmpeg, и libjpeg с failOn:'truncated') читают целиком и без потери пикселей.
+      base = sharp(rawPath, SHARP_IN).rotate();
     }
 
-    const meta = await sharp(decodedPath, { animated: true }).metadata().catch(() => null);
+    const meta = await sharp(decodedPath, SHARP_IN).metadata().catch(() => null);
     const animated = (meta?.pages ?? 1) > 1;
 
     // ICC кладём через keepIccProfile(): без профиля Display P3-фото выглядят блёкло
@@ -816,7 +846,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     if (!existsSync(posterRaw)) {
       await this.run(job.id, [...FFMPEG, '-y', '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     }
-    const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
+    const poster = await sharp(posterRaw, SHARP_IN).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
     // 2) превью 1080: 5 → 99%.
@@ -907,7 +937,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         const why = String((e as { stderr?: string }).stderr || (e as Error).message).split('\n').filter(Boolean).pop();
         throw new Error(`страница ${page}: pdftoppm не смог (${why?.slice(0, 200) ?? 'без вывода'})`);
       }
-      const webp = await sharp(png)
+      const webp = await sharp(png, SHARP_IN)
         .flatten({ background: '#ffffff' }) // страница прозрачной не бывает, но JPEG-подложка серую не даёт
         .webp({ quality: 78 })
         .toBuffer();
@@ -933,7 +963,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   /** Миниатюра для списка: первая страница, вписанная в квадрат GRID_SIZE на белом фоне. */
   private async pdfGrid(pagePng: string): Promise<Buffer> {
-    return sharp(pagePng)
+    return sharp(pagePng, SHARP_IN)
       .resize({ width: GRID_SIZE, height: GRID_SIZE, fit: 'contain', background: '#ffffff', withoutEnlargement: true })
       .flatten({ background: '#ffffff' })
       .webp({ quality: 78 })
@@ -1010,6 +1040,38 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const ch = src.channels ?? 2;
     if (ch > 2) return ch > 6 ? '384k' : '256k';
     return stereo;
+  }
+
+  /**
+   * Реальный формат файла по сигнатуре. mime заявляет клиент при загрузке и он врёт:
+   * попадались файлы с mime image/heic, внутри которых обычный JPEG — heif-convert на них
+   * отвечал «Input file is not an HEIF/AVIF file», хотя декодируются они без проблем.
+   * Читаем 16 байт заголовка и больше ничего: содержимое распаковывать здесь незачем.
+   */
+  private sniffImage(file: string): 'heic' | 'avif' | 'jpeg' | 'png' | 'webp' | 'gif' | 'tiff' | 'other' {
+    let fd: number | null = null;
+    try {
+      fd = openSync(file, 'r');
+      const buf = Buffer.alloc(16);
+      readSync(fd, buf, 0, buf.length, 0);
+      if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpeg';
+      if (buf.subarray(0, 8).toString('latin1') === '\x89PNG\r\n\x1a\n') return 'png';
+      if (buf.subarray(0, 4).toString('latin1') === 'RIFF' && buf.subarray(8, 12).toString('latin1') === 'WEBP') return 'webp';
+      if (buf.subarray(0, 4).toString('latin1') === 'GIF8') return 'gif';
+      const tiff = buf.subarray(0, 4).toString('latin1');
+      if (tiff === 'II*\x00' || tiff === 'MM\x00*') return 'tiff';
+      // ISO-BMFF: у HEIC/AVIF на смещении 4 стоит 'ftyp', дальше — основной бренд
+      if (buf.subarray(4, 8).toString('latin1') === 'ftyp') {
+        const brand = buf.subarray(8, 12).toString('latin1');
+        if (brand === 'avif' || brand === 'avis') return 'avif';
+        if (/^(heic|heix|hevc|hevx|heim|heis|mif1|msf1|miaf)$/.test(brand)) return 'heic';
+      }
+      return 'other';
+    } catch {
+      return 'other';
+    } finally {
+      if (fd !== null) closeSync(fd);
+    }
   }
 
   /** Параметры источника одним вызовом ffprobe: длительность, 10 бит/HDR, каналы. */
