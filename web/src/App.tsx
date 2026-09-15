@@ -515,6 +515,14 @@ function fmtDuration(sec?: number): string | undefined {
   const s2 = total % 60;
   return h ? `${h} ч ${m} мин ${s2} с` : `${m}:${String(s2).padStart(2, '0')}`;
 }
+/** Срок на остаток очереди: точность до минут не нужна, поэтому секунды → минуты → часы → сутки. */
+function fmtEta(sec?: number | null): string | undefined {
+  if (!sec || !Number.isFinite(sec) || sec <= 0) return undefined;
+  if (sec < 90) return `${Math.round(sec)} с`;
+  if (sec < 5400) return `${Math.round(sec / 60)} мин`;
+  if (sec < 48 * 3600) return `${Math.round(sec / 3600)} ч`;
+  return `${Math.round(sec / 86400)} сут`;
+}
 /** Причина падения сборки превью в одну строку: ffmpeg сыпет баннер и настройки,
  *  поэтому причина — в самом конце stderr, а не в начале. */
 function shortErr(e?: string | null, max = 110): string {
@@ -1287,6 +1295,12 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
   };
 
   const remaining = q?.remaining ?? 0;
+  /** Срок на остаток по виду задачи — в скобках рядом с числом, если статистика уже набралась. */
+  const etaOf = (kind: 'photo' | 'video' | 'pdf') => {
+    if (!(q?.remainingByKind?.[kind] ?? 0)) return '';
+    const eta = fmtEta(q?.estimates?.[kind]?.etaSec);
+    return eta ? ` (≈ ${eta})` : '';
+  };
 
   return (
     <div className="panel">
@@ -1314,12 +1328,13 @@ function QueuePanel({ onErrors }: { onErrors: () => void }) {
           </div>
           {/* Разбивка остатка по типам: фото уходят пачкой, видео идёт по одному и часами —
               без неё «осталось 500» ничего не говорит о том, сколько это займёт.
+              В скобках — оценка срока по средней длительности задач за сутки.
               PDF показываем, только когда они есть: обычно их нет вовсе. */}
           {!!remaining && (
             <div className="copy">
-              фото: {(q.remainingByKind?.photo ?? 0).toLocaleString('ru-RU')}
-              {' · '}видео: {(q.remainingByKind?.video ?? 0).toLocaleString('ru-RU')}
-              {q.remainingByKind?.pdf ? ` · PDF: ${q.remainingByKind.pdf.toLocaleString('ru-RU')}` : ''}
+              фото: {(q.remainingByKind?.photo ?? 0).toLocaleString('ru-RU')}{etaOf('photo')}
+              {' · '}видео: {(q.remainingByKind?.video ?? 0).toLocaleString('ru-RU')}{etaOf('video')}
+              {q.remainingByKind?.pdf ? ` · PDF: ${q.remainingByKind.pdf.toLocaleString('ru-RU')}${etaOf('pdf')}` : ''}
             </div>
           )}
           <div className={q.paused ? 'copy empty' : 'copy'}>

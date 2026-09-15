@@ -333,6 +333,22 @@ model QueueState {
   updatedAt DateTime @updatedAt
 }
 
+// ===== Статистика конвертации =====
+// Длительность сборки превью по видам задач. Нужна потому, что строка Job на успехе
+// удаляется (очередь — это список того, что осталось), а без средней длительности
+// остаток «7399 видео» не переводится в срок. Читается в /queue/status, старые строки
+// подчищаются самим воркером (30 дней).
+
+model ConvertStat {
+  id         String   @id @default(uuid())
+  kind       String // 'photo' | 'video' | 'pdf'
+  state      String   @default("done") // done | failed
+  durationMs Int
+  finishedAt DateTime @default(now())
+
+  @@index([kind, finishedAt])
+}
+
 // ===== Разархивирование архивов внутри хранилища (без диска) =====// ZIP читается из S3 по Range-запросам, файлы кладутся обратно в S3
 // (content-addressed, с дедупом), в дерево добавляется папка с именем архива.
 

@@ -573,6 +573,11 @@ export interface QueueStatus {
   errors: number;
   /** Из чего состоит остаток: фото разбираются пачкой и быстро, видео идёт по одному и часами. */
   remainingByKind: { photo: number; video: number; pdf: number };
+  /**
+   * Оценка срока по видам: средняя длительность задачи (за сутки) и срок на остаток.
+   * null — статистики ещё нет (например, сразу после установки): тогда срок не показываем.
+   */
+  estimates: Record<'photo' | 'video' | 'pdf', { avgSec: number | null; etaSec: number | null; samples: number }>;
   /** Свободно байт на диске сервера (null — сервер не смог посчитать). */
   diskFree: number | null;
   /** Места мало — конвертация стоит, пока не освободится. */

@@ -58,6 +58,9 @@ export class QueueController {
       remaining: pending + processing,
       processing,
       remainingByKind,
+      // Срок остатка по видам: средняя длительность задач (ConvertStat) × остаток / слоты.
+      // Без этого «7399 видео» не отличается от «7399 фото», а разница — в днях.
+      estimates: await this.queue.estimates(remainingByKind),
       errors: failed,
       // Место на диске сервера: когда его мало, конвертация встаёт — и это должно быть видно
       // в настройках, а не только в логах на сервере (13.09.2026 диск кончился и уронил всё).

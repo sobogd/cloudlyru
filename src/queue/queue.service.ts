@@ -37,6 +37,12 @@ const X264_PRESET = 'veryfast';
 const X264_CRF = 20;
 const AV1_CRF = 36;
 /**
+ * ffmpeg всегда с -hide_banner -loglevel error. Без них первое, что попадает в stderr, — баннер
+ * сборки, и в Job.error (600 символов) уезжала версия с конфигурацией вместо причины сбоя:
+ * у одного упавшего видео так и осталось «ffmpeg version 7.0.2-static … built with gcc 8».
+ */
+const FFMPEG = ['ffmpeg', '-hide_banner', '-loglevel', 'error'];
+/**
  * HDR → SDR. 8-битный H.264 с BT.2020/PQ-источника выглядит выцветшим, поэтому кадр
  * переводится в линейный свет, тонапмапится (hable) и возвращается в BT.709.
  * Фильтры (zscale/tonemap) приходят с libzimg — проверено на проде: в сборке есть.
@@ -76,6 +82,12 @@ const TRANSIENT_ERR =
   /(NetworkingError|TimeoutError|RequestTimeout|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network|throttl|SlowDown|ServiceUnavailable|InternalError|reduce your request rate|(?:HTTP|Status Code): 5\d\d)/i;
 /** Сколько символов stderr кладём в Job.error (раньше в БД уезжал дамп настроек libaom на 1.5 КБ). */
 const MAX_ERROR_CHARS = 600;
+/** Окно статистики для оценки срока: 6 часов — оценка успевает следовать за настройками. */
+const STAT_WINDOW_MS = 6 * 60 * 60 * 1000;
+/** Сколько последних задач вида берём для медианы: 500 хватает с запасом (это минуты работы). */
+const STAT_SAMPLE = 500;
+/** Сколько хранить статистику конвертации (чистится попутно, вероятность 1% на задачу). */
+const STAT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 /** Префикс временных каталогов задач — для чистки осиротевших после SIGKILL/pm2 reload. */
 const TMP_PREFIX = 'clq-';
 /** Файл задачи старше этого возраста считаем мусором (мастер 4K может идти часами). */
@@ -158,6 +170,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private readonly active = new Map<string, { assetId: string; group: JobGroup; child: import('child_process').ChildProcess | null }>();
   /** Короткий кэш числа ожидающих фото: по нему решается, брать ли видео. */
   private photoPendingCache: { at: number; value: number } | null = null;
+  /** Кэш средней длительности задач по видам (см. estimates): статус спрашивают часто. */
+  private estCache: { at: number; value: Record<string, { avgMs: number | null; samples: number }> } | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -529,6 +543,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     mkdirSync(dir, { recursive: true });
     const rawPath = join(dir, 'raw');
     const tag = `${job.kind} ${job.sha256.slice(0, 8)}`;
+    // Длительность задачи: она идёт в лог и в ConvertStat. Строка Job на успехе удаляется
+    // (очередь — это список того, что осталось), поэтому без ConvertStat срок остатка
+    // посчитать негде: «7399 видео» без средней длительности ничего не говорит о сроке.
+    const startedMs = Date.now();
+    const tookMs = () => Date.now() - startedMs;
+    const took = () => `${Math.max(1, Math.round(tookMs() / 1000))} с`;
     try {
       try {
         await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
@@ -539,7 +559,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         if (!this.isMissingObject(e)) throw e;
         await this.markImpossible(job.assetId, NO_ORIGINAL);
         await this.prisma.job.delete({ where: { id: job.id } }).catch(() => undefined);
-        this.logger.warn(`✗ ${tag}: ${NO_ORIGINAL} — превью не собрать`);
+        this.logger.warn(`✗ ${tag} за ${took()}: ${NO_ORIGINAL} — превью не собрать`);
         return;
       }
       // EXIF из локального файла, если MediaMeta ещё нет: так помечаются фото из архивов
@@ -595,8 +615,10 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         // Строку удаляем: очередь = список того, что осталось, готовое в ней не живёт.
         await this.prisma.job.delete({ where: { id: job.id } }).catch(() => undefined);
       }
-      if (res.warn) this.logger.warn(`△ ${tag}: ${res.warn}`);
-      else this.logger.log(`✓ ${tag}`);
+      const ms = tookMs();
+      void this.recordStat(job.kind, 'done', ms);
+      if (res.warn) this.logger.warn(`△ ${tag} за ${took()}: ${res.warn}`);
+      else this.logger.log(`✓ ${tag} за ${took()}`);
     } catch (e) {
       const msg = (e as Error).message || 'error';
       // Строки может уже не быть: ассет вычистили из корзины или очередь очистили кнопкой,
@@ -604,11 +626,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       const row = await this.prisma.job.findUnique({ where: { id: job.id } }).catch(() => null);
       const attempts = row?.attempts ?? 1;
       const transient = this.isTransient(msg);
+      void this.recordStat(job.kind, 'failed', tookMs());
       if (transient && attempts < MAX_ATTEMPTS) {
         const delay = RETRY_BASE_DELAY_MS * attempts;
         this.retryAfter.set(job.id, Date.now() + delay);
         this.logger.warn(
-          `✗ ${tag}: ${msg.slice(0, 200)} — повтор через ${Math.round(delay / 1000)} с (попытка ${attempts} из ${MAX_ATTEMPTS})`,
+          `✗ ${tag} за ${took()}: ${msg.slice(0, 200)} — повтор через ${Math.round(delay / 1000)} с (попытка ${attempts} из ${MAX_ATTEMPTS})`,
         );
         await this.prisma.job.update({ where: { id: job.id }, data: { state: 'pending', error: truncErr(msg) } }).catch(() => undefined);
       } else {
@@ -616,7 +639,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         // Строка остаётся со статусом ошибки — её видно на странице ошибок и можно повторить.
         const why = transient ? `попытки исчерпаны (${attempts})` : 'ошибка не временная — повтор не поможет';
         this.retryAfter.delete(job.id);
-        this.logger.warn(`✗ ${tag}: ${msg.slice(0, 200)} — ${why}`);
+        this.logger.warn(`✗ ${tag} за ${took()}: ${msg.slice(0, 200)} — ${why}`);
         await this.prisma.job.update({ where: { id: job.id }, data: { state: 'failed', error: truncErr(msg), finishedAt: new Date() } }).catch(() => undefined);
       }
     } finally {
@@ -625,6 +648,70 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       // и файлы, которые задача писала рядом с каталогом, а не внутри него
       this.removeJobTmp(job.id);
     }
+  }
+
+  /**
+   * Записать длительность задачи в ConvertStat. Ошибку записи не поднимаем: статистика —
+   * вещь полезная, но ронять из-за неё конвертацию нельзя. Заодно редкая чистка старых строк.
+   */
+  private async recordStat(kind: string, state: 'done' | 'failed', durationMs: number): Promise<void> {
+    await this.prisma.convertStat
+      .create({ data: { kind, state, durationMs: Math.max(0, Math.round(durationMs)) } })
+      .catch(() => undefined);
+    if (Math.random() < 0.01) {
+      await this.prisma.convertStat
+        .deleteMany({ where: { finishedAt: { lt: new Date(Date.now() - STAT_RETENTION_MS) } } })
+        .catch(() => undefined);
+    }
+  }
+
+  /**
+   * Оценка срока остатка по видам задач: медианная длительность успешной задачи × остаток,
+   * делённый на число слотов (фото идут пачкой по PHOTO_PARALLEL, видео и PDF — по одному).
+   *
+   * Медиана, а не среднее, и окно 6 часов, а не сутки: среднее поднимает одна зависшая задача
+   * (таймаут энкода — 6 часов), а широкое окно долго держит старые настройки — сразу после
+   * смены кодека оценка показывала бы прежние часы на видео. Это всё равно оценка, и грубая:
+   * видео стартует только когда фото-очередь пуста, поэтому «срок всего» — сумма по видам.
+   * Кэш на 30 с: статус спрашивают каждые пару секунд.
+   */
+  async estimates(remaining: Record<string, number>): Promise<Record<string, { avgSec: number | null; etaSec: number | null; samples: number }>> {
+    const out: Record<string, { avgSec: number | null; etaSec: number | null; samples: number }> = {};
+    const now = Date.now();
+    if (!this.estCache || now - this.estCache.at > 30_000) {
+      const since = new Date(now - STAT_WINDOW_MS);
+      const perKind = await Promise.all(
+        ['photo', 'video', 'pdf'].map((kind) =>
+          this.prisma.convertStat
+            .findMany({
+              where: { kind, state: 'done', finishedAt: { gt: since } },
+              orderBy: { finishedAt: 'desc' },
+              take: STAT_SAMPLE,
+              select: { durationMs: true },
+            })
+            .catch(() => [] as Array<{ durationMs: number }>),
+        ),
+      );
+      const value: Record<string, { avgMs: number | null; samples: number }> = {};
+      (['photo', 'video', 'pdf'] as const).forEach((kind, i) => {
+        const d = perKind[i].map((r) => r.durationMs).sort((a, b) => a - b);
+        const median = d.length ? d[Math.floor(d.length / 2)] : null;
+        value[kind] = { avgMs: median, samples: d.length };
+      });
+      this.estCache = { at: now, value };
+    }
+    for (const kind of ['photo', 'video', 'pdf']) {
+      const s = this.estCache.value[kind];
+      const slots = kind === 'photo' ? PHOTO_PARALLEL : 1;
+      const left = Math.max(0, Math.round(remaining[kind] ?? 0));
+      const avgSec = s?.avgMs ? Math.round(s.avgMs / 1000) : null;
+      out[kind] = {
+        avgSec,
+        etaSec: avgSec === null ? null : Math.round((left * avgSec) / slots),
+        samples: s?.samples ?? 0,
+      };
+    }
+    return out;
   }
 
   // ============ Фото → превью 50×50 (список) + 1080 (полный экран) ============
@@ -725,9 +812,9 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // центральный кроп — иначе постер 16:9 растянулся бы в квадратной ячейке сетки.
     const seek = src.duration > 1.5 ? '1' : '0';
     const posterVf = `scale=${GRID_SIZE}:${GRID_SIZE}:force_original_aspect_ratio=increase,crop=${GRID_SIZE}:${GRID_SIZE}`;
-    await this.run(job.id, ['ffmpeg', '-y', '-ss', seek, '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
+    await this.run(job.id, [...FFMPEG, '-y', '-ss', seek, '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     if (!existsSync(posterRaw)) {
-      await this.run(job.id, ['ffmpeg', '-y', '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
+      await this.run(job.id, [...FFMPEG, '-y', '-i', rawPath, '-frames:v', '1', '-vf', posterVf, posterRaw], 180000);
     }
     const poster = await sharp(posterRaw).webp({ quality: 78 }).toBuffer();
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
@@ -745,7 +832,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // Keys (GPS, Make/Model, ContentIdentifier) не переносятся вообще — проверено на проде.
     try {
       await this.run(job.id, [
-        'ffmpeg', '-y', '-i', rawPath,
+        ...FFMPEG, '-y', '-i', rawPath,
         '-map_metadata', '0',
         '-map', '0:v:0', ...vf,
         ...this.videoEncodeArgs(src),
