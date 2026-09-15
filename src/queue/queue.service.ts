@@ -22,12 +22,20 @@ import { CONVERT_MAX_BYTES, env } from '../config/env';
 const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 3 ГБ)
 /** Кодек полноэкранного превью видео (см. videoEncodeArgs). */
 const VIDEO_CODEC = env.CONVERT_VIDEO_CODEC;
-/** Preset и CRF превью. Шкалы у кодеков разные: 26 у H.264 ≈ 36 у AV1 по видимому качеству. */
+/**
+ * Preset и CRF превью. Шкалы у кодеков разные, и разницу видно только замером: на проде
+ * 3 с 4K50-ролика (608×1080, 150 кадров) против lossless-референса дали
+ *   AV1 crf 36 — SSIM 0.9693, PSNR 37.65 (1182 КБ)
+ *   H.264 crf 26 — SSIM 0.9431, PSNR 34.38 (772 КБ)   ← заметно хуже
+ *   H.264 crf 20 — SSIM 0.9720, PSNR 38.46 (2083 КБ)  ← как AV1 или лучше
+ * Поэтому 20, а не 26: превью должно выглядеть как оригинал, а по времени качество тут
+ * бесплатно — энкод упирается в декодер исходника (3.6 с против 3.8 с на все три CRF).
+ * Цена — файл примерно в 1.7 раза тяжелее AV1-превью (и всё ещё в 9 раз легче оригинала
+ * этого ролика: 5.5 Мбит/с против 48).
+ */
 const X264_PRESET = 'veryfast';
-const X264_CRF = 26;
+const X264_CRF = 20;
 const AV1_CRF = 36;
-/** Выше этого fps превью не нужно: 50/60/120 к/с — это лишние кадры, то есть лишняя работа. */
-const PREVIEW_MAX_FPS = 30;
 /**
  * HDR → SDR. 8-битный H.264 с BT.2020/PQ-источника выглядит выцветшим, поэтому кадр
  * переводится в линейный свет, тонапмапится (hable) и возвращается в BT.709.
@@ -92,8 +100,6 @@ interface SourceProbe {
   colorSpace?: string;
   colorRange?: string;
   channels?: number;
-  /** Частота кадров источника: выше 30 в превью не нужна (см. PREVIEW_MAX_FPS). */
-  fps?: number;
   /** Кодек аудиодорожки: AAC из исходника копируем, не перекодируя. */
   audioCodec?: string;
   /** Теги контейнера: com.apple.quicktime.* (GPS, камера, дата) и creation_time. */
@@ -727,13 +733,13 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     await this.s3.putObject(MediaService.videoPosterKey(sha), poster, 'image/webp');
 
     // 2) превью 1080: 5 → 99%.
-    // Апскейл не делаем: ролики ниже 1080 остаются в своём разрешении (scale с ростом
-    // только раздул бы битрейт без пользы).
+    // Разрешение и частота кадров исходника сохраняются: апскейла нет (ролики ниже 1080
+    // остаются в своём разрешении), fps не трогаем, кадры не выбрасываем — превью должно
+    // выглядеть как оригинал, экономить на кадрах тут нечего.
     const filters: string[] = [];
     if (!(src.height && src.height <= 1080)) filters.push('scale=-2:1080');
     // HDR в 8-битном H.264 без тонапмапа выглядит выцветшим (AV1-ветка держит 10 бит и теги).
     if (VIDEO_CODEC === 'h264' && src.hdr) filters.push(TONEMAP_SDR);
-    if (src.fps && src.fps > PREVIEW_MAX_FPS) filters.push(`fps=${PREVIEW_MAX_FPS}`);
     const vf = filters.length ? ['-vf', filters.join(',')] : [];
     // -map_metadata 0 + use_metadata_tags: без них у превью creation_time = 0, а Apple
     // Keys (GPS, Make/Model, ContentIdentifier) не переносятся вообще — проверено на проде.
@@ -869,9 +875,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
    * По умолчанию H.264 (libx264 veryfast). Причина — замер на проде: libaom-av1 в good-режиме
    * (`-cpu-used 8`) давал около кадра в секунду, и 18-секундный 4K50-ролик кодировался
    * 12 минут; libx264 на нём же упирается в декодер исходника и заканчивает за полминуты
-   * (8.7 с на 5 с источника против ~200 с). Плюс H.264 играется везде, включая Safari и iOS
-   * без AV1, поэтому фолбэк `video-preview?src=original` нужен реже. Цена — файл примерно
-   * вдвое тяжелее AV1, для превью это не критично.
+   * (3.8 с на 3 с источника против 90 с у AV1). Плюс H.264 играется везде, включая Safari
+   * и iOS без AV1, поэтому фолбэк `video-preview?src=original` нужен реже. Цена — файл
+   * примерно в 1.7 раза тяжелее AV1 (см. X264_CRF), для превью это приемлемо.
+   *
+   * Разрешение и fps исходника не трогаем: апскейла нет, кадры не выбрасываются — превью
+   * должно выглядеть так же, как оригинал.
    *
    * CONVERT_VIDEO_CODEC=av1 возвращает AV1: там тот же libaom, но в realtime-режиме
    * (замер: 15.7 с против ~200 с на том же ролике, то есть в разы быстрее good).
@@ -926,7 +935,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
           '-v', 'error',
           '-show_entries', 'format=duration',
           '-show_entries', 'format_tags',
-          '-show_entries', 'stream=codec_type,codec_name,pix_fmt,color_primaries,color_transfer,color_space,color_range,channels,width,height,r_frame_rate',
+          '-show_entries', 'stream=codec_type,codec_name,pix_fmt,color_primaries,color_transfer,color_space,color_range,channels,width,height',
           '-of', 'json',
           file,
         ],
@@ -945,10 +954,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       if (v) {
         res.width = Number(v.width) || undefined;
         res.height = Number(v.height) || undefined;
-        // r_frame_rate приходит дробью ("50/1", "30000/1001") — по ней капнем fps превью
-        const rate = typeof v.r_frame_rate === 'string' ? v.r_frame_rate.split('/').map(Number) : [];
-        const fps = rate.length === 2 && rate[0] > 0 && rate[1] > 0 ? rate[0] / rate[1] : NaN;
-        if (Number.isFinite(fps)) res.fps = fps;
         res.pixFmt = typeof v.pix_fmt === 'string' ? v.pix_fmt : undefined;
         res.colorPrimaries = typeof v.color_primaries === 'string' ? v.color_primaries : undefined;
         res.colorTrc = typeof v.color_transfer === 'string' ? v.color_transfer : undefined;
