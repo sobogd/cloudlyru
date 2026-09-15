@@ -162,7 +162,9 @@ class SyncController extends ChangeNotifier {
 
       if (_api != null) await _rememberSystemFolders(_api!);
       notifyListeners();
-      // Синхронизация не должна ждать, пока её попросят: проверяем себя сразу после старта
+      // Синхронизация не должна ждать, пока её попросят: проверяем себя сразу после старта и
+      // дальше следим за собой сторожем
+      _startWatchdog();
       unawaited(checkAndResume());
     } catch (e) {
       debugPrint('cloudly-sync: старт синхронизации не удался: $e');
@@ -343,6 +345,8 @@ class SyncController extends ChangeNotifier {
     // Задание снимаем: без токена оно всё равно ничего не делает, но будить приложение зря
     // после выхода из аккаунта незачем
     await BackgroundSync.cancel();
+    _watchdog?.cancel();
+    _watchdog = null;
     await live?.dispose();
     _api = null;
     _sessionApi = null;
@@ -428,6 +432,10 @@ class SyncController extends ChangeNotifier {
 
   bool _resuming = false;
 
+  /// Сторож: пока приложение открыто, ждущее выгружается само.
+  Timer? _watchdog;
+  DateTime? _lastQueueRefreshAt;
+
   /// Проверить, что синхронизация идёт, и догнать её, если встала.
   ///
   /// Встать она может по-разному: кончился бюджет времени (выгрузка гигабайтов идёт часами),
@@ -445,6 +453,13 @@ class SyncController extends ChangeNotifier {
       // наблюдение могло не встать при старте или отвалиться после перезагрузки системы
       await startWatching();
 
+      // Сначала очередь: её и видно в разделе. Раньше догон стоял после прохода зеркала,
+      // а проход идёт минутами — всё это время человек смотрел на «ждёт запуска» и решал,
+      // что синхронизация встала.
+      await _drainQueue();
+
+      // Проход зеркала — после очереди и без ожидания: он может идти минутами, а раздел
+      // не должен из-за него ничего ждать
       final status = mirrorStatus;
       final hasFolders = (selection?.paths(Section.files).isNotEmpty ?? false);
       final finished = status.finishedAt;
@@ -452,9 +467,8 @@ class SyncController extends ChangeNotifier {
           finished == 0 ||
           DateTime.now().millisecondsSinceEpoch - finished > _stalePassMs;
       if (hasFolders && !status.busy && (status.waitingFiles > 0 || stale)) {
-        await mirrorPass();
+        unawaited(mirrorPass());
       }
-      await _drainQueue();
     } finally {
       _resuming = false;
       activity = null;
@@ -486,8 +500,41 @@ class SyncController extends ChangeNotifier {
     }
   }
 
+  /// Сторож, пока приложение открыто.
+  ///
+  /// Проверки «при открытии раздела» мало: файл может появиться, пока раздел закрыт, а строка
+  /// очереди — остаться ждать, пока человек снова туда зайдёт. Сторож каждую минуту смотрит,
+  /// есть ли что выгружать (и выгружает), а раз в пять минут пересматривает выбранные папки —
+  /// иначе новые файлы вообще не попадут в очередь до следующей проверки.
+  ///
+  /// Работает только на переднем плане: в фоне тем же занимается задание системы.
+  void _startWatchdog() {
+    _watchdog ??= Timer.periodic(const Duration(seconds: 60), (_) {
+      unawaited(_watchdogTick());
+    });
+  }
+
+  Future<void> _watchdogTick() async {
+    if (!foreground || _resuming || _api == null) return;
+    final store = queueStore;
+    if (store == null) return;
+    try {
+      if (await store.waitingCount() > 0) {
+        await _drainQueue();
+        return;
+      }
+      final last = _lastQueueRefreshAt;
+      final now = DateTime.now();
+      if (last == null || now.difference(last) > const Duration(minutes: 5)) {
+        await refreshQueue(quiet: true);
+      }
+    } catch (e) {
+      debugPrint('cloudly-sync: сторож споткнулся: $e');
+    }
+  }
+
   /// Наполнить очередь: пройти выбранные папки и поставить новое. Ничего не выгружает.
-  Future<QueueBuildResult?> refreshQueue() async {
+  Future<QueueBuildResult?> refreshQueue({bool quiet = false}) async {
     final store = queueStore;
     final sel = selection;
     final prefs = syncPrefs;
@@ -499,8 +546,10 @@ class SyncController extends ChangeNotifier {
       notifyListeners();
       return null;
     }
-    activity = 'прохожу папки…';
-    notifyListeners();
+    if (!quiet) {
+      activity = 'прохожу папки…';
+      notifyListeners();
+    }
     try {
       final refresher = QueueRefresher(() => _api, prefs, sel, store, files);
       final result = await refresher.refresh(
@@ -516,12 +565,14 @@ class SyncController extends ChangeNotifier {
       queueNote = 'не удалось пройти папки: $e';
       return null;
     } finally {
-      activity = null;
-      notifyListeners();
+      if (!quiet) {
+        activity = null;
+        notifyListeners();
+      }
     }
   }
 
-  /// Выгрузить один файл из очереди: запускается вручную, кнопкой на строке.
+  /// Выгрузить один файл из очереди: кнопкой на строке — если хочется поторопить.
   Future<void> uploadItem(
     int itemId, {
     void Function(UploadProgress)? onProgress,

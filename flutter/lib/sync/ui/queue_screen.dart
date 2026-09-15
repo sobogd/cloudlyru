@@ -325,12 +325,12 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     );
   }
 
-  /// Строка счётчиков: в шапке — коротко (ждут запуска и зеркало), в теле — по состояниям.
+  /// Строка счётчиков: в шапке — коротко (очередь и зеркало), в теле — по состояниям.
   String _countsLine({bool short = false}) {
     if (short) {
       final mine = _waiting == 0
           ? 'нечего выгружать'
-          : 'ждут запуска: $_waiting';
+          : 'в очереди: $_waiting — выгружается само';
       final mirror = _sync.mirrorStatus.waitingFiles;
       return '$mine · зеркало: '
           '${mirror == 0 ? 'всё выгружено' : 'ждёт выгрузки: $mirror'}';
@@ -465,7 +465,7 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
   }
 
   String _stateText(QueueState state) => switch (state) {
-    QueueState.pending => 'ждёт запуска',
+    QueueState.pending => 'в очереди',
     QueueState.running => 'грузится',
     QueueState.done => 'выгружен',
     QueueState.skipped => 'уже в облаке',

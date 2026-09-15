@@ -622,7 +622,7 @@ class _SyncPanelState extends ConsumerState<_SyncPanel> {
             title: 'Очередь выгрузки',
             subtitle: sync.waiting == 0
                 ? 'нечего выгружать'
-                : 'ждут запуска: ${sync.waiting}',
+                : 'в очереди: ${sync.waiting} — выгружается само',
             enabled: granted,
             onTap: () => _open(const QueueScreen()),
           ),
