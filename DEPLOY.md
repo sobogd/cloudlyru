@@ -1,6 +1,6 @@
 # CloudlyRu — деплой runbook
 
-Автодеплой: **push в main** (по путям `src/**`, `prisma/**`, `web/**`, `package.json`, `pnpm-lock.yaml`, `.env.example`)
+Автодеплой: **push в main** (по путям `src/**`, `prisma/**`, `package.json`, `pnpm-lock.yaml`, `.env.example`)
 → GitHub Actions собирает → `deployer@<SERVER_IP>` → pm2 `cloudlyru` (:8305, 127.0.0.1) → nginx `files.iq-factura.com`.
 
 Чего автодеплой НЕ делает: не накатывает `deploy/nginx/cloudlyru.conf` (конфиг nginx живёт на сервере
@@ -68,7 +68,7 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 # логин: ADMIN_LOGIN/CLOUDLY_ADMIN_PASSWORD из ~/work/.env
 ```
 
-## Android-клиент: постоянная ссылка на последнюю сборку
+## Мобильное приложение: постоянная ссылка на последнюю сборку
 
 `https://files.iq-factura.com/apk` отдаёт последнюю опубликованную сборку APK (ручки `/apk`
 и `/apk/version` в `src/release/`). Байты лежат в релизном артефакте S3
@@ -84,8 +84,9 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 gh workflow run android.yml --repo sobogd/cloudlyru
 ```
 
-Старый нативный синхронизатор (`android/`) в CI больше не собирается: у Flutter-клиента тот же
-`applicationId` (`ru.cloudly.sync`) и та же подпись, поэтому он встаёт поверх него.
+Заменять нативный синхронизатор нечем и не нужно: единственный клиент — это приложение из
+`flutter/`, у него `applicationId` `ru.cloudly.sync` и та же подпись, поэтому оно встаёт поверх
+уже установленного.
 
 Ручная публикация уже собранного APK:
 

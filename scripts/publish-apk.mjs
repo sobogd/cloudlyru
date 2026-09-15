@@ -22,7 +22,7 @@ const PUBLIC_URL = (process.env.CLOUDLY_BASE_URL || 'https://files.iq-factura.co
 const args = process.argv.slice(2);
 const flags = new Set(args.filter((a) => a.startsWith('--')));
 const positional = args.filter((a) => !a.startsWith('--'));
-const apkPath = resolve(positional[0] || 'android/app/build/outputs/apk/release/app-release.apk');
+const apkPath = resolve(positional[0] || 'flutter/build/app/outputs/apk/release/app-release.apk');
 const dryRun = flags.has('--dry-run');
 const force = flags.has('--force');
 
@@ -110,7 +110,7 @@ if (published) {
     if (!force) {
       throw new Error(
         `в релизе уже versionCode ${published.versionCode}: поднимите versionCode/versionName ` +
-          'в android/app/build.gradle.kts, иначе телефон это обновлением не увидит ' +
+          'в flutter/pubspec.yaml, иначе телефон это обновлением не увидит ' +
           '(или передайте --force, если публикуете осознанно)',
       );
     }

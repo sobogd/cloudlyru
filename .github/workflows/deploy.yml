@@ -11,7 +11,6 @@ on:
     paths:
       - 'src/**'
       - 'prisma/**'
-      - 'web/**'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.env.example'
@@ -38,14 +37,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec prisma generate
       - run: pnpm build
-      - name: Build web (Vite + React SPA)
-        run: |
-          pnpm --dir web install --frozen-lockfile
-          pnpm --dir web build
-      - name: "Prepare bundle (tar: dist + web + node_modules)"
+      - name: "Prepare bundle (tar: dist + prisma + node_modules)"
         run: |
           tar czf cloudlyru.tgz \
-            package.json pnpm-lock.yaml prisma dist web/dist node_modules deploy
+            package.json pnpm-lock.yaml prisma dist node_modules deploy
       - name: Prisma migrate deploy (SSH tunnel to prod Postgres)
         if: ${{ github.event_name == 'push' || inputs.run_migrations }}
         env:
@@ -109,9 +104,9 @@ jobs:
             cp incoming/package.json ./package.json
             cp incoming/pnpm-lock.yaml ./pnpm-lock.yaml
             cp -r incoming/prisma ./prisma
-            mkdir -p web
-            rm -rf web/dist
-            cp -r incoming/web/dist web/dist
+            # Веб-клиента больше нет: раньше здесь лежала SPA из web/dist, а сервер её
+            # раздавал. Приложение — только мобильное, страниц сервер не отдаёт.
+            rm -rf web
             # deploy/ нужен на сервере: оттуда cron запускает backup-db.sh
             rm -rf deploy
             cp -r incoming/deploy ./deploy

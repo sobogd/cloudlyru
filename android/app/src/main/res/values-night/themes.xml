@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- Тёмная системная тема: фон окна до первого кадра Compose. Схема цветов внутри
-         приложения выбирается по isSystemInDarkTheme(), здесь нужен только фон окна,
-         иначе при запуске и в списке недавних мелькал бы белый экран. -->
-    <style name="Theme.Cloudly" parent="android:Theme.Material.NoActionBar" />
-</resources>

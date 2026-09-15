@@ -918,41 +918,6 @@ class MailReplyContext {
       );
 }
 
-// ===== shares =====
-
-class ShareInfo {
-  final String token;
-  final String url;
-  final String kind;
-  final String capability;
-  final String targetId;
-  final bool hasPassword;
-  final String? expiresAt;
-  final String? createdAt;
-
-  ShareInfo({
-    required this.token,
-    required this.url,
-    required this.kind,
-    required this.capability,
-    required this.targetId,
-    required this.hasPassword,
-    this.expiresAt,
-    this.createdAt,
-  });
-
-  factory ShareInfo.fromJson(Map<String, dynamic> j) => ShareInfo(
-        token: j.s('token'),
-        url: j.s('url'),
-        kind: j.s('kind'),
-        capability: j.s('capability'),
-        targetId: j.s('targetId'),
-        hasPassword: j.b('hasPassword'),
-        expiresAt: j.sN('expiresAt'),
-        createdAt: j.sN('createdAt'),
-      );
-}
-
 // ===== релиз приложения (обновление по кнопке) =====
 
 class AppRelease {

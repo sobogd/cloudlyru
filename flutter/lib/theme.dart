@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
-/// Палитра тёмной темы веб-клиента (styles.css, `prefers-color-scheme: dark`).
+/// Палитра тёмной темы приложения: цвета перенесены из веб-клиента, который жил в `web/src`
+/// (в репозитории его больше нет).
 class C {
   static const canvas = Color(0xFF0D0F14);
   static const island = Color(0xFF161A22);

@@ -1,7 +1,0 @@
-# Сборка Android: артефакты, локальные пути к SDK и ключи подписи не в git
-.gradle/
-build/
-local.properties
-*.jks
-*.keystore
-keystore.properties

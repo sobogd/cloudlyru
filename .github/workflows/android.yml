@@ -4,9 +4,9 @@ name: Android APK (build + publish)
 # подписанный APK в релизный артефакт S3, откуда сборку всегда отдаёт
 # https://files.iq-factura.com/apk.
 #
-# Собирается именно Flutter-клиент: у него тот же applicationId ru.cloudly.sync и та же
-# подпись, что у старого нативного синхронизатора, поэтому он встаёт поверх него. Старый
-# клиент (android/) в CI больше не собирается и в релиз не попадает.
+# Собирается единственный мобильный клиент — Flutter-приложение (flutter/). Его
+# applicationId ru.cloudly.sync и подпись те же, что у уже установленного на телефоне
+# приложения, поэтому новая сборка встаёт поверх без удаления.
 #
 # Автоматического запуска по push нет: релиз — осознанное действие, перед ним нужно поднять
 # versionCode в flutter/pubspec.yaml (`version: 1.0.0+41`). Скрипт публикации не даёт положить
@@ -59,8 +59,9 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
-      # Подпись читает flutter/android/app/build.gradle.kts — путь ../../../android/keystore.properties,
-      # то есть файл старого клиента: ключ один и тот же, иначе APK не встанет поверх.
+      # Подпись читает flutter/android/app/build.gradle.kts — путь ../keystore.properties,
+      # то есть этот файл. Ключ обязан быть тем же, что у уже установленного приложения:
+      # с другой подписью APK поверх не встанет, потребуется удалять приложение.
       - name: Ключ подписи из секретов
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -71,13 +72,13 @@ jobs:
           set -e
           test -n "$KEYSTORE_BASE64" || { echo "нет секрета ANDROID_KEYSTORE_BASE64"; exit 1; }
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          cat > android/keystore.properties <<EOF
+          cat > flutter/android/keystore.properties <<EOF
           storeFile=$RUNNER_TEMP/release.jks
           storePassword=$KEYSTORE_PASSWORD
           keyAlias=$KEY_ALIAS
           keyPassword=$KEY_PASSWORD
           EOF
-          chmod 600 android/keystore.properties
+          chmod 600 flutter/android/keystore.properties
 
       - name: Тесты и сборка релиза
         working-directory: flutter

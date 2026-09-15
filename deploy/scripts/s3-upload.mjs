@@ -2,7 +2,7 @@
 // Запуск из каталога приложения (там же лежат node_modules с @aws-sdk):
 //   node deploy/scripts/s3-upload.mjs <локальный файл> <ключ в бакете> [content-type]
 // Пример для APK:
-//   node deploy/scripts/s3-upload.mjs android/app/build/outputs/apk/release/app-release.apk \
+//   node deploy/scripts/s3-upload.mjs flutter/build/app/outputs/apk/release/app-release.apk \
 //     dist/cloudlyru-sync.apk application/vnd.android.package-archive
 // Ключи берутся из окружения (S3_FILES_*), в аргументы процесса не попадают.
 import { createReadStream } from 'fs';

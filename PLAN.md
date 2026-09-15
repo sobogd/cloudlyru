@@ -8,14 +8,14 @@
 
 ## 0. Рамки этого плана (M0)
 
-Делаем **только фундамент**, на котором потом вырастут фото-таймлайн, шаринг и мобильные клиенты:
+Делаем **только фундамент**, на котором потом вырастут фото-таймлайн и мобильные клиенты:
 
 1. Сервер-приложение (NestJS) на VPS: авторизация владельца, файловое дерево, загрузка/скачивание.
 2. Postgres на VPS: метаданные (файлы, папки, хэши, сессии, токены).
 3. Hetzner Object Storage (S3) как **основное хранилище файлов** (оригиналы, content-addressed).
 4. Домен `files.iq-factura.com` + nginx reverse proxy + TLS.
 5. Бэкап БД: ежедневный `pg_dump` → S3 (префикс `db/`).
-6. Позже (вне M0): WebDAV/Finder, шаринг-ссылки с паролем/сроком, альбомы, фото-таймлайн, мобильные клиенты, домашний HDD-бэкап.
+6. Позже (вне M0): WebDAV/Finder, альбомы, фото-таймлайн, мобильные клиенты, домашний HDD-бэкап.
 
 **Принцип (уточнён по факту реализации):** фото/видео/файлы = объекты в S3 (content-addressed по SHA-256, дедуп), Postgres владеет логическим деревом и метаданными. Производные (превью/транскоды) лежат **в том же бакете под префиксом `view/`**, а не на диске VPS: локальный диск VPS маленький (на CAX11 — 40 ГБ, из них свободно ~5 ГБ), поэтому буфер транскода живёт в `/tmp` только на время задачи. Важное следствие: производные **не «регенерируемы» бесплатно** — при `KEEP_ORIGINALS=false` сырьё удаляется после конвертации, и пересобрать мастер без оригинала нельзя. Полный список ключей и правило удаления — см. §«Хранилище».
 
@@ -187,7 +187,7 @@ model ApiToken {                             // app-password / device-токен
   userId    String
   label     String                           // 'iphone-15', 'webdav-finder'
   tokenHash String   @unique
-  scope     String   @default("files:rw")    // будущие: files:ro, files:upload:<folderId>, share:rw
+  scope     String   @default("files:rw")    // будущие: files:ro, files:upload:<folderId>
   lastUsedAt DateTime?
   createdAt DateTime @default(now())
   revokedAt DateTime?
@@ -229,26 +229,10 @@ model FileEntry {                            // «файл» в папке — �
   @@unique([folderId, name])
 }
 
-// ===== Шаринг (каркас под M1; таблицу заводим сразу) =====
-enum ShareKind      { FOLDER FILE ALBUM }
-enum ShareCapability{ VIEW DOWNLOAD UPLOAD RW }
-
-model Share {
-  id         String         @id @default(uuid())
-  kind       ShareKind
-  targetId   String                        // folderId | fileEntryId | albumId
-  token      String         @unique        // 128 бит случайности
-  passwordHash String?                     // пароль на ссылку (без логина)
-  capability ShareCapability @default(VIEW)
-  expiresAt  DateTime?
-  createdAt  DateTime       @default(now())
-  revokedAt  DateTime?
-}
-
 // ===== Аудит =====
 model AuditLog {
   id        String   @id @default(uuid())
-  action    String                          // 'auth.login', 'share.created', 'file.deleted' ...
+  action    String                          // 'auth.login', 'file.deleted' ...
   meta      Json?
   ip        String?
   createdAt DateTime @default(now())
@@ -313,7 +297,6 @@ tmp/                          # мусор от прерванных загру�
 | **POST** | **`/uploads`** | init: `{folderId?, name, size, mime, totalChunks}` → `uploadId` |
 | **PUT** | **`/uploads/:id/chunks/:n`** | чанк (≤20 МБ), поток → во временный объект S3/буфер |
 | **POST** | **`/uploads/:id/complete`** | склейка, SHA-256, дедуп, создание Asset+FileEntry; 409 если уже есть |
-| POST | `/shares` (каркас) | создать share (без UI в M0) |
 | GET  | `/healthz` | для мониторинга nginx/pm2 |
 
 ### 7.1 Поток загрузки (чанки, resume)
@@ -333,8 +316,8 @@ tmp/                          # мусор от прерванных загру�
 - **Один владелец**: seed-админ (login/password). Пароль — argon2id.
 - Веб-сессия: httpOnly + Secure + SameSite=Lax cookie; CSRF — double-submit токен (SPA).
 - Никакой регистрации. Никакого Google (решение зафиксировано).
-- **ApiToken (app-password)**: генерится в вебе, используется WebDAV/Finder/клиентами (Basic по HTTPS) — таблица готова, UI в M1.
-- Гости: только share-ссылки с паролем и сроком (таблица готова, функционал в M1).
+- **ApiToken (app-password)**: выпускается в мобильном приложении, используется WebDAV/Finder и синхронизацией телефона (Basic по HTTPS).
+- Гостей и публичных ссылок нет: доступ есть только у владельца — по сессии или по его токену приложения.
 - Rate-limit на `/auth/login` (например 5 попыток/мин + lockout), audit-log входов.
 
 ---
@@ -454,7 +437,10 @@ curl -s https://files.iq-factura.com/api/v1/healthz
 
 ## 16. Что НЕ входит в M0 (роадмап дальше)
 
-- M1: WebDAV (Finder/Mac), корзина-UI, шаринг-ссылки (пароль+срок), presigned-загрузка.
+- M1: WebDAV (Finder/Mac), корзина-UI, presigned-загрузка.
 - M2: фото-таймлайн по EXIF, альбомы. Карта и авто-определение поездок — снято: от них отказались, из продукта они убраны.
 - M3: Android-клиент (автовыгрузка + share-диалог), затем iOS (шеринг в оригинале + автовыгрузка).
 - M4: история местоположений («где я был», 5–10 мин), дом. HDD-бэкап, миграция из Google.
+
+Убрано из продукта: веб-клиент и шаринг-ссылки целиком, старое нативное Android-приложение
+(`android/`). Остаются сервер-API (`src/`) и мобильный клиент на Flutter (`flutter/`).

@@ -9,7 +9,6 @@ import { FoldersModule } from './folders/folders.module';
 import { FilesModule } from './files/files.module';
 import { UploadsModule } from './uploads/uploads.module';
 import { TrashModule } from './trash/trash.module';
-import { SharesModule } from './shares/shares.module';
 import { DavModule } from './dav/dav.module';
 import { MediaModule } from './media/media.module';
 import { MediaFeedModule } from './media-feed/media-feed.module';
@@ -30,7 +29,6 @@ import { MailModule } from './mail/mail.module';
     FilesModule,
     UploadsModule,
     TrashModule,
-    SharesModule,
     DavModule,
     MediaModule,
     MediaFeedModule,

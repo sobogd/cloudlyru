@@ -1,6 +1,6 @@
 # CloudlyRu
 
-Личное self-hosted облако: сервер на VPS, веб-клиент, Android-клиент для телефона.
+Личное self-hosted облако: сервер на VPS и мобильное приложение на Android (Flutter).
 Прод — <https://files.iq-factura.com>, репозиторий — `sobogd/cloudlyru`.
 
 Принцип хранения: файлы лежат объектами в S3 (Hetzner Object Storage) с адресацией по
@@ -11,16 +11,18 @@ SHA-256 (одинаковое содержимое не дублируется),
 
 | Каталог | Что это |
 |---|---|
-| `src/` | API (NestJS + Prisma): авторизация, файлы и папки, загрузки (в том числе частями прямо в S3), превью и конвертация медиа, корзина, шаринг-ссылки, WebDAV, журнал изменений для клиентов |
-| `web/` | Веб-клиент (React + Vite SPA), раздаётся тем же сервером из `web/dist` |
-| `android/` | Android-клиент: разделы «Файлы» и «Фото» со списком файлов выбранных папок телефона, настройки с входом, облако в системном выборе файлов (только чтение), обновление по кнопке. Синхронизация переделывается — в 0.4.x её в приложении нет (см. `ANDROID.md`) |
+| `src/` | API (NestJS + Prisma): авторизация, файлы и папки, загрузки (в том числе частями прямо в S3), превью и конвертация медиа, корзина, WebDAV, журнал изменений для клиентов |
+| `flutter/` | Мобильное приложение (Flutter, Android): файлы, почта, медиа, карта, корзина, настройки и синхронизация папок телефона |
 | `deploy/` | nginx-конфиг, pm2-процесс, серверные скрипты (бэкап БД, уборка сирот в бакете) |
 | `scripts/` | Утилиты: публикация APK, локальные проверки контрактов и медиа-метаданных |
 | `prisma/` | Схема БД и миграции |
 
-Документация: [`DEPLOY.md`](DEPLOY.md) — деплой и эксплуатация, [`ANDROID.md`](ANDROID.md) —
-как устроен и почему так сделан Android-клиент, [`android/README.md`](android/README.md) —
-сборка и установка приложения, [`PLAN.md`](PLAN.md) — план развития и принятые решения.
+Веб-клиента и нативного Android-клиента в проекте больше нет: браузерных страниц сервер не
+отдаёт вовсе, единственный клиент — приложение из `flutter/`.
+
+Документация: [`DEPLOY.md`](DEPLOY.md) — деплой и эксплуатация, [`FLUTTER.md`](FLUTTER.md) —
+как устроено и почему так сделано мобильное приложение, [`PLAN.md`](PLAN.md) — план развития
+и принятые решения.
 
 ## Локальный запуск
 
@@ -29,22 +31,20 @@ pnpm install
 cp .env.example .env          # DATABASE_URL, SESSION_SECRET, ADMIN_PASSWORD; ключи S3 — по желанию
 pnpm exec prisma migrate deploy
 pnpm build && pnpm start      # http://127.0.0.1:8305
-
-pnpm --dir web install && pnpm --dir web dev   # веб-клиент с hot-reload (Vite)
 ```
 
 Без ключей S3 поднимается только API: файловые операции требуют объектного хранилища.
 
 ## Прод
 
-Автодеплой: push в `main` по путям `src/**`, `prisma/**`, `web/**`, `package.json`,
+Автодеплой: push в `main` по путям `src/**`, `prisma/**`, `package.json`,
 `pnpm-lock.yaml`, `.env.example` → GitHub Actions (`.github/workflows/deploy.yml`) собирает
-сервер и веб, кладёт бандл на VPS и перезапускает pm2 `cloudlyru` (:8305, только локально)
+сервер, кладёт бандл на VPS и перезапускает pm2 `cloudlyru` (:8305, только локально)
 за nginx `files.iq-factura.com`. Ручной запуск — `gh workflow run deploy.yml`.
 
 Проверка: `curl -s https://files.iq-factura.com/api/v1/healthz` → `{"ok":true,…}`.
 
-## Android-клиент: одна ссылка и обновление по кнопке
+## Мобильное приложение: одна ссылка и обновление по кнопке
 
 **Скачать приложение: <https://files.iq-factura.com/apk>** — ссылка постоянная и всегда
 отдаёт последнюю опубликованную сборку. Версию, размер и sha256 этой сборки отдаёт
@@ -62,8 +62,8 @@ pnpm --dir web install && pnpm --dir web dev   # веб-клиент с hot-relo
 Сборка и публикация автоматические, но номер версии поднимает человек — по нему телефон
 и понимает, что вышло обновление:
 
-1. Поднять `versionCode` (и `versionName`) в `android/app/build.gradle.kts`.
-2. Push в `main`, если менялся `android/**` (или `gh workflow run android.yml`).
+1. Поднять `versionCode` (и `versionName`) в `flutter/pubspec.yaml` (`version: 1.0.0+45`).
+2. Push в `main`, если менялся `flutter/**` (или `gh workflow run android.yml`).
 3. GitHub Actions (`.github/workflows/android.yml`) прогоняет юнит-тесты, собирает
    подписанный релиз и публикует его в релизный артефакт S3 — `/apk` сразу отдаёт новую сборку.
 
@@ -75,25 +75,25 @@ pnpm --dir web install && pnpm --dir web dev   # веб-клиент с hot-relo
 
 ```bash
 node --env-file=$HOME/work/.env scripts/publish-apk.mjs \
-  android/app/build/outputs/apk/release/app-release.apk          # + --dry-run, чтобы только посмотреть
+  flutter/build/app/outputs/apk/release/app-release.apk          # + --dry-run, чтобы только посмотреть
 ```
 
 Сборка на маке:
 
 ```bash
-cd android
-JAVA_HOME=/opt/homebrew/opt/openjdk@21 ./gradlew :app:testDebugUnitTest :app:assembleRelease
+cd flutter
+flutter build apk --release
 ```
 
-Релиз подписывается ключом из `android/keystore.properties` (в git не попадает; в CI — из
-секретов репозитория). Ставится APK поверх только той же подписью: ключ терять нельзя,
+Релиз подписывается ключом из `flutter/android/keystore.properties` (в git не попадает; в CI —
+из секретов репозитория). Ставится APK поверх только той же подписью: ключ терять нельзя,
 иначе обновление потребует удаления приложения.
 
 ## Проверки
 
 ```bash
 pnpm build                                                 # сервер компилируется
-cd android && JAVA_HOME=/opt/homebrew/opt/openjdk@21 ./gradlew :app:testDebugUnitTest
+cd flutter && flutter analyze && flutter test              # анализ и юнит-тесты клиента
 
 # контрактные проверки на локальной БД (не на проде):
 DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \

@@ -55,8 +55,8 @@ class _DigestSink implements Sink<Digest> {
 class CloudlyApi {
   String serverUrl;
 
-  /// Cookie веб-сессии (`cl_session=…`). Приложение — порт веб-клиента, поэтому ходит
-  /// той же сессией: ручки с @SessionOnly (почта: accounts/sync/status/send) принимают
+  /// Cookie веб-сессии (`cl_session=…`). Интерфейс приложения ходит именно ею:
+  /// ручки с @SessionOnly (почта: accounts/sync/status/send) принимают
   /// только её, device-токену они отвечают 403.
   String? session;
 
@@ -159,8 +159,8 @@ class CloudlyApi {
 
   // ---------- авторизация ----------
 
-  /// Вход логином/паролем. Возвращает cookie веб-сессии — дальше приложение ходит ею,
-  /// как веб-клиент (ручки с @SessionOnly иначе отвечают 403). Пароль не сохраняется.
+  /// Вход логином/паролем. Возвращает cookie веб-сессии — дальше приложение ходит ею
+  /// (ручки с @SessionOnly иначе отвечают 403). Пароль не сохраняется.
   Future<String> login(String login, String password) async {
     final res = await _session.post('/auth/login',
         data: {'login': login, 'password': password},

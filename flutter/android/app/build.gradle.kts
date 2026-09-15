@@ -6,16 +6,17 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// Подпись релиза — тот же ключ, что у нативного синхронизатора (android/keystore.properties),
-// чтобы APK вставал поверх уже установленного приложения (тот же applicationId + та же подпись).
+// Подпись релиза — ключ лежит рядом, в flutter/android/keystore.properties (в git не попадает;
+// в CI его пишет workflow из секретов). Ключ обязан остаться тем же: приложение уже установлено
+// на телефоне, и обновление поверх возможно только с той же подписью и тем же applicationId.
 val keystoreProperties = Properties().apply {
-    val f = file("../../../android/keystore.properties")
+    val f = file("../keystore.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
     // namespace = пакет Kotlin-классов (совпадает с MainActivity); applicationId ниже — это id
-    // приложения, и он должен оставаться ru.cloudly.sync, чтобы вставать поверх старого клиента.
+    // приложения, и он остаётся ru.cloudly.sync: смена id поставила бы рядом второе приложение.
     namespace = "ru.cloudly.cloudly_flutter"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
@@ -27,7 +28,7 @@ android {
 
     defaultConfig {
         applicationId = "ru.cloudly.sync"
-        // Тот же уровень, что у нативного клиента: обновление поверх него не требует понижения API.
+        // 29 — уровень уже установленного приложения: обновление поверх него не требует понижения API.
         minSdk = 29
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

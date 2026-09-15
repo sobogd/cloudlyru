@@ -21,7 +21,7 @@ class AppState extends ChangeNotifier {
 
   late final UploadQueue uploads = UploadQueue(() => api);
 
-  /// Синхронизатор: он не часть веб-клиента, а отдельная подсистема со своими базами,
+  /// Синхронизатор: он не часть интерфейса, а отдельная подсистема со своими базами,
   /// поэтому живёт в провайдере, а сюда только подключается (см. [attachSync]).
   SyncController? _sync;
 

@@ -21,7 +21,6 @@ model User {
   createdAt     DateTime   @default(now())
   sessions      Session[]
   apiTokens     ApiToken[]
-  shares        Share[]
   mailAccounts  MailAccount[]
   rootFolderId  String? // корневая папка пользователя (создаётся при seed)
   photoFolderId String? // системная папка «Фото» (медиа-зона; создаётся при seed/lazy)
@@ -186,39 +185,6 @@ model UploadSession {
 
   @@index([userId])
   @@index([updatedAt])
-}
-
-// ===== Шаринг (каркас M1) =====
-
-enum ShareKind {
-  FOLDER
-  FILE
-  ALBUM
-}
-
-enum ShareCapability {
-  VIEW
-  DOWNLOAD
-  UPLOAD
-  RW
-}
-
-model Share {
-  id           String          @id @default(uuid())
-  // владелец ссылки: без него list/update/revoke работали по одному токену,
-  // то есть любой залогиненный мог увидеть и отозвать чужой шаринг
-  userId       String?
-  user         User?           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  kind         ShareKind
-  targetId     String
-  token        String          @unique // 128 бит случайности
-  passwordHash String?
-  capability   ShareCapability @default(VIEW)
-  expiresAt    DateTime?
-  createdAt    DateTime        @default(now())
-  revokedAt    DateTime?
-
-  @@index([userId])
 }
 
 // ===== Аудит =====
