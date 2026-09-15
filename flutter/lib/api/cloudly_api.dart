@@ -354,8 +354,12 @@ class CloudlyApi {
   Future<MailMessageView> mailMessage(String id) async =>
       MailMessageView.fromJson(_m(await _req('/mail/messages/$id')));
 
-  Future<Map<String, dynamic>> mailBody(String id, bool images) async =>
-      _m(await _req('/mail/messages/$id/body${images ? '?images=1' : ''}'));
+  /// Тело письма: `images` — показывать внешние картинки, `text` — отдать текстовую версию
+  /// вместо разметки (на случай письма, которое и в браузере читается плохо).
+  Future<Map<String, dynamic>> mailBody(String id, bool images, {bool text = false}) async {
+    final params = <String>[if (images) 'images=1', if (text) 'text=1'];
+    return _m(await _req('/mail/messages/$id/body${params.isEmpty ? '' : '?${params.join('&')}'}'));
+  }
 
   Future<void> mailSetSeen(String id, bool seen) async =>
       _req('/mail/messages/$id/seen', method: 'POST', body: {'seen': seen});

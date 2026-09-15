@@ -305,8 +305,16 @@ export class MailFeedService {
    * две версии одного и того же и не расходиться с .eml, который и есть источник истины.
    * Разбор одного письма — миллисекунды; тяжёлые письма с картинками в data: ограничены
    * потолком размера (иначе ответ раздувается в разы).
+   *
+   * `asText` — просьба клиента отдать текстовую версию даже у письма с разметкой: у части
+   * рассылок вёрстка нечитаема ни в одном движке, и текстовый вариант — единственный выход.
    */
-  async body(userId: string, id: string, allowRemote: boolean): Promise<{ html: string; blockedRemote: number; kind: 'html' | 'text' }> {
+  async body(
+    userId: string,
+    id: string,
+    allowRemote: boolean,
+    asText = false,
+  ): Promise<{ html: string; blockedRemote: number; kind: 'html' | 'text' }> {
     const row = await this.prisma.mailMessage.findFirst({
       where: { id, userId },
       select: { id: true, bodyText: true, rawAsset: { select: { sha256: true } } },
@@ -324,7 +332,7 @@ export class MailFeedService {
       this.logger.warn(`тело письма ${id} не разобрано: ${(e as Error).message}`);
     }
 
-    if (parsed?.html && htmlWithinLimit(parsed.html)) {
+    if (!asText && parsed?.html && htmlWithinLimit(parsed.html)) {
       const { html, blockedRemote } = sanitizeMailHtml(parsed.html, allowRemote);
       return { html, blockedRemote, kind: 'html' };
     }

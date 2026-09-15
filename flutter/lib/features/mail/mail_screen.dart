@@ -3,7 +3,6 @@ import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_html/flutter_html.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../api/cloudly_api.dart';
@@ -12,9 +11,9 @@ import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/download.dart';
 import '../../util/format.dart';
-import '../../util/mail_html.dart';
 import '../../util/widgets.dart';
 import '../files/file_detail.dart';
+import 'mail_body_web.dart';
 
 const _rowH = 76.0;
 
@@ -324,42 +323,6 @@ class _MailScreenState extends ConsumerState<MailScreen> {
 
 // ---------- просмотр письма ----------
 
-/// Тело письма на экране: разметка, подготовленная к показу во flutter_html.
-///
-/// Разбор разметки делаем один раз на письмо, а не в каждом build: письма бывают на мегабайты.
-class MailBodyHtml extends StatefulWidget {
-  final String html;
-  const MailBodyHtml(this.html, {super.key});
-
-  @override
-  State<MailBodyHtml> createState() => _MailBodyHtmlState();
-}
-
-class _MailBodyHtmlState extends State<MailBodyHtml> {
-  late String _prepared = prepareMailHtml(widget.html);
-
-  @override
-  void didUpdateWidget(MailBodyHtml oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.html != widget.html) _prepared = prepareMailHtml(widget.html);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    // Письмо верстают под белый лист и чёрный текст. Тема приложения тёмная, и без этой
-    // подмены письмо без собственных цветов рисовалось светлым по светлому — то есть пустотой.
-    // Цвета и размеры из самого письма важнее: они применяются к своим элементам.
-    return Container(
-      color: const Color(0xFFFFFFFF),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      child: DefaultTextStyle(
-        style: const TextStyle(color: Color(0xFF000000), fontSize: 15, height: 1.35),
-        child: Html(data: _prepared),
-      ),
-    );
-  }
-}
-
 class MailViewerScreen extends ConsumerStatefulWidget {
   final String messageId;
   final bool inTrash;
@@ -374,6 +337,11 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
   Map<String, dynamic>? _body;
   String? _error;
   bool _busy = false;
+  /// Показываем текстовую версию вместо разметки: у рассылок, которые и в браузере едут,
+  /// читаемый выход важнее оформления.
+  bool _asText = false;
+  /// Была ли у письма версия с разметкой: по ней решаем, показывать ли переключатель.
+  bool _hasHtml = false;
 
   @override
   void initState() {
@@ -389,10 +357,30 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
       if (!m.seen) {
         api.mailSetSeen(m.id, true).catchError((_) {});
       }
-      final b = await api.mailBody(widget.messageId, true);
-      if (mounted) setState(() => _body = b);
+      await _loadBody();
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
+    }
+  }
+
+  /// Тело письма в нужной версии: разметка или текст. Картинки разрешены всегда — трекеры
+  /// тут не новость, а без картинок письмо не прочитать; подробности — в src/mail/mail-html.ts.
+  Future<void> _loadBody() async {
+    final api = ref.read(appStateProvider).api;
+    final b = await api.mailBody(widget.messageId, true, text: _asText);
+    if (!mounted) return;
+    setState(() {
+      _body = b;
+      if (!_asText && b['kind'] == 'html') _hasHtml = true;
+    });
+  }
+
+  Future<void> _toggleText() async {
+    setState(() => _asText = !_asText);
+    try {
+      await _loadBody();
+    } catch (e) {
+      if (mounted) snack(context, e.toString());
     }
   }
 
@@ -466,6 +454,12 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
         title: Text(m == null ? 'Письмо' : fullDate(DateTime.parse(m.sortAt ?? DateTime.now().toIso8601String())),
             style: const TextStyle(color: C.fg3, fontSize: 14)),
         actions: [
+          if (_hasHtml)
+            IconButton(
+              tooltip: _asText ? 'Показать письмо' : 'Показать как текст',
+              icon: Icon(_asText ? Icons.html : Icons.notes, color: C.fg),
+              onPressed: _busy ? null : _toggleText,
+            ),
           if (m != null && !widget.inTrash) ...[
             IconButton(tooltip: 'Ответить', icon: const Icon(Icons.reply, color: C.fg), onPressed: () => _reply('reply')),
             IconButton(tooltip: 'Ответить всем', icon: const Icon(Icons.reply_all, color: C.fg), onPressed: () => _reply('replyAll')),
@@ -503,12 +497,12 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
             if (_body == null)
               const Padding(padding: EdgeInsets.all(20), child: Center(child: CircularProgressIndicator()))
             else
-              // Обе версии тела — и разметка, и текст в `<pre>` от сервера — идут одной дорогой.
-              // У текстовой раньше брался `m.bodyText`, а это превью для списка: 2000 символов,
-              // то есть длинное письмо обрывалось на полуслове.
+              // Тело письма — в системном WebView: разметка рассылок (таблицы, медиазапросы,
+              // inline-стили) рассчитана на браузерный движок, а не на виджеты Flutter.
+              // Обе версии — и разметка, и текст в `<pre>` от сервера — идут одной дорогой.
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: MailBodyHtml(_body!['html'] as String? ?? ''),
+                child: MailBodyWeb(_body!['html'] as String? ?? ''),
               ),
             if (files.isNotEmpty) ...[
               const SizedBox(height: 8),

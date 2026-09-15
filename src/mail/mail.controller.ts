@@ -203,12 +203,19 @@ export class MailController {
   /**
    * Тело письма для показа. `images=1` — пользователь нажал «показать картинки»: тогда
    * внешние картинки в разметке остаются, иначе вырезаются (трекинг-пиксели).
+   * `text=1` — отдать текстовую версию даже у письма с разметкой: у части рассылок вёрстка
+   * нечитаема в любом движке, и это единственный способ прочитать письмо.
    */
   @Get('messages/:id/body')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
-  body(@Param('id') id: string, @CurrentUser() user: RequestUser, @Query('images') images?: string) {
-    return this.feed.body(user.id, id, images === '1');
+  body(
+    @Param('id') id: string,
+    @CurrentUser() user: RequestUser,
+    @Query('images') images?: string,
+    @Query('text') text?: string,
+  ) {
+    return this.feed.body(user.id, id, images === '1', text === '1');
   }
 
   /** Сырое письмо файлом: содержимое письма как оно пришло, ничего не потеряно. */
