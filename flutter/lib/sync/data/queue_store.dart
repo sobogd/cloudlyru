@@ -17,9 +17,9 @@ enum QueueState {
   final String storageKey;
 
   static QueueState byKey(String? key) => QueueState.values.firstWhere(
-        (s) => s.storageKey == key,
-        orElse: () => QueueState.pending,
-      );
+    (s) => s.storageKey == key,
+    orElse: () => QueueState.pending,
+  );
 }
 
 /// Строка очереди: что выгружать, куда и что с этим уже произошло.
@@ -80,6 +80,14 @@ class QueueStore {
     final db = await openDatabase(
       path,
       version: _version,
+      // Своё соединение на каждый движок. В одном процессе живут два: приложение и фоновое
+      // задание (SyncJobService). sqflite по умолчанию отдаёт одно соединение на путь, и тогда
+      // закрытие базы в фоне закрывало её и в приложении — «database closed» на первом же
+      // обращении после прохода
+      singleInstance: false,
+      // Два соединения к одному файлу — это нормально для SQLite, но короткая
+      // параллельная запись может попасть в «database is locked». Пусть лучше подождёт
+      onConfigure: (db) => db.execute('PRAGMA busy_timeout = 5000'),
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE uploaded(
@@ -113,7 +121,9 @@ class QueueStore {
             sha256 TEXT
           )
         ''');
-        await db.execute('CREATE UNIQUE INDEX queue_unique ON queue(path, target)');
+        await db.execute(
+          'CREATE UNIQUE INDEX queue_unique ON queue(path, target)',
+        );
         await db.execute('CREATE INDEX queue_state ON queue(state, id)');
       },
       onUpgrade: (db, oldVersion, newVersion) async {
@@ -149,18 +159,27 @@ class QueueStore {
 
   /// Что на телефоне соответствует этой записи облака: по ней применяются правки из веба.
   Future<List<(UploadedKey, Uploaded)>> uploadedByEntry(String entryId) async {
-    final rows = await _db.query('uploaded', where: 'entry_id = ?', whereArgs: [entryId]);
+    final rows = await _db.query(
+      'uploaded',
+      where: 'entry_id = ?',
+      whereArgs: [entryId],
+    );
     return [
       for (final r in rows)
         (
           UploadedKey('${r['path']}', '${r['target']}'),
-          Uploaded('${r['entry_id']}', (r['size'] as int?) ?? 0, (r['mtime'] as int?) ?? 0),
+          Uploaded(
+            '${r['entry_id']}',
+            (r['size'] as int?) ?? 0,
+            (r['mtime'] as int?) ?? 0,
+          ),
         ),
     ];
   }
 
   /// Путь файла на телефоне изменился (переименование в вебе): переносим запись.
-  Future<void> moveUploaded(String oldPath, String target, String newPath) => _db.update(
+  Future<void> moveUploaded(String oldPath, String target, String newPath) =>
+      _db.update(
         'uploaded',
         {'path': newPath},
         where: 'path = ? AND target = ?',
@@ -174,18 +193,17 @@ class QueueStore {
     int size,
     int mtime,
     String? sha256,
-  ) =>
-      _db.update(
-        'uploaded',
-        {
-          'size': size,
-          'mtime': mtime,
-          'sha256': ?sha256,
-          'at': DateTime.now().millisecondsSinceEpoch,
-        },
-        where: 'path = ? AND target = ?',
-        whereArgs: [path, target],
-      );
+  ) => _db.update(
+    'uploaded',
+    {
+      'size': size,
+      'mtime': mtime,
+      'sha256': ?sha256,
+      'at': DateTime.now().millisecondsSinceEpoch,
+    },
+    where: 'path = ? AND target = ?',
+    whereArgs: [path, target],
+  );
 
   Future<String?> shaOfUploaded(String path, String target) async {
     final rows = await _db.query(
@@ -206,20 +224,15 @@ class QueueStore {
     int size,
     int mtime, {
     String? sha256,
-  }) =>
-      _db.insert(
-        'uploaded',
-        {
-          'path': path,
-          'target': target,
-          'entry_id': entryId,
-          'size': size,
-          'mtime': mtime,
-          'sha256': ?sha256,
-          'at': DateTime.now().millisecondsSinceEpoch,
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+  }) => _db.insert('uploaded', {
+    'path': path,
+    'target': target,
+    'entry_id': entryId,
+    'size': size,
+    'mtime': mtime,
+    'sha256': ?sha256,
+    'at': DateTime.now().millisecondsSinceEpoch,
+  }, conflictAlgorithm: ConflictAlgorithm.replace);
 
   // ===== очередь =====
 
@@ -245,7 +258,14 @@ class QueueStore {
               last_error = CASE WHEN state IN ('DONE','SKIPPED') THEN NULL ELSE last_error END
             WHERE path = ? AND target = ?
             ''',
-            [item.relDir, item.name, item.size, item.mtime, item.path, item.target],
+            [
+              item.relDir,
+              item.name,
+              item.size,
+              item.mtime,
+              item.path,
+              item.target,
+            ],
           );
         } else {
           await txn.rawInsert(
@@ -285,7 +305,9 @@ class QueueStore {
   }
 
   Future<Map<QueueState, int>> counts() async {
-    final rows = await _db.rawQuery('SELECT state, COUNT(*) AS n FROM queue GROUP BY state');
+    final rows = await _db.rawQuery(
+      'SELECT state, COUNT(*) AS n FROM queue GROUP BY state',
+    );
     return {
       for (final r in rows)
         QueueState.byKey('${r['state']}'): (r['n'] as int?) ?? 0,
@@ -301,35 +323,40 @@ class QueueStore {
   }
 
   Future<QueueItem?> item(int id) async {
-    final rows = await _db.query('queue', where: 'id = ?', whereArgs: [id], limit: 1);
+    final rows = await _db.query(
+      'queue',
+      where: 'id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
     return rows.isEmpty ? null : _readItem(rows.first);
   }
 
   Future<void> markRunning(int id) => _update(id, {
-        'state': QueueState.running.storageKey,
-        'started_at': DateTime.now().millisecondsSinceEpoch,
-        'last_error': null,
-      });
+    'state': QueueState.running.storageKey,
+    'started_at': DateTime.now().millisecondsSinceEpoch,
+    'last_error': null,
+  });
 
   Future<void> markDone(int id, String entryId) => _update(id, {
-        'state': QueueState.done.storageKey,
-        'entry_id': entryId,
-        'finished_at': DateTime.now().millisecondsSinceEpoch,
-      });
+    'state': QueueState.done.storageKey,
+    'entry_id': entryId,
+    'finished_at': DateTime.now().millisecondsSinceEpoch,
+  });
 
   /// Содержимое уже было в облаке: байты не передавались, но запись там есть.
   Future<void> markSkipped(int id, String entryId) => _update(id, {
-        'state': QueueState.skipped.storageKey,
-        'entry_id': entryId,
-        'finished_at': DateTime.now().millisecondsSinceEpoch,
-      });
+    'state': QueueState.skipped.storageKey,
+    'entry_id': entryId,
+    'finished_at': DateTime.now().millisecondsSinceEpoch,
+  });
 
   Future<void> markFailed(int id, String error, int attempts) => _update(id, {
-        'state': QueueState.failed.storageKey,
-        'last_error': error.length > 500 ? error.substring(0, 500) : error,
-        'attempts': attempts,
-        'finished_at': DateTime.now().millisecondsSinceEpoch,
-      });
+    'state': QueueState.failed.storageKey,
+    'last_error': error.length > 500 ? error.substring(0, 500) : error,
+    'attempts': attempts,
+    'finished_at': DateTime.now().millisecondsSinceEpoch,
+  });
 
   /// Вернуть в ожидание: кнопка повтора на строке с ошибкой.
   Future<void> markPending(int id) =>
@@ -341,27 +368,32 @@ class QueueStore {
   /// Снять зависшие «грузится». После перезапуска приложения ничего не может быть в работе,
   /// а строка осталась бы в этом состоянии навсегда.
   Future<int> resetRunning() => _db.update(
-        'queue',
-        {'state': QueueState.pending.storageKey, 'last_error': null},
-        where: 'state = ?',
-        whereArgs: [QueueState.running.storageKey],
-      );
+    'queue',
+    {'state': QueueState.pending.storageKey, 'last_error': null},
+    where: 'state = ?',
+    whereArgs: [QueueState.running.storageKey],
+  );
 
   /// Убрать из очереди то, чего больше не должно быть: папку отключили от раздела или файл
   /// с телефона исчез. Ключи, которые остались кандидатами, и незатронутые разделы
   /// остаются на месте.
   Future<int> prune(Set<UploadedKey> keep, Set<Section> scannedSections) async {
     if (scannedSections.isEmpty) return 0;
-    final rows = await _db.query('queue', columns: ['id', 'path', 'target', 'section', 'state']);
+    final rows = await _db.query(
+      'queue',
+      columns: ['id', 'path', 'target', 'section', 'state'],
+    );
     final doomed = QueuePlanner.obsolete(
       rows
-          .map((r) => QueueRow(
-                (r['id'] as int?) ?? 0,
-                '${r['path']}',
-                '${r['target']}',
-                '${r['section']}',
-                '${r['state']}',
-              ))
+          .map(
+            (r) => QueueRow(
+              (r['id'] as int?) ?? 0,
+              '${r['path']}',
+              '${r['target']}',
+              '${r['section']}',
+              '${r['state']}',
+            ),
+          )
           .toList(),
       keep,
       scannedSections,
@@ -383,19 +415,19 @@ class QueueStore {
       _db.update('queue', values, where: 'id = ?', whereArgs: [id]);
 
   QueueItem _readItem(Map<String, Object?> r) => QueueItem(
-        id: (r['id'] as int?) ?? 0,
-        path: '${r['path']}',
-        relDir: '${r['rel_dir']}',
-        name: '${r['name']}',
-        size: (r['size'] as int?) ?? 0,
-        mtime: (r['mtime'] as int?) ?? 0,
-        section: Section.byStorageKey('${r['section']}') ?? Section.files,
-        target: '${r['target']}',
-        state: QueueState.byKey('${r['state']}'),
-        attempts: (r['attempts'] as int?) ?? 0,
-        lastError: r['last_error'] == null ? null : '${r['last_error']}',
-        entryId: r['entry_id'] == null ? null : '${r['entry_id']}',
-        sha256: r['sha256'] == null ? null : '${r['sha256']}',
-        createdAt: (r['created_at'] as int?) ?? 0,
-      );
+    id: (r['id'] as int?) ?? 0,
+    path: '${r['path']}',
+    relDir: '${r['rel_dir']}',
+    name: '${r['name']}',
+    size: (r['size'] as int?) ?? 0,
+    mtime: (r['mtime'] as int?) ?? 0,
+    section: Section.byStorageKey('${r['section']}') ?? Section.files,
+    target: '${r['target']}',
+    state: QueueState.byKey('${r['state']}'),
+    attempts: (r['attempts'] as int?) ?? 0,
+    lastError: r['last_error'] == null ? null : '${r['last_error']}',
+    entryId: r['entry_id'] == null ? null : '${r['entry_id']}',
+    sha256: r['sha256'] == null ? null : '${r['sha256']}',
+    createdAt: (r['created_at'] as int?) ?? 0,
+  );
 }

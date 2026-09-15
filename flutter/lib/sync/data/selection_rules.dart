@@ -15,10 +15,11 @@ abstract final class SelectionRules {
   /// Отметить папку: она вбирает всё поддерево, поэтому её подпапки и её предки из набора
   /// уходят — иначе дерево отвечало бы «выбрано» на разные вопросы сразу.
   static Set<String> choose(Set<String> paths, String path) => {
-        ...paths.where((p) =>
-            p != path && !p.startsWith('$path/') && !path.startsWith('$p/')),
-        path,
-      };
+    ...paths.where(
+      (p) => p != path && !p.startsWith('$path/') && !path.startsWith('$p/'),
+    ),
+    path,
+  };
 
   /// Снять выбор. Если папка была покрыта выбранным предком, предка «раскрываем»: убираем его
   /// и отмечаем его прямые подпапки. Иначе снять галочку внутри выбранного дерева было бы нечем.
@@ -48,7 +49,9 @@ abstract final class SelectionRules {
   /// Папки для обхода: без тех, что лежат внутри других выбранных.
   static List<String> scanRoots(Set<String> paths) {
     final out = paths
-        .where((p) => !paths.any((other) => other != p && p.startsWith('$other/')))
+        .where(
+          (p) => !paths.any((other) => other != p && p.startsWith('$other/')),
+        )
         .toList();
     out.sort();
     return out;

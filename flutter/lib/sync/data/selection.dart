@@ -21,10 +21,13 @@ class Selection {
     Section section,
     String path,
     List<String> Function(String) childDirsOf,
-  ) =>
-      _store(section, SelectionRules.unchoose(paths(section), path, childDirsOf));
+  ) => _store(
+    section,
+    SelectionRules.unchoose(paths(section), path, childDirsOf),
+  );
 
-  Future<Set<String>> clear(Section section) => _store(section, const <String>{});
+  Future<Set<String>> clear(Section section) =>
+      _store(section, const <String>{});
 
   /// Сколько папок отмечено в разделе: этим живёт сводка раздела.
   int count(Section section) => paths(section).length;
@@ -35,5 +38,6 @@ class Selection {
     return paths;
   }
 
-  String _key(Section section) => 'sync_folders_${section.storageKey.toLowerCase()}';
+  String _key(Section section) =>
+      'sync_folders_${section.storageKey.toLowerCase()}';
 }

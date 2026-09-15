@@ -17,18 +17,21 @@ class SyncPrefs {
   /// Медиатека: куда льётся раздел «Фото» (плоско, без структуры папок).
   String get photoFolderId => _prefs.getString(_photoFolderKey) ?? '';
 
-  Future<void> setPhotoFolderId(String id) => _prefs.setString(_photoFolderKey, id);
+  Future<void> setPhotoFolderId(String id) =>
+      _prefs.setString(_photoFolderKey, id);
 
   /// Легаси-папка «Телефон»: только читается, раздел «Файлы» ведёт зеркало.
   String get phoneFolderId => _prefs.getString(_phoneFolderKey) ?? '';
 
-  Future<void> setPhoneFolderId(String id) => _prefs.setString(_phoneFolderKey, id);
+  Future<void> setPhoneFolderId(String id) =>
+      _prefs.setString(_phoneFolderKey, id);
 
   /// Корень зеркала этого устройства. Кэш нужен, чтобы настройки показывали папку даже
   /// без сети; истина — ответ сервера на `/auth/me`.
   String get mirrorFolderId => _prefs.getString(_mirrorFolderKey) ?? '';
 
-  Future<void> setMirrorFolderId(String id) => _prefs.setString(_mirrorFolderKey, id);
+  Future<void> setMirrorFolderId(String id) =>
+      _prefs.setString(_mirrorFolderKey, id);
 
   /// Разрешение «доступ ко всем файлам» уже спрашивали: подсказку показываем один раз.
   bool get putBackTouched => _prefs.getBool(_putBackKey) ?? false;

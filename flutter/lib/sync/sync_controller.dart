@@ -54,6 +54,11 @@ class SyncController extends ChangeNotifier {
   QueueStore? queueStore;
   MirrorStore? mirrorStore;
   SyncApi? _api;
+
+  /// Сессия и логин, которыми выпускается токен устройства: нужны, чтобы повторить попытку
+  /// после отказа, не дожидаясь перезапуска приложения.
+  CloudlyApi? _sessionApi;
+  String _login = '';
   MirrorEngine? engine;
   MirrorLive? live;
   UploadRunner? uploads;
@@ -125,14 +130,16 @@ class SyncController extends ChangeNotifier {
         status: _status,
         native: native,
       );
-      uploads = UploadRunner(_requireApi(), queueStore!);
-      final liveMode = MirrorLive(mirrorStore!, engine!, _status, _watcher, native);
-      liveMode.hasToken = () => _api != null;
-      liveMode.paused = () => _paused;
-      liveMode.foreground = () => foreground;
-      liveMode.bindWatcher();
-      liveMode.start();
-      live = liveMode;
+      if (_api != null) {
+        uploads = UploadRunner(_api!, queueStore!);
+        final liveMode = MirrorLive(mirrorStore!, engine!, _status, _watcher, native);
+        liveMode.hasToken = () => _api != null;
+        liveMode.paused = () => _paused;
+        liveMode.foreground = () => foreground;
+        liveMode.bindWatcher();
+        liveMode.start();
+        live = liveMode;
+      }
 
       _status.update((s) => s.copyWith(
             phase: _paused ? MirrorPhase.paused : s.phase,
@@ -141,14 +148,46 @@ class SyncController extends ChangeNotifier {
       await refreshQueue();
       notifyListeners();
     } catch (e) {
+      debugPrint('cloudly-sync: старт синхронизации не удался: $e');
       activity = 'синхронизация недоступна: $e';
       notifyListeners();
     }
   }
 
+  /// Догнать то, что не получилось при старте.
+  ///
+  /// Токен устройства выпускается один раз, и отказ бывает временным: сеть, разблокировка
+  /// хранилища, лимит живых токенов на сервере. Без повторной попытки приложение оставалось бы
+  /// мёртвым до перезапуска, а человек видел бы только «нет токена» без причины.
+  Future<bool> ensureReady() async {
+    if (_api != null) return true;
+    final sessionApi = _sessionApi;
+    if (sessionApi == null) return false;
+    await _bindToken(sessionApi, _login, _sessionEpoch);
+    final api = _api;
+    if (api == null) {
+      notifyListeners();
+      return false;
+    }
+    uploads ??= UploadRunner(api, queueStore!);
+    if (engine != null && live == null) {
+      final liveMode = MirrorLive(mirrorStore!, engine!, _status, _watcher, native);
+      liveMode.hasToken = () => _api != null;
+      liveMode.paused = () => _paused;
+      liveMode.foreground = () => foreground;
+      liveMode.bindWatcher();
+      liveMode.start();
+      live = liveMode;
+    }
+    notifyListeners();
+    return true;
+  }
+
   /// Токен устройства: свой у каждого устройства, поэтому корень зеркала в облаке не делится
   /// между телефонами.
   Future<void> _bindToken(CloudlyApi sessionApi, String login, int epoch) async {
+    _sessionApi = sessionApi;
+    _login = login;
     try {
       final token = await ensureDeviceToken(
         session: sessionApi,
@@ -159,10 +198,24 @@ class SyncController extends ChangeNotifier {
       );
       if (epoch != _sessionEpoch) return;
       _api = SyncApi(serverUrl: sessionApi.serverUrl, token: token.token);
+      tokenError = null;
     } catch (e) {
       _api = null;
-      activity = 'токен устройства не выпущен: $e';
+      tokenError = _tokenProblem(e);
+      // Без строки в логе причину отказа на телефоне искать негде: в интерфейсе видно только
+      // «нет токена», а подробность сервера приходит именно здесь
+      debugPrint('cloudly-sync: $tokenError');
     }
+  }
+
+  /// Отказ выпуска токена словами. Сервер отвечает понятным текстом (в том числе про лимит
+  /// живых токенов), поэтому его сообщение и показываем — но с подсказкой, что с этим делать.
+  String _tokenProblem(Object e) {
+    final text = 'токен устройства не выпущен: $e';
+    if (e is ApiException && (e.status == 400 || e.status == 401 || e.status == 403)) {
+      return '$text · проверьте «Токены приложений»: ненужные лучше отозвать';
+    }
+    return text;
   }
 
   /// Выход из аккаунта: токен отзывается на сервере, иначе он остаётся живым до истечения срока
@@ -176,6 +229,9 @@ class SyncController extends ChangeNotifier {
     await BackgroundSync.cancel();
     await live?.dispose();
     _api = null;
+    _sessionApi = null;
+    _login = '';
+    tokenError = null;
     _started = false;
     _sessionEpoch++;
     await queueStore?.close();
@@ -193,9 +249,15 @@ class SyncController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Что не вышло с токеном устройства: показывается в настройках, пока не получится.
+  String? tokenError;
+
   SyncApi _requireApi() {
     final api = _api;
-    if (api == null) throw StateError('синхронизация не настроена: нет токена устройства');
+    if (api == null) {
+      final why = tokenError;
+      throw StateError(why == null ? 'нет токена устройства' : 'нет токена устройства: $why');
+    }
     return api;
   }
 
@@ -242,6 +304,13 @@ class SyncController extends ChangeNotifier {
     final store = queueStore;
     final sel = selection;
     if (store == null || sel == null) return null;
+    // Токен мог не выпуститься при старте (сеть, лимит живых токенов): без повторной попытки
+    // кнопка «Обновить» молча ничего бы не делала
+    if (_api == null && !await ensureReady()) {
+      queueNote = tokenError ?? 'нет токена устройства';
+      notifyListeners();
+      return null;
+    }
     activity = 'прохожу папки…';
     notifyListeners();
     try {
@@ -270,6 +339,11 @@ class SyncController extends ChangeNotifier {
 
   /// Выгрузить один файл из очереди: запускается вручную, кнопкой на строке.
   Future<void> uploadItem(int itemId, {void Function(UploadProgress)? onProgress}) async {
+    if (_api == null && !await ensureReady()) {
+      queueNote = tokenError ?? 'нет токена устройства';
+      notifyListeners();
+      return;
+    }
     final runner = uploads;
     if (runner == null) return;
     activity = 'выгружаю…';
@@ -289,6 +363,11 @@ class SyncController extends ChangeNotifier {
   Future<MirrorReport?> mirrorPass({bool manual = true}) async {
     final e = engine;
     if (e == null) return null;
+    // Сверить сейчас имеет смысл и после отказа выпустить токен: причина часто временная,
+    // и повторная попытка тут же даёт ответ — либо проход, либо внятную ошибку
+    if (_api == null && !await ensureReady()) {
+      return MirrorReport()..error = tokenError ?? 'нет токена устройства';
+    }
     activity = 'сверяю…';
     notifyListeners();
     try {

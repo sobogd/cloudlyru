@@ -64,6 +64,12 @@ class MirrorStore {
     final db = await openDatabase(
       path,
       version: _version,
+      // Своё соединение на каждый движок: в процессе живут два — приложение и фоновое задание.
+      // С общим соединением закрытие базы в фоне ломало приложение («database closed»)
+      singleInstance: false,
+      // Два соединения к одному файлу — это нормально для SQLite, но короткая
+      // параллельная запись может попасть в «database is locked». Пусть лучше подождёт
+      onConfigure: (db) => db.execute('PRAGMA busy_timeout = 5000'),
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE roots(
@@ -93,7 +99,9 @@ class MirrorStore {
         ''');
         await db.execute('CREATE INDEX files_entry ON files(entry_id)');
         await db.execute('CREATE INDEX files_inode ON files(inode)');
-        await db.execute('CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+        await db.execute(
+          'CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+        );
         await db.execute('''
           CREATE TABLE uploads(
             path TEXT PRIMARY KEY,
@@ -132,7 +140,12 @@ class MirrorStore {
   // ===== незавершённые выгрузки =====
 
   Future<UploadSessionRow?> uploadSession(String path) async {
-    final rows = await _db.query('uploads', where: 'path = ?', whereArgs: [path], limit: 1);
+    final rows = await _db.query(
+      'uploads',
+      where: 'path = ?',
+      whereArgs: [path],
+      limit: 1,
+    );
     if (rows.isEmpty) return null;
     final r = rows.first;
     return UploadSessionRow(
@@ -145,31 +158,31 @@ class MirrorStore {
     );
   }
 
-  Future<void> putUploadSession(UploadSessionRow row) => _db.insert(
-        'uploads',
-        {
-          'path': row.path,
-          'upload_id': row.uploadId,
-          'folder_id': row.folderId,
-          'size': row.size,
-          'mtime': row.mtime,
-          'sha256': row.sha256,
-          'at': DateTime.now().millisecondsSinceEpoch,
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+  Future<void> putUploadSession(UploadSessionRow row) => _db.insert('uploads', {
+    'path': row.path,
+    'upload_id': row.uploadId,
+    'folder_id': row.folderId,
+    'size': row.size,
+    'mtime': row.mtime,
+    'sha256': row.sha256,
+    'at': DateTime.now().millisecondsSinceEpoch,
+  }, conflictAlgorithm: ConflictAlgorithm.replace);
 
   Future<void> dropUploadSession(String path) =>
       _db.delete('uploads', where: 'path = ?', whereArgs: [path]);
 
   // ===== корни зеркала =====
 
-  Future<void> putRoot(String localPath, String cloudId, String cloudPath) async {
-    await _db.insert(
-      'roots',
-      {'local_path': localPath, 'cloud_id': cloudId, 'cloud_path': cloudPath},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+  Future<void> putRoot(
+    String localPath,
+    String cloudId,
+    String cloudPath,
+  ) async {
+    await _db.insert('roots', {
+      'local_path': localPath,
+      'cloud_id': cloudId,
+      'cloud_path': cloudPath,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
     await registerDir(cloudId, localPath);
   }
 
@@ -194,11 +207,10 @@ class MirrorStore {
 
   Future<void> registerDir(String cloudId, String localPath) async {
     if (cloudId.isEmpty) return;
-    await _db.insert(
-      'dirs',
-      {'cloud_id': cloudId, 'local_path': localPath},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await _db.insert('dirs', {
+      'cloud_id': cloudId,
+      'local_path': localPath,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<String?> dirId(String localPath) async {
@@ -228,22 +240,28 @@ class MirrorStore {
 
   /// Папку на телефоне переименовали или перенесли: путь в паре меняется, id остаётся.
   Future<void> moveDir(String cloudId, String newLocalPath) => _db.update(
-        'dirs',
-        {'local_path': newLocalPath},
-        where: 'cloud_id = ?',
-        whereArgs: [cloudId],
-      );
+    'dirs',
+    {'local_path': newLocalPath},
+    where: 'cloud_id = ?',
+    whereArgs: [cloudId],
+  );
 
   // ===== файлы =====
 
   Future<Map<String, MirrorRow>> files() async {
     final rows = await _db.query(
       'files',
-      columns: ['path', 'cloud_folder_id', 'entry_id', 'inode', 'size', 'mtime', 'sha256'],
+      columns: [
+        'path',
+        'cloud_folder_id',
+        'entry_id',
+        'inode',
+        'size',
+        'mtime',
+        'sha256',
+      ],
     );
-    return {
-      for (final r in rows) '${r['path']}': _row(r),
-    };
+    return {for (final r in rows) '${r['path']}': _row(r)};
   }
 
   Future<MirrorRow?> fileByEntry(String entryId) async {
@@ -261,9 +279,22 @@ class MirrorStore {
     return (rows.first['n'] as int?) ?? 0;
   }
 
-  Future<void> putFile(MirrorRow row) => _db.insert(
-        'files',
-        {
+  Future<void> putFile(MirrorRow row) => _db.insert('files', {
+    'path': row.path,
+    'cloud_folder_id': row.cloudFolderId,
+    'entry_id': row.entryId,
+    'inode': row.inode,
+    'size': row.size,
+    'mtime': row.mtime,
+    'sha256': row.sha256,
+    'at': DateTime.now().millisecondsSinceEpoch,
+  }, conflictAlgorithm: ConflictAlgorithm.replace);
+
+  /// Переименование: путь меняется, запись в облаке остаётся той же.
+  Future<void> moveFile(String oldPath, MirrorRow row) =>
+      _db.transaction((txn) async {
+        await txn.delete('files', where: 'path = ?', whereArgs: [oldPath]);
+        await txn.insert('files', {
           'path': row.path,
           'cloud_folder_id': row.cloudFolderId,
           'entry_id': row.entryId,
@@ -272,27 +303,7 @@ class MirrorStore {
           'mtime': row.mtime,
           'sha256': row.sha256,
           'at': DateTime.now().millisecondsSinceEpoch,
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-
-  /// Переименование: путь меняется, запись в облаке остаётся той же.
-  Future<void> moveFile(String oldPath, MirrorRow row) => _db.transaction((txn) async {
-        await txn.delete('files', where: 'path = ?', whereArgs: [oldPath]);
-        await txn.insert(
-          'files',
-          {
-            'path': row.path,
-            'cloud_folder_id': row.cloudFolderId,
-            'entry_id': row.entryId,
-            'inode': row.inode,
-            'size': row.size,
-            'mtime': row.mtime,
-            'sha256': row.sha256,
-            'at': DateTime.now().millisecondsSinceEpoch,
-          },
-          conflictAlgorithm: ConflictAlgorithm.replace,
-        );
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
       });
 
   Future<void> dropFile(String path) =>
@@ -301,7 +312,11 @@ class MirrorStore {
   /// Записи папки: нужны, когда папку удалили в облаке — поддерево уходит целиком.
   Future<List<MirrorRow>> filesUnder(String localPath) async {
     final prefix = localPath.endsWith('/') ? localPath : '$localPath/';
-    final rows = await _db.query('files', where: 'path LIKE ?', whereArgs: ['$prefix%']);
+    final rows = await _db.query(
+      'files',
+      where: 'path LIKE ?',
+      whereArgs: ['$prefix%'],
+    );
     return rows.map(_row).toList();
   }
 
@@ -319,8 +334,13 @@ class MirrorStore {
 
   /// Что уже выгружено по данным зеркала: из этого считается «сколько реально в облаке».
   Future<Totals> inCloud() async {
-    final rows = await _db.rawQuery('SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS b FROM files');
-    return Totals((rows.first['n'] as int?) ?? 0, (rows.first['b'] as int?) ?? 0);
+    final rows = await _db.rawQuery(
+      'SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS b FROM files',
+    );
+    return Totals(
+      (rows.first['n'] as int?) ?? 0,
+      (rows.first['b'] as int?) ?? 0,
+    );
   }
 
   /// Сколько всего нашлось в выбранных папках на последнем обходе (переживает перезапуск).
@@ -349,10 +369,10 @@ class MirrorStore {
   /// аккаунта делают все локальные файлы «уже выгруженными», и папка нового аккаунта
   /// остаётся пустой навсегда.
   Future<void> wipe() => _db.transaction((txn) async {
-        for (final table in ['files', 'dirs', 'roots', 'uploads', 'meta']) {
-          await txn.delete(table);
-        }
-      });
+    for (final table in ['files', 'dirs', 'roots', 'uploads', 'meta']) {
+      await txn.delete(table);
+    }
+  });
 
   // ===== прочее =====
 
@@ -367,25 +387,25 @@ class MirrorStore {
     return rows.isEmpty ? null : '${rows.first['value']}';
   }
 
-  Future<void> setMeta(String key, String value) => _db.insert(
-        'meta',
-        {'key': key, 'value': value},
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+  Future<void> setMeta(String key, String value) => _db.insert('meta', {
+    'key': key,
+    'value': value,
+  }, conflictAlgorithm: ConflictAlgorithm.replace);
 
-  Future<void> clearMeta(String key) => _db.delete('meta', where: 'key = ?', whereArgs: [key]);
+  Future<void> clearMeta(String key) =>
+      _db.delete('meta', where: 'key = ?', whereArgs: [key]);
 
   Future<int?> cursor() async => int.tryParse(await meta(keyCursor) ?? '');
 
   Future<void> setCursor(int seq) => setMeta(keyCursor, '$seq');
 
   MirrorRow _row(Map<String, Object?> r) => MirrorRow(
-        path: '${r['path']}',
-        cloudFolderId: '${r['cloud_folder_id']}',
-        entryId: '${r['entry_id']}',
-        inode: (r['inode'] as int?) ?? 0,
-        size: (r['size'] as int?) ?? 0,
-        mtime: (r['mtime'] as int?) ?? 0,
-        sha256: r['sha256'] == null ? null : '${r['sha256']}',
-      );
+    path: '${r['path']}',
+    cloudFolderId: '${r['cloud_folder_id']}',
+    entryId: '${r['entry_id']}',
+    inode: (r['inode'] as int?) ?? 0,
+    size: (r['size'] as int?) ?? 0,
+    mtime: (r['mtime'] as int?) ?? 0,
+    sha256: r['sha256'] == null ? null : '${r['sha256']}',
+  );
 }

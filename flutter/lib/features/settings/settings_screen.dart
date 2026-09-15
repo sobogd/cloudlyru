@@ -628,6 +628,32 @@ class _SyncPanelState extends ConsumerState<_SyncPanel> {
                   child: const Text('Разрешить доступ ко всем файлам'),
                 ),
               ],
+              // Токен устройства не выпустился: без него синхронизация мертва, и молчать об
+              // этом нельзя — «Сверить сейчас» иначе отвечает только «нет токена».
+              // Причина приходит от сервера словами, её и показываем.
+              if (sync.tokenError != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  sync.tokenError!,
+                  style: const TextStyle(color: C.fg, fontSize: 12),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: () async {
+                    final ok = await _sync.ensureReady();
+                    if (mounted) {
+                      setState(() {});
+                      if (!ok) {
+                        snack(
+                          context,
+                          _sync.tokenError ?? 'токен устройства не выпущен',
+                        );
+                      }
+                    }
+                  },
+                  child: const Text('Повторить'),
+                ),
+              ],
               const SizedBox(height: 4),
               _row(
                 icon: Icons.folder_outlined,

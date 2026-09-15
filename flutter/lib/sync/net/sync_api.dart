@@ -170,21 +170,33 @@ class SyncUploadStatus {
 /// пустым — зеркало осталось бы без своего корня.
 class SyncApi {
   SyncApi({required String serverUrl, required this.token})
-      : serverUrl = _normalize(serverUrl) {
-    final base = '$this.serverUrl/api/v1';
-    _http = Dio(BaseOptions(
-      baseUrl: base,
-      connectTimeout: const Duration(seconds: 20),
-      receiveTimeout: const Duration(seconds: 60),
-      sendTimeout: const Duration(seconds: 120),
-      headers: {'Authorization': 'Bearer $token', 'Accept': 'application/json'},
-    ));
+    : serverUrl = _normalize(serverUrl) {
+    // Пустой адрес — не «странный URL» от Dio, а понятная причина: синхронизации некуда ходить
+    if (this.serverUrl.isEmpty) {
+      throw StateError('не задан адрес сервера');
+    }
+    // Подстановка именно через `${…}`: `$this.serverUrl` Dart читает как «объект целиком»,
+    // и адресом становится «Instance of 'SyncApi'.serverUrl» — Dio такое отвергает.
+    _http = Dio(
+      BaseOptions(
+        baseUrl: baseUrl,
+        connectTimeout: const Duration(seconds: 20),
+        receiveTimeout: const Duration(seconds: 60),
+        sendTimeout: const Duration(seconds: 120),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Accept': 'application/json',
+        },
+      ),
+    );
     // Свой клиент без Authorization: ссылка уже подписана, лишние заголовки ломают подпись
-    _s3 = Dio(BaseOptions(
-      connectTimeout: const Duration(seconds: 20),
-      receiveTimeout: const Duration(seconds: 300),
-      sendTimeout: const Duration(seconds: 300),
-    ));
+    _s3 = Dio(
+      BaseOptions(
+        connectTimeout: const Duration(seconds: 20),
+        receiveTimeout: const Duration(seconds: 300),
+        sendTimeout: const Duration(seconds: 300),
+      ),
+    );
   }
 
   final String serverUrl;
@@ -192,6 +204,10 @@ class SyncApi {
 
   late final Dio _http;
   late final Dio _s3;
+
+  /// Базовый адрес API: один на все запросы. Вынесен в поле, чтобы его можно было проверить
+  /// тестом — ошибка в нём роняет всю синхронизацию разом, а видно её только на телефоне.
+  String get baseUrl => '$serverUrl/api/v1';
 
   static String _normalize(String u) => u.trim().replaceAll(RegExp(r'/+$'), '');
 
@@ -246,8 +262,13 @@ class SyncApi {
 
   /// Идемпотентный mkdir: возвращает id папки по пути от корня.
   Future<String> ensurePath(String path, String? parentId) async {
-    final j = _m(await _req('/folders/ensure-path',
-        method: 'POST', body: {'path': path, 'parentId': ?parentId}));
+    final j = _m(
+      await _req(
+        '/folders/ensure-path',
+        method: 'POST',
+        body: {'path': path, 'parentId': ?parentId},
+      ),
+    );
     return '${j['id'] ?? ''}';
   }
 
@@ -256,7 +277,10 @@ class SyncApi {
       '${_m(await _req('/folders/$folderId/meta'))['name'] ?? ''}';
 
   /// Содержимое папки одной страницей: сервер отдаёт порциями по 1000 записей.
-  Future<(FolderChildren, String?)> _childrenPage(String folderId, String? after) async {
+  Future<(FolderChildren, String?)> _childrenPage(
+    String folderId,
+    String? after,
+  ) async {
     final suffix = (after == null || after.isEmpty)
         ? ''
         : '?after=${Uri.encodeQueryComponent(after)}';
@@ -265,7 +289,9 @@ class SyncApi {
     for (final f in ((o['folders'] as List?) ?? const []).whereType<Map>()) {
       folders['${f['name']}'] = '${f['id']}';
     }
-    final entries = ((o['entries'] as List?) ?? const []).whereType<Map>().map((e) {
+    final entries = ((o['entries'] as List?) ?? const []).whereType<Map>().map((
+      e,
+    ) {
       return RemoteEntry(
         id: '${e['id']}',
         name: '${e['name']}',
@@ -371,26 +397,36 @@ class SyncApi {
       '${_m(await _req('/uploads/$uploadId/url/$part'))['url'] ?? ''}';
 
   Future<void> registerPart(String uploadId, int part, String etag, int size) =>
-      _req('/uploads/$uploadId/parts/$part',
-          method: 'PUT', body: {'etag': etag, 'size': size});
+      _req(
+        '/uploads/$uploadId/parts/$part',
+        method: 'PUT',
+        body: {'etag': etag, 'size': size},
+      );
 
   /// Заливка части через сервер: нужно, когда хранилище с телефона недоступно.
   Future<void> relayChunk(String uploadId, int part, Uint8List bytes) async {
     try {
-      await _http.put('/uploads/$uploadId/chunks/$part',
-          data: bytes,
-          options: Options(
-            contentType: 'application/octet-stream',
-            responseType: ResponseType.plain,
-          ));
+      await _http.put(
+        '/uploads/$uploadId/chunks/$part',
+        data: bytes,
+        options: Options(
+          contentType: 'application/octet-stream',
+          responseType: ResponseType.plain,
+        ),
+      );
     } on DioException catch (e) {
       throw _toException(e);
     }
   }
 
   Future<String> complete(String uploadId, String sha256) async {
-    final o = _m(await _req('/uploads/$uploadId/complete',
-        method: 'POST', body: {'sha256': sha256}));
+    final o = _m(
+      await _req(
+        '/uploads/$uploadId/complete',
+        method: 'POST',
+        body: {'sha256': sha256},
+      ),
+    );
     return _sOrNull((o['entry'] as Map?)?['id']) ?? '';
   }
 
@@ -404,12 +440,14 @@ class SyncApi {
   Future<String> putPartToS3(String presignedUrl, Uint8List bytes) async {
     final host = Uri.tryParse(presignedUrl)?.host ?? 'S3';
     try {
-      final res = await _s3.put<List<int>>(presignedUrl,
-          data: bytes,
-          options: Options(
-            contentType: 'application/octet-stream',
-            responseType: ResponseType.plain,
-          ));
+      final res = await _s3.put<List<int>>(
+        presignedUrl,
+        data: bytes,
+        options: Options(
+          contentType: 'application/octet-stream',
+          responseType: ResponseType.plain,
+        ),
+      );
       final etag = res.headers.value('etag');
       if (etag == null || etag.isEmpty) throw Exception('$host не отдал ETag');
       return etag.replaceAll('"', '');
@@ -419,13 +457,14 @@ class SyncApi {
     }
   }
 
-  Future<void> deleteFile(String entryId) => _req('/files/$entryId', method: 'DELETE');
+  Future<void> deleteFile(String entryId) =>
+      _req('/files/$entryId', method: 'DELETE');
 
   Future<void> moveFile(String entryId, String folderId, String name) => _req(
-        '/files/$entryId',
-        method: 'PATCH',
-        body: {'folderId': folderId, 'name': name},
-      );
+    '/files/$entryId',
+    method: 'PATCH',
+    body: {'folderId': folderId, 'name': name},
+  );
 
   /// Переименование без переноса: сервер считает это отдельной операцией.
   Future<void> renameFile(String entryId, String name) =>
@@ -441,8 +480,14 @@ class SyncApi {
   /// Пишем во временное имя рядом и переименовываем только после успеха — иначе сканирование
   /// подхватило бы недописанный файл. `expectedSha256` приходит из журнала: если содержимое
   /// не сошлось, файл не оставляем.
-  Future<void> downloadToFile(String entryId, File dest, {String? expectedSha256}) async {
-    final tmp = File(p.join(dest.parent.path, '.${p.basename(dest.path)}.cloudly-tmp'));
+  Future<void> downloadToFile(
+    String entryId,
+    File dest, {
+    String? expectedSha256,
+  }) async {
+    final tmp = File(
+      p.join(dest.parent.path, '.${p.basename(dest.path)}.cloudly-tmp'),
+    );
     Object? lastError;
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
@@ -454,13 +499,17 @@ class SyncApi {
             // огрызок с чужим содержимым копить нельзя: следующая попытка начнётся с нуля,
             // иначе к нему приклеится ещё кусок и файл так и останется испорченным
             await tmp.delete();
-            throw const FileSystemException('содержимое не сошлось с хэшем из журнала');
+            throw const FileSystemException(
+              'содержимое не сошлось с хэшем из журнала',
+            );
           }
         }
         // прежний файл не удаляем, а уводим в сторону: если переименование не удастся,
         // на месте останется рабочая версия, а не пустота (иначе зеркало сочло бы файл
         // удалённым и унесло бы облачную копию в корзину)
-        final backup = File(p.join(dest.parent.path, '${p.basename(dest.path)}.cloudly-old'));
+        final backup = File(
+          p.join(dest.parent.path, '${p.basename(dest.path)}.cloudly-old'),
+        );
         if (await dest.exists()) {
           if (await backup.exists()) await backup.delete();
           await dest.rename(backup.path);
@@ -493,7 +542,9 @@ class SyncApi {
       ..connectionTimeout = const Duration(seconds: 20)
       ..idleTimeout = const Duration(minutes: 5);
     try {
-      final req = await client.getUrl(Uri.parse('$serverUrl/api/v1/files/$entryId/content'));
+      final req = await client.getUrl(
+        Uri.parse('$serverUrl/api/v1/files/$entryId/content'),
+      );
       req.headers.set('Authorization', 'Bearer $token');
       req.headers.set('Accept-Encoding', 'identity');
       if (from > 0) req.headers.set('Range', 'bytes=$from-');
@@ -504,7 +555,9 @@ class SyncApi {
       // 206 — сервер продолжил с запрошенного места. Если он ответил 200, значит Range
       // проигнорирован и пришло всё содержимое: дописывать его к огрызку нельзя, пишем заново.
       final resumed = from > 0 && res.statusCode == 206;
-      final sink = target.openWrite(mode: resumed ? FileMode.append : FileMode.write);
+      final sink = target.openWrite(
+        mode: resumed ? FileMode.append : FileMode.write,
+      );
       try {
         await res.forEach(sink.add);
       } finally {
@@ -518,10 +571,17 @@ class SyncApi {
 
   // ---------- внутреннее ----------
 
-  Future<dynamic> _req(String path, {String method = 'GET', Object? body}) async {
+  Future<dynamic> _req(
+    String path, {
+    String method = 'GET',
+    Object? body,
+  }) async {
     try {
-      final res = await _http.request<dynamic>(path,
-          data: body, options: Options(method: method));
+      final res = await _http.request<dynamic>(
+        path,
+        data: body,
+        options: Options(method: method),
+      );
       return res.data;
     } on DioException catch (e) {
       throw _toException(e);
@@ -551,8 +611,7 @@ class SyncApi {
       message = switch (e.type) {
         DioExceptionType.connectionTimeout ||
         DioExceptionType.sendTimeout ||
-        DioExceptionType.receiveTimeout =>
-          'не дождался ответа сервера',
+        DioExceptionType.receiveTimeout => 'не дождался ответа сервера',
         DioExceptionType.connectionError => 'нет соединения с сервером',
         _ => e.message ?? 'ошибка сети',
       };
