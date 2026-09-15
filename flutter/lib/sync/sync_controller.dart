@@ -98,6 +98,11 @@ class SyncController extends ChangeNotifier {
   /// Нужно ли просить доступ ко всем файлам: без него не видно ни дерева, ни содержимого.
   bool get needsAccess => access == SyncAccess.denied;
 
+  /// Корень зеркала этого устройства в облаке. По нему «Файлы» помечают папку, которая
+  /// синхронизируется: имя у неё ничем не отличается от обычной, а перепутать её с обычной
+  /// папкой — значит удалить или переименовать корень, на который смотрит зеркало.
+  String get mirrorRootId => syncPrefs?.mirrorFolderId ?? '';
+
   /// Запуск: открыть базы, прочитать выбор папок, проверить доступ, поднять мгновенный режим.
   ///
   /// Вызывается при входе в аккаунт и при старте приложения, если сессия уже есть.
@@ -141,6 +146,7 @@ class SyncController extends ChangeNotifier {
         live = liveMode;
       }
 
+      if (_api != null) await _rememberSystemFolders(_api!);
       _status.update((s) => s.copyWith(
             phase: _paused ? MirrorPhase.paused : s.phase,
           ));
@@ -169,6 +175,7 @@ class SyncController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+    await _rememberSystemFolders(api);
     uploads ??= UploadRunner(api, queueStore!);
     if (engine != null && live == null) {
       final liveMode = MirrorLive(mirrorStore!, engine!, _status, _watcher, native);
@@ -181,6 +188,26 @@ class SyncController extends ChangeNotifier {
     }
     notifyListeners();
     return true;
+  }
+
+  /// Запомнить системные папки сервера — прежде всего корень зеркала. Спрашиваем один раз
+  /// при запуске: без него «Файлы» не отличат синхронизируемую папку от обычной.
+  Future<void> _rememberSystemFolders(SyncApi api) async {
+    final prefs = syncPrefs;
+    if (prefs == null) return;
+    try {
+      final me = await api.systemFolders();
+      final mirror = me.mirrorFolderId;
+      if (mirror != null && mirror.isNotEmpty) await prefs.setMirrorFolderId(mirror);
+      final photo = me.photoFolderId;
+      if (photo != null && photo.isNotEmpty) await prefs.setPhotoFolderId(photo);
+      final phone = me.phoneFolderId;
+      if (phone != null && phone.isNotEmpty) await prefs.setPhoneFolderId(phone);
+      notifyListeners();
+    } catch (e) {
+      // папки придут и позже — например, при наполнении очереди; ронять из-за них старт незачем
+      debugPrint('cloudly-sync: системные папки не спрошены: $e');
+    }
   }
 
   /// Токен устройства: свой у каждого устройства, поэтому корень зеркала в облаке не делится
