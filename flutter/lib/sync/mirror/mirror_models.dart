@@ -41,15 +41,16 @@ class LocalFile {
 /// Папка телефона. Нужна, чтобы в облаке повторялась и пустая структура, а не только места
 /// с файлами.
 class LocalDir {
-  /// @param path полный путь в файловой системе, @param relDir — путь внутри выбранной папки
-  ///        вместе с её именем (так же, как [LocalFile.relDir]).
+  /// @param path полный путь в файловой системе, @param relDir — путь внутри связанной папки
+  ///        без её имени: у `Download/Telegram` при связке на `Download` это `Telegram`.
+  ///        Ровно этот путь зеркало и повторяет в облаке.
   const LocalDir(this.path, this.relDir);
 
   final String path;
   final String relDir;
 }
 
-/// Снимок выбранных папок.
+/// Снимок связанных папок.
 ///
 /// [unreadable] и [capped] — часть контракта «можно ли удалять», а не справочные числа:
 /// решения по ним принимает [MirrorRules.deletionsAllowed], и по неполному снимку удаления

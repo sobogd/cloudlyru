@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../data/mirror_store.dart';
 import '../data/queue_store.dart';
 import '../data/selection.dart';
+import '../data/sync_links.dart';
 import '../data/sync_prefs.dart';
 import '../device/device_files.dart';
 import '../device/native_fs.dart';
@@ -166,11 +167,14 @@ Future<(bool, String)> _pass(
     mirrorStore = await MirrorStore.open();
     queueStore = await QueueStore.open();
 
+    // Связки — для зеркала («Файлы»), выбор папок — для очереди («Фото»): это два разных
+    // механизма, и в фоне нужны оба
+    final links = SyncLinks(prefs);
     final selection = Selection(prefs);
     final native = NativeFs();
     // Один мост на зеркало и очередь: канал к Android общий, и второй экземпляр ничего
     // не добавил бы, только продублировал бы подписку на события файловой системы
-    final engine = MirrorEngine(() => api, mirrorStore, selection, native: native);
+    final engine = MirrorEngine(() => api, mirrorStore, links, native: native);
     final report = await engine.pass(
       budgetMs: passBudgetMs,
       isCancelled: cancelled,

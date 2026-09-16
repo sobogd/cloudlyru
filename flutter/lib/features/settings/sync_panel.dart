@@ -10,8 +10,10 @@ import '../../sync/ui/folder_tree_screen.dart';
 import '../../sync/ui/queue_screen.dart';
 import '../../theme.dart';
 import '../../util/widgets.dart';
+import 'sync_links_screen.dart';
 
-/// Группа «Синхронизация»: доступ к файлам, папки разделов, очередь и зеркало.
+/// Группа «Синхронизация»: доступ к файлам, связки «устройство ↔ облако», папки «Фото»,
+/// очередь и зеркало.
 ///
 /// Всё, что делает синхронизатор, видно и настраивается здесь: отдельной вкладки у него нет —
 /// нижняя навигация остаётся той же, что и раньше, а разделы «Файлы»/«Фото» и очередь
@@ -73,7 +75,8 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
   @override
   Widget build(BuildContext context) {
     final sync = ref.watch(syncControllerProvider);
-    final fileFolders = sync.selection?.count(Section.files) ?? 0;
+    // у «Файлов» не выбор папок, а связки: папку в облаке человек выбирает сам
+    final fileLinks = sync.links?.all().length ?? 0;
     final photoFolders = sync.selection?.count(Section.photos) ?? 0;
     final granted = sync.access == SyncAccess.granted;
 
@@ -130,11 +133,11 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
           ],
           const SizedBox(height: 4),
           _row(
-            icon: Icons.folder_outlined,
+            icon: Icons.sync_alt,
             title: 'Папки для файлов',
-            subtitle: fileFolders == 0 ? 'не выбраны' : 'выбрано: $fileFolders',
+            subtitle: fileLinks == 0 ? 'связок нет' : 'связок: $fileLinks',
             enabled: granted,
-            onTap: () => _open(const FolderTreeScreen(section: Section.files)),
+            onTap: () => _open(const SyncLinksScreen()),
           ),
           _row(
             icon: Icons.photo_library_outlined,
@@ -161,7 +164,7 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
           ),
           const SizedBox(height: 2),
           Text(
-            _watchLine(granted, fileFolders, sync.watchedDirs),
+            _watchLine(granted, fileLinks, sync.watchedDirs),
             style: const TextStyle(color: C.fg3, fontSize: 12),
           ),
           // Итог фонового прохода показываем, только когда он есть: пока приложение ни разу
@@ -197,12 +200,12 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
 
   /// Наблюдение за папками — ускоритель, а не сама синхронизация: без него изменения
   /// подхватит ближайший проход. Поэтому вместо «не поставлено» говорим причину.
-  String _watchLine(bool granted, int fileFolders, int watched) {
+  String _watchLine(bool granted, int fileLinks, int watched) {
     if (!granted) {
       return 'наблюдение за папками появится после доступа к файлам';
     }
-    if (fileFolders == 0) {
-      return 'наблюдение за папками: ни одной папки не выбрано';
+    if (fileLinks == 0) {
+      return 'наблюдение за папками: ни одной связки нет';
     }
     if (watched > 0) {
       return 'наблюдение за папками: $watched';

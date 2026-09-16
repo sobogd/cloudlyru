@@ -36,12 +36,26 @@ const int _searchLimit = 500;
 /// Открывается из «Настроек» → «Синхронизация» (см. `features/settings/sync_panel.dart`)
 /// отдельно для каждого раздела: [section] определяет и набор выбранных папок, и подписи
 /// на экране.
+///
+/// Второй режим — [FolderTreeScreen.pick]: выбрать одну папку и вернуть её путь. Так
+/// выбирается папка устройства для связки (см. `features/settings/sync_links_screen.dart`):
+/// связка — это ровно одна пара папок, поэтому отметка тут одиночная и в настройки раздела
+/// не пишется вовсе.
 class FolderTreeScreen extends ConsumerStatefulWidget {
   /// [section] — какой раздел настраивается: у «Файлов» и «Фото» свои наборы папок, и один
   /// экран обслуживает оба, потому что поведение у них одинаковое.
-  const FolderTreeScreen({super.key, required this.section});
+  const FolderTreeScreen({super.key, required this.section}) : pick = false;
+
+  /// Выбор одной папки устройства: экран закрывается с выбранным путём
+  /// (`Navigator.pop<String>(path)`), ничего не записывая в настройки раздела.
+  const FolderTreeScreen.pick({super.key})
+    : section = Section.files,
+      pick = true;
 
   final Section section;
+
+  /// Режим выбора одной папки вместо набора папок раздела.
+  final bool pick;
 
   @override
   ConsumerState<FolderTreeScreen> createState() => _FolderTreeScreenState();
@@ -107,8 +121,12 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
   @override
   void initState() {
     super.initState();
-    // выбор уже мог быть сделан раньше: показываем его, а не пустое дерево
-    _chosen = _sync.selection?.paths(widget.section) ?? const <String>{};
+    // выбор уже мог быть сделан раньше: показываем его, а не пустое дерево. В режиме выбора
+    // одной папки показывать нечего: там выбор начинается с пустого места, и в настройках
+    // раздела он не лежит
+    _chosen = widget.pick
+        ? const <String>{}
+        : (_sync.selection?.paths(widget.section) ?? const <String>{});
     _search.addListener(_onQueryChanged);
     unawaited(_loadRoots());
   }
@@ -208,7 +226,14 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
   }
 
   /// Галочка: отметка вбирает поддерево, снятие внутри выбранной папки раскрывает предка.
+  ///
+  /// В режиме выбора одной папки отметка просто переезжает на тронутый узел: связка — это
+  /// одна пара папок, и записывать тут нечего — выбор забирает вызывающий экран.
   Future<void> _toggle(FolderNode node) async {
+    if (widget.pick) {
+      setState(() => _chosen = {node.path});
+      return;
+    }
     final selection = _sync.selection;
     if (selection == null) return;
     final covered = SelectionRules.isCovered(_chosen, node.path);
@@ -278,6 +303,9 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
   /// не произойдёт вовсе — до следующего запуска приложения (там её сделает `SyncController`
   /// при старте). Выбор при этом не теряется: он пишется в настройки сразу при каждой галочке.
   Future<void> _apply() async {
+    // Режим одиночного выбора в настройки раздела ничего не пишет: пересобирать наблюдение
+    // и очередь тут не от чего — связку применяет экран, который этот выбор забрал
+    if (widget.pick) return;
     if (_applied || !_dirty) return;
     _applied = true;
     await _sync.onSelectionChanged(widget.section);
@@ -351,11 +379,21 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
     });
   }
 
-  /// Заголовок экрана: он же отличает, какой раздел настраивается — «Файлы» или «Фото».
-  String get _title => switch (widget.section) {
-    Section.photos => 'Папки для фото и видео',
-    Section.files => 'Папки для файлов',
-  };
+  /// Закрыть экран с выбранной папкой. Связку создаёт вызывающий: этот экран знает только
+  /// путь на телефоне, а пару «устройство ↔ облако» собирает экран связок.
+  void _confirmPick() {
+    if (_chosen.length != 1) return;
+    Navigator.of(context).pop(_chosen.first);
+  }
+
+  /// Заголовок экрана: он же отличает, какой раздел настраивается — «Файлы» или «Фото» —
+  /// и что это вообще за экран, когда выбирают одну папку.
+  String get _title => widget.pick
+      ? 'Папка на устройстве'
+      : switch (widget.section) {
+          Section.photos => 'Папки для фото и видео',
+          Section.files => 'Папки для файлов',
+        };
 
   /// Как называется раздел в основном интерфейсе: подсказка на экране должна называть его
   /// теми же словами, иначе человек ищет вкладку, которой нет.
@@ -393,21 +431,34 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
               Text(
                 _chosen.isEmpty
                     ? 'ничего не выбрано'
+                    : widget.pick
+                    ? _chosen.first
                     : 'выбрано папок: ${_chosen.length}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: C.fg3, fontSize: 11),
               ),
             ],
           ),
           actions: [
-            if (_chosen.isNotEmpty)
-              TextButton(onPressed: _clearAll, child: const Text('Снять всё')),
-            TextButton(
-              onPressed: () {
-                unawaited(_apply());
-                Navigator.of(context).pop();
-              },
-              child: const Text('Готово'),
-            ),
+            // В режиме выбора одной папки кнопка одна: закрыть экран с выбранным путём.
+            // «Снять всё» и «Готово» здесь не нужны — выбор не набор, а одна пара папок
+            if (widget.pick)
+              TextButton(
+                onPressed: _chosen.isEmpty ? null : _confirmPick,
+                child: const Text('Выбрать'),
+              )
+            else ...[
+              if (_chosen.isNotEmpty)
+                TextButton(onPressed: _clearAll, child: const Text('Снять всё')),
+              TextButton(
+                onPressed: () {
+                  unawaited(_apply());
+                  Navigator.of(context).pop();
+                },
+                child: const Text('Готово'),
+              ),
+            ],
           ],
         ),
         body: Column(
@@ -415,8 +466,11 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
               child: Text(
-                'Отмеченная папка включает все вложенные. Содержимое этих папок появится '
-                'в разделе $_sectionHint.',
+                widget.pick
+                    ? 'Отметьте папку, содержимое которой поедет в выбранную папку облака. '
+                          'Отмеченная папка включает все вложенные.'
+                    : 'Отмеченная папка включает все вложенные. Содержимое этих папок '
+                          'появится в разделе $_sectionHint.',
                 style: const TextStyle(color: C.fg3, fontSize: 11),
               ),
             ),
@@ -457,9 +511,13 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
                         return _FolderRow(
                           node: node,
                           covered: SelectionRules.isCovered(_chosen, node.path),
+                          // в режиме одной папки частичной отметки не бывает: поддерево
+                          // не вбирается, отметка стоит ровно на одном узле
                           partly:
+                              !widget.pick &&
                               !SelectionRules.isCovered(_chosen, node.path) &&
                               SelectionRules.hasInside(_chosen, node.path),
+                          pick: widget.pick,
                           expandable: matches == null && _canExpand(node.path),
                           expanded: _expanded.contains(node.path),
                           busy: _busyDirs.contains(node.path),
@@ -536,20 +594,22 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
   }
 }
 
-/// Строка дерева: стрелка раскрытия, галочка и путь.
+/// Строка дерева: стрелка раскрытия, отметка и путь.
 ///
 /// Тап по строке ставит или снимает галочку — так же, как в нативном клиенте: попадать
-/// пальцем в небольшой квадратик галочки на телефоне неудобно.
+/// пальцем в небольшой квадратик галочки на телефоне неудобно. В режиме выбора одной папки
+/// вместо галочки кружок: он и показывает, что отметить можно ровно одну папку.
 class _FolderRow extends StatelessWidget {
   /// [covered] — папка выбрана (или покрыта выбранным предком), [partly] — внутри неё есть
   /// выбранные (галочка в промежуточном состоянии), [expandable] и [expanded] — про стрелку,
   /// [busy] — подпапки читаются прямо сейчас, [unreadable] — папку не удалось прочитать
   /// (нет доступа): об этом в строке написано словами, иначе пустая папка и закрытая
-  /// выглядели бы одинаково.
+  /// выглядели бы одинаково. [pick] — режим выбора одной папки: отметка рисуется кружком.
   const _FolderRow({
     required this.node,
     required this.covered,
     required this.partly,
+    required this.pick,
     required this.expandable,
     required this.expanded,
     required this.busy,
@@ -561,6 +621,7 @@ class _FolderRow extends StatelessWidget {
   final FolderNode node;
   final bool covered;
   final bool partly;
+  final bool pick;
   final bool expandable;
   final bool expanded;
   final bool busy;
@@ -594,11 +655,20 @@ class _FolderRow extends StatelessWidget {
               )
             else
               const SizedBox(width: 40),
-            Checkbox(
-              value: covered ? true : (partly ? null : false),
-              tristate: true,
-              onChanged: (_) => onToggle(),
-            ),
+            if (pick)
+              Icon(
+                covered
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_unchecked,
+                size: 20,
+                color: covered ? C.accent : C.fg3,
+              )
+            else
+              Checkbox(
+                value: covered ? true : (partly ? null : false),
+                tristate: true,
+                onChanged: (_) => onToggle(),
+              ),
             Icon(
               Icons.folder_outlined,
               size: 20,

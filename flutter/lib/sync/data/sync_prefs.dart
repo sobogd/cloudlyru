@@ -16,7 +16,6 @@ class SyncPrefs {
   // Ключи значений. Менять нельзя: там уже лежат данные с прошлых сборок.
   static const String _photoFolderKey = 'sync_photo_folder_id';
   static const String _phoneFolderKey = 'sync_phone_folder_id';
-  static const String _mirrorFolderKey = 'sync_mirror_folder_id';
   static const String _putBackKey = 'sync_put_back_touched';
 
   /// Медиатека: куда льётся раздел «Фото» (плоско, без структуры папок).
@@ -37,17 +36,6 @@ class SyncPrefs {
   /// Запомнить легаси-id папки «Телефон»: пишет в SharedPreferences.
   /// Читателей у значения сейчас нет — ключ ведётся вместе с остальными папками.
   Future<void> setPhoneFolderId(String id) => _setString(_phoneFolderKey, id);
-
-  /// Корень зеркала этого устройства. Кэш нужен, чтобы настройки показывали папку даже
-  /// без сети; истина — ответ сервера на `/auth/me`.
-  ///
-  /// Пустая строка — «корень ещё не спрашивали»: настройки тогда показывают незнание,
-  /// а не пустой путь.
-  String get mirrorFolderId => _prefs.getString(_mirrorFolderKey) ?? '';
-
-  /// Запомнить корень зеркала этого устройства: пишет в SharedPreferences, чтобы настройки
-  /// показывали папку и без сети.
-  Future<void> setMirrorFolderId(String id) => _setString(_mirrorFolderKey, id);
 
   /// Разрешение «доступ ко всем файлам» уже спрашивали: подсказку показываем один раз.
   /// Флаг ставится один раз и назад не снимается — системное разрешение может быть отозвано,

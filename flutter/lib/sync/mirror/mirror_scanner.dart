@@ -72,10 +72,10 @@ class MirrorScanner {
 
     for (final root in SelectionRules.scanRoots(paths.toSet())) {
       if (capped || cancelled()) break;
-      final rootName = p.basename(root);
-      // обход в глубину: относительный путь копится от выбранной папки вместе с её именем —
-      // ровно он и станет структурой папок в облаке
-      final queue = <(String, String)>[(root, rootName)];
+      // обход в глубину: относительный путь копится от связанной папки и её имени не включает.
+      // Связанная папка — это и есть папка в облаке, которую выбрал человек: её содержимое
+      // лежит в ней самой, а не во вложенной папке с тем же именем (см. `SyncLinks`)
+      final queue = <(String, String)>[(root, '')];
       while (queue.isNotEmpty && !capped) {
         if (cancelled()) {
           aborted = true;
@@ -90,9 +90,13 @@ class MirrorScanner {
           unreadable += 1;
           continue;
         }
-        // папка попадает в снимок целиком, независимо от содержимого: пустая структура тоже
-        // должна доехать до облака
-        dirs.add(LocalDir(dir, relDir));
+        // Сама связанная папка в снимок папок не попадает: в облаке она уже есть — человек
+        // её и выбрал. Заводить по ней папку значило бы создать вложенную тёзку
+        if (relDir.isNotEmpty) {
+          // папка попадает в снимок целиком, независимо от содержимого: пустая структура тоже
+          // должна доехать до облака
+          dirs.add(LocalDir(dir, relDir));
+        }
         visited += 1;
         if (visited % 100 == 0) {
           progress('просмотрено папок: $visited, файлов: ${gathered.length}');
@@ -111,7 +115,8 @@ class MirrorScanner {
             if (MediaRules.skipDir(name, parentName) || MirrorRules.ignored(name)) {
               continue;
             }
-            queue.add((child.path, '$relDir/$name'));
+            // у первой вложенной папки пути ещё нет: относительный путь связанной папки пуст
+            queue.add((child.path, relDir.isEmpty ? name : '$relDir/$name'));
             continue;
           }
           if (child is! File) continue;

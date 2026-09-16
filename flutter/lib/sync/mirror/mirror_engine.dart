@@ -1,17 +1,17 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import '../data/mirror_store.dart';
-import '../data/selection.dart';
 import '../data/selection_rules.dart';
+import '../data/sync_links.dart';
 import '../device/hasher.dart';
 import '../device/media_rules.dart';
 import '../device/native_fs.dart';
 import '../net/sync_api.dart';
 import '../queue/uploader.dart';
-import '../section.dart';
 import 'failure_streak.dart';
 import 'mirror_folders.dart';
 import 'mirror_models.dart';
@@ -118,12 +118,17 @@ class MirrorReport {
   }
 }
 
-/// Двустороннее зеркало выбранных папок раздела «Файлы»: содержимое телефона и папки в облаке
+/// Двустороннее зеркало связанных папок раздела «Файлы»: содержимое телефона и папки в облаке
 /// совпадает в обе стороны — как «зеркалирование» в Google Drive, но без «оптимизировать место»:
 /// приложение никогда не удаляет файл на телефоне ради свободного места.
 ///
+/// Что с чем связано, решает человек: пара «папка на устройстве ↔ папка в облаке» приходит
+/// связками (см. `SyncLinks`). Движок ничего не заводит на верхнем уровне — связанная папка
+/// в облаке уже существует, и содержимое папки телефона лежит прямо в ней. Ниже уровня связки
+/// структура повторяется через `ensure-path`.
+///
 /// Порядок прохода:
-///   1. корни — выбранная папка телефона получает свою папку в облаке;
+///   1. корни — каждой связке ставится пара «папка телефона ↔ папка облака»;
 ///   2. облако → телефон: догон журнала (или полный проход, если курсора ещё нет);
 ///   3. телефон → облако: новые и изменившиеся файлы, переименования, удаления.
 ///
@@ -133,8 +138,8 @@ class MirrorReport {
 /// Предохранители, без которых зеркало однажды выкосит облако:
 ///   • папка не читается или обход неполный — удаления в облаке не отправляются вовсе;
 ///   • пропало слишком много за один проход — удаления приостанавливаются до подтверждения.
-/// Снятие галочки с папки удалением не считается: удаление приходит только из сравнения
-/// с файловой системой.
+/// Снятие связки удалением не считается: удаление приходит только из сравнения
+/// с файловой системой, а папка без связки вообще вне области работы движка.
 ///
 /// Проход можно прервать, и прерывание ничего не ломает: сверка идемпотентна — в базе
 /// остаётся только сделанное (курсор журнала, строки выгруженного и пары папок), а остаток
@@ -148,13 +153,13 @@ class MirrorReport {
 /// Создаётся [SyncController] (один движок на приложение, живёт до выхода из аккаунта) и
 /// фоновым заданием (`runBackgroundPass` — свой движок в своём изоляте).
 class MirrorEngine {
-  /// Зависимости приходят готовыми: склад, выбор папок, состояние и мост заводит точка сборки
+  /// Зависимости приходят готовыми: склад, связки, состояние и мост заводит точка сборки
   /// ([SyncController] для приложения, `runBackgroundPass` для фонового задания) — по одному
   /// движку на процесс.
   MirrorEngine(
     this._api,
     this._store,
-    this._selection, {
+    this._links, {
     MirrorStatusHolder? status,
     NativeFs? native,
   }) : _status = status ?? MirrorStatusHolder(),
@@ -164,7 +169,10 @@ class MirrorEngine {
   /// после создания движка и может быть перевыпущен, а движок при этом остаётся тем же.
   final SyncApi Function() _api;
   final MirrorStore _store;
-  final Selection _selection;
+
+  /// Связки человека: что с чем синхронизировать. Читаются на каждом проходе — связки могли
+  /// изменить, пока проход шёл (тогда это учтёт следующий).
+  final SyncLinks _links;
   final MirrorStatusHolder _status;
   final NativeFs _native;
 
@@ -275,8 +283,8 @@ class MirrorEngine {
   /// Проход целиком, уже под замком: от проверки опознания аккаунта до уборки пустых папок.
   ///
   /// Здесь же — порядок фаз и всё, что нужно сделать до них: сброс состояния в интерфейсе,
-  /// проверка, что состояние в базе принадлежит этому же аккаунту и корню зеркала, завод
-  /// папок для выбранных корней.
+  /// проверка, что состояние в базе принадлежит этому же аккаунту и устройству, постановка пар
+  /// для связок (папки в облаке уже существуют — их выбрал человек).
   Future<MirrorReport> _passLocked(
     void Function(String) onProgress,
     bool Function() isCancelled,
@@ -329,36 +337,62 @@ class MirrorEngine {
     } catch (e) {
       return _finish(report..error = 'нет связи с сервером: $e');
     }
-    final mirrorRootId = me.mirrorFolderId;
-    if (mirrorRootId == null || mirrorRootId.isEmpty) {
-      // корня нет — ни выгружать, ни догонять некуда: сервер заводит его устройству
-      return _finish(
-        report
-          ..error = 'сервер не отдал корень зеркала — проверьте подключение',
-      );
+    // Связки: что с чем синхронизировать. Движок ничего не выбирает сам и ни одной папки
+    // в облаке на верхнем уровне не заводит — папку облака выбирает человек
+    final links = _links.all();
+    final roots = SelectionRules.scanRoots({for (final l in links) l.localPath});
+    final cloudByRoot = {
+      for (final l in links) l.localPath: l.cloudId,
+    };
+    // Связку перенаправили на другую папку облака: строки `files` описывают записи в прежней
+    // папке, и сверка сочла бы файлы уже выгруженными — новая папка осталась бы пустой.
+    // Прежнее состояние берём из meta; строки там нет (база от сборки, где корень зеркала
+    // заводил сервер) — тогда прежнее соответствие лежит в парах `roots`, и повторной
+    // выгрузки из-за обновления приложения не будет
+    final previous = await _previousLinks();
+    // Связка появилась или сменила папку: в выбранной папке облака может уже что-то лежать,
+    // и это надо забрать на телефон — человек связывает папки, чтобы они объединились.
+    // Журнал про прошлое содержимое не рассказывает (он про изменения с курсора), поэтому
+    // курсор снимаем: догон облака пойдёт полным проходом по папкам связок — тем же путём,
+    // что при первом запуске (см. `MirrorPull.catchUp`), — и только потом догонит журнал
+    var linksChanged = false;
+    for (final link in links) {
+      final was = previous[link.localPath];
+      // Связка новая (в прежнем состоянии её нет) или ведёт в другую папку — строки
+      // выгруженного описывают записи не в той папке, куда теперь смотрит связка, и держать
+      // их нельзя. Новая связка бывает и над папкой, чьи строки остались от прежней связки
+      // на родителя (`Download` сняли, связали `Download/Telegram`): без сброса сверка сочла бы
+      // файлы уже выгруженными, а новая папка осталась бы пустой
+      if (was == link.cloudId) continue;
+      linksChanged = true;
+      await _store.dropLocalState(link.localPath);
+      if (was != null) {
+        onProgress(
+          'связка «${p.basename(link.localPath)}» ведёт в другую папку: собираю заново',
+        );
+      }
     }
-    // Состояние зеркала принадлежит аккаунту И своему корню: строки `files` описывают записи
+    if (linksChanged) await _store.clearMeta(MirrorStore.keyCursor);
+    await _store.setMeta(MirrorStore.keyLinks, _linksState(links, previous));
+
+    // Состояние зеркала принадлежит аккаунту И устройству: строки `files` описывают записи
     // в конкретной папке облака. Сменили сервер или логин — строки прошлого аккаунта сделали бы
-    // все локальные файлы «уже выгруженными»; сменился корень (сервер завёл папку новому
-    // устройству, токен перевыпущен) — то же самое, только новая папка осталась бы пустой.
+    // все локальные файлы «уже выгруженными».
     //
-    // Проверка по корню закрывает и случай базы от старого нативного клиента: у неё нет записи
-    // о корне, зато есть device_id прежнего токена, и он не совпадёт с нынешним.
+    // Проверка по устройству закрывает и случай базы от старого нативного клиента: у неё есть
+    // device_id прежнего токена, и он не совпадёт с нынешним.
     final identity = '${api.serverUrl}|${me.login}';
     final wasAccount = await _store.meta(MirrorStore.keyAccount);
-    final wasRoot = await _store.meta(MirrorStore.keyMirrorRoot);
     final wasDevice = await _store.meta(MirrorStore.keyDeviceId);
     final otherAccount = wasAccount != null && wasAccount != identity;
-    final otherRoot =
-        wasRoot != null && wasRoot.isNotEmpty && wasRoot != mirrorRootId;
     final otherDevice =
         wasDevice != null &&
         wasDevice.isNotEmpty &&
         me.deviceId != null &&
         wasDevice != me.deviceId;
-    if (otherAccount || otherRoot || otherDevice) {
+    if (otherAccount || otherDevice) {
       // чужое состояние выкидываем целиком: держать его — значит считать чужие записи своими,
-      // а свои файлы — уже выгруженными. Всё содержимое уедет заново, в новую папку
+      // а свои файлы — уже выгруженными. Всё содержимое уедет заново, в папки связок
       await _store.wipe();
       _status.update(
         (s) => s.copyWith(
@@ -371,43 +405,21 @@ class MirrorEngine {
     }
     await _store.setMeta(MirrorStore.keyAccount, identity);
     await _store.setMeta(MirrorStore.keyDeviceId, me.deviceId ?? '');
-    await _store.setMeta(MirrorStore.keyMirrorRoot, mirrorRootId);
 
     final folders = MirrorFolders(api, _store);
-    final roots = SelectionRules.scanRoots(_selection.paths(Section.files));
-    // папку сняли с выбора: пару убираем, а строки выгруженного остаются — вернуть выбор
-    // можно без повторной заливки и без удаления в облаке
+    // Папок вне связок зеркало не касается вовсе: снятую связку убираем из пар, а строки
+    // выгруженного остаются — вернуть связку можно без повторной заливки и без удаления
+    // в облаке, и уборка пустых папок в чужое дерево тоже не полезет (`roots` — её область)
     for (final gone in (await _store.roots()).keys.where(
       (r) => !roots.contains(r),
     )) {
       await _store.dropRoot(gone);
     }
-    // фаза корней: каждой выбранной папке — своя папка в облаке. Ошибка завода одного корня
-    // не мешает остальным: без него работа пойдёт по остальным папкам
-    final rootNames = _rootCloudNames(roots);
-    // Счётчик подряд идущих сбоев и здесь: при отвалившейся сети заведение каждой из сотен
-    // папок стоило бы своего таймаута (до 20 секунд на соединение — см. SyncApi)
-    final rootStreak = FailureStreak();
-    for (final root in roots) {
+    // фаза корней: связка становится парой «папка телефона ↔ папка облака». Сети здесь нет
+    // вовсе — папка в облаке уже существует, её выбрал человек
+    for (final link in links) {
       if (isCancelled()) return _finish(report..stopped = true);
-      final name = rootNames[root] ?? p.basename(root);
-      try {
-        await _store.putRoot(
-          root,
-          await folders.ensure(name, root, mirrorRootId),
-          name,
-        );
-        rootStreak.success();
-      } catch (e) {
-        report.failed += 1;
-        report.noteFailure('папка ${p.basename(root)}: $e');
-        if (rootStreak.failure(e)) {
-          report.error = rootStreak.reason;
-          report.authFailed = rootStreak.authFailed;
-          report.stopped = true;
-          return _finish(report);
-        }
-      }
+      await _store.putRoot(link.localPath, link.cloudId, link.cloudPath);
     }
 
     // 1) облако → телефон
@@ -443,7 +455,7 @@ class MirrorEngine {
       await _pushLocal(
         roots: roots,
         folders: folders,
-        mirrorRootId: mirrorRootId,
+        cloudByRoot: cloudByRoot,
         api: api,
         pull: pull,
         report: report,
@@ -457,45 +469,62 @@ class MirrorEngine {
     return _finish(report);
   }
 
-  /// Имена выбранных папок в облаке: ключ — путь на телефоне.
+  /// Прежнее состояние связок: путь на телефоне → id папки облака.
   ///
-  /// `ensure-path` на сервере — это find-or-create **по имени** внутри родителя, поэтому двум
-  /// выбранным папкам с одинаковым именем (`/storage/emulated/0/Download` и
-  /// `/storage/XXXX-XXXX/Download` — внутренняя память и карта памяти) досталась бы одна и та же
-  /// облачная папка: пары «папка облака ↔ путь на телефоне» схлопнулись бы в одну, содержимое
-  /// обоих томов уехало бы в общий каталог, а правка из веба приезжала бы не на тот том.
-  ///
-  /// Разводятся только совпадающие имена и только меткой тома — метка выводится из пути,
-  /// поэтому она одна и та же во всех проходах. У обычного единственного корня имя остаётся
-  /// прежним: переименование корня завело бы вторую папку в облаке и повторную выгрузку всего.
-  static Map<String, String> _rootCloudNames(List<String> roots) {
-    final byName = <String, List<String>>{};
-    for (final root in roots) {
-      byName.putIfAbsent(p.basename(root), () => []).add(root);
+  /// Читается из `meta` ([MirrorStore.keyLinks]). Строки там нет у базы, которую завела сборка
+  /// с корнем зеркала устройства: тогда прежнее соответствие — это пары `roots`, и берём их,
+  /// иначе обновление приложения выглядело бы как «цель связки сменилась» и залило бы всё заново.
+  /// Испорченное значение даёт пустую карту: это «не знаем прежнего», а не ошибка прохода.
+  Future<Map<String, String>> _previousLinks() async {
+    final raw = await _store.meta(MirrorStore.keyLinks);
+    if (raw == null) {
+      final pairs = await _store.roots();
+      return {
+        for (final entry in pairs.entries) entry.key: entry.value.cloudId,
+      };
     }
-    final out = <String, String>{};
-    for (final entry in byName.entries) {
-      final clash = entry.value.length > 1;
-      for (final root in entry.value) {
-        out[root] = clash ? '${entry.key} (${_volumeMark(root)})' : entry.key;
-      }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return const {};
+      return {
+        for (final entry in decoded.entries)
+          if (entry.key is String && entry.value is String)
+            entry.key as String: entry.value as String,
+      };
+    } catch (_) {
+      return const {};
     }
-    return out;
   }
 
-  /// Метка тома для разведения одинаковых имён папок.
+  /// Состояние связок для следующего прохода: что связано сейчас плюс то, что было связано
+  /// раньше.
   ///
-  /// `/storage/emulated/0/Download` → `internal` (внутренняя память),
-  /// `/storage/1234-5678/Download` → `1234-5678` (карта памяти), прочее — по имени
-  /// предпоследнего сегмента пути. Точный тип тома умеет называть только мост к Android;
-  /// это помечено в отчёте по ревью.
-  static String _volumeMark(String path) {
-    final parts = p.split(path);
-    if (parts.length >= 3 && parts[1] == 'storage') {
-      return parts[2] == 'emulated' ? 'internal' : parts[2];
+  /// Прежние записи сохраняются намеренно: связку сняли и вернули с той же папкой облака —
+  /// по прежней записи видно, что цель не менялась, и выгружать всё заново не нужно.
+  static String _linksState(
+    List<SyncLink> links,
+    Map<String, String> previous,
+  ) {
+    final state = {...previous};
+    for (final link in links) {
+      state[link.localPath] = link.cloudId;
     }
-    if (parts.length >= 2) return parts[parts.length - 2];
-    return 'volume';
+    return jsonEncode(state);
+  }
+
+  /// Папка облака той связки, внутри которой лежит путь на телефоне.
+  ///
+  /// По ней заводится папка для подпапки (`ensure-path` ищет и создаёт по имени внутри
+  /// родителя). Из двух подходящих связок берётся самая длинная: вложенные связки форма
+  /// не пропускает, но выбор обязан быть определённым. `null` — путь не под связкой: обход
+  /// идёт только по связкам, и такого пути в снимке быть не может.
+  static String? _cloudIdFor(String path, Map<String, String> cloudByRoot) {
+    String? best;
+    for (final root in cloudByRoot.keys) {
+      if (path != root && !path.startsWith('$root/')) continue;
+      if (best == null || root.length > best.length) best = root;
+    }
+    return best == null ? null : cloudByRoot[best];
   }
 
   /// Только облачная сторона: догнать журнал, не трогая диск. Так работает мгновенный режим:
@@ -671,7 +700,7 @@ class MirrorEngine {
   Future<void> _pushLocal({
     required List<String> roots,
     required MirrorFolders folders,
-    required String mirrorRootId,
+    required Map<String, String> cloudByRoot,
     required SyncApi api,
     required MirrorPull pull,
     required MirrorReport report,
@@ -684,7 +713,7 @@ class MirrorEngine {
         .snapshot(roots, onProgress: onProgress, isCancelled: isCancelled);
     report.unreadable = snapshot.unreadable;
     report.capped = snapshot.capped;
-    // сколько всего лежит в выбранных папках: от этого считается доля выгруженного
+    // сколько всего лежит в связанных папках: от этого считается доля выгруженного
     final localBytes = snapshot.files.fold<int>(0, (sum, f) => sum + f.size);
     await _store.setLocalTotals(snapshot.files.length, localBytes);
     _status.update(
@@ -697,7 +726,8 @@ class MirrorEngine {
       ),
     );
 
-    // структура в облаке повторяет структуру телефона, включая пустые папки.
+    // структура в облаке повторяет структуру телефона, включая пустые папки: подпапки
+    // заводятся внутри папки связки (`ensure-path`), а сама папка связки уже существует.
     // Счётчик сбоев тот же по смыслу, что у выгрузки: при отвалившейся сети заведение каждой
     // папки стоило бы своего таймаута, а проход молотил бы весь бюджет впустую
     final folderStreak = FailureStreak();
@@ -706,8 +736,13 @@ class MirrorEngine {
         report.stopped = true;
         return;
       }
+      // Папка связки, внутри которой лежит эта подпапка. Пусто — пути нет ни под одной связкой:
+      // обход идёт только по связкам, и такого пути в снимке быть не может, но заводить папку
+      // «куда-нибудь» нельзя — пропускаем
+      final parentId = _cloudIdFor(dir.path, cloudByRoot);
+      if (parentId == null) continue;
       try {
-        await folders.ensure(dir.relDir, dir.path, mirrorRootId);
+        await folders.ensure(dir.relDir, dir.path, parentId);
         folderStreak.success();
       } catch (e) {
         // папку заведёт следующий проход: файлы в неё всё равно не уедут, пока её нет
@@ -727,9 +762,9 @@ class MirrorEngine {
     // Здесь же оно и расходуется — снять его успеет и [_finish], если проход сюда не дошёл
     final confirmed = (_confirmToken ?? '').isNotEmpty;
     final deletionsAllowed = MirrorRules.deletionsAllowed(snapshot);
-    // строки, относящиеся к выбранным сейчас папкам, отсекаются признаком: копию таблицы
+    // строки, относящиеся к связанным сейчас папкам, отсекаются признаком: копию таблицы
     // на большой библиотеке делать нельзя, а без отсечения сверка удалила бы содержимое
-    // папки, снятой с выбора
+    // папки, связку с которой сняли
     final known = await _store.files();
     final plan = MirrorRules.plan(
       local: snapshot.files,
@@ -979,7 +1014,7 @@ class MirrorEngine {
   ///
   /// Зеркало удаляет в облаке только файлы, поэтому папка, из которой файлы перенесли,
   /// оставалась там навсегда. Здесь она уходит — но лишь при трёх условиях сразу: её завело
-  /// зеркало, на телефоне её больше нет и она внутри выбранных папок. Плюс на момент удаления
+  /// зеркало, на телефоне её больше нет и она внутри связанных папок. Плюс на момент удаления
   /// в ней должно быть пусто: если сверка ошиблась и содержимое осталось, папка останется тоже.
   ///
   /// Список кандидатов считает [MirrorRules.emptyFolderCandidates] — без запросов; пустоту
@@ -1000,7 +1035,7 @@ class MirrorEngine {
     required int startedAt,
     required int budgetMs,
   }) async {
-    // корни выбранных папок: их пары тоже лежат в dirs, но корень — это адрес, по которому
+    // корни связанных папок: их пары тоже лежат в dirs, но корень — это адрес, по которому
     // лежит всё содержимое, и удалять его нельзя
     final rootIds = {for (final r in (await _store.roots()).values) r.cloudId};
     final candidates = MirrorRules.emptyFolderCandidates(

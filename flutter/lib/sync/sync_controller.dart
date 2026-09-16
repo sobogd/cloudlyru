@@ -10,6 +10,7 @@ import 'background/background_schedule.dart';
 import 'data/mirror_store.dart';
 import 'data/queue_store.dart';
 import 'data/selection.dart';
+import 'data/sync_links.dart';
 import 'data/sync_prefs.dart';
 import 'device/device_files.dart';
 import 'device/native_fs.dart';
@@ -70,6 +71,11 @@ class SyncController extends ChangeNotifier {
   SharedPreferences? _prefs;
   SyncPrefs? syncPrefs;
   Selection? selection;
+
+  /// Связки «папка на устройстве ↔ папка в облаке» раздела «Файлы»: что и куда синхронизировать.
+  /// Выбор папок для «Фото» живёт отдельно ([selection]) — там зеркала нет, только заливка
+  /// в медиатеку.
+  SyncLinks? links;
   QueueStore? queueStore;
   MirrorStore? mirrorStore;
   SyncApi? _api;
@@ -137,10 +143,16 @@ class SyncController extends ChangeNotifier {
   /// не предлагая его выдать.
   bool get needsAccess => access != SyncAccess.granted;
 
-  /// Корень зеркала этого устройства в облаке. По нему «Файлы» помечают папку, которая
-  /// синхронизируется: имя у неё ничем не отличается от обычной, а перепутать её с обычной
-  /// папкой — значит удалить или переименовать корень, на который смотрит зеркало.
-  String get mirrorRootId => syncPrefs?.mirrorFolderId ?? '';
+  /// Папки облака, которые сейчас связаны с телефоном. По ним «Файлы» помечают папку, которая
+  /// синхронизируется: снаружи она ничем не отличается от обычной, а перепутать её с обычной —
+  /// значит удалить или переименовать то, на что смотрит зеркало.
+  ///
+  /// Набор кэшируется: интерфейс подписан на него через `select`, а сравнивает `select` ссылки.
+  /// Без кэша каждое уведомление контроллера (а их немало: ход прохода, счётчики, статус)
+  /// выглядело бы для «Файлов» изменением, и список папок перерисовывался бы на каждый тик.
+  Set<String> get linkedCloudIds =>
+      _linkedCloudIds ??= links?.cloudIds() ?? const <String>{};
+  Set<String>? _linkedCloudIds;
 
   /// Запуск: открыть базы, прочитать выбор папок, проверить доступ, поднять мгновенный режим.
   ///
@@ -163,6 +175,7 @@ class SyncController extends ChangeNotifier {
       _prefs ??= await SharedPreferences.getInstance();
       syncPrefs ??= SyncPrefs(_prefs!);
       selection ??= Selection(_prefs!);
+      links ??= SyncLinks(_prefs!);
       // Доступ и метка устройства — до баз: если база почему-то не откроется, человек всё равно
       // должен видеть, выдан ли доступ, а не «проверяю доступ к файлам…» навсегда
       deviceLabel = await native.deviceLabel();
@@ -178,6 +191,9 @@ class SyncController extends ChangeNotifier {
       // мог остаться от прежних сборок, поэтому снимаем его, иначе синхронизация молчала бы
       // без всякой возможности её вернуть.
       await mirrorStore?.clearMeta(MirrorStore.keyPaused);
+      // Перенос прежнего выбора папок — после баз: пары «папка телефона ↔ папка облака»
+      // сложились в прошлых проходах и лежат именно в базе зеркала
+      await _migrateLegacySelection();
 
       await _bindToken(sessionApi, login, epoch);
       // Выход из аккаунта во время старта: продолжать нечего — [signOut] уже закрыл то, что
@@ -231,14 +247,14 @@ class SyncController extends ChangeNotifier {
   /// ([_restoreLastState]); повторный вызов ничего не делает.
   Future<void> _ensureEngine() async {
     final store = mirrorStore;
-    final sel = selection;
-    if (store == null || sel == null || engine != null) return;
+    final linkStore = links;
+    if (store == null || linkStore == null || engine != null) return;
     // движок один на приложение: он держит замок «один проход за раз» и кэш хэшей
     // между проходами. Клиент берётся функцией — токен может быть перевыпущен
     engine = MirrorEngine(
       () => _requireApi(),
       store,
-      sel,
+      linkStore,
       status: _status,
       native: native,
     );
@@ -381,12 +397,14 @@ class SyncController extends ChangeNotifier {
         _prefs = await SharedPreferences.getInstance();
         syncPrefs ??= SyncPrefs(_prefs!);
         selection ??= Selection(_prefs!);
+        links ??= SyncLinks(_prefs!);
       } catch (e) {
         debugPrint('cloudly-sync: настройки не открылись: $e');
       }
     }
     queueStore ??= await _openQueueStore();
     mirrorStore ??= await _openMirrorStore();
+    await _migrateLegacySelection();
     await _ensureEngine();
     await _ensureLive();
     if (_disposed) return false;
@@ -394,8 +412,11 @@ class SyncController extends ChangeNotifier {
     return true;
   }
 
-  /// Запомнить системные папки сервера — прежде всего корень зеркала. Спрашиваем один раз
-  /// при запуске: без него «Файлы» не отличат синхронизируемую папку от обычной.
+  /// Запомнить системные папки сервера: медиатеку «Фото» и легаси-«Телефон». Спрашиваем один
+  /// раз при запуске — id медиатеки нужен наполнению очереди.
+  ///
+  /// Корень зеркала устройства здесь больше не запоминается: папки в облаке для «Файлов»
+  /// выбирает человек, и сервер их не заводит (см. `SyncLinks`).
   ///
   /// Побочные эффекты: запрос к серверу и запись в настройки (кэш — истина всё равно за
   /// ответом сервера). Ошибка не пробрасывается: папки придут при следующем случае.
@@ -404,10 +425,6 @@ class SyncController extends ChangeNotifier {
     if (prefs == null) return;
     try {
       final me = await api.systemFolders();
-      final mirror = me.mirrorFolderId;
-      if (mirror != null && mirror.isNotEmpty) {
-        await prefs.setMirrorFolderId(mirror);
-      }
       final photo = me.photoFolderId;
       if (photo != null && photo.isNotEmpty) {
         await prefs.setPhotoFolderId(photo);
@@ -552,6 +569,8 @@ class SyncController extends ChangeNotifier {
     _prefs = null;
     syncPrefs = null;
     selection = null;
+    links = null;
+    _linkedCloudIds = null;
     engine = null;
     uploads = null;
     live = null;
@@ -651,27 +670,90 @@ class SyncController extends ChangeNotifier {
     await recheckAccess();
   }
 
-  /// Выбор папок изменился: пересобираем наблюдение и наполняем очередь заново.
+  /// Выбор папок раздела «Фото» изменился: наполняем очередь заново.
   ///
-  /// @param section раздел, в котором меняли выбор; в теле не используется — и наблюдение
-  ///        (оно вообще только по разделу «Файлы»), и очередь пересобираются целиком.
+  /// @param section раздел, в котором меняли выбор; в теле не используется — очередь
+  ///        пересобирается целиком. Наблюдения за папками у «Фото» нет: там плоская заливка
+  ///        в медиатеку, а не зеркало дерева (см. `QueueBuilder`).
   Future<void> onSelectionChanged(Section section) async {
-    // наблюдение ставится только по разделу «Файлы»: в «Фото» переставлять нечего, а вызов
-    // моста не бесплатный
-    if (section == Section.files) await startWatching();
     await refreshQueue();
   }
 
-  /// Переставить наблюдение за папками раздела «Файлы» по текущему выбору.
+  /// Разовый перенос прежнего выбора папок в связки.
   ///
-  /// Зовётся при старте, после выдачи доступа и при смене выбора. Ошибка моста не пробрасывается:
+  /// Раньше «Файлы» синхронизировались по галочкам в дереве, а папку в облаке каждой галочке
+  /// заводил сервер (`‹Имя устройства› - Файлы/‹имя›`). Теперь обе стороны выбирает человек,
+  /// и без переноса после обновления синхронизация молча встала бы: галочки на месте, связок нет.
+  ///
+  /// Пары берутся из базы зеркала: там лежит соответствие, сложившееся в прошлых проходах,
+  /// поэтому в облаке ничего не создаётся и не перевыгружается. Путь, которого в парах нет,
+  /// пропускается — он и не синхронизировался.
+  ///
+  /// Побочные эффекты: запись связок в настройки и стирание прежнего ключа выбора (переносить
+  /// больше нечего). Ничего не делает, если связки уже есть или прежнего выбора нет.
+  Future<void> _migrateLegacySelection() async {
+    final linkStore = links;
+    final store = mirrorStore;
+    if (linkStore == null || store == null) return;
+    final legacy = selection?.paths(Section.files) ?? const <String>{};
+    if (legacy.isEmpty) return;
+    // Связки уже есть — человек их создал сам: прежний выбор ему больше не нужен
+    if (linkStore.all().isNotEmpty) {
+      await selection?.clear(Section.files);
+      return;
+    }
+    final pairs = await store.roots();
+    final migrated = <SyncLink>[];
+    for (final path in legacy) {
+      final pair = pairs[path];
+      if (pair == null) continue;
+      migrated.add(
+        SyncLink(
+          localPath: path,
+          cloudId: pair.cloudId,
+          cloudPath: pair.cloudPath,
+        ),
+      );
+    }
+    if (migrated.isEmpty) {
+      // Переносить нечего, но и стирать прежний выбор нельзя: пар может не быть просто потому,
+      // что база ещё не открылась или проход ни разу не доходил до этой папки
+      return;
+    }
+    await linkStore.replaceAll(migrated);
+    await selection?.clear(Section.files);
+    debugPrint('cloudly-sync: прежний выбор папок перенесён в связки: ${migrated.length}');
+  }
+
+  /// Связки раздела «Файлы» изменились: переставляем наблюдение и запускаем проход.
+  ///
+  /// Проход запускается сразу, не дожидаясь сторожа: человек только что связал папку и ждёт,
+  /// что она поедет. Ожидания в интерфейсе нет — проход идёт в фоне.
+  ///
+  /// Побочные эффекты: вызов моста наблюдения, возможно проход зеркала и уведомление
+  /// интерфейса (снятая связка должна погасить метку в «Файлах» сразу, а не после перезахода).
+  Future<void> onLinksChanged() async {
+    // кэш папок облака снимаем до уведомления: «Файлы» должны увидеть новый набор в той же
+    // перерисовке, а не на следующем событии
+    _linkedCloudIds = null;
+    await startWatching();
+    notifyListeners();
+    // Связок нет — идти некуда: проход всё равно ничего не сделает, кроме пустого снимка
+    if (!(links?.all().isNotEmpty ?? false)) return;
+    if (mirrorStatus.busy) return;
+    unawaited(mirrorPass());
+  }
+
+  /// Переставить наблюдение за папками раздела «Файлы» по текущим связкам.
+  ///
+  /// Зовётся при старте, после выдачи доступа и при смене связок. Ошибка моста не пробрасывается:
   /// наблюдение — только ускоритель, без него остаётся периодический проход. Фактический
   /// результат видно по [watchedDirs].
   Future<void> startWatching() async {
-    final sel = selection;
-    if (sel == null) return;
+    final linkStore = links;
+    if (linkStore == null) return;
     try {
-      await _watcher.watch(sel);
+      await _watcher.watch(linkStore.localPaths());
     } catch (_) {
       // наблюдение — только ускоритель: без него остаётся периодический проход
     }
@@ -765,7 +847,8 @@ class SyncController extends ChangeNotifier {
       // Проход зеркала — после очереди и без ожидания: он может идти минутами, а раздел
       // не должен из-за него ничего ждать
       final status = mirrorStatus;
-      final hasFolders = (selection?.paths(Section.files).isNotEmpty ?? false);
+      // связок нет — зеркалу нечего делать: ни обходить, ни догонять
+      final hasLinks = links?.all().isNotEmpty ?? false;
       final finished = status.finishedAt;
       // прохода не было вовсе (0) — тоже повод: после перезапуска состояние пустое,
       // а работа могла стоять
@@ -777,7 +860,7 @@ class SyncController extends ChangeNotifier {
       // бюджета самого прохода (8 минут — MirrorEngine.defaultBudgetMs): проход, который
       // идёт дольше, уже не «работает», а застрял.
       // busy — это «фаза не idle»: если проход уже идёт, второй не запускаем
-      if (hasFolders && !status.busy && (status.waitingFiles > 0 || stale)) {
+      if (hasLinks && !status.busy && (status.waitingFiles > 0 || stale)) {
         unawaited(mirrorPass());
       }
     } finally {
@@ -1030,9 +1113,8 @@ class SyncController extends ChangeNotifier {
       // негодным: сохранённый токен проверяется на живость перед использованием, и ближайшая
       // проверка ([ensureReady] — её зовут сторожа, открытие раздела, наполнение очереди,
       // старт приложения) выпустит вместо него новый.
-      // У нового токена будет свой корень зеркала, поэтому движок сбросит строки прежнего
-      // корня и выгрузит содержимое в новую папку (см. проверку корня в проходе),
-      // а прежняя папка останется в облаке — её убирает пользователь.
+      // Связки при этом не трогаются: выгрузка пойдёт в те же папки облака, которые выбрал
+      // человек, а прежние строки зеркала останутся при своих связках.
       if (report.authFailed) {
         _api = null;
         tokenError = 'токен устройства отозван — нужен новый';

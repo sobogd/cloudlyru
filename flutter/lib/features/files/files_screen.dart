@@ -311,12 +311,11 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
   Widget build(BuildContext context) {
     final state = ref.watch(appStateProvider);
     final uploads = state.uploads;
-    // Корень зеркала этого устройства читается здесь же, в build: подпись «синхронизируется»
-    // должна появиться, когда синхронизатор назовёт корень, а не при следующем действии
-    // человека. Список его не читает сам — иначе было бы неясно, что в экране реактивно, а что
-    // снимок на момент сборки.
-    final mirrorRootId = ref.watch(
-      syncControllerProvider.select((c) => c.mirrorRootId),
+    // Связанные папки облака читаются здесь же, в build: метка «синхронизируется» должна
+    // гаснуть сразу со снятием связки, а не при следующем действии человека. Список их не
+    // читает сам — иначе было бы неясно, что в экране реактивно, а что снимок на момент сборки.
+    final linkedCloudIds = ref.watch(
+      syncControllerProvider.select((c) => c.linkedCloudIds),
     );
     return Scaffold(
       appBar: AppBar(
@@ -419,7 +418,7 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
                 style: const TextStyle(color: C.ok, fontSize: 13),
               ),
             ),
-          Expanded(child: _buildList(state.api, mirrorRootId)),
+          Expanded(child: _buildList(state.api, linkedCloudIds)),
         ],
       ),
     );
@@ -429,9 +428,9 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
   /// по алфавиту; порядок разделов фиксированный, вложенности в списке нет — уровень
   /// открывается тапом и становится новым шагом стека).
   ///
-  /// [api] и [mirrorRootId] приходят из `build`: список не читает провайдеры сам, чтобы было
+  /// [api] и [linkedCloudIds] приходят из `build`: список не читает провайдеры сам, чтобы было
   /// видно, что он получает снимок на момент сборки, а не подписывается на что-то своё.
-  Widget _buildList(CloudlyApi api, String mirrorRootId) {
+  Widget _buildList(CloudlyApi api, Set<String> linkedCloudIds) {
     final v = _view;
     if (v == null && _error != null) {
       // Данных нет и пришли с ошибкой: показывать здесь «Пусто — нажмите Загрузить» нельзя,
@@ -458,7 +457,9 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
         ),
       );
     }
-    final insideMirror = _stack.any((e) => e.id == mirrorRootId);
+    // Внутри связанной папки: в стеке есть сама связанная папка. По этой метке видно, что
+    // содержимое уровня — тоже часть зеркала, а не обычные папки облака
+    final insideLinked = _stack.any((e) => linkedCloudIds.contains(e.id));
     return RefreshIndicator(
       // Жест «потянуть вниз»: содержимое папки меняют синхронизатор и веб-клиент, а сам экран
       // об изменениях не узнаёт — так его можно перечитать, не уходя из папки.
@@ -472,16 +473,18 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
             (f) => ListTile(
               leading: const Icon(Icons.folder, color: C.accent),
               title: Text(f.name, style: const TextStyle(color: C.fg)),
-              trailing: (f.id == mirrorRootId || insideMirror)
+              // Метка считается по связкам, а не по корню зеркала: снятая связка гасит её
+              // сразу, а папка в облаке остаётся обычной — в ней ничего не удаляется
+              trailing: (linkedCloudIds.contains(f.id) || insideLinked)
                   ? Tooltip(
-                      message: f.id == mirrorRootId
-                          ? 'Зеркало этого устройства: содержимое совпадает с выбранными '
-                                'папками телефона'
-                          : 'Внутри зеркала устройства: эта папка синхронизируется с телефоном',
+                      message: linkedCloudIds.contains(f.id)
+                          ? 'Связана с папкой телефона: содержимое совпадает в обе стороны'
+                          : 'Внутри связанной папки: это содержимое синхронизируется '
+                                'с телефоном',
                       child: Icon(
                         Icons.sync,
                         size: 18,
-                        color: f.id == mirrorRootId ? C.accent : C.fg3,
+                        color: linkedCloudIds.contains(f.id) ? C.accent : C.fg3,
                       ),
                     )
                   : null,

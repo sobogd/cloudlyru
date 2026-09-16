@@ -1,10 +1,9 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { env } from '../config/env';
 import { PrismaService } from '../prisma/prisma.service';
 import { randomToken, sha256Hex, assertSafeName } from '../common/utils';
-import { MAIL_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_MAIL, ZONE_PHOTOS, mirrorFolderName } from '../common/zones';
+import { MAIL_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_MAIL, ZONE_PHOTOS } from '../common/zones';
 import { AuditService } from '../audit/audit.service';
 import { ChangesService } from '../sync/changes.service';
 import { badRequest, notFound, unauthorized } from '../common/errors';
@@ -277,15 +276,12 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Свои данные и id системных папок. `deviceId` — id ApiToken'а, которым пришёл запрос
-   * (Bearer): клиенту синхронизации нужен свой корень зеркала, поэтому для устройства он
-   * создаётся лениво. Веб-сессия папку не заводит — там зеркало ни к чему.
+   * (Bearer): по нему отдаётся корень зеркала этого устройства.
    *
-   * Заведение корня зеркала в GET — осознанное ленивое создание в read-пути: id своей папки
-   * клиент узнаёт только из этого ответа, и отдельная ручка «ensure» была бы лишним шагом
-   * в его бутстрапе. При параллельных первых запросах с одним токеном гонку разрешают
-   * уникальный индекс (parentId, name) и ретрай с уточнением «(2)»; в ApiToken.mirrorFolderId
-   * останется папка, чья запись успела последней, а проигравшая попытка может оставить
-   * в корне лишнюю однотипную папку — на адресацию это не влияет, id берётся из токена.
+   * Папку зеркала (`‹Имя устройства› - Файлы`) сервер больше не заводит: что с чем
+   * синхронизировать, клиент спрашивает у человека связками «папка устройства ↔ папка облака»
+   * (см. `SyncLinks` в приложении). Поле в ответе остаётся только на чтение — им пользуются
+   * прежние сборки приложения, у которых корень заводил сервер.
    */
   async me(userId: string, deviceId?: string | null) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
@@ -294,9 +290,9 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     // «Телефон» только читаем: папка больше не создаётся (корень зеркала свой у каждого
     // устройства), но поле в ответе остаётся — на него завязан веб и старые сборки клиента
     const phoneFolderId = await this.optionalSystemFolder('«Телефон»', () => this.phoneRootIdOrNull(userId));
-    const mirrorFolderId = deviceId
-      ? await this.optionalSystemFolder('корень зеркала', () => this.deviceMirrorFolderId(deviceId))
-      : null;
+    const mirrorFolderId = await this.optionalSystemFolder('корень зеркала', () =>
+      this.deviceMirrorFolderIdOrNull(deviceId),
+    );
     return {
       id: user.id,
       login: user.login,
@@ -358,54 +354,22 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Корень зеркала устройства «<Имя> - Файлы» в корне пользователя. Ищем строго по
-   * ApiToken.mirrorFolderId: раньше папка искалась по имени и «усыновлялась» (в том числе
-   * воскрешалась из корзины), из-за чего чужая папка с подходящим именем молча становилась
-   * корнем зеркала, а два телефона одной модели вели один корень и удаляли файлы друг друга.
-   * Если своей папки нет или она в корзине — заводим НОВУЮ со свободным именем: корень
-   * адресуется по id из токена, а не по имени, поэтому имя в корне — только подпись.
+   * Корень зеркала устройства «<Имя> - Файлы», если он уже есть (без побочных эффектов).
+   *
+   * Папка больше не заводится: зеркало ходит по связкам «папка устройства ↔ папка облака»,
+   * которые выбирает человек (см. `SyncLinks` в приложении). Здесь только чтение — по
+   * ApiToken.mirrorFolderId, чтобы прежние сборки продолжали видеть свою папку. Папку убрали
+   * в корзину — тоже отдаём null: корня у устройства нет.
    */
-  async deviceMirrorFolderId(tokenId: string): Promise<string> {
+  async deviceMirrorFolderIdOrNull(tokenId?: string | null): Promise<string | null> {
+    if (!tokenId) return null;
     const token = await this.prisma.apiToken.findUnique({ where: { id: tokenId } });
-    if (!token) throw unauthorized();
-    if (token.mirrorFolderId) {
-      const current = await this.prisma.folder.findUnique({ where: { id: token.mirrorFolderId } });
-      if (current && !current.deletedAt) return current.id;
-    }
-    const rootId = await this.rootFolderId(token.userId);
-    const base = mirrorFolderName(token.label);
-
-    // Уникальный индекс (parentId, name) распространяется и на записи в корзине, поэтому
-    // имя мог занять параллельный запрос или удалённая тёзка — тогда берём уточнение «(2)».
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const name = await this.freeChildFolderName(rootId, base);
-      let mirror: { id: string };
-      try {
-        mirror = await this.prisma.folder.create({ data: { parentId: rootId, name } });
-      } catch (e) {
-        // имя занял параллельный запрос — берём следующее уточнение, а не чужую папку
-        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
-          lastError = e;
-          continue;
-        }
-        throw e;
-      }
-      await this.prisma.apiToken.update({ where: { id: tokenId }, data: { mirrorFolderId: mirror.id } });
-      await this.audit.log('device.mirror.folder.create', {
-        userId: token.userId,
-        tokenId,
-        folderId: mirror.id,
-        name,
-        label: token.label,
-      });
-      // событие в журнал: остальные устройства пользователя увидят новую папку обычным
-      // проходом, без «папка появилась, а журнал про неё молчит»
-      await this.changes.recordFolder(token.userId, mirror.id, 'create');
-      this.logger.log(`Корень зеркала устройства «${token.label}»: ${name}`);
-      return mirror.id;
-    }
-    throw lastError;
+    if (!token?.mirrorFolderId) return null;
+    const folder = await this.prisma.folder.findUnique({
+      where: { id: token.mirrorFolderId },
+      select: { id: true, deletedAt: true },
+    });
+    return folder && !folder.deletedAt ? folder.id : null;
   }
 
   /**
