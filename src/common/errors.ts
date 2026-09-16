@@ -30,5 +30,3 @@ export const tooMany = (msg = 'too many requests', code = 'rate_limited', retryA
   );
 export const payloadTooLarge = (msg = 'payload too large', code = 'payload_too_large') =>
   new ApiError(HttpStatus.PAYLOAD_TOO_LARGE, msg, code);
-export const notImplemented = (msg = 'not implemented', code = 'not_implemented') =>
-  new ApiError(HttpStatus.NOT_IMPLEMENTED, msg, code);
