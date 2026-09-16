@@ -740,7 +740,14 @@ class SyncController extends ChangeNotifier {
     notifyListeners();
     // Связок нет — идти некуда: проход всё равно ничего не сделает, кроме пустого снимка
     if (!(links?.all().isNotEmpty ?? false)) return;
-    if (mirrorStatus.busy) return;
+    // Проход уже идёт, и связку, добавленную посреди него, он не увидит: ждём его конца
+    // и запускаем свой. Иначе новая связка ждала бы сторожа — до десяти минут, и человек
+    // решил бы, что связка не работает
+    final running = _passInFlight;
+    if (running != null) {
+      unawaited(running.then((_) async => mirrorPass()));
+      return;
+    }
     unawaited(mirrorPass());
   }
 
@@ -821,11 +828,17 @@ class SyncController extends ChangeNotifier {
   /// «продолжить» в разделе нет намеренно, поэтому проверка делается сама — при старте
   /// приложения и при каждом открытии раздела синхронизации.
   ///
+  /// @param mirror запустить проход зеркала в любом случае, а не только когда он «встал».
+  ///        Так зовёт кнопка «Проверить и догнать»: человек нажал её, чтобы синхронизация
+  ///        прошла сейчас, — и проход обязан пройти, даже если предыдущий закончился минуту
+  ///        назад и ждать нечего. Автоматическим заходам (старт, открытие раздела, сторож)
+  ///        это не нужно: там проход идёт по нужде, а не по требованию.
+  ///
   /// Побочные эффекты: выпуск токена, если его нет, наполнение очереди, выгрузка до
   /// [_drainPerCheck] файлов и, если зеркало не работает или давно не заканчивало проход,
   /// запуск прохода в фоне ([mirrorPass] не ожидается). Второй заход во время первого
   /// возвращается сразу. В конце — подсчёт ждущих строк и уведомление интерфейса.
-  Future<void> checkAndResume() async {
+  Future<void> checkAndResume({bool mirror = false}) async {
     if (_resuming) return;
     _resuming = true;
     activity = 'проверяю, не встала ли синхронизация…';
@@ -855,12 +868,13 @@ class SyncController extends ChangeNotifier {
       final stale =
           finished == 0 ||
           DateTime.now().millisecondsSinceEpoch - finished > _stalePassMs;
-      // Проход запускаем по двум поводам: есть что выгружать (waitingFiles) или зеркало
-      // давно не заканчивало проход (stale). Порог _stalePassMs (10 минут) вдвое больше
-      // бюджета самого прохода (8 минут — MirrorEngine.defaultBudgetMs): проход, который
-      // идёт дольше, уже не «работает», а застрял.
+      // Проход запускаем по трём поводам: есть что выгружать (waitingFiles), зеркало давно
+      // не заканчивало проход (stale) или проход попросили руками ([mirror]). Порог
+      // _stalePassMs (10 минут) вдвое больше бюджета самого прохода (8 минут —
+      // MirrorEngine.defaultBudgetMs): проход, который идёт дольше, уже не «работает»,
+      // а застрял.
       // busy — это «фаза не idle»: если проход уже идёт, второй не запускаем
-      if (hasLinks && !status.busy && (status.waitingFiles > 0 || stale)) {
+      if (hasLinks && !status.busy && (mirror || status.waitingFiles > 0 || stale)) {
         unawaited(mirrorPass());
       }
     } finally {

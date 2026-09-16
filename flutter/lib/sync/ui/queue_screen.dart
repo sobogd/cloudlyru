@@ -134,6 +134,10 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
   /// Ядро само решает, что нужно: заново выпустить токен, обновить очередь, пересобрать
   /// наблюдение за папками, прогнать зеркало и выгрузить ждущие файлы. Здесь остаётся
   /// только показать, что проверка идёт, и перечитать список.
+  ///
+  /// У кнопки проход зеркала просят явно (`mirror: true`): нажатие значит «сделай сейчас»,
+  /// и ждать, пока проход «устареет», человеку нечем. При открытии раздела проход идёт
+  /// по обычным поводам — иначе каждый заход в раздел гонял бы обход диска зря.
   Future<void> _check({bool initial = false}) async {
     if (_checking && !initial) return;
     if (initial) {
@@ -142,7 +146,7 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
       setState(() => _checking = true);
     }
     try {
-      await _sync.checkAndResume();
+      await _sync.checkAndResume(mirror: !initial);
     } finally {
       if (mounted) setState(() => _checking = false);
       await _reload();
