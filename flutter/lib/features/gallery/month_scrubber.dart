@@ -15,6 +15,11 @@ import 'gallery_calendar.dart';
 /// дорожки, пустые месяцы тоже. Геометрия одна на всё — на палец, на риски и на ползунок:
 /// раньше палец считался по всей высоте виджета, а ползунок по доле прокрутки, и эти величины
 /// расходились — ползунок уезжал от пальца, а список вставал не туда.
+///
+/// Сверху — свежие кадры, снизу — старые: шкала читается в ту же сторону, что и сетка, поэтому
+/// прокрутка вниз (к прошлому) двигает ползунок вниз. Доля пальца ([_dragFraction]) считается
+/// сверху вниз, а время по ней переводится через календарь, у которого отсчёт обратный —
+/// `monthAt(1 - доля)` (см. `GalleryCalendar`).
 class MonthScrubber extends StatefulWidget {
   const MonthScrubber({
     super.key,
@@ -68,7 +73,7 @@ class _MonthScrubberState extends State<MonthScrubber> {
   /// Палец на шкале: подсказка видна, а ползунок стоит под пальцем, а не там, где окно.
   bool _dragging = false;
 
-  /// Доля, на которую указывает палец (для ползунка и подсказки).
+  /// Доля дорожки, на которую указывает палец, СВЕРХУ ВНИЗ (0 — верх, свежее; 1 — низ, старее).
   double _dragFraction = 0;
 
   /// Палец в зоне кадров без даты.
@@ -107,7 +112,8 @@ class _MonthScrubberState extends State<MonthScrubber> {
     if (tail) {
       widget.onJumpToTail();
     } else {
-      widget.onJumpToMonth(widget.calendar.monthAt(fraction));
+      // Доля пальца — сверху вниз, а календарь считает время от старого края: отсюда `1 - доля`.
+      widget.onJumpToMonth(widget.calendar.monthAt(1 - fraction));
     }
   }
 
@@ -166,6 +172,7 @@ class _MonthScrubberState extends State<MonthScrubber> {
                 builder: (context, pos, _) {
                   final fraction = _dragging ? _dragFraction : pos.fraction;
                   final inTail = _dragging ? _dragTail : pos.tail;
+                  // Доля ползунка считается сверху вниз — она же и координата на дорожке.
                   final top = inTail
                       ? _trackTop + _trackLength + _tailHeight / 2
                       : _trackTop + fraction.clamp(0.0, 1.0) * _trackLength;
@@ -202,7 +209,7 @@ class _MonthScrubberState extends State<MonthScrubber> {
   Widget _bubble(double maxHeight) {
     final text = _dragTail
         ? 'Без даты'
-        : widget.calendar.labelOf(widget.calendar.monthAt(_dragFraction));
+        : widget.calendar.labelOf(widget.calendar.monthAt(1 - _dragFraction));
     final top = _dragTail
         ? _trackTop + _trackLength + _tailHeight / 2
         : _trackTop + _dragFraction * _trackLength;
@@ -275,8 +282,11 @@ class _RailPainter extends CustomPainter {
 
     final mark = Paint()..strokeCap = StrokeCap.round;
     for (final t in ticks) {
-      // Первую риску не рисуем: это самый верх дорожки, там и так её начало.
-      if (t.from <= 0) continue;
+      // Доли приходят от старого края, а дорожка читается сверху вниз (сверху — свежее),
+      // поэтому положение риски — `1 - доля`.
+      final rail = 1 - t.from;
+      // Риску в самом низу дорожки не рисуем: там конец таймлайна, начало самого старого месяца.
+      if (rail >= 1) continue;
       // Январь — начало года: он длиннее и ярче, по нему видно, сколько на шкале лет.
       final year = t.january;
       final empty = (counts[t.month] ?? 0) == 0;
@@ -284,7 +294,7 @@ class _RailPainter extends CustomPainter {
         ..color = empty ? C.brd : C.fg3
         ..strokeWidth = year ? 2.5 : 1.5;
       final w = year ? yearWidth : markWidth;
-      final y = t.from * size.height;
+      final y = rail * size.height;
       canvas.drawLine(Offset(center - w / 2, y), Offset(center + w / 2, y), mark);
     }
   }

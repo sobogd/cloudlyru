@@ -265,6 +265,9 @@ class GalleryController extends ChangeNotifier {
     _rebuildArms();
     _refreshTopFromScroll();
     _publish();
+    // Короткая библиотека (или короткий месяц) может целиком уместиться в экран — тогда
+    // прокручивать нечего, события прокрутки не будет, и догрузку надо проверить самому.
+    _checkViewportFilled();
   }
 
   /// Показать окно, начинающееся с месяца [month] (прыжок по шкале).
@@ -330,6 +333,7 @@ class GalleryController extends ChangeNotifier {
     try {
       final page = await _olderPage(MediaCursor.of(_items.last), pageSize);
       if (gen != _generation) return;
+      error = null;
       if (page.items.isNotEmpty) _items = [..._items, ...page.items];
       _hasOlder = page.hasMore;
       // Датированная лента кончилась — ниже идёт хвост кадров без даты. Он запрашивается
@@ -357,6 +361,7 @@ class GalleryController extends ChangeNotifier {
     _rebuildArms();
     _publish();
     _scheduleStatusPoll();
+    _checkViewportFilled();
   }
 
   /// Догрузить страницу вверх (к новым кадрам).
@@ -374,6 +379,7 @@ class GalleryController extends ChangeNotifier {
       final cursor = _newerCursorOverride ?? MediaCursor.of(_items.first);
       final page = await _newerPage(cursor, pageSize);
       if (gen != _generation) return;
+      error = null;
       if (page.items.isEmpty) {
         _hasNewer = false;
         _newerCursorOverride = null;
@@ -397,6 +403,7 @@ class GalleryController extends ChangeNotifier {
     _rebuildArms();
     _publish();
     _scheduleStatusPoll();
+    _checkViewportFilled();
   }
 
   /// Подгрузить кадры по просьбе просмотрщика: диапазон номеров в окне.
@@ -448,6 +455,10 @@ class GalleryController extends ChangeNotifier {
       if (gen != _generation) return;
       _items = page.items;
       _hasOlder = page.hasMore;
+      // Пустая страница на якоре — не «медиа нет» (библиотека непуста, раз шкала нарисована),
+      // а «в этом месте ленты ничего не нашлось»: говорим это прямо, иначе человек видит
+      // надпись про пустой раздел и не понимает, почему прыжок ничего не дал.
+      error = page.items.isEmpty ? 'Здесь кадров нет — выберите другое место на шкале' : null;
     } catch (e) {
       if (gen == _generation) error = e.toString();
     } finally {
@@ -457,6 +468,9 @@ class GalleryController extends ChangeNotifier {
         _refreshTopFromScroll();
         _publish();
         _scheduleStatusPoll();
+        // Месяц бывает коротким: окно из одной страницы может оказаться короче экрана, и без
+        // этой проверки догрузка не случилась бы — прокручивать было бы нечего.
+        _checkViewportFilled();
       }
     }
   }
@@ -515,13 +529,24 @@ class GalleryController extends ChangeNotifier {
     _publish();
   }
 
-  /// Первая страница: из индекса, а если индекс пуст — с сервера (и сразу в индекс).
+  /// Первая страница окна — начало ленты.
+  ///
+  /// Полный индекс отвечает сам: это чтение из SQLite, без сети и мгновенно. Неполному верить
+  /// нельзя: он знает только прочитанную часть ленты, поэтому его `hasMore = false` означал бы
+  /// «дальше ничего нет» на живой библиотеке — окно кончилось бы через два экрана, и догрузка
+  /// не пришла бы никогда. Поэтому пока индекс неполон, страница берётся с сервера и кладётся
+  /// в индекс; локальное берётся, только если сети нет вовсе.
   Future<MediaFeedPage> _headPage(int limit) async {
-    final local = await store.head(limit);
-    if (local.items.isNotEmpty) return local;
-    final page = await apiOf().mediaFeed(limit: limit);
-    await store.upsertAll(page.items);
-    return page;
+    if (_indexComplete) return store.head(limit);
+    try {
+      final page = await apiOf().mediaFeed(limit: limit);
+      await store.upsertAll(page.items);
+      return page;
+    } catch (e) {
+      final local = await store.head(limit);
+      if (local.items.isNotEmpty) return local;
+      rethrow;
+    }
   }
 
   /// Страница вниз от курсора.
@@ -578,10 +603,36 @@ class GalleryController extends ChangeNotifier {
       width: _gridWidth,
       tzOffsetMin: tz,
     );
+    // Строка состояния — последняя в нижнем плече: пока грузится страница, по ней видно, что
+    // лента не кончилась, а при сбое — почему она не грузится и что с этим делать. Без неё сбой
+    // выглядел бы либо как «кадры кончились», либо как вечная загрузка.
+    final note = _footerNote();
+    if (note != null) olderRows.add(GalleryRow.note(note, GalleryGrid.noteHeight));
     // Плечо выше якоря собирается «наружу» переворотом строк: слот, примыкающий к якорю, —
     // последний в визуальном порядке (см. `GalleryArm.of`).
     newerArm = GalleryArm.of(newerRows, up: true);
     olderArm = GalleryArm.of(olderRows, up: false);
+  }
+
+  /// Текст строки состояния внизу окна; `null` — показывать нечего.
+  ///
+  /// Сбой показывается вместо загрузки: причина важнее, а «грузим» на сбое было бы враньём —
+  /// именно так и выглядел прежний вечный спиннер.
+  String? _footerNote() {
+    if (error != null) return error;
+    if (_loadingOlder) return 'Загружаем…';
+    return null;
+  }
+
+  /// Повторить неудавшуюся загрузку — кнопкой в строке состояния.
+  ///
+  /// Направление берётся по тому, что видно: сбой почти всегда случается там, куда человек
+  /// листает, а если данных не хватает и сверху, окно само догрузится при прокрутке.
+  void retry() {
+    error = null;
+    notifyListeners();
+    unawaited(loadOlder());
+    unawaited(loadNewer());
   }
 
   /// С какого кадра начинается новый месяц — по флагу на каждый кадр окна.
@@ -675,11 +726,24 @@ class GalleryController extends ChangeNotifier {
     }
     final dt = DateTime.tryParse(at);
     if (dt == null || cal == null || cal.isEmpty) return;
-    final fraction = cal.fractionOf(dt);
+    // Календарь считает время от старого края, а ползунок ходит сверху вниз (сверху — свежее),
+    // поэтому доля дорожки — это `1 - доля времени`.
+    final fraction = 1 - cal.fractionOf(dt);
     if (rail.value.tail || (rail.value.fraction - fraction).abs() > 1e-4) {
       rail.value = GalleryRailPosition(fraction);
     }
     barTitle.value = monthLabel(GalleryGrid.monthKey(dt, _tz));
+  }
+
+  /// Проверить догрузку после кадра.
+  ///
+  /// Нужна потому, что окно бывает короче экрана (в месяце мало кадров): прокручивать тогда
+  /// нечего, события прокрутки не будет вовсе, и страница не запросилась бы никогда.
+  void _checkViewportFilled() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_disposed || !scroll.hasClients) return;
+      _maybeLoad(scroll.position);
+    });
   }
 
   /// Догрузить страницу, если до края окна осталось меньше двух экранов.

@@ -17,11 +17,24 @@ class GalleryRow {
   /// что видно в окне, и куда встать после прыжка по шкале.
   final double height;
 
-  const GalleryRow.header(String this.header, this.height) : items = const [];
-  const GalleryRow.items(this.items, this.height) : header = null;
+  /// Текст строки состояния внизу окна («Загружаем…», причина сбоя) — `null` у остальных строк.
+  final String? note;
+
+  const GalleryRow.header(String this.header, this.height)
+      : items = const [],
+        note = null;
+  const GalleryRow.items(this.items, this.height)
+      : header = null,
+        note = null;
+  const GalleryRow.note(String this.note, this.height)
+      : header = null,
+        items = const [];
 
   /// Заголовок ли это (у ряда кадров подписи нет).
   bool get isHeader => header != null;
+
+  /// Строка состояния ли это.
+  bool get isNote => note != null;
 }
 
 /// Геометрия сетки: сколько кадров в ряду и какие у рядов высоты.
@@ -43,6 +56,9 @@ class GalleryGrid {
 
   /// Высота строки-заголовка месяца вместе с отступом.
   static const double headerHeight = 34.0;
+
+  /// Высота строки состояния внизу окна (загрузка или сбой).
+  static const double noteHeight = 52.0;
 
   /// Сторона клетки при ширине сетки [width]: экран минус шкала и зазоры, поделённый на колонки.
   static double cellSide(double width) => (width - (columns + 1) * gap) / columns;

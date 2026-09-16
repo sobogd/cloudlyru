@@ -196,6 +196,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   /// Высота строки берётся у неё самой, а не считается здесь: по этим высотам контроллер
   /// переводит позицию прокрутки в видимый кадр, и разойтись они не должны.
   Widget _row(GalleryController c, GalleryRow row) {
+    if (row.isNote) return _noteRow(c, row);
     if (row.isHeader) {
       return SizedBox(
         height: row.height,
@@ -229,6 +230,40 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  /// Строка состояния внизу окна: загрузка страницы или причина сбоя с кнопкой повтора.
+  ///
+  /// Она нужна именно строкой, а не всплывающей подсказкой: сбой догрузки — это не событие,
+  /// а состояние, и человек должен видеть и причину, и способ её пережить.
+  Widget _noteRow(GalleryController c, GalleryRow row) {
+    final failed = c.error != null;
+    return SizedBox(
+      height: row.height,
+      child: Center(
+        child: failed
+            ? TextButton.icon(
+                onPressed: c.retry,
+                icon: const Icon(Icons.refresh, size: 16, color: C.fg2),
+                label: Text(
+                  'Не загрузилось — повторить',
+                  style: const TextStyle(color: C.fg2, fontSize: 13),
+                ),
+              )
+            : Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: C.fg3),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(row.note!, style: const TextStyle(color: C.fg3, fontSize: 13)),
+                ],
+              ),
       ),
     );
   }

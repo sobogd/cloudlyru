@@ -20,7 +20,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # .github/workflows/android.yml, и номер сборки обязан расти с каждым выпуском.
 # Номер общий для платформ: из него же собирается CFBundleVersion настольной сборки
 # (workflow .github/workflows/macos.yml), поэтому поднимать его достаточно один раз.
-version: 1.0.0+74
+version: 1.0.0+76
 
 environment:
   sdk: ^3.13.3
