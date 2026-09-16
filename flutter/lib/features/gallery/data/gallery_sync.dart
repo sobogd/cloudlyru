@@ -112,6 +112,27 @@ class GallerySync {
   Future<bool> sync() async {
     if (_busy) return false;
     _busy = true;
+    try {
+      return await _run();
+    } finally {
+      _busy = false;
+    }
+  }
+
+  /// Продолжить наполнение индекса и дождаться его конца.
+  ///
+  /// Нужно после того, как индекс признан неполным по ходу листания: идущий проход мог уже
+  /// считать его полным и сам наполнение не запустит (`sync` в этот момент только вернёт
+  /// «занято»), поэтому сначала дожидаемся текущего прохода, а потом запускаем свой.
+  Future<void> refill() async {
+    for (var i = 0; i < 120 && _busy; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    await sync();
+  }
+
+  /// Тело прохода: то, что было в [sync] до появления [refill].
+  Future<bool> _run() async {
     var changed = false;
     try {
       final last = DateTime.tryParse(await store.meta(GalleryStore.keySyncAt) ?? '');

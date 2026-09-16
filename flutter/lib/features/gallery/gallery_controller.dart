@@ -231,6 +231,10 @@ class GalleryController extends ChangeNotifier {
   Future<void> open() async {
     await _loadCalendar();
     _indexComplete = await store.meta(GalleryStore.keyBackboneDone) == '1';
+    if (kDebugMode) {
+      debugPrint('cloudly-gallery: открытие — кадров ${await store.count()}, '
+          'месяцев ${_months.length}, индекс полон: $_indexComplete');
+    }
     await loadFirstWindow();
     // Шкала — единственный способ попасть в нужный год, и ждать её до конца наполнения индекса
     // (десятки страниц) нельзя: один запрос отдаёт все месяцы сразу.
@@ -245,6 +249,9 @@ class GalleryController extends ChangeNotifier {
     _publish();
     try {
       final page = await _headPage(pageSize);
+      if (kDebugMode) {
+        debugPrint('cloudly-gallery: первая страница ${page.items.length} кадров, дальше: ${page.hasMore}');
+      }
       _items = page.items;
       _hasOlder = page.hasMore;
       // Датированных кадров нет вовсе — вся медиатека ещё без дат (метаданные не разобраны).
@@ -279,6 +286,7 @@ class GalleryController extends ChangeNotifier {
     final cal = calendar;
     if (cal == null || cal.isEmpty) return;
     final boundary = cal.monthBoundaryUtc(cal.nextMonth(month));
+    if (kDebugMode) debugPrint('cloudly-gallery: прыжок к $month, граница ${boundary.toIso8601String()}');
     // Якорь — начало месяца: страница начнётся с его первого кадра, и у него будет заголовок.
     _anchorAtMonthStart = true;
     await _reanchor(MediaCursor(at: boundary.toIso8601String(), id: ''));
@@ -332,6 +340,9 @@ class GalleryController extends ChangeNotifier {
     final gen = _generation;
     try {
       final page = await _olderPage(MediaCursor.of(_items.last), pageSize);
+      if (kDebugMode) {
+        debugPrint('cloudly-gallery: вниз ${page.items.length} кадров, дальше: ${page.hasMore}');
+      }
       if (gen != _generation) return;
       error = null;
       if (page.items.isNotEmpty) _items = [..._items, ...page.items];
@@ -378,21 +389,34 @@ class GalleryController extends ChangeNotifier {
     try {
       final cursor = _newerCursorOverride ?? MediaCursor.of(_items.first);
       final page = await _newerPage(cursor, pageSize);
+      if (kDebugMode) {
+        debugPrint('cloudly-gallery: вверх ${page.items.length} кадров, дальше: ${page.hasMore}');
+      }
       if (gen != _generation) return;
       error = null;
       if (page.items.isEmpty) {
-        _hasNewer = false;
-        _newerCursorOverride = null;
-        return;
+        // Пустая страница: либо выше действительно ничего нет, либо только что дочитан хвост
+        // кадров без даты. У хвоста свой ключ (id записи), и «новее хвоста» — это уже
+        // датированная лента, которую спрашивают другим курсором. Без этой подмены человек
+        // оставался в «Без даты» навсегда: выше хвоста страницы нет, а лента есть.
+        final tailEnd = cursor.at == null && cursor.id.isNotEmpty;
+        if (tailEnd) {
+          _newerCursorOverride = const MediaCursor(at: null, id: '');
+          _hasNewer = true;
+        } else {
+          _newerCursorOverride = null;
+          _hasNewer = false;
+        }
+      } else {
+        _items = [...page.items, ..._items];
+        _newerCount += page.items.length;
+        _anchorAtMonthStart = false;
+        // Хвост без даты дочитан: выше него начинается датированная лента, и продолжение
+        // берётся уже курсором «к самым старым датированным кадрам».
+        final tailExhausted = !page.hasMore && cursor.at == null && cursor.id.isNotEmpty;
+        _newerCursorOverride = tailExhausted ? const MediaCursor(at: null, id: '') : null;
+        _hasNewer = page.hasMore || tailExhausted;
       }
-      _items = [...page.items, ..._items];
-      _newerCount += page.items.length;
-      _anchorAtMonthStart = false;
-      // Хвост без даты дочитан: выше него начинается датированная лента, и продолжение берётся
-      // уже курсором «к самым старым датированным кадрам».
-      final tailExhausted = !page.hasMore && cursor.at == null && cursor.id.isNotEmpty;
-      _newerCursorOverride = tailExhausted ? const MediaCursor(at: null, id: '') : null;
-      _hasNewer = page.hasMore || tailExhausted;
     } catch (e) {
       error = e.toString();
     } finally {
@@ -532,12 +556,16 @@ class GalleryController extends ChangeNotifier {
   /// Первая страница окна — начало ленты.
   ///
   /// Полный индекс отвечает сам: это чтение из SQLite, без сети и мгновенно. Неполному верить
-  /// нельзя: он знает только прочитанную часть ленты, поэтому его `hasMore = false` означал бы
-  /// «дальше ничего нет» на живой библиотеке — окно кончилось бы через два экрана, и догрузка
-  /// не пришла бы никогда. Поэтому пока индекс неполон, страница берётся с сервера и кладётся
-  /// в индекс; локальное берётся, только если сети нет вовсе.
+  /// нельзя: он знает только прочитанную часть ленты, поэтому его «дальше ничего» означало бы
+  /// конец ленты через пару экранов. Поэтому пока индекс неполон, страница берётся с сервера
+  /// и кладётся в индекс; локальное берётся, только если сети нет вовсе.
   Future<MediaFeedPage> _headPage(int limit) async {
-    if (_indexComplete) return store.head(limit);
+    if (_indexComplete && await _indexBelievable()) {
+      final local = await store.head(limit);
+      if (local.hasMore) return local;
+      // Индекс говорит «это вся лента»: проверяем у сервера, прежде чем поверить.
+      return _verifyEnd(const MediaCursor(at: null, id: ''), limit, local, older: false, head: true);
+    }
     try {
       final page = await apiOf().mediaFeed(limit: limit);
       await store.upsertAll(page.items);
@@ -552,11 +580,15 @@ class GalleryController extends ChangeNotifier {
   /// Страница вниз от курсора.
   ///
   /// Полный индекс отвечает сам: это чтение из SQLite, то есть без сети и мгновенно. Неполный
-  /// (идёт первое наполнение) берёт страницу с сервера и кладёт её в индекс — так следующие
-  /// заходы в это же место обходятся без сети. Если сети нет, но локально что-то есть, отдаём
+  /// (идёт наполнение) берёт страницу с сервера и кладёт её в индекс — так следующие заходы
+  /// в это же место обходятся без сети. Если сети нет, но локально что-то есть, отдаём
   /// локальное: офлайн-галерея важнее свежести.
   Future<MediaFeedPage> _olderPage(MediaCursor cursor, int limit) async {
-    if (_indexComplete) return store.older(cursor, limit);
+    if (_indexComplete && await _indexBelievable()) {
+      final local = await store.older(cursor, limit);
+      if (local.hasMore) return local;
+      return _verifyEnd(cursor, limit, local, older: true);
+    }
     try {
       final page = await apiOf().mediaFeed(before: cursor, limit: limit);
       await store.upsertAll(page.items);
@@ -570,7 +602,11 @@ class GalleryController extends ChangeNotifier {
 
   /// Страница вверх от курсора — тем же правилом, что и [_olderPage].
   Future<MediaFeedPage> _newerPage(MediaCursor cursor, int limit) async {
-    if (_indexComplete) return store.newer(cursor, limit);
+    if (_indexComplete && await _indexBelievable()) {
+      final local = await store.newer(cursor, limit);
+      if (local.hasMore) return local;
+      return _verifyEnd(cursor, limit, local, older: false);
+    }
     try {
       final page = await apiOf().mediaFeed(after: cursor, limit: limit);
       await store.upsertAll(page.items);
@@ -580,6 +616,77 @@ class GalleryController extends ChangeNotifier {
       if (local.items.isNotEmpty) return local;
       rethrow;
     }
+  }
+
+  /// Сверить с сервером «дальше ничего» от локального индекса.
+  ///
+  /// Индекс — кэш: он наполняется фоном, пересобирается после сброса журнала и может остаться
+  /// неполным, а его «кадров больше нет» человек видит как «лента кончилась в прошлом месяце» —
+  /// то есть не видит остальных лет съёмки. Поэтому такой ответ проверяется у сервера.
+  ///
+  /// Проверка сравнивает страницы, а не «есть ли у сервера кадры вообще»: последняя страница
+  /// ленты у обоих источников короткая и непустая, и принимать её за доказательство неполноты
+  /// значило бы гонять полное наполнение индекса на каждой остановке у конца ленты (именно так
+  /// и выглядела вечная полоса загрузки в шапке). Неполнота — это когда сервер знает о
+  /// продолжении или отдаёт больше кадров, чем нашлось локально.
+  ///
+  /// [head] — запрос без курсора (начало ленты): у него нет позиции, только «дальше есть/нет».
+  /// Побочно: `_indexComplete`, мета наполнения, локальный индекс и запуск наполнения.
+  Future<MediaFeedPage> _verifyEnd(
+    MediaCursor cursor,
+    int limit,
+    MediaFeedPage local, {
+    required bool older,
+    bool head = false,
+  }) async {
+    try {
+      final remote = head
+          ? await apiOf().mediaFeed(limit: limit)
+          : (older
+              ? await apiOf().mediaFeed(before: cursor, limit: limit)
+              : await apiOf().mediaFeed(after: cursor, limit: limit));
+      if (!remote.hasMore && remote.items.length <= local.items.length) return local;
+      if (kDebugMode) {
+        debugPrint('cloudly-gallery: индекс неполон — сервер отдал ${remote.items.length} кадров '
+            'против ${local.items.length} локальных');
+      }
+      await store.upsertAll(remote.items);
+      await _markIndexIncomplete();
+      return remote;
+    } catch (e) {
+      // Сервер недоступен — верим индексу: показать то, что есть, важнее полноты.
+      if (kDebugMode) debugPrint('cloudly-gallery: сверка конца ленты не удалась: $e');
+      return local;
+    }
+  }
+
+  /// Признать локальный индекс неполным: страницы пойдут с сервера, а наполнение — заново.
+  ///
+  /// Побочно: `_indexComplete` (снимается сразу и возвращается, когда наполнение дочитает ленту).
+  Future<void> _markIndexIncomplete() async {
+    _indexComplete = false;
+    await store.setMeta(GalleryStore.keyBackboneDone, '0');
+    await store.setMeta(GalleryStore.keyBackboneCursor, '');
+    // Именно `refill`, а не `sync`: проход мог уже идти и считать индекс полным — тогда
+    // обычный запуск вернул бы «занято» и наполнение не началось бы вовсе.
+    unawaited(sync.refill().then((_) async {
+      if (_disposed) return;
+      final full = await store.meta(GalleryStore.keyBackboneDone) == '1';
+      if (full && !_indexComplete) {
+        _indexComplete = true;
+        if (kDebugMode) debugPrint('cloudly-gallery: индекс наполнен заново');
+      }
+    }));
+  }
+
+  /// Можно ли верить индексу прямо сейчас.
+  ///
+  /// Два условия: он считался полным при открытии раздела и наполнение по нему уже не идёт
+  /// (иначе прочитанная часть ещё растёт, и её «конец» — временный).
+  Future<bool> _indexBelievable() async {
+    if (!_indexComplete) return false;
+    if (sync.progress.value?.running ?? false) return false;
+    return true;
   }
 
   /// Пересобрать плечи окна по текущим кадрам и раскладке.
@@ -617,12 +724,17 @@ class GalleryController extends ChangeNotifier {
   /// Текст строки состояния внизу окна; `null` — показывать нечего.
   ///
   /// Сбой показывается вместо загрузки: причина важнее, а «грузим» на сбое было бы враньём —
-  /// именно так и выглядел прежний вечный спиннер.
+  /// именно так и выглядел прежний вечный спиннер. Конец ленты тоже называется прямо: иначе
+  /// «дальше не грузится» неотличимо от «сломалось».
   String? _footerNote() {
     if (error != null) return error;
     if (_loadingOlder) return 'Загружаем…';
+    if (!_hasOlder && _items.isNotEmpty) return 'Это все кадры';
     return null;
   }
+
+  /// Страница вниз едет прямо сейчас (по этому признаку в строке состояния спиннер).
+  bool get loadingOlder => _loadingOlder;
 
   /// Повторить неудавшуюся загрузку — кнопкой в строке состояния.
   ///
@@ -630,6 +742,9 @@ class GalleryController extends ChangeNotifier {
   /// листает, а если данных не хватает и сверху, окно само догрузится при прокрутке.
   void retry() {
     error = null;
+    // Строка состояния собрана вместе со слотами, поэтому её надо пересобрать сразу: иначе
+    // причина сбоя осталась бы на экране до конца следующей загрузки.
+    _rebuildArms();
     notifyListeners();
     unawaited(loadOlder());
     unawaited(loadNewer());
@@ -737,11 +852,20 @@ class GalleryController extends ChangeNotifier {
 
   /// Проверить догрузку после кадра.
   ///
-  /// Нужна потому, что окно бывает короче экрана (в месяце мало кадров): прокручивать тогда
-  /// нечего, события прокрутки не будет вовсе, и страница не запросилась бы никогда.
-  void _checkViewportFilled() {
+  /// Нужна потому, что окно бывает короче экрана (в месяце мало кадров, а хвост без даты и вовсе
+  /// из одного кадра): прокручивать тогда нечего, события прокрутки не будет вовсе, и страница
+  /// не запросилась бы никогда.
+  ///
+  /// Ожидание списка повторяется: сразу после прыжка окно пусто, и на месте сетки стоит заглушка
+  /// — списка, у которого можно спросить размеры, в этот момент ещё нет, а проверка, сделанная
+  /// один раз, молча ничего бы не сделала.
+  void _checkViewportFilled([int attempt = 0]) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_disposed || !scroll.hasClients) return;
+      if (_disposed) return;
+      if (!scroll.hasClients) {
+        if (attempt < 5) _checkViewportFilled(attempt + 1);
+        return;
+      }
       _maybeLoad(scroll.position);
     });
   }

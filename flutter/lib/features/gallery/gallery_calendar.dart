@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import '../../api/models.dart';
 import '../../util/format.dart';
 
@@ -59,7 +61,8 @@ class GalleryCalendar {
   GalleryCalendar({required List<MediaMonthBucket> months, required this.tzOffsetMin})
       : months = _sorted(months),
         undatedCount = _undated(months),
-        _counts = {for (final m in _sorted(months)) m.month!: m.count};
+        _counts = {for (final m in _sorted(months)) m.month!: m.count},
+        _span = _coreSpan(months);
 
   /// Месяцы съёмки по возрастанию (от старых к свежим), без бакета «без даты».
   final List<MediaMonthBucket> months;
@@ -73,17 +76,30 @@ class GalleryCalendar {
   /// Число кадров по месяцам — по нему подсказка у ползунка показывает, сколько там снимков.
   final Map<String, int> _counts;
 
+  /// Первый и последний месяцы «ядра» — по ним считается отрезок шкалы (см. [_coreSpan]).
+  final (String, String) _span;
+
+  /// Какая доля кадров должна набраться за краем, чтобы край перестал быть выбросом.
+  ///
+  /// Полпроцента: месяц, в котором меньше этого от всей библиотеки, из отрезка выбрасывается.
+  /// Так шкала перестаёт зависеть от одиночных кадров с битой датой: нулевая дата EXIF («1970»)
+  /// или старый сканер находятся почти в любой библиотеке, а если тянуть шкалу до них, весь
+  /// остальной таймлайн сжимается в верхние проценты дорожки и перестаёт работать — тянешь
+  /// в середину, а попадаешь в те же 1970-е. Сами кадры никуда не деваются: они за концом шкалы
+  /// и дочитываются обычной прокруткой.
+  static const double outlierShare = 0.005;
+
   /// Пустая шкала: кадров нет вовсе (или разбивка ещё не приехала).
   bool get isEmpty => months.isEmpty;
 
-  /// Начало отрезка шкалы — первый день самого старого месяца (настенное время).
-  DateTime get start => _monthStart(months.first.month!);
+  /// Начало отрезка шкалы — первый день самого старого месяца ядра (настенное время).
+  DateTime get start => _monthStart(_span.$1);
 
-  /// Конец отрезка — первый день месяца, следующего за самым свежим (настенное время).
+  /// Конец отрезка — первый день месяца, следующего за самым свежим в ядре (настенное время).
   ///
   /// Именно начало следующего месяца, а не конец текущего: так доля 1.0 означает «свежее
   /// некуда» без возни с длиной последнего месяца.
-  DateTime get end => _monthStart(nextMonth(months.last.month!));
+  DateTime get end => _monthStart(nextMonth(_span.$2));
 
   /// Доля шкалы, на которой находится момент съёмки [at].
   double fractionOf(DateTime at) =>
@@ -97,10 +113,12 @@ class GalleryCalendar {
     final span = end.difference(start).inMilliseconds;
     final wall = start.add(Duration(milliseconds: (span * fraction.clamp(0.0, 1.0)).round()));
     final key = '${wall.year}-${wall.month.toString().padLeft(2, '0')}';
-    // За границы списка месяцев доля не выводит (fractionOf и monthAt согласованы), но кадр
-    // может стоять в пустом месяце — тогда ближайший сосед из списка и есть ответ.
-    if (key.compareTo(months.first.month!) < 0) return months.first.month!;
-    if (key.compareTo(months.last.month!) > 0) return months.last.month!;
+    // За границы отрезка доля не выводит (fractionOf и monthAt согласованы), но кадр может
+    // стоять в пустом месяце — тогда ближайший сосед из ядра и есть ответ. Крайние выбросы
+    // (те, что за концом шкалы) сюда не возвращаются намеренно: иначе ползунок, отпущенный
+    // у нижнего края, уводил бы в тот самый 1970-й.
+    if (key.compareTo(_span.$1) < 0) return _span.$1;
+    if (key.compareTo(_span.$2) > 0) return _span.$2;
     return key;
   }
 
@@ -139,8 +157,8 @@ class GalleryCalendar {
   List<({String month, double from, double to, bool january})> ticks() {
     if (isEmpty) return const [];
     final out = <({String month, double from, double to, bool january})>[];
-    final last = months.last.month!;
-    var key = months.first.month!;
+    final last = _span.$2;
+    var key = _span.$1;
     while (true) {
       out.add((
         month: key,
@@ -167,6 +185,38 @@ class GalleryCalendar {
     final y = int.tryParse(month.substring(0, 4)) ?? 1970;
     final m = int.tryParse(month.substring(5, 7)) ?? 1;
     return DateTime.utc(y, m);
+  }
+
+  /// Первый и последний месяцы «ядра» съёмки: те, за которыми уже набрана заметная доля кадров.
+  ///
+  /// Считается накоплением счётчиков с обоих концов по возрастанию даты: как только за краем
+  /// набралось больше [outlierShare] от всех кадров, край перестаёт считаться выбросом.
+  static (String, String) _coreSpan(List<MediaMonthBucket> months) {
+    final dated = _sorted(months);
+    if (dated.isEmpty) return ('1970-01', '1970-01');
+    final total = dated.fold<int>(0, (sum, m) => sum + m.count);
+    final edge = math.max(1, (total * outlierShare).floor());
+    var first = dated.first.month!;
+    var last = dated.last.month!;
+    var acc = 0;
+    for (final m in dated) {
+      acc += m.count;
+      if (acc > edge) {
+        first = m.month!;
+        break;
+      }
+    }
+    acc = 0;
+    for (final m in dated.reversed) {
+      acc += m.count;
+      if (acc > edge) {
+        last = m.month!;
+        break;
+      }
+    }
+    // Ядро не может схлопнуться в обратную сторону: если кадров мало, отрезок — весь список.
+    if (first.compareTo(last) > 0) return (dated.first.month!, dated.last.month!);
+    return (first, last);
   }
 
   /// Месяцы съёмки по возрастанию, без пустых бакетов.

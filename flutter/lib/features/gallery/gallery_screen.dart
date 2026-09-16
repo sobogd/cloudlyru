@@ -92,7 +92,12 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
               ),
         bottom: c == null ? null : _syncBar(c),
       ),
-      body: c == null ? const Center(child: CircularProgressIndicator()) : _body(c),
+      // Экран обязан слушать контроллер: окно меняется из фоновых загрузок (страницы, прыжок
+      // по шкале, удаление кадра, подключение миниатюр), и без подписки сетка осталась бы той,
+      // какой её собрали в первый раз — с прежним числом строк и прежним якорем.
+      body: c == null
+          ? const Center(child: CircularProgressIndicator())
+          : ListenableBuilder(listenable: c, builder: (_, _) => _body(c)),
     );
   }
 
@@ -260,12 +265,15 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
             : Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: C.fg3),
-                  ),
-                  const SizedBox(width: 8),
+                  // Спиннер только у загрузки: у «это все кадры» крутить нечего.
+                  if (c.loadingOlder) ...[
+                    const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: C.fg3),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
                   Text(row.note!, style: const TextStyle(color: C.fg3, fontSize: 13)),
                 ],
               ),
