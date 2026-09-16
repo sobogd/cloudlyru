@@ -1,6 +1,71 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
+import '../api/cloudly_api.dart';
 import '../theme.dart';
+
+/// Картинка с сервера, закрытая сессией: миниатюра файла, логотип домена, метка на карте.
+///
+/// Один виджет на все такие места намеренно: ручки превью и логотипов требуют сессию, и без
+/// заголовков из [CloudlyApi.authHeaders] на месте картинки остаётся заглушка. Выглядит это
+/// как «картинки нет» и ищется долго, поэтому заголовки подставляет сам виджет, а не каждый
+/// вызывающий по памяти (раньше таких копий было три: список файлов, аватар письма, метка).
+///
+/// Размеры квадратные: у всех трёх мест картинка вписана в квадрат со скруглением.
+class AuthThumb extends StatelessWidget {
+  const AuthThumb({
+    super.key,
+    required this.api,
+    required this.url,
+    required this.size,
+    this.cacheKey,
+    this.radius = 8,
+    this.placeholder,
+    this.fallback,
+  });
+
+  /// Клиент API: отсюда приходят заголовки сессии.
+  final CloudlyApi api;
+  /// Адрес картинки (`CloudlyApi.thumbUrl`, `faviconUrl`, `previewUrl`).
+  final String url;
+  /// Сторона квадрата в логических пикселях.
+  final double size;
+  /// Ключ кэша. Нужен там, где адрес не меняется при смене содержимого: миниатюра записи
+  /// живёт по `entryId`, а картинка под тем же адресом обновляется по `sha256` — без ключа
+  /// на экране осталась бы прежняя картинка.
+  final String? cacheKey;
+  /// Скругление углов. Половина стороны даёт круг (так нарисован аватар письма).
+  final double radius;
+  /// Что показывать, пока картинка грузится. По умолчанию — то же, что и при ошибке.
+  final Widget? placeholder;
+  /// Что показывать, если картинки нет вовсе (ошибка загрузки, нет такой ручки, нет записи).
+  /// По умолчанию — серая плашка: пустое место в списке читается как ошибка вёрстки,
+  /// а плашка — как «картинки ещё нет».
+  final Widget? fallback;
+
+  /// Серая плашка — общий запасной вариант: она же заглушка загрузки, если не задано своё.
+  Widget _grey() => Container(color: C.surface3);
+
+  @override
+  Widget build(BuildContext context) {
+    final miss = fallback ?? _grey();
+    return SizedBox(
+      width: size,
+      height: size,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(radius),
+        child: CachedNetworkImage(
+          imageUrl: url,
+          cacheKey: cacheKey,
+          httpHeaders: api.authHeaders,
+          fit: BoxFit.cover,
+          placeholder: (_, _) => placeholder ?? miss,
+          errorWidget: (_, _, _) => miss,
+        ),
+      ),
+    );
+  }
+}
 
 /// Иконка для строки списка по mime-типу файла.
 ///

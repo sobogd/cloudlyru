@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
 
-import 'package:cached_network_image/cached_network_image.dart';
 // kDebugMode приходит из foundation: material его больше не реэкспортирует, а без него
 // отладочную печать в проглатываемой ошибке пришлось бы либо печатать всегда, либо убрать.
 import 'package:flutter/foundation.dart';
@@ -530,18 +529,15 @@ class _MailScreenState extends ConsumerState<MailScreen> {
     final domain = _domainOfEmail(item.fromAddr);
     final letter = _firstLetter(item.fromName ?? item.fromAddr);
     if (domain == null) return _letterAvatar(letter);
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(18),
-      child: SizedBox(
-        width: 36,
-        height: 36,
-        child: CachedNetworkImage(
-          imageUrl: api.faviconUrl(domain),
-          httpHeaders: api.authHeaders,
-          fit: BoxFit.cover,
-          errorWidget: (_, _, _) => _letterAvatar(letter),
-        ),
-      ),
+    // Логотип домена тянет и кэширует сервер (`/mail/favicon`), поэтому клиент в чужой сайт
+    // не ходит; ручка закрыта сессией, и заголовки подставляет [AuthThumb]. Нет логотипа —
+    // остаётся буква: строка не должна зависеть от того, отдал ли чужой сайт иконку.
+    return AuthThumb(
+      api: api,
+      url: api.faviconUrl(domain),
+      size: 36,
+      radius: 18,
+      fallback: _letterAvatar(letter),
     );
   }
 

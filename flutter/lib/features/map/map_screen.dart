@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11,6 +10,7 @@ import '../../api/cloudly_api.dart';
 import '../../api/models.dart';
 import '../../providers.dart';
 import '../../theme.dart';
+import '../../util/widgets.dart';
 import '../media/media_screen.dart';
 
 /// Размер клетки кластеризации в экранных пикселях.
@@ -589,21 +589,14 @@ class _MapScreenState extends ConsumerState<MapScreen> {
   Widget _clusterMarker(_Cluster c, CloudlyApi api) {
     final entryId = _points[c.ids.first].entryId;
     return Stack(alignment: Alignment.center, children: [
-      ClipRRect(
-        borderRadius: BorderRadius.circular(5),
-        child: CachedNetworkImage(
-          imageUrl: api.thumbUrl(entryId),
-          httpHeaders: api.authHeaders,
-          width: _clusterSide,
-          height: _clusterSide,
-          fit: BoxFit.cover,
-          errorWidget: (_, _, _) => Container(
-            width: _clusterSide,
-            height: _clusterSide,
-            color: C.surface3,
-            child: const Icon(Icons.image_outlined, size: 14, color: C.fg3),
-          ),
-        ),
+      // Миниатюра первого кадра клетки: ручка закрыта сессией, поэтому картинку строит
+      // [AuthThumb] — он же подставляет заглушку, если превью ещё не собрано.
+      AuthThumb(
+        api: api,
+        url: api.thumbUrl(entryId),
+        size: _clusterSide,
+        radius: 5,
+        fallback: const Icon(Icons.image_outlined, size: 14, color: C.fg3),
       ),
       if (c.n > 1)
         Container(

@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -594,20 +593,14 @@ class _Thumb extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final sha = entry.sha256;
-    return SizedBox(
-      width: 44,
-      height: 44,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: CachedNetworkImage(
-          imageUrl: api.thumbUrl(entry.id),
-          cacheKey: (sha != null && sha.isNotEmpty) ? 'thumb-$sha' : 'thumb-${entry.id}',
-          httpHeaders: api.authHeaders,
-          fit: BoxFit.cover,
-          placeholder: (_, _) => Container(color: C.surface3),
-          errorWidget: (_, _, _) => Icon(fileIcon(entry.mime), color: C.fg3),
-        ),
-      ),
+    return AuthThumb(
+      api: api,
+      url: api.thumbUrl(entry.id),
+      size: 44,
+      // Ключ по хешу содержимого: адрес миниатюры привязан к записи, а сама картинка меняется
+      // при замене файла — без ключа на экране осталась бы прежняя миниатюра.
+      cacheKey: (sha != null && sha.isNotEmpty) ? 'thumb-$sha' : 'thumb-${entry.id}',
+      fallback: Icon(fileIcon(entry.mime), color: C.fg3),
     );
   }
 }
