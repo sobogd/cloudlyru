@@ -28,12 +28,14 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     logger: LOG_LEVELS[env.LOG_LEVEL],
   });
-  // /apk — постоянная ссылка на последнюю сборку мобильного приложения, её открывают
-  // в браузере и вбивают в телефон: префикс api/v1 тут только мешал бы.
+  // /apk и /macos — постоянные ссылки на последние сборки приложения, их открывают в браузере
+  // и вбивают в телефон: префикс api/v1 тут только мешал бы.
   app.setGlobalPrefix('api/v1', {
     exclude: [
       { path: 'apk', method: RequestMethod.GET },
       { path: 'apk/version', method: RequestMethod.GET },
+      { path: 'macos', method: RequestMethod.GET },
+      { path: 'macos/version', method: RequestMethod.GET },
     ],
   });
   app.enableShutdownHooks();

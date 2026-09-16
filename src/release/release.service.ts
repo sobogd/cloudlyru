@@ -3,29 +3,61 @@ import { S3Service } from '../s3/s3.service';
 import { env } from '../config/env';
 
 /**
- * Релизный артефакт Android-клиента. Лежит отдельно от личных файлов владельца
- * (не в дереве папок облака): это не файл библиотеки, а сборка приложения, и ссылка
- * на неё должна быть постоянной — /apk.
+ * Куда кладётся сборка платформы и по какому адресу её отдаёт сервер.
+ *
+ * Релизные артефакты лежат отдельно от личных файлов владельца (не в дереве папок облака):
+ * это не файлы библиотеки, а сборки приложения, и ссылки на них должны быть постоянными —
+ * `/apk` для Android и `/macos` для настольной сборки.
  */
-export const APK_KEY = 'release/android/cloudlyru-sync.apk';
-export const APK_META_KEY = 'release/android/latest.json';
-export const APK_NAME = 'cloudlyru-sync.apk';
-export const APK_MIME = 'application/vnd.android.package-archive';
+export interface ReleaseArtifact {
+  /** Ключ файла сборки в бакете. */
+  key: string;
+  /** Ключ описания сборки рядом с файлом — его пишет скрипт публикации. */
+  metaKey: string;
+  /** Имя, под которым файл отдаётся на скачивание. */
+  name: string;
+  mime: string;
+  /** Постоянный публичный путь без префикса api/v1. */
+  path: string;
+}
+
+export const RELEASE_ARTIFACTS = {
+  android: {
+    key: 'release/android/cloudlyru-sync.apk',
+    metaKey: 'release/android/latest.json',
+    name: 'cloudlyru-sync.apk',
+    mime: 'application/vnd.android.package-archive',
+    path: 'apk',
+  },
+  macos: {
+    key: 'release/macos/cloudlyru-sync-macos.zip',
+    metaKey: 'release/macos/latest.json',
+    name: 'Cloudly.zip',
+    mime: 'application/zip',
+    path: 'macos',
+  },
+} as const satisfies Record<string, ReleaseArtifact>;
+
+export type ReleasePlatform = keyof typeof RELEASE_ARTIFACTS;
 
 /** Сведения о сборке читаются из S3 на каждый запрос, но не чаще раза в минуту. */
 const META_TTL_MS = 60_000;
 
-export interface AndroidRelease {
+export interface AppRelease {
   applicationId: string;
-  /** versionCode из сборки: по нему приложение понимает, что вышла новая версия. */
+  /**
+   * Номер сборки: у Android это versionCode, у настольной сборки — CFBundleVersion.
+   * По нему приложение понимает, что вышла новая версия.
+   */
   versionCode: number;
   versionName: string;
   size: number;
   sha256: string;
+  /** Минимальная версия системы, заявленная сборкой; у настольной сборки не заполняется. */
   minSdk: number;
   /** Пустая строка — «в описании сборки даты нет»; null тут не бывает, поэтому проверять `!= null` бессмысленно. */
   builtAt: string;
-  /** Постоянная публичная ссылка на APK (её открывает и браузер, и само приложение). */
+  /** Постоянная публичная ссылка на сборку (её открывает и браузер, и само приложение). */
   url: string;
   /**
    * false — сборка найдена в бакете без описания latest.json (её выложил кто-то руками или
@@ -38,36 +70,41 @@ export interface AndroidRelease {
 }
 
 /**
- * Последняя опубликованная сборка APK: байты в S3, описание — рядом в latest.json
- * (его пишет `scripts/publish-apk.mjs`). Сборки нет — методов отвечает null,
- * ручки превращают это в честный 404, а не в пустой файл.
+ * Последняя опубликованная сборка платформы: байты в S3, описание — рядом в latest.json
+ * (его пишут `scripts/publish-apk.mjs` и `scripts/publish-macos.mjs`). Сборки нет — метод
+ * отвечает null, ручки превращают это в честный 404, а не в пустой файл.
  */
 @Injectable()
 export class ReleaseService {
   private readonly logger = new Logger(ReleaseService.name);
-  private cache: { at: number; value: AndroidRelease | null } | null = null;
+
+  /** Кэш на платформу: у каждой свой срок и своё значение. */
+  private readonly cache = new Map<ReleasePlatform, { at: number; value: AppRelease | null }>();
 
   constructor(private readonly s3: S3Service) {}
 
-  /** Постоянная публичная ссылка на последнюю сборку. */
-  get publicUrl(): string {
-    return `${env.BASE_URL.replace(/\/+$/, '')}/apk`;
+  /** Постоянная публичная ссылка на последнюю сборку платформы. */
+  publicUrl(platform: ReleasePlatform = 'android'): string {
+    const base = env.BASE_URL.replace(/\/+$/, '');
+    return `${base}/${RELEASE_ARTIFACTS[platform].path}`;
   }
 
-  async latest(): Promise<AndroidRelease | null> {
+  async latest(platform: ReleasePlatform = 'android'): Promise<AppRelease | null> {
+    const artifact = RELEASE_ARTIFACTS[platform];
     const now = Date.now();
-    if (this.cache && now - this.cache.at < META_TTL_MS) return this.cache.value;
+    const cached = this.cache.get(platform);
+    if (cached && now - cached.at < META_TTL_MS) return cached.value;
 
-    let value: AndroidRelease | null = null;
+    let value: AppRelease | null = null;
     try {
-      value = await this.readMeta();
-      // APK без описания (публикация скриптом старой версии или руками) — файл отдать можно,
+      value = await this.readMeta(platform);
+      // Сборка без описания (публикация скриптом старой версии или руками) — файл отдать можно,
       // но версии в нём нет: приложение такую сборку обновлением не считает.
       // «Сборка есть, latest.json нет» — это осознанная деградация: url ведёт на настоящий
       // файл (скачать руками можно), а versionCode 0 не больше текущего у приложения, поэтому
       // обновление по ней не предложится. Клиент должен читать это как «версия неизвестна»,
       // а не как «вышла новая сборка» — поэтому metaKnown=false вместо правдоподобных нулей.
-      if (!value && (await this.s3.headObject(APK_KEY))) {
+      if (!value && (await this.s3.headObject(artifact.key))) {
         value = {
           applicationId: '',
           versionCode: 0,
@@ -76,7 +113,7 @@ export class ReleaseService {
           sha256: '',
           minSdk: 0,
           builtAt: '',
-          url: this.publicUrl,
+          url: this.publicUrl(platform),
           metaKnown: false,
         };
       }
@@ -85,16 +122,19 @@ export class ReleaseService {
       this.logger.warn(`не удалось прочитать сведения о сборке: ${(e as Error).message}`);
       return null;
     }
-    this.cache = { at: now, value };
+    this.cache.set(platform, { at: now, value });
     return value;
   }
 
-  private async readMeta(): Promise<AndroidRelease | null> {
-    if (!(await this.s3.headObject(APK_META_KEY))) return null;
-    const raw = (await this.s3.getObjectBytes(APK_META_KEY, 64 * 1024)).toString('utf8');
-    const parsed = JSON.parse(raw) as Partial<AndroidRelease>;
+  private async readMeta(platform: ReleasePlatform): Promise<AppRelease | null> {
+    const artifact = RELEASE_ARTIFACTS[platform];
+    if (!(await this.s3.headObject(artifact.metaKey))) return null;
+    const raw = (await this.s3.getObjectBytes(artifact.metaKey, 64 * 1024)).toString('utf8');
+    const parsed = JSON.parse(raw) as Partial<AppRelease>;
     if (typeof parsed.versionCode !== 'number' || !parsed.sha256) {
-      this.logger.warn('latest.json без versionCode/sha256 — считаю сборку неопознанной');
+      this.logger.warn(
+        `${artifact.metaKey} без versionCode/sha256 — считаю сборку неопознанной`,
+      );
       return null;
     }
     return {
@@ -105,7 +145,7 @@ export class ReleaseService {
       sha256: String(parsed.sha256),
       minSdk: Number(parsed.minSdk ?? 0),
       builtAt: String(parsed.builtAt ?? ''),
-      url: this.publicUrl,
+      url: this.publicUrl(platform),
       metaKnown: true,
     };
   }
