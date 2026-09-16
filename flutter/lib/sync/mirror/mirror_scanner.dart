@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import '../data/selection_rules.dart';
 import '../device/media_rules.dart';
 import '../device/native_fs.dart';
+import '../device/native_stat.dart';
 import 'mirror_models.dart';
 import 'mirror_rules.dart';
 
@@ -58,7 +59,7 @@ class MirrorScanner {
     void Function(String)? onProgress,
     bool Function()? isCancelled,
   }) async {
-    // Номера файлов спрашиваем пачками (см. [NativeFs.inodes]): по одному вызову моста на файл
+    // Ключи файлов спрашиваем пачками (см. [NativeFs.ids]): по одному системному вызову на файл
     // проход по десяткам тысяч файлов растягивается на десятки секунд
     final gathered = <_Gathered>[];
     final dirs = <LocalDir>[];
@@ -146,8 +147,8 @@ class MirrorScanner {
       }
     }
 
-    // Второй проход — за номерами файлов: номера берутся отдельно от обхода, пачкой путей,
-    // чтобы на каждый файл не заводить C-строку и не ходить в диск дважды подряд.
+    // Второй проход — за ключами файлов (том и номер): они берутся отдельно от обхода, пачкой
+    // путей, чтобы на каждый файл не заводить C-строку и не ходить в диск дважды подряд.
     // Отменённый обход второго прохода не делает: снимок всё равно неполный, а номера файлов
     // никому не понадобятся — удалять по нему нельзя, а план выгрузки движок не строит
     final files = <LocalFile>[];
@@ -161,7 +162,7 @@ class MirrorScanner {
           start,
           math.min(start + inodeBatch, gathered.length),
         );
-        final inodes = _native.inodes([for (final g in chunk) g.path]);
+        final ids = _native.ids([for (final g in chunk) g.path]);
         for (var i = 0; i < chunk.length; i++) {
           final g = chunk[i];
           files.add(
@@ -171,10 +172,10 @@ class MirrorScanner {
               dir: g.dir,
               size: g.size,
               mtime: g.mtime,
-              // 0 — «номер неизвестен»: тогда переименование не распознаётся и файл уедет
-              // заново. Список номеров короче запроса быть не может, но проверка дешёвая:
-              // перепутанный номер хуже отсутствующего
-              inode: i < inodes.length ? inodes[i] : 0,
+              // Ключ без номера — «неизвестен»: тогда переименование не распознаётся и файл
+              // уедет заново. Список ключей короче запроса быть не может, но проверка дешёвая:
+              // перепутанный ключ хуже отсутствующего
+              id: i < ids.length ? ids[i] : FileId.unknown,
             ),
           );
         }

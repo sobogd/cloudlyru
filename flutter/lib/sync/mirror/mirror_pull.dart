@@ -6,6 +6,7 @@ import '../data/mirror_store.dart';
 import '../device/hasher.dart';
 import '../device/media_rules.dart';
 import '../device/native_fs.dart';
+import '../device/native_stat.dart';
 import '../net/sync_api.dart';
 import 'failure_streak.dart';
 import 'mirror_folders.dart';
@@ -568,7 +569,7 @@ class MirrorPull {
     final stat = exists ? await file.stat() : null;
     final localSize = stat?.size ?? 0;
     final localMtime = stat?.modified.millisecondsSinceEpoch ?? 0;
-    final localInode = exists ? _native.inode(path) : 0;
+    final localId = exists ? _native.id(path) : FileId.unknown;
     final cloudSha = sha256?.toLowerCase();
     final rowSha = row?.sha256?.toLowerCase();
 
@@ -579,7 +580,7 @@ class MirrorPull {
         exists &&
         row.size == localSize &&
         row.mtime == localMtime &&
-        (row.inode <= 0 || localInode <= 0 || row.inode == localInode);
+        (!row.id.known || !localId.known || row.id == localId);
     // строки нет, но файл — тот самый, что в облаке: совпали размер и дата источника
     final looksLikeSource =
         row == null &&
@@ -626,7 +627,7 @@ class MirrorPull {
             path: path,
             cloudFolderId: folderId ?? '',
             entryId: entryId,
-            inode: localInode,
+            id: localId,
             size: localSize,
             mtime: localMtime,
             sha256: localSha,
@@ -834,7 +835,7 @@ class MirrorPull {
           path: dest.path,
           cloudFolderId: folderId ?? '',
           entryId: entryId,
-          inode: _native.inode(dest.path),
+          id: _native.id(dest.path),
           size: stat.size,
           mtime: stat.modified.millisecondsSinceEpoch,
           // хэш — из журнала: содержимое скачанного файла повторно не хэшируется

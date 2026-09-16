@@ -3,6 +3,45 @@ import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
+/// Ключ файла в файловой системе: том ([dev]) и номер файла внутри тома ([ino]).
+///
+/// Номер уникален **только внутри тома**: на внутренней памяти и на карте памяти легко
+/// найдутся файлы с одним и тем же номером (каждый том нумерует свои), и сравнивать номера
+/// без тома нельзя — копия файла, перенесённая на другой том, выглядела бы переименованием
+/// и увезла бы облачную запись на чужой путь. Поэтому том и номер ходят вместе.
+///
+/// `ino == 0` — «номер неизвестен» (раскладка не сошлась, файла нет, нет прав): тогда
+/// сравнение по ключу не делается вовсе, и остаются размер с датой.
+///
+/// Том — величина не вечная: у съёмного тома номер устройства меняется при каждом подключении,
+/// поэтому совпадение тома требуется только для распознавания переименования, и его отсутствие
+/// означает «сравнить нельзя», а не «файл изменился».
+class FileId {
+  const FileId(this.dev, this.ino);
+
+  /// Идентификатор тома (`st_dev`).
+  final int dev;
+
+  /// Номер файла внутри тома (`st_ino`).
+  final int ino;
+
+  /// Ключа нет: сравнивать не с чем.
+  static const FileId unknown = FileId(0, 0);
+
+  /// Номер известен — по ключу можно сравнивать.
+  bool get known => ino > 0;
+
+  @override
+  bool operator ==(Object other) =>
+      other is FileId && other.dev == dev && other.ino == ino;
+
+  @override
+  int get hashCode => Object.hash(dev, ino);
+
+  @override
+  String toString() => known ? 'FileId($dev, $ino)' : 'FileId(неизвестен)';
+}
+
 /// Чтение номера файла (`st_ino`) через `stat(2)` — прямо из libc, без нативного кода проекта.
 ///
 /// Зачем он нужен: Dart `FileStat` номера файла не отдаёт, а зеркалу он необходим, чтобы
@@ -17,12 +56,12 @@ import 'package:ffi/ffi.dart';
 /// переименования начинают складываться неправильно. Поэтому смещения не «по памяти»,
 /// а сняты с заголовков:
 ///
-/// | платформа | символ | `st_ino` | `st_size` | `sizeof` |
-/// |---|---|---|---|---|
-/// | macOS (arm64 и x86_64) | `stat`, на x86_64 ещё `stat$INODE64` | 8 | 96 | 144 |
-/// | Android, arm64 | `stat` | 8 | 48 | 128 |
-/// | Android, x86_64 | `stat` | 8 | 48 | 144 |
-/// | Android, arm 32 | `stat` | 96 | 48 | 104 |
+/// | платформа | символ | `st_dev` | `st_ino` | `st_size` | `sizeof` |
+/// |---|---|---|---|---|---|
+/// | macOS (arm64 и x86_64) | `stat`, на x86_64 ещё `stat$INODE64` | 0 | 8 | 96 | 144 |
+/// | Android, arm64 | `stat` | 0 | 8 | 48 | 128 |
+/// | Android, x86_64 | `stat` | 0 | 8 | 48 | 144 |
+/// | Android, arm 32 | `stat` | 0 | 96 | 48 | 104 |
 ///
 /// Три андроидные раскладки сняты с NDK 28.2.13676358:
 /// `clang --target=<abi>21 -Xclang -fdump-record-layouts` по `<sys/stat.h>`. На arm 32
@@ -36,12 +75,12 @@ import 'package:ffi/ffi.dart';
 /// сверяется по размеру структуры (`sizeOf` должен дать 128/144/104 — размер из заголовка):
 /// разошлось — раскладка не берётся вовсе. Потом, первым же вызовом, размер файла из `stat`
 /// сверяется с [File.lengthSync] — два независимых источника об одном и том же файле.
-/// Не сошлось — [inode] и [inodes] навсегда отвечают нулём («номер неизвестен»), и
-/// приложение работает как без номеров: переименование не распознаётся и файл уедет заново.
-/// Это дороже, но не потеря данных, и это единственный безопасный ответ, если раскладка не та.
+/// Не сошлось — [id] и [ids] навсегда отвечают [FileId.unknown], и приложение работает как без
+/// номеров: переименование не распознаётся и файл уедет заново. Это дороже, но не потеря
+/// данных, и это единственный безопасный ответ, если раскладка не та.
 ///
-/// Номер уникален только внутри тома; сравнивать его между томами нельзя, и за этим следит
-/// вызывающий: у `MirrorRow.inode` своя строка на каждый путь.
+/// Том читается из той же структуры и по той же причине: без него номер файла с одной карты
+/// памяти совпал бы с номером чужого файла на другой, и копия выглядела бы переименованием.
 class NativeStat {
   NativeStat._(this._layout);
 
@@ -65,33 +104,33 @@ class NativeStat {
   /// Вердикт самопроверки: `null` — ещё не проверялась. Нужен для логов.
   bool? get layoutOk => _layoutOk;
 
-  /// Номер файла в файловой системе; `0` — «узнать не удалось».
+  /// Ключ файла (том и номер в нём); [FileId.unknown] — «узнать не удалось».
   ///
-  /// Ноль вместо исключения — сознательный контракт: сбой `stat` (файла нет, нет прав,
-  /// раскладка не сошлась) не должен ронять обход. Все вызывающие уже трактуют ноль как
-  /// «номера нет» и деградируют до сравнения по размеру и дате.
-  int inode(String path) {
-    if (_layoutOk == false) return 0;
+  /// Пустой ключ вместо исключения — сознательный контракт: сбой `stat` (файла нет, нет прав,
+  /// раскладка не сошлась) не должен ронять обход. Все вызывающие уже трактуют такой ключ как
+  /// «сравнивать не с чем» и деградируют до сравнения по размеру и дате.
+  FileId id(String path) {
+    if (_layoutOk == false) return FileId.unknown;
     final pathPtr = path.toNativeUtf8();
     try {
       final read = _layout.read(pathPtr);
-      if (read == null) return 0;
-      if (!_verify(path, read.size)) return 0;
-      return read.ino;
+      if (read == null) return FileId.unknown;
+      if (!_verify(path, read.size)) return FileId.unknown;
+      return read.id;
     } finally {
       malloc.free(pathPtr);
     }
   }
 
-  /// Номера файлов пачкой — в том же порядке, что [paths]; `0` в позиции — номер неизвестен.
+  /// Ключи файлов пачкой — в том же порядке, что [paths].
   ///
   /// Пачка нужна обходу: на десятках тысяч файлов разница между циклом здесь и запросом на
   /// каждый файл — это разница между «проход идёт» и «проход ползёт».
-  List<int> inodes(List<String> paths) {
+  List<FileId> ids(List<String> paths) {
     if (paths.isEmpty) return const [];
-    final out = List<int>.filled(paths.length, 0);
+    final out = List<FileId>.filled(paths.length, FileId.unknown);
     for (var i = 0; i < paths.length; i++) {
-      out[i] = inode(paths[i]);
+      out[i] = id(paths[i]);
     }
     return out;
   }
@@ -215,8 +254,8 @@ typedef _StatArmDart = int Function(Pointer<Utf8>, Pointer<_StatAndroidArm>);
 abstract class _Layout {
   const _Layout();
 
-  /// Номер файла и размер; `null` — `stat` вернул ошибку (файла нет, нет прав).
-  ({int ino, int size})? read(Pointer<Utf8> path);
+  /// Ключ файла и его размер; `null` — `stat` вернул ошибку (файла нет, нет прав).
+  ({FileId id, int size})? read(Pointer<Utf8> path);
 }
 
 /// Платформа без поддержки: номера не отдаём вовсе, как при неудачном `stat`.
@@ -224,7 +263,7 @@ class _NoLayout extends _Layout {
   const _NoLayout();
 
   @override
-  ({int ino, int size})? read(Pointer<Utf8> path) => null;
+  ({FileId id, int size})? read(Pointer<Utf8> path) => null;
 }
 
 /// Раскладка macOS.
@@ -239,9 +278,10 @@ final class _DarwinLayout extends _Layout {
   final Pointer<_StatDarwin> _buf = calloc<_StatDarwin>();
 
   @override
-  ({int ino, int size})? read(Pointer<Utf8> path) {
+  ({FileId id, int size})? read(Pointer<Utf8> path) {
     if (_stat(path, _buf) != 0) return null;
-    return (ino: _buf.ref.ino, size: _buf.ref.size);
+    final id = FileId(_buf.ref.dev, _buf.ref.ino);
+    return (id: id, size: _buf.ref.size);
   }
 }
 
@@ -253,9 +293,10 @@ final class _AndroidArm64Layout extends _Layout {
   final Pointer<_StatAndroidArm64> _buf = calloc<_StatAndroidArm64>();
 
   @override
-  ({int ino, int size})? read(Pointer<Utf8> path) {
+  ({FileId id, int size})? read(Pointer<Utf8> path) {
     if (_stat(path, _buf) != 0) return null;
-    return (ino: _buf.ref.ino, size: _buf.ref.size);
+    final id = FileId(_buf.ref.dev, _buf.ref.ino);
+    return (id: id, size: _buf.ref.size);
   }
 }
 
@@ -267,9 +308,10 @@ final class _AndroidX64Layout extends _Layout {
   final Pointer<_StatAndroidX64> _buf = calloc<_StatAndroidX64>();
 
   @override
-  ({int ino, int size})? read(Pointer<Utf8> path) {
+  ({FileId id, int size})? read(Pointer<Utf8> path) {
     if (_stat(path, _buf) != 0) return null;
-    return (ino: _buf.ref.ino, size: _buf.ref.size);
+    final id = FileId(_buf.ref.dev, _buf.ref.ino);
+    return (id: id, size: _buf.ref.size);
   }
 }
 
@@ -281,9 +323,10 @@ final class _AndroidArmLayout extends _Layout {
   final Pointer<_StatAndroidArm> _buf = calloc<_StatAndroidArm>();
 
   @override
-  ({int ino, int size})? read(Pointer<Utf8> path) {
+  ({FileId id, int size})? read(Pointer<Utf8> path) {
     if (_stat(path, _buf) != 0) return null;
-    return (ino: _buf.ref.ino, size: _buf.ref.size);
+    final id = FileId(_buf.ref.dev, _buf.ref.ino);
+    return (id: id, size: _buf.ref.size);
   }
 }
 

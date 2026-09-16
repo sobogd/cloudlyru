@@ -2,9 +2,10 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
+import '../device/native_stat.dart';
 import '../mirror/mirror_models.dart';
 
-/// Локальное состояние зеркала: база `cloudly-mirror.db`, версия 2, пять таблиц.
+/// Локальное состояние зеркала: база `cloudly-mirror.db`, версия 3, пять таблиц.
 ///
 /// ## `roots` — пары «папка телефона ↔ папка в облаке»
 ///
@@ -31,13 +32,15 @@ import '../mirror/mirror_models.dart';
 ///
 /// ## `files` — что уже выгружено
 ///
-///   • назначение: запись в облаке, номер файла на телефоне, слепок содержимого;
+///   • назначение: запись в облаке, ключ файла на телефоне, слепок содержимого;
 ///   • ключ: `path` (путь файла на телефоне);
 ///   • `INDEX files_entry(entry_id)` — найти строку по записи облака (правки из веба);
-///     `INDEX files_inode(inode)` — найти файл по номеру в файловой системе (переименование);
-///   • колонки: `cloud_folder_id` — папка облака, `entry_id` — запись, `inode` — номер файла
-///     (`0` значит «номер неизвестен»: у части томов его нет), `size`/`mtime`/`sha256` —
-///     слепок выгруженного содержимого, `sha256` может быть NULL, `at` — когда записали;
+///     `INDEX files_inode(inode)` — найти файл по номеру в файловой системе;
+///   • колонки: `cloud_folder_id` — папка облака, `entry_id` — запись, `dev`/`inode` — ключ
+///     файла: том и номер в нём (см. [FileId]; ноль в `inode` значит «номер неизвестен»,
+///     ноль в `dev` — «строка заведена до появления тома, сравнивать ключ нельзя»),
+///     `size`/`mtime`/`sha256` — слепок выгруженного содержимого, `sha256` может быть NULL,
+///     `at` — когда записали;
 ///   • главный инвариант строки: **строка = «этот файл лежит в облаке»**, и сверка читает её
 ///     буквально: по строкам, чьи файлы пропали с телефона, облачная копия уходит в корзину,
 ///     а файл без строки выгружается заново. Поэтому миграции ничего не удаляют, база чистится
@@ -73,12 +76,13 @@ class MirrorStore {
   /// жизнь, и его строки не должны зависеть от того, что человек сделал с очередью.
   static const String _name = 'cloudly-mirror.db';
 
-  /// Версия схемы: 1 — без `uploads`, 2 — с ней. Поднимая версию, добавь ветку в `onUpgrade`,
-  /// которая только создаёт или добавляет: удалять данные здесь нельзя ни при каких условиях.
-  /// Ветки там идемпотентны (`CREATE TABLE IF NOT EXISTS`), поэтому повторный проход по ним
-  /// после отката версии ничего не ломает. Родословная: 1 — `roots`, `dirs`, `files`, `meta`,
-  /// 2 — `uploads`; состояние строк при апгрейде не переписывается ни разу.
-  static const int _version = 2;
+  /// Версия схемы: 1 — без `uploads`, 2 — с ней, 3 — с колонкой `dev` в `files`. Поднимая
+  /// версию, добавь ветку в `onUpgrade`, которая только создаёт или добавляет: удалять данные
+  /// здесь нельзя ни при каких условиях. Ветки там идемпотентны (`CREATE TABLE IF NOT EXISTS`,
+  /// [_addColumn]), поэтому повторный проход по ним после отката версии ничего не ломает.
+  /// Родословная: 1 — `roots`, `dirs`, `files`, `meta`, 2 — `uploads`, 3 — `files.dev`;
+  /// состояние строк при апгрейде не переписывается ни разу.
+  static const int _version = 3;
 
   /// Курсор журнала: с какого seq продолжать догон облака.
   static const String keyCursor = 'changes_cursor';
@@ -184,6 +188,7 @@ class MirrorStore {
             path TEXT PRIMARY KEY,
             cloud_folder_id TEXT NOT NULL,
             entry_id TEXT NOT NULL,
+            dev INTEGER NOT NULL DEFAULT 0,
             inode INTEGER NOT NULL DEFAULT 0,
             size INTEGER NOT NULL,
             mtime INTEGER NOT NULL,
@@ -192,7 +197,7 @@ class MirrorStore {
           )
         ''');
         // по entry_id строку находят правки из веба (переименование, перенос, удаление),
-        // по inode — переименование на телефоне: тот же файл, другой путь
+        // по inode — файл по номеру в файловой системе
         await db.execute('CREATE INDEX files_entry ON files(entry_id)');
         await db.execute('CREATE INDEX files_inode ON files(inode)');
         // `meta` — всё остальное состояние зеркала: курсор журнала, итоги обходов, отчёт
@@ -231,6 +236,14 @@ class MirrorStore {
               at INTEGER NOT NULL
             )
           ''');
+        }
+        if (oldVersion < 3) {
+          // Ключ файла стал парой «том + номер»: без тома номер с карты памяти совпадал бы
+          // с номером чужого файла на внутренней памяти, и копия, перенесённая на другой том,
+          // выглядела бы переименованием. У старых строк том остаётся нулём — «сравнивать
+          // нельзя»: по такой строке переименование один раз не распознается, и файл уедет
+          // заново, а дальше строка перезапишется с настоящим томом.
+          await _addColumn(db, 'files', 'dev', 'INTEGER NOT NULL DEFAULT 0');
         }
       },
       // Версия ниже нашей — старая сборка поверх новой (откат обновления). Ронять базу из-за
@@ -441,6 +454,7 @@ class MirrorStore {
         'path',
         'cloud_folder_id',
         'entry_id',
+        'dev',
         'inode',
         'size',
         'mtime',
@@ -492,7 +506,8 @@ class MirrorStore {
       'path': row.path,
       'cloud_folder_id': row.cloudFolderId,
       'entry_id': row.entryId,
-      'inode': row.inode,
+      'dev': row.id.dev,
+      'inode': row.id.ino,
       'size': row.size,
       'mtime': row.mtime,
       'sha256': row.sha256,
@@ -521,7 +536,8 @@ class MirrorStore {
           'path': row.path,
           'cloud_folder_id': row.cloudFolderId,
           'entry_id': row.entryId,
-          'inode': row.inode,
+          'dev': row.id.dev,
+          'inode': row.id.ino,
           'size': row.size,
           'mtime': row.mtime,
           'sha256': row.sha256,
@@ -713,18 +729,37 @@ class MirrorStore {
 
   /// Собрать строку `files` из результата запроса.
   ///
-  /// Значения читаются «мягко»: отсутствующее число — 0 (для `inode` это «номер неизвестен»),
-  /// отсутствующий `sha256` — null, то есть «хэша нет». Такая строка не ломает сверку:
-  /// она просто заставит посчитать хэш заново.
+  /// Значения читаются «мягко»: отсутствующее число — 0 (для `inode` это «номер неизвестен»,
+  /// для `dev` — «том неизвестен, ключ сравнивать нельзя»: так приходят строки, заведённые
+  /// до появления колонки), отсутствующий `sha256` — null, то есть «хэша нет». Такая строка
+  /// не ломает сверку: она просто заставит посчитать хэш заново.
   MirrorRow _row(Map<String, Object?> r) => MirrorRow(
     path: '${r['path']}',
     cloudFolderId: '${r['cloud_folder_id']}',
     entryId: '${r['entry_id']}',
-    inode: (r['inode'] as int?) ?? 0,
+    id: FileId((r['dev'] as int?) ?? 0, (r['inode'] as int?) ?? 0),
     size: (r['size'] as int?) ?? 0,
     mtime: (r['mtime'] as int?) ?? 0,
     sha256: r['sha256'] == null ? null : '${r['sha256']}',
   );
+}
+
+/// Добавить колонку, если её ещё нет.
+///
+/// Явная проверка нужна из-за откатов версии: после установки старой сборки поверх новой
+/// sqflite опускает `user_version`, и ветка апгрейда выполнится второй раз — `ALTER TABLE
+/// ADD COLUMN` без проверки упал бы с «duplicate column name» и база не открылась бы вовсе.
+Future<void> _addColumn(
+  Database db,
+  String table,
+  String column,
+  String declaration,
+) async {
+  final columns = await db.rawQuery('PRAGMA table_info($table)');
+  for (final c in columns) {
+    if (c['name'] == column) return;
+  }
+  await db.execute('ALTER TABLE $table ADD COLUMN $column $declaration');
 }
 
 /// Экранировать префикс пути для шаблона `LIKE ... ESCAPE '\'`.
