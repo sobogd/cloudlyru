@@ -5,8 +5,6 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/cloudly_api.dart';
-import 'background/background_pass.dart';
-import 'background/background_schedule.dart';
 import 'data/mirror_store.dart';
 import 'data/queue_store.dart';
 import 'data/selection.dart';
@@ -104,14 +102,6 @@ class SyncController extends ChangeNotifier {
   /// Последний итог наполнения очереди.
   String? queueNote;
 
-  /// Что делал фоновый проход в прошлый раз — строкой из базы зеркала.
-  ///
-  /// Пока приложение выгружено из памяти, работает задание системы, и его итог пишет
-  /// `background_pass.dart` (см. [keyBackgroundReport]). Читается это только здесь и только
-  /// для показа: без такой строки человек не может отличить «фоновый проход ничего не нашёл»
-  /// от «фоновое задание не запускалось вовсе».
-  String? backgroundReport;
-
   /// Устройство: так называется корень зеркала в облаке.
   String deviceLabel = 'Android';
 
@@ -200,19 +190,6 @@ class SyncController extends ChangeNotifier {
       // успело открыться, снял сторожа и наблюдение
       if (epoch != _sessionEpoch || _disposed) return;
 
-      // Проход зеркала, когда приложения нет на экране: задание живёт в системе, а не в этом
-      // процессе (см. lib/sync/background/). Фоновое задание — ускоритель, а не условие работы:
-      // на сборке без моста к Android (macOS, iPad — о них говорит FLUTTER.md) его регистрация
-      // бросает MissingPluginException, и ронять из-за неё всю синхронизацию нельзя
-      try {
-        await BackgroundSync.register(
-          serverUrl: sessionApi.serverUrl,
-          login: login,
-        );
-      } catch (e) {
-        debugPrint('cloudly-sync: фоновое задание не поставлено: $e');
-      }
-
       await _ensureEngine();
       await _ensureLive();
 
@@ -227,7 +204,7 @@ class SyncController extends ChangeNotifier {
       _startWatchdog();
       unawaited(checkAndResume());
       // Флаг ставится только после успеха. Раньше он ставился первым делом, и одного
-      // исключения в любом `await` (настройки, мост, регистрация задания) хватало, чтобы
+      // исключения в любом `await` (настройки, наблюдение, запуск движка) хватало, чтобы
       // синхронизация умерла до перезапуска приложения: повторный [start] выходил сразу,
       // а [ensureReady] догонял только токен
       _started = true;
@@ -541,9 +518,6 @@ class SyncController extends ChangeNotifier {
         debugPrint('cloudly-sync: токен устройства не забыт: $e');
       }
     }
-    // Задание снимаем: без токена оно всё равно ничего не делает, но будить приложение зря
-    // после выхода из аккаунта незачем
-    await BackgroundSync.cancel();
     _watchdog?.cancel();
     _watchdog = null;
     await live?.dispose();
@@ -846,9 +820,6 @@ class SyncController extends ChangeNotifier {
     notifyListeners();
     try {
       if (_api == null && !await ensureReady()) return;
-      // Итог фонового прохода — до всего остального: если приложение открыли утром, человек
-      // первым делом смотрит, работала ли синхронизация ночью
-      await _readBackgroundReport();
       await refreshQueue();
       // наблюдение могло не встать при старте или отвалиться после перезагрузки системы
       await startWatching();
@@ -883,22 +854,6 @@ class SyncController extends ChangeNotifier {
       activity = null;
       waiting = await queueStore?.waitingCount() ?? waiting;
       notifyListeners();
-    }
-  }
-
-  /// Прочитать итог последнего фонового прохода из базы зеркала.
-  ///
-  /// Читаем при каждой проверке «не встала ли синхронизация»: пока приложение было выгружено
-  /// из памяти, работало задание системы, и его итог лежит в `meta` (пишет `background_pass`).
-  /// Ошибку чтения глушим — это строка для показа, а не работа: без неё раздел просто не
-  /// расскажет, что делал фон.
-  Future<void> _readBackgroundReport() async {
-    final store = mirrorStore;
-    if (store == null) return;
-    try {
-      backgroundReport = await store.meta(keyBackgroundReport);
-    } catch (_) {
-      backgroundReport = null;
     }
   }
 

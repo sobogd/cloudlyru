@@ -64,16 +64,37 @@ Future<String?> downloadAndOpen(
       await _delete(path);
       return 'не удалось скачать: $e';
     }
+    final failure = await _open(path);
+    if (failure != null) return failure;
+    return null;
+  } catch (e) {
+    return 'не удалось скачать или открыть файл: $e';
+  } finally {
+    _inFlight.remove(entryId);
+  }
+}
+
+/// Открыть скачанный файл системным способом: `null` — получилось, иначе текст ошибки.
+///
+/// Платформы расходятся: на Android это `open_filex` (передаёт файл приложению через
+/// `FileProvider` и умеет сказать, что открывать нечем), на macOS — `open` из системы, который
+/// и есть «открыть файл как из Finder»: `open_filex` настольную сборку не поддерживает вовсе.
+Future<String?> _open(String path) async {
+  if (!Platform.isMacOS) {
     final result = await OpenFilex.open(path);
     if (result.type == ResultType.done) return null;
     if (result.type == ResultType.noAppToOpen) {
       return 'на устройстве нечем открыть этот файл';
     }
     return 'не удалось открыть файл: ${result.message}';
+  }
+  try {
+    final result = await Process.run('open', [path]);
+    if (result.exitCode == 0) return null;
+    final reason = '${result.stderr}'.trim();
+    return 'не удалось открыть файл: $reason';
   } catch (e) {
-    return 'не удалось скачать или открыть файл: $e';
-  } finally {
-    _inFlight.remove(entryId);
+    return 'не удалось открыть файл: $e';
   }
 }
 

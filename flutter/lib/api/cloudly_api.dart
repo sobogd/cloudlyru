@@ -430,7 +430,7 @@ class CloudlyApi {
     await _req('/auth/logout', method: 'POST');
   }
 
-  /// Последняя опубликованная сборка приложения (`GET /app/android`).
+  /// Последняя опубликованная сборка Android-приложения (`GET /app/android`).
   ///
   /// Ручка без авторизации: проверка обновления должна работать и с отозванным токеном —
   /// приложение как раз может стоять со старым, а починиться ему нужно.
@@ -440,6 +440,14 @@ class CloudlyApi {
   /// `ApiException.code`, а не показывать это как ошибку.
   Future<AppRelease> latestApp() async =>
       AppRelease.fromJson(_m(await _req('/app/android')));
+
+  /// Последняя опубликованная настольная сборка (`GET /app/macos`).
+  ///
+  /// Отдельная ручка, а не параметр у предыдущей: сборки платформ публикуются порознь, и на маке
+  /// версия мобильной сборки означала бы предложение скачать APK. Ответ устроен так же, включая
+  /// `no_release`, когда настольную сборку ещё не публиковали.
+  Future<AppRelease> latestAppMacos() async =>
+      AppRelease.fromJson(_m(await _req('/app/macos')));
 
   /// Список выпущенных app-токенов; самих токенов в нём нет — сервер отдаёт их только при выпуске.
   Future<List<ApiTokenRow>> listTokens() async =>

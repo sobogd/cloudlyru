@@ -5,13 +5,15 @@
     <!-- Обновление по кнопке: открывает системный установщик APK. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <!-- «Доступ ко всем файлам»: без него не видно ни дерева папок, ни содержимого разделов.
-         Приложение личное, поставляется APK-ом, в Google Play не идёт. -->
+         Приложение личное, поставляется APK-ом, в Google Play не идёт. Признак доступа
+         приложение проверяет пробой каталога (`NativeFs.hasAllFilesAccess`), а не системным
+         вызовом: в Dart `Environment.isExternalStorageManager` нет. -->
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage"/>
     <!-- Android 10: разрешения появились в Android 11, поэтому на десятом доступ к пользовательским
          папкам дают обычные разрешения на хранилище — и читать дерево, и писать в него скачанное
-         (зеркало кладёт файлы прямо в выбранные папки). Без них `hasAllFilesAccess` отвечал бы
+         (зеркало кладёт файлы прямо в выбранные папки). Без них проба доступа отвечала бы
          «доступ есть», а дерево и разделы выглядели бы пустыми без единой подсказки.
          `maxSdkVersion="29"` — на 11 и выше эти разрешения не нужны и не запрашиваются вовсе.
          `tools:replace` обязателен: ту же пару разрешений объявляет `open_filex` (у него
@@ -28,25 +30,21 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29"
         tools:replace="android:maxSdkVersion"/>
-    <!-- Разрешения на постоянный сервис с уведомлением оставлены с прежнего замысла и сейчас
-         не используются: постоянного сервиса нет — в манифесте объявлена только служба задания
-         `.SyncJobService` (это `JobService`, а не foreground-сервис), `startForeground`
-         не вызывается нигде, и уведомления приложение не показывает вовсе. Пока приложение
-         выгружено из памяти, работает периодическое задание системы, а не сервис. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-    <!-- Проход зеркала после перезагрузки: система возвращает задание, приложение поднимает
-         наблюдение за папками заново. -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <!-- Разрешений на постоянный сервис, уведомления и перезагрузку здесь больше нет: своей
+         службы у приложения не осталось вовсе. Проход зеркала делает само приложение, пока
+         оно запущено (наблюдение за папками и мгновенный режим), а после запуска недостающее
+         догоняет `SyncController.checkAndResume`. -->
     <application
         android:label="Cloudly"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true"
         tools:ignore="ScopedStorage">
+        <!-- Активность объявлена прямо движком Flutter: своей `MainActivity` в проекте нет,
+             и весь Kotlin удалён — регистрировать в ней больше нечего (плагины ставит
+             `GeneratedPluginRegistrant`, который движок подключает сам). -->
         <activity
-            android:name=".MainActivity"
+            android:name="io.flutter.embedding.android.FlutterActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:taskAffinity=""
@@ -67,29 +65,6 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        <!-- Периодический проход зеркала, когда приложения нет на экране или его процесс
-             выгружен. Пятнадцать минут — минимум JobScheduler, а не расписание: в Doze и при
-             экономии батареи система сдвигает запуск (см. SyncJobScheduler). Служба поднимает
-             свой движок Flutter, ставит мост к Android (номер файла нужен, чтобы переименование
-             не выглядело как повторная выгрузка) и запускает точку входа в Dart (см.
-             SyncJobService). Это JobService, а не постоянный сервис: он живёт только на время
-             прохода и уведомлений не показывает. -->
-        <service
-            android:name=".SyncJobService"
-            android:exported="false"
-            android:permission="android.permission.BIND_JOB_SERVICE"/>
-
-        <!-- Задание переживает перезагрузку через setPersisted, но система возвращает такие
-             задания только после запуска приложения: получатель заводит его заново, если
-             владелец не вышел из аккаунта. -->
-        <receiver
-            android:name=".SyncBootReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED"/>
-                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
-            </intent-filter>
-        </receiver>
 
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

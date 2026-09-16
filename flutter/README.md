@@ -13,6 +13,7 @@ Android-клиент CloudlyRu: файлы, почта, медиа, карта, 
 flutter pub get
 flutter analyze
 flutter build apk --release   # релизная сборка, подпись — flutter/android/keystore.properties
+flutter build macos --release # настольная сборка (macOS); нужен Xcode
 ```
 
 Тестов в проекте нет намеренно (решение владельца): каталог `test/` и зависимость `flutter_test`
@@ -28,5 +29,6 @@ flutter build apk --release   # релизная сборка, подпись �
 - `lib/features/` — экраны (файлы, почта, медиа, карта, корзина, настройки);
 - `lib/api/` — клиент REST API и модели;
 - `lib/sync/` — очередь выгрузки и двустороннее зеркало;
-- `android/app/src/main/kotlin/ru/cloudly/cloudly_flutter/` — нативный мост к Android API
-  (доступ ко всем файлам, `FileObserver`, задания `JobScheduler`).
+- `lib/sync/device/native_stat.dart` — номер файла в файловой системе через `stat(2)` по FFI:
+  единственное, чего Dart не умеет своими средствами;
+- `android/`, `macos/` — платформы сборки. Своего нативного кода (Kotlin, Swift) в проекте нет.

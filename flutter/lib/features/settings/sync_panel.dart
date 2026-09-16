@@ -167,15 +167,8 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
             _watchLine(granted, fileLinks, sync.watchedDirs),
             style: const TextStyle(color: C.fg3, fontSize: 12),
           ),
-          // Итог фонового прохода показываем, только когда он есть: пока приложение ни разу
-          // не выгружали из памяти, строки нет — и пустая строка «фон: —» только путала бы
-          if (sync.backgroundReport != null) ...[
-            const SizedBox(height: 2),
-            Text(
-              'фон: ${sync.backgroundReport}',
-              style: const TextStyle(color: C.fg3, fontSize: 12),
-            ),
-          ],
+          // Итога фонового прохода здесь больше нет: фонового прохода нет — синхронизация идёт,
+          // пока приложение запущено, и её ход виден строками выше
         ],
       ),
     );
