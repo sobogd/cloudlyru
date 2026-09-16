@@ -51,12 +51,29 @@ class _ThumbImageState extends ConsumerState<ThumbImage> {
   /// дедуплицирует), а вот запомнить факт полезно — иначе каждый `build` слал бы запрос заново.
   bool _requested = false;
 
+  /// Пауза перед просьбой о миниатюре.
+  ///
+  /// Просить сразу нельзя: при прокрутке плитки создаются десятками и уезжают за доли секунды,
+  /// и загрузка кадров, которые человек уже проехал, занимает потоки и канал — из-за этого
+  /// видимые плитки оставались серыми (по логам: 300 фоновых задач в очереди, 182 окна за
+  /// минуту, а миниатюры качались вхолостую). Пока плитка живёт меньше паузы, она ничего не
+  /// просит; запрос уходит только у того, что реально задержалось на экране.
+  static const Duration _settleDelay = Duration(milliseconds: 500);
+  Timer? _settle;
+
   @override
-  /// Просьба о миниатюре — после первого кадра, а не в `build`: запрос трогает провайдеры
-  /// и очередь, а `build` обязан оставаться чистым.
+  /// Просьба о миниатюре — с паузой, а не в `build`: запрос трогает провайдеры и очередь,
+  /// а `build` обязан оставаться чистым.
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _request());
+    _settle = Timer(_settleDelay, _request);
+  }
+
+  @override
+  /// Плитка уехала с экрана — пауза отменяется, запрос не уходит.
+  void dispose() {
+    _settle?.cancel();
+    super.dispose();
   }
 
   /// Попросить миниатюру у очереди и перерисоваться, когда она появится.
@@ -68,6 +85,7 @@ class _ThumbImageState extends ConsumerState<ThumbImage> {
     if (!mounted || _requested) return;
     final cache = ref.read(thumbCacheProvider).value;
     if (cache == null) {
+      // Хранилище ещё открывается (первый запуск): возвращаемся к просьбе через мгновение.
       Future.delayed(const Duration(milliseconds: 200), () {
         if (mounted) _request();
       });

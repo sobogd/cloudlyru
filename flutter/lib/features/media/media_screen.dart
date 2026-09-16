@@ -93,12 +93,6 @@ const _statusMaxTries = 24;
 /// Две тысячи кадров — это ~35 экранов запаса, дальше кэш чистится по удалённости от окна.
 const int _itemsLimit = 2000;
 
-/// Сколько кадров страницы прогревать миниатюрами заранее (см. `_fetchVisible`).
-///
-/// Пара экранов вперёд: больше — и фоновая очередь растёт быстрее, чем качается, а пользы
-/// нет — до дальних кадров человек дойдёт нескоро, и к тому времени они уже неактуальны.
-const _prefetchMax = 120;
-
 /// Потолок числа id в одном `/media/status` — серверный `MEDIA_STATUS_MAX = 500`
 /// (src/media-feed/media-feed.service.ts): более длинный список сервер обрежет и только
 /// предупредит об этом в логе, признака усечения в ответе нет.
@@ -348,6 +342,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     final cols = math.max(1, _cols.value);
     final offset = (index / cols) * _rowStep.value;
     _sc.jumpTo(offset.clamp(0.0, _sc.position.maxScrollExtent));
+    // Окно просим сразу: дебаунс скролла ждёт 400 мс, а после прыжка человек может тапнуть
+    // по кадру немедленно — и открыл бы просмотрщик по ещё не загруженному списку.
+    _fetchVisible();
   }
 
   /// Подпись месяца для кадра с этим индексом (что видно на шкале при перетаскивании).
@@ -510,17 +507,10 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
             // текущий экран, соседние кадры уже скачиваются, и листание идёт без серых плиток.
             // Запросы дедуплицируются по sha, поэтому повторный вызов для уже скачанного
             // кадра ничего не стоит.
-            final thumbs = ref.read(thumbCacheProvider).value;
-            if (thumbs != null) {
-              // Только начало страницы: страница — до 500 кадров, а держать в фоне незачем
-              // больше пары экранов вперёд. Остальное попросят плитки, когда дойдут до них.
-              for (final it in page.take(_prefetchMax)) {
-                final sha = it.sha256;
-                if (sha != null && sha.isNotEmpty && it.previewState == 'done') {
-                  unawaited(thumbs.request(sha, background: true));
-                }
-              }
-            }
+            // Устаревший прогрев не нужен: кадры этого окна уже уехали с экрана, а их загрузки
+            // занимали канал и потоки — видимые плитки из-за этого оставались серыми.
+            // Миниатюры просят сами плитки: то, что видно, грузится первым (высокий приоритет).
+            ref.read(thumbCacheProvider).value?.dropBackground();
             setState(() {
               // Ключ — абсолютный индекс кадра в ленте, а не порядок прихода: страницы могут
               // приехать вразнобой, а по индексу они ложатся на свои клетки.
@@ -670,12 +660,51 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
           // Запрос просмотрщика только будит ленту — грузится окно ленты. Ленте этого хватает:
           // просмотрщик открывают из неё же, и он листает рядом с открытым кадром (у карты
           // `ensure`, наоборот, точечный: там кадров в памяти нет вовсе, см. map_screen.dart).
-          if (!_items.containsKey(s) || !_items.containsKey(e)) _fetchVisible();
+          // Грузим именно запрошенный просмотрщиком диапазон, а не видимое окно сетки:
+          // открыть кадр можно и там, где сетка не стоит (прыжок шкалой, листание внутри
+          // просмотрщика), и тогда «разбудить ленту» было бесполезно — она тянула своё окно,
+          // а кадр оставался незагруженным: бесконечный спиннер.
+          _ensureRange(s, e);
         },
         onDelete: (i) => _handleDelete(i),
         revision: _revision,
       ),
     ));
+  }
+
+  /// Догрузить кадры по просьбе просмотрщика — ровно этот диапазон индексов.
+  ///
+  /// Диапазон берётся из локального списка, поэтому запрос дешёвый. Недостающие кадры
+  /// запрашиваются одним сплошным куском: просмотрщик листает по одному, и городить запрос
+  /// на каждый индекс было бы расточительно.
+  ///
+  /// Побочно: `_items` пополняется, `_revision` будит просмотрщик, чтобы он перерисовал слайд.
+  Future<void> _ensureRange(int start, int end) async {
+    final feed = _feed;
+    if (feed == null || _total.value == 0) return;
+    final from = math.max(0, start);
+    final to = math.min(_total.value - 1, end);
+    if (to < from) return;
+    var firstMissing = -1;
+    var lastMissing = -1;
+    for (var i = from; i <= to; i++) {
+      if (_items.containsKey(i)) continue;
+      if (firstMissing < 0) firstMissing = i;
+      lastMissing = i;
+    }
+    if (firstMissing < 0) return;
+    try {
+      final page = await feed.store.range(firstMissing, lastMissing - firstMissing + 1);
+      if (!mounted || page.isEmpty) return;
+      setState(() {
+        for (var j = 0; j < page.length; j++) {
+          _items[firstMissing + j] = page[j];
+        }
+      });
+      _revision.value++;
+    } catch (e) {
+      if (kDebugMode) debugPrint('media ensure error: $e');
+    }
   }
 
   /// Убирает удалённый кадр из кэша ленты, сдвигает индексы остальных и уменьшает счётчик.
