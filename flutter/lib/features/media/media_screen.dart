@@ -218,12 +218,15 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     final n = await feed.store.count();
     final m = await feed.store.months(tzOffsetMin: DateTime.now().timeZoneOffset.inMinutes);
     if (!mounted) return;
+    final changed = n != _total.value;
     setState(() {
       _total.value = n;
       _months = m;
       _loaded = true;
-      // Кадры перечитываются заново: после полного прохода индексы кадров могли сдвинуться.
-      _items.clear();
+      // Кадры перечитываются только при смене числа кадров: после полного прохода индексы
+      // могли сдвинуться, а на обычном догоне журнала (изменений нет) сброс кэша заставил бы
+      // плитки мигнуть заглушками на ровном месте.
+      if (changed) _items.clear();
     });
   }
 

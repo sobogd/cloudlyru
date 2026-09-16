@@ -148,7 +148,14 @@ class MediaFeedSync {
   ///    заливка обычного файла не должна тянуть перечитывание медиатеки.
   Future<void> syncChanges() async {
     final changes = changesApiOf?.call();
-    if (changes == null) return;
+    if (changes == null) {
+      // Журнала нет (device-токен не выпущен или отозван): дельты взять неоткуда, но список
+      // не должен замирать. Сверяемся по счётчику — он дешёвый, а расхождение означает, что
+      // состав медиатеки изменился, и тогда список собирается заново.
+      final onServer = await apiOf().mediaCount();
+      if (onServer != await store.count()) await syncFull();
+      return;
+    }
     var since = int.tryParse(await store.meta(MediaFeedStore.keyCursor) ?? '') ?? 0;
     final created = <String>{};
     var needFull = false;
