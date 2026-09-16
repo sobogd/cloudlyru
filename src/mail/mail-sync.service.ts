@@ -155,7 +155,7 @@ const SHUTDOWN_WAIT_MS = 10_000;
 const INGEST_MAX_TRIES = 3;
 
 /** Сколько несохранённых писем показываем в статусе аккаунта (см. [unsavedFor]). */
-const _unsavedKeep = 50;
+const UNSAVED_KEEP = 50;
 
 /**
  * Потолок размера письма для IMAP-пути, МБ.
@@ -456,14 +456,14 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
    * Читается из таблицы `MailIngestFailure`, а не из памяти: пропущенное письмо (курсор ушёл
    * дальше после `INGEST_MAX_TRIES` попыток) иначе исчезало бы из отчёта при первом же
    * перезапуске процесса, и дырка в архиве оставалась бы невидимой. Записи старше
-   * [_unsavedKeep] не показываем: отчёт нужен про свежие неудачи, а не про всю историю,
+   * [UNSAVED_KEEP] не показываем: отчёт нужен про свежие неудачи, а не про всю историю,
    * и таблица не растёт без предела.
    */
   async unsavedFor(accountId: string): Promise<UnsavedLetter[]> {
     const rows = await this.prisma.mailIngestFailure.findMany({
       where: { accountId },
       orderBy: { lastAt: 'desc' },
-      take: _unsavedKeep,
+      take: UNSAVED_KEEP,
     });
     return rows.map((r) => ({
       folderPath: r.folderPath,
