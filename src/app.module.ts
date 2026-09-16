@@ -1,5 +1,5 @@
-import { Module, ValidationPipe } from '@nestjs/common';
-import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
+import { Module } from '@nestjs/common';
+import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { AuthGuard } from './common/guards/auth.guard';
@@ -35,10 +35,15 @@ import { MailModule } from './mail/mail.module';
  * Здесь же висят общесервисные вещи, без которых у остальных модулей нет единого поведения:
  *  - AllExceptionsFilter — единственное место, где любое исключение превращается в формат
  *    `{statusCode, message, code}` (его разбирает клиент) и логируется с id запроса;
- *  - ValidationPipe — зарегистрирован заранее: тел с DTO пока нет (контроллеры разбирают тело
- *    руками, чтобы лишние поля не проходили молча), но как только DTO появятся, валидация
- *    включится сама, а не станет отдельной задачей «не забыть добавить пайп»;
  *  - RequestLogInterceptor — id запроса в заголовке ответа и лог запросов (подробности — в нём).
+ *
+ * `ValidationPipe` здесь СОЗНАТЕЛЬНО не зарегистрирован. Он требует пакет `class-validator`,
+ * которого в зависимостях нет: Nest падает на старте с «The "class-validator" package is
+ * missing», приложение уходит в цикл перезапусков, health-чек деплоя не проходит — так это
+ * и случилось на проде. Тел с DTO в проекте нет вовсе (контроллеры разбирают тело руками,
+ * чтобы лишние поля не проходили молча), то есть пайп ничего бы не валидировал. Когда DTO
+ * появятся, порядок такой: сначала `class-validator` и `class-transformer` в package.json,
+ * потом сам пайп.
  */
 @Module({
   imports: [
@@ -65,9 +70,6 @@ import { MailModule } from './mail/mail.module';
     { provide: APP_GUARD, useClass: RateLimitGuard },
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
-    // transform+whitelist — на будущее для DTO; тела без класса-метатипа пайп не трогает,
-    // поэтому сейчас поведение ручек не меняется
-    { provide: APP_PIPE, useValue: new ValidationPipe({ transform: true, whitelist: true }) },
     { provide: APP_INTERCEPTOR, useClass: RequestLogInterceptor },
   ],
 })
