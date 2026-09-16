@@ -395,6 +395,19 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
             // поэтому прокрутка не зависит от сети (данные догоняются синхронизацией).
             final page = await feed.store.range(off, len);
             if (!mounted) return;
+            // Миниатюры всего загруженного окна — в фоновую очередь: пока человек смотрит на
+            // текущий экран, соседние кадры уже скачиваются, и листание идёт без серых плиток.
+            // Запросы дедуплицируются по sha, поэтому повторный вызов для уже скачанного
+            // кадра ничего не стоит.
+            final thumbs = ref.read(thumbCacheProvider).value;
+            if (thumbs != null) {
+              for (final it in page) {
+                final sha = it.sha256;
+                if (sha != null && sha.isNotEmpty && it.previewState == 'done') {
+                  unawaited(thumbs.request(sha, background: true));
+                }
+              }
+            }
             setState(() {
               // Ключ — абсолютный индекс кадра в ленте, а не порядок прихода: страницы могут
               // приехать вразнобой, а по индексу они ложатся на свои клетки.
