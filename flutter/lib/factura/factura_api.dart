@@ -129,11 +129,13 @@ class FacturaApi {
   /// HTTP-клиент раздела: относительные пути от `/api/v1`, Cookie — из облачного клиента.
   late final Dio _http;
 
-  /// Один запрос с JSON-ответом: ошибки приводятся к [FacturaApiException].
+  /// Один запрос: тело ответа как есть (`Map`, `List` или примитив).
   ///
-  /// Отправка в AEAT и распознавание сканов идут мимо этого метода: у них своё тело отказа
-  /// и свои таймауты (см. [submit]).
-  Future<Map<String, dynamic>> _json(
+  /// Разделение на [_json] и [_list] нужно потому, что ручки раздела отвечают по-разному:
+  /// `/invoices` и `/contacts/parse` — объектом, а `/contacts`, `/bank-accounts`, `/expenses`,
+  /// `/filed-declarations` — голым массивом (так исторически и осталось при переносе). Раньше
+  /// клиент ждал объект везде и молча получал пустые списки там, где сервер отдал массив.
+  Future<Object?> _raw(
     String method,
     String path, {
     Object? body,
@@ -154,11 +156,28 @@ class FacturaApi {
         final map = data is Map ? Map<String, dynamic>.from(data) : const <String, dynamic>{};
         throw FacturaApiException(res.statusCode!, _messageOf(map) ?? 'Ошибка ${res.statusCode}');
       }
-      if (data is Map) return Map<String, dynamic>.from(data);
-      return const <String, dynamic>{};
+      return data;
     } on DioException catch (e) {
       throw FacturaApiException(e.response?.statusCode ?? 0, _dioMessage(e));
     }
+  }
+
+  /// Запрос, ответ которого — JSON-объект. Массив или пустое тело дают пустой объект.
+  Future<Map<String, dynamic>> _json(
+    String method,
+    String path, {
+    Object? body,
+  }) async {
+    final data = await _raw(method, path, body: body);
+    return data is Map ? Map<String, dynamic>.from(data) : const <String, dynamic>{};
+  }
+
+  /// Запрос, ответ которого — JSON-массив объектов (списки раздела отвечают именно так).
+  Future<List<Map<String, dynamic>>> _list(String path) async {
+    final data = await _raw('GET', path);
+    return data is List
+        ? data.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
+        : const [];
   }
 
   /// Строка для человека из тела ошибки сервера (облако отвечает `{message, code}`).
@@ -277,22 +296,69 @@ class FacturaApi {
   /// Отменяет зависшую запись: AEAT её не получил, номер освобождается, фактура снова черновик.
   Future<void> cancelPending(String id) => _json('POST', '/invoices/$id/verifactu/cancel');
 
+  /// Список расходов, свежие сверху; [year] — фильтр по году документа.
+  Future<List<ExpenseView>> listExpenses({int? year}) async {
+    final rows = await _list('/expenses${year == null ? '' : '?year=$year'}');
+    return rows.map(ExpenseView.fromJson).toList();
+  }
+
+  /// Создаёт расход. Все суммы сервер пересчитывает сам из базы и ставок.
+  Future<void> createExpense(Map<String, dynamic> body) => _json('POST', '/expenses', body: body);
+
+  /// Правит расход.
+  Future<void> updateExpense(String id, Map<String, dynamic> body) =>
+      _json('PATCH', '/expenses/$id', body: body);
+
+  /// Удаляет расход вместе с приложенным документом.
+  Future<void> deleteExpense(String id) => _json('DELETE', '/expenses/$id');
+
+  /// Загружает документ расхода (скан или PDF) в S3.
+  ///
+  /// [parse] включает распознавание: сервер прогоняет документ через Gemini и возвращает
+  /// заполненные поля, чтобы человек их только проверил. Ответ несёт ключ в S3 — его и надо
+  /// сохранить в расходе, поэтому загрузка идёт до сохранения формы.
+  Future<({String key, String mime, String? fileName, ParsedExpenseDraft? parsed})> uploadExpenseDoc({
+    required String base64,
+    required String mimeType,
+    String? fileName,
+    bool parse = true,
+  }) async {
+    final json = await _json('POST', '/expenses/upload', body: {
+      'data': base64,
+      'mimeType': mimeType,
+      'fileName': ?fileName,
+      'parse': parse,
+    });
+    return (
+      key: '${json['fileS3Key']}',
+      mime: '${json['fileMime']}',
+      fileName: json['fileName'] == null ? null : '${json['fileName']}',
+      parsed: json['parsed'] is Map
+          ? ParsedExpenseDraft.fromJson(Map<String, dynamic>.from(json['parsed'] as Map))
+          : null,
+    );
+  }
+
+  /// Прямая ссылка на документ расхода (закрыта авторизацией, как и PDF фактуры).
+  String expenseFileUrl(String id) => '${cloudly.baseUrl}/expenses/$id/file';
+
+  /// Сервер считает его заново на каждый запрос: цифры берутся из фактур и расходов квартала,
+  /// поэтому кэшировать ответ нельзя — после любой правки фактуры расчёт меняется.
+  Future<DeclarationQuarter> getDeclarations({required int year, required int quarter}) async {
+    final json = await _json('GET', '/declarations?year=$year&quarter=$quarter');
+    return DeclarationQuarter.fromJson(json);
+  }
+
   /// Справочник контрагентов (без архивных — их отсекает сервер).
   Future<List<ContactView>> listContacts() async {
-    final json = await _json('GET', '/contacts');
-    return (json['rows'] as List? ?? const [])
-        .whereType<Map>()
-        .map((e) => ContactView.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
+    final rows = await _list('/contacts');
+    return rows.map(ContactView.fromJson).toList();
   }
 
   /// Банковские счета компании.
   Future<List<BankAccountView>> listBankAccounts() async {
-    final json = await _json('GET', '/bank-accounts');
-    return (json['rows'] as List? ?? const [])
-        .whereType<Map>()
-        .map((e) => BankAccountView.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
+    final rows = await _list('/bank-accounts');
+    return rows.map(BankAccountView.fromJson).toList();
   }
 
   /// Профиль компании-эмитента (в том числе метаданные сертификата AEAT).

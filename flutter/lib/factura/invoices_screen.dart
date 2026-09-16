@@ -3,23 +3,14 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../providers.dart';
 import '../util/format.dart';
+import 'declarations_screen.dart';
+import 'expenses_screen.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
+import 'factura_providers.dart';
 import 'invoice_detail_screen.dart';
 import 'invoice_form_screen.dart';
-
-/// Клиент фактурного API, собранный поверх текущего облачного клиента.
-///
-/// Зависит от `appStateProvider` намеренно: при смене сервера или выходе из аккаунта облачный
-/// клиент пересоздаётся, и раздел фактур обязан ходить новым адресом с новой сессией. `watch`
-/// здесь — это реакция на такие события, а не на каждый кадр: AppState уведомляет слушателей
-/// только при входе, выходе и смене адреса.
-final facturaApiProvider = Provider<FacturaApi>((ref) {
-  final state = ref.watch(appStateProvider);
-  return FacturaApi(state.api);
-});
 
 /// Экран «Фактуры»: список по месяцам, свежие сверху.
 ///
@@ -86,6 +77,47 @@ class _InvoicesScreenState extends ConsumerState<InvoicesScreen> {
     await _load();
   }
 
+  /// Открывает меню разделов фактур.
+  ///
+  /// Раздел — не одна вкладка, а несколько экранов (фактуры, расходы, декларации, справочники).
+  /// Нижняя панель приложения этого не показывает, поэтому вход в остальные экраны живёт здесь:
+  /// список остаётся главным экраном раздела, а не меню из иконок.
+  Future<void> _openSectionMenu() async {
+    final target = await showModalBottomSheet<Widget>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              leading: Icon(Icons.receipt_long),
+              title: Text('Фактуры'),
+              subtitle: Text('Текущий экран'),
+              enabled: false,
+            ),
+            ListTile(
+              leading: const Icon(Icons.receipt_outlined),
+              title: const Text('Расходы'),
+              subtitle: const Text('Полученные счета: скан, распознавание, вычет НДС'),
+              onTap: () => Navigator.pop(ctx, const ExpensesScreen()),
+            ),
+            ListTile(
+              leading: const Icon(Icons.calculate_outlined),
+              title: const Text('Декларации'),
+              subtitle: const Text('Расчёт 303 / 130 / 349 за квартал'),
+              onTap: () => Navigator.pop(ctx, const DeclarationsScreen()),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (target == null || !mounted) return;
+    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => target));
+    // После возвращения список перечитываем: декларации считаются по фактурам, и за время
+    // просмотра фактуру могли отправить или поправить в другом месте.
+    await _load();
+  }
+
   /// Открывает форму новой фактуры и перечитывает список, если черновик создан.
   Future<void> _create() async {
     final created = await Navigator.of(context).push<bool>(MaterialPageRoute<bool>(
@@ -104,6 +136,11 @@ class _InvoicesScreenState extends ConsumerState<InvoicesScreen> {
             onPressed: _loading ? null : () => unawaited(_load()),
             icon: const Icon(Icons.refresh),
             tooltip: 'Обновить',
+          ),
+          IconButton(
+            onPressed: _openSectionMenu,
+            icon: const Icon(Icons.grid_view),
+            tooltip: 'Разделы фактур',
           ),
         ],
       ),

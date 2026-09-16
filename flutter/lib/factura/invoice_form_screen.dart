@@ -5,7 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'factura_api.dart';
 import 'factura_models.dart';
-import 'invoices_screen.dart';
+import 'factura_providers.dart';
 
 /// Форма фактуры: создание черновика и правка существующего.
 ///

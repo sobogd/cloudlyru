@@ -9,7 +9,7 @@ import '../util/format.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
 import 'invoice_form_screen.dart';
-import 'invoices_screen.dart';
+import 'factura_providers.dart';
 
 /// Карточка фактуры: реквизиты, строки, итоги, цепочка VeriFactu и действия.
 ///

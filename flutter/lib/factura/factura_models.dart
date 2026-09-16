@@ -545,3 +545,422 @@ class SubmitResult {
         rawResponse: rawResponse,
       );
 }
+
+/// Значение одной касильи (клетки) декларации.
+///
+/// Подписи приходят в двух языках: испанская — та, что напечатана в форме AEAT, английская —
+/// для тех, кому удобнее читать по-английски. Показываем испанскую как основную: именно её
+/// человек видит в кабинете налоговой, — а английскую оставляем подсказкой.
+class DeclarationBox {
+  const DeclarationBox({
+    required this.code,
+    required this.labelEs,
+    required this.labelEn,
+    required this.value,
+  });
+
+  /// Номер клетки в форме (например `07`).
+  final String code;
+  final String labelEs;
+  final String labelEn;
+  final double value;
+
+  /// Собирает касилью из ответа сервера.
+  factory DeclarationBox.fromJson(Map<String, dynamic> json) => DeclarationBox(
+        code: '${json['code']}',
+        labelEs: '${json['labelEs'] ?? ''}',
+        labelEn: '${json['labelEn'] ?? ''}',
+        value: _num(json['value']) ?? 0,
+      );
+}
+
+/// Замечание движка деклараций: что проверить перед подачей.
+///
+/// `severity` = `warning` — на что обратить внимание (например, перенос вычета на другой
+/// период оформляется вручную в форме AEAT), `error` — так подавать нельзя.
+class DeclarationIssue {
+  const DeclarationIssue({
+    required this.code,
+    required this.severity,
+    required this.messageEs,
+    required this.messageEn,
+  });
+
+  final String code;
+  final String severity;
+  final String messageEs;
+  final String messageEn;
+
+  /// Тревожное замечание — ошибка, а не предупреждение.
+  bool get isError => severity == 'error';
+
+  /// Собирает замечание из ответа сервера.
+  factory DeclarationIssue.fromJson(Map<String, dynamic> json) => DeclarationIssue(
+        code: '${json['code']}',
+        severity: '${json['severity'] ?? 'warning'}',
+        messageEs: '${json['messageEs'] ?? ''}',
+        messageEn: '${json['messageEn'] ?? ''}',
+      );
+}
+
+/// Одна операция в modelos 349 — поставка клиенту из другой страны ЕС.
+class DeclarationOperation {
+  const DeclarationOperation({
+    required this.taxId,
+    required this.country,
+    required this.name,
+    required this.clave,
+    required this.base,
+  });
+
+  /// VAT-номер контрагента.
+  final String taxId;
+
+  /// ISO-код страны контрагента.
+  final String country;
+
+  final String name;
+
+  /// `clave` из формы 349: `S` — поставки услуг, `E` — поставки товаров и т. д.
+  final String clave;
+
+  /// База операции.
+  final double base;
+
+  /// Собирает операцию из ответа сервера.
+  factory DeclarationOperation.fromJson(Map<String, dynamic> json) => DeclarationOperation(
+        taxId: '${json['taxId'] ?? ''}',
+        country: '${json['country'] ?? ''}',
+        name: '${json['name'] ?? ''}',
+        clave: '${json['clave'] ?? ''}',
+        base: _num(json['base']) ?? 0,
+      );
+}
+
+/// Одна модель (форма) декларации: 303, 130 или 349.
+///
+/// [required] отвечает на вопрос «нужно ли её вообще подавать в этом квартале», [reason] —
+/// почему движок так решил, [deadline] — срок подачи. Касильи и итоговые суммы заполнены
+/// только у тех моделей, к которым они относятся: у 349 вместо них список операций.
+class DeclarationModel {
+  const DeclarationModel({
+    required this.model,
+    required this.required,
+    required this.reason,
+    required this.deadline,
+    required this.amounts,
+    required this.boxes,
+    required this.operations,
+  });
+
+  /// Номер формы (`303`, `130`, `349`).
+  final String model;
+
+  /// Обязательна ли подача в этом квартале.
+  final bool required;
+
+  /// Объяснение движка (по-испански: так человек ищет норму).
+  final String reason;
+
+  /// Срок подачи `YYYY-MM-DD`.
+  final String? deadline;
+
+  /// Итоговые суммы модели: подписи уже человеческие (`IVA devengado`, `A ingresar`, …).
+  /// Порядок сохранён тем, в котором движок их считал.
+  final List<({String label, double value})> amounts;
+
+  /// Клетки формы с их номерами.
+  final List<DeclarationBox> boxes;
+
+  /// Операции для 349; у остальных моделей пусто.
+  final List<DeclarationOperation> operations;
+
+  /// Собирает модель из её ветки ответа.
+  ///
+  /// [amountKeys] — какие поля этой модели считать итоговыми суммами и как их подписать:
+  /// у каждой формы свой набор, и брать «все числа подряд» нельзя (в ответе есть и служебные,
+  /// вроде `operadores`).
+  factory DeclarationModel.fromJson(
+    String model,
+    Map<String, dynamic> json,
+    List<({String key, String label})> amountKeys,
+  ) {
+    return DeclarationModel(
+      model: model,
+      required: json['required'] == true,
+      reason: '${json['reason'] ?? ''}',
+      deadline: json['deadline'] == null ? null : '${json['deadline']}',
+      amounts: [
+        for (final a in amountKeys)
+          if (json[a.key] != null) (label: a.label, value: _num(json[a.key]) ?? 0),
+      ],
+      boxes: (json['casillas'] as List? ?? const [])
+          .whereType<Map>()
+          .map((e) => DeclarationBox.fromJson(Map<String, dynamic>.from(e)))
+          .toList(),
+      operations: (json['operaciones'] as List? ?? const [])
+          .whereType<Map>()
+          .map((e) => DeclarationOperation.fromJson(Map<String, dynamic>.from(e)))
+          .toList(),
+    );
+  }
+}
+
+/// Квартальный расчёт целиком: что подавать и с какими числами.
+///
+/// Это помощник, а не канал подачи: значения переносятся в форму AEAT руками (движок прямо
+/// пишет об этом в замечаниях), а поданное потом фиксируется в «Поданных декларациях».
+class DeclarationQuarter {
+  const DeclarationQuarter({
+    required this.year,
+    required this.quarter,
+    required this.label,
+    required this.deadline,
+    required this.invoices,
+    required this.expenses,
+    required this.activityType,
+    required this.estimacionDirecta,
+    required this.issues,
+    required this.models,
+  });
+
+  final int year;
+  final int quarter;
+
+  /// Подпись периода (`Q3 2026`).
+  final String label;
+
+  /// Самый ранний срок подачи среди моделей квартала.
+  final String? deadline;
+
+  /// Сколько фактур попало в квартал.
+  final int invoices;
+
+  /// Сколько расходов попало в квартал.
+  final int expenses;
+
+  /// Тип деятельности компании — от него зависит, нужна ли 130 и какая ставка IRPF.
+  final String activityType;
+
+  /// Прямая оценка (estimación directa) — режим, при котором подаётся 130.
+  final bool estimacionDirecta;
+
+  final List<DeclarationIssue> issues;
+
+  /// Модели в порядке 303 → 130 → 349.
+  final List<DeclarationModel> models;
+
+  /// Собирает квартальный расчёт из ответа `/declarations`.
+  factory DeclarationQuarter.fromJson(Map<String, dynamic> json) {
+    final period = json['period'] is Map ? Map<String, dynamic>.from(json['period'] as Map) : const <String, dynamic>{};
+    final profile = json['profile'] is Map ? Map<String, dynamic>.from(json['profile'] as Map) : const <String, dynamic>{};
+    final counts = json['counts'] is Map ? Map<String, dynamic>.from(json['counts'] as Map) : const <String, dynamic>{};
+
+    // Итоговые поля каждой модели: берём их поимённо, чтобы в блок не попали служебные числа.
+    final models = <DeclarationModel>[
+      if (json['modelo303'] is Map)
+        DeclarationModel.fromJson(
+          '303',
+          Map<String, dynamic>.from(json['modelo303'] as Map),
+          const [
+            (key: 'ivaDevengado', label: 'IVA devengado'),
+            (key: 'ivaDeducible', label: 'IVA deducible'),
+            (key: 'resultado', label: 'Resultado'),
+          ],
+        ),
+      if (json['modelo130'] is Map)
+        DeclarationModel.fromJson(
+          '130',
+          Map<String, dynamic>.from(json['modelo130'] as Map),
+          const [
+            (key: 'ingresosTrim', label: 'Ingresos del trimestre'),
+            (key: 'gastosTrim', label: 'Gastos del trimestre'),
+            (key: 'rendimientoTrim', label: 'Rendimiento del trimestre'),
+            (key: 'ingresosAcum', label: 'Ingresos acumulados'),
+            (key: 'gastosAcum', label: 'Gastos acumulados'),
+            (key: 'rendimiento', label: 'Rendimiento acumulado'),
+            (key: 'resultado', label: 'Resultado'),
+            (key: 'aIngresar', label: 'A ingresar'),
+          ],
+        ),
+      if (json['modelo349'] is Map)
+        DeclarationModel.fromJson(
+          '349',
+          Map<String, dynamic>.from(json['modelo349'] as Map),
+          const [
+            (key: 'operadores', label: 'Operadores'),
+            (key: 'importeTotal', label: 'Importe total'),
+          ],
+        ),
+    ];
+
+    final deadlines = <String>[
+      for (final m in models)
+        if (m.required && m.deadline != null) m.deadline!,
+    ]..sort();
+
+    return DeclarationQuarter(
+      year: (_num(period['year']) ?? 0).toInt(),
+      quarter: (_num(period['quarter']) ?? 0).toInt(),
+      label: '${period['label'] ?? ''}',
+      deadline: deadlines.isEmpty ? null : deadlines.first,
+      invoices: (_num(counts['invoices']) ?? 0).toInt(),
+      expenses: (_num(counts['expenses']) ?? 0).toInt(),
+      activityType: '${profile['activityType'] ?? ''}',
+      estimacionDirecta: profile['estimacionDirecta'] == true,
+      issues: (json['issues'] as List? ?? const [])
+          .whereType<Map>()
+          .map((e) => DeclarationIssue.fromJson(Map<String, dynamic>.from(e)))
+          .toList(),
+      models: models,
+    );
+  }
+}
+
+/// Расход (factura recibida): документ поставщика, который уменьшает базу IRPF и даёт вычет НДС.
+///
+/// Номер и VeriFactu к расходам не применяются — это документы поставщика, их только
+/// агрегируют для деклараций. Все денежные поля сервер считает сам из базы, ставки НДС и IRPF,
+/// поэтому в форме достаточно базы и ставок.
+class ExpenseView {
+  const ExpenseView({
+    required this.id,
+    required this.supplierName,
+    required this.supplierTaxId,
+    required this.supplierCountryCode,
+    required this.nature,
+    required this.kind,
+    required this.issueDate,
+    required this.category,
+    required this.description,
+    required this.notes,
+    required this.currency,
+    required this.netAmount,
+    required this.vatRate,
+    required this.irpfRate,
+    required this.totalAmount,
+    required this.deductibleVatPct,
+    required this.deductibleForIrpf,
+    required this.reverseCharge,
+    required this.hasDocument,
+    required this.fileName,
+  });
+
+  final String id;
+
+  /// Имя поставщика — единственное обязательное поле расхода.
+  final String supplierName;
+
+  final String? supplierTaxId;
+  final String? supplierCountryCode;
+
+  /// `goods` | `service` — от этого зависит clave в форме 349.
+  final String? nature;
+
+  /// `invoice` — обычный счёт; `recurring_no_invoice` — взнос RETA/соцстраха без счёта.
+  final String? kind;
+
+  final DateTime? issueDate;
+  final String? category;
+  final String? description;
+  final String? notes;
+  final String currency;
+  final double netAmount;
+
+  /// Ставка НДС (`0`, `4`, `10`, `21`).
+  final double vatRate;
+
+  /// Удержание IRPF, обычно 0.
+  final double irpfRate;
+
+  /// Итог с НДС.
+  final double totalAmount;
+
+  /// Какую долю НДС можно принять к вычету, % (топливо и подобное бывает 50%).
+  final double deductibleVatPct;
+
+  /// Учитывать ли расход в базе IRPF (штрафы и часть представительских — нет).
+  final bool deductibleForIrpf;
+
+  /// Обратное начисление НДС: покупка внутри ЕС, НДС начисляет получатель.
+  final bool reverseCharge;
+
+  /// К расходу приложен документ (скан или PDF) — по нему его открывают на просмотр.
+  final bool hasDocument;
+
+  final String? fileName;
+
+  /// Собирает расход из ответа `/expenses`.
+  factory ExpenseView.fromJson(Map<String, dynamic> json) => ExpenseView(
+        id: '${json['id']}',
+        supplierName: _str(json['supplierName']) ?? '',
+        supplierTaxId: _str(json['supplierTaxId']),
+        supplierCountryCode: _str(json['supplierCountryCode']),
+        nature: _str(json['nature']),
+        kind: _str(json['kind']),
+        issueDate: _date(json['issueDate']),
+        category: _str(json['category']),
+        description: _str(json['description']),
+        notes: _str(json['notes']),
+        currency: _str(json['currency']) ?? 'EUR',
+        netAmount: _num(json['netAmount']) ?? 0,
+        vatRate: _num(json['vatRate']) ?? 0,
+        irpfRate: _num(json['irpfRate']) ?? 0,
+        totalAmount: _num(json['totalAmount']) ?? 0,
+        deductibleVatPct: _num(json['deductibleVatPct']) ?? 100,
+        deductibleForIrpf: json['deductibleForIrpf'] != false,
+        reverseCharge: json['reverseCharge'] == true,
+        hasDocument: _str(json['fileS3Key']) != null,
+        fileName: _str(json['fileName']),
+      );
+}
+
+/// Поля, которые распознал сервер по скану расхода.
+///
+/// Это черновик заполнения, а не готовый расход: человек проверяет то, что прочитала модель,
+/// и сохраняет уже своими руками (см. `expense_form_screen.dart`).
+class ParsedExpenseDraft {
+  const ParsedExpenseDraft({
+    required this.supplierName,
+    required this.supplierTaxId,
+    required this.supplierCountryCode,
+    required this.issueDate,
+    required this.currency,
+    required this.netAmount,
+    required this.vatRate,
+    required this.irpfRate,
+    required this.reverseCharge,
+    required this.nature,
+    required this.kind,
+    required this.description,
+  });
+
+  final String supplierName;
+  final String supplierTaxId;
+  final String supplierCountryCode;
+  final String issueDate;
+  final String currency;
+  final double netAmount;
+  final double vatRate;
+  final double irpfRate;
+  final bool reverseCharge;
+  final String nature;
+  final String kind;
+  final String description;
+
+  /// Собирает распознанные поля; отсутствующие значения остаются пустыми, а не падают.
+  factory ParsedExpenseDraft.fromJson(Map<String, dynamic> json) => ParsedExpenseDraft(
+        supplierName: _str(json['supplierName']) ?? '',
+        supplierTaxId: _str(json['supplierTaxId']) ?? '',
+        supplierCountryCode: _str(json['supplierCountryCode']) ?? '',
+        issueDate: _str(json['issueDate']) ?? '',
+        currency: _str(json['currency']) ?? '',
+        netAmount: _num(json['netAmount']) ?? 0,
+        vatRate: _num(json['vatRate']) ?? 0,
+        irpfRate: _num(json['irpfRate']) ?? 0,
+        reverseCharge: json['reverseCharge'] == true,
+        nature: _str(json['nature']) ?? 'service',
+        kind: _str(json['kind']) ?? 'invoice',
+        description: _str(json['description']) ?? '',
+      );
+}
