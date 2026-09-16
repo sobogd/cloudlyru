@@ -15,8 +15,10 @@ import { parseTzOffsetMin } from '../media/media.service';
  * архивы в «Медиа» не попадают вовсе, а BMP/JXL попадают без превью — у них
  * `previewState = 'impossible'`.
  *
- * Клиент знает только общее число (`count`) и запрашивает элементы по смещению (`range`):
- * высота скролла считается на клиенте целиком, а данные грузятся куском видимой части.
+ * Галерея ходит по курсору (`feed`): страница — это кадры старше или новее указанной позиции,
+ * поэтому прокрутка не зависит от того, что библиотека меняется под руками. Число кадров
+ * (`count`) и срез по смещению (`range`) остались для прогрева миниатюр — он идёт по всей
+ * библиотеке страницами и нумерует их сам.
  *
  * Пояс: `capturedAt` — истинный UTC-момент, а месяцы для ползунка считаются по поясу клиента
  * (`?tz=` в `/media/months`), иначе фото у границы месяца попадает не в тот бакет.
@@ -24,6 +26,19 @@ import { parseTzOffsetMin } from '../media/media.service';
 
 /** Потолок одного запроса range. */
 export const MEDIA_RANGE_MAX = 1000;
+/**
+ * Потолок одного запроса курсорной ленты (`/media/feed`).
+ *
+ * Тысяча — как у `range`: страницу такого размера клиент просит только на наполнении
+ * локального индекса (`GallerySync`), а при листании берёт 200–300 кадров.
+ */
+export const MEDIA_FEED_MAX = 1000;
+/**
+ * Потолок списка id в одном запросе ленты (`?ids=`). Синхронизация клиента присылает сюда
+ * пачку правок журнала: больше — уже дешевле перечитать ленту страницами, чем одним
+ * `= ANY(...)` на тысячи id.
+ */
+export const MEDIA_FEED_IDS_MAX = 500;
 /**
  * Потолок одного запроса статусов превью. Список сверх него обрезается (об усечении
  * предупреждаем в логе): клиенту, который спрашивает статусы пачками, нужно присылать
@@ -87,6 +102,38 @@ export interface MediaItem {
    * `capturedAt + tzOffsetMin` — «время как в файле», `null` — пояс брать из устройства.
    */
   tzOffsetMin: number | null;
+}
+
+/**
+ * Позиция кадра в ленте — курсор листания.
+ *
+ * Лента упорядочена `capturedAt DESC NULLS LAST, id DESC`, и этой же парой адресуется её
+ * любая точка: `at` — момент съёмки в UTC (ISO) либо `null` у кадров без даты (они идут
+ * последними, «хвостом»), `id` — id записи, который разрывает ничьи по одинаковому моменту
+ * и адресует сам хвост.
+ */
+export interface MediaCursor {
+  /** Момент съёмки в UTC (ISO); `null` — курсор в хвосте ленты, у кадров без даты. */
+  at: string | null;
+  /**
+   * id записи в дереве (не хэш): тот же, что `entryId` у кадра. Пустой id означает, что
+   * позиция задана только моментом: у курсора без даты это край хвоста («с его начала» для
+   * `before` и «к самым старым датированным» для `after`), у датированного — граница момента
+   * (строго до/после него, без разрыва ничьих по одинаковому времени съёмки).
+   */
+  id: string;
+}
+
+/** Страница курсорной ленты: кадры в порядке ленты и признак, что за ними есть ещё. */
+export interface MediaFeedPage {
+  /** Кадры в порядке ленты — от свежих к старым. */
+  items: MediaItem[];
+  /**
+   * Есть ли кадры дальше по направлению запроса: для `before` — старше последнего
+   * отданного, для `after` — новее первого. Считается по лишней запрошенной строке,
+   * а не по равенству длине страницы.
+   */
+  hasMore: boolean;
 }
 
 /**
@@ -239,13 +286,15 @@ export class MediaFeedService {
 
   /**
    * Срез ленты по абсолютному смещению: элементы [offset, offset+limit) в порядке ленты.
-   * OFFSET умеет прыгнуть в любую точку (в отличие от keyset-курсора) — это и нужно клиенту,
-   * чтобы после остановки скролла забрать ровно видимый кусок.
+   *
+   * Смещение умеет прыгнуть в любую точку (в отличие от keyset-курсора), и этим пользуется
+   * прогрев миниатюр: он идёт по всей библиотеке страницами и нумерует их сам
+   * (`ThumbCache.warmLibrary`). Листание галереи ходит в [feed] — там адресом кадра служит
+   * его позиция в ленте, а не номер.
    *
    * Осторожно: смещение абсолютное и снимка состояния нет. Загрузка или удаление между
-   * запросами сдвигает индексы, поэтому клиент, который кэширует кадры по абсолютному номеру
-   * (`flutter/lib/features/media/media_screen.dart`), на этом может увидеть дубль или пропуск.
-   * Лечится общим с клиентом переходом на курсор `(capturedAt, id)` — пока его нет.
+   * запросами сдвигает индексы, поэтому клиент, привязанный к номеру, может увидеть дубль
+   * или пропуск.
    */
   async range(userId: string, offset = 0, limit = 300): Promise<MediaItem[]> {
     const tree = await this.auth.subtreeIds(userId);
@@ -253,12 +302,164 @@ export class MediaFeedService {
     const take = Math.min(Math.max(limit, 1), MEDIA_RANGE_MAX);
     const skip = Math.max(0, Math.floor(offset));
     const rows = await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
-      SELECT f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt",
-             j."state" AS "jobState",
-             -- Пояс съёмки: у фото он в EXIF, у видео — в дате из Apple Keys. Достаём только
-             -- эти два ключа, а не весь raw: строк в ответе до 1000.
-             mm."raw"->>'offsetTime' AS "rawOffsetTime",
-             mm."raw"->>'createdAt' AS "rawCreatedAt"
+      ${MediaFeedService.columns}
+      ${MediaFeedService.scope(tree)}
+      ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
+      LIMIT ${take} OFFSET ${skip}
+    `);
+    return rows.map(MediaFeedService.mapRow);
+  }
+
+  /**
+   * Срез ленты по курсору: кадры старше (`before`) или новее (`after`) указанной позиции.
+   *
+   * Зачем это вместо смещения ([range]): номер кадра — не адрес. Библиотека живая (приложение
+   * само выгружает фото с телефона), поэтому за время между двумя запросами состав ленты
+   * меняется, и по номеру на уже показанном месте оказывается чужой кадр. Курсор
+   * `(capturedAt, id)` указывает на сам кадр, и сдвиг ленты вокруг него ничего не ломает.
+   *
+   * Направления:
+   *  • `before` — кадры СТАРШЕ курсора (листание в прошлое). Курсор с `at = null` адресует
+   *    хвост ленты — кадры без даты съёмки, которые идут после всех датированных; датированный
+   *    курсор хвост не захватывает, поэтому клиент дочитывает его отдельной страницей.
+   *    Пустой `id` у датированного курсора — граница момента: строго до него, без разрыва
+   *    ничьих (так клиент прыгает к месяцу, не зная id его первого кадра);
+   *  • `after` — кадры НОВЕЕ курсора (листание к свежему). Курсор без даты означает «новее
+   *    хвоста без даты»: с непустым id — остаток самого хвоста, с пустым — самые старые
+   *    датированные кадры (они и примыкают к хвосту снизу);
+   *  • `ids` — конкретные записи (`?ids=a,b,c`), без курсора: так синхронизация клиента
+   *    забирает изменившееся по журналу одним запросом вместо запроса на кадр.
+   *
+   * Порядок кадров в ответе всегда ленты (свежие → старые), независимо от направления запроса:
+   * клиент раскладывает страницу по своему окну, и разворачивать её ему незачем.
+   */
+  async feed(
+    userId: string,
+    opts: { before?: MediaCursor | null; after?: MediaCursor | null; ids?: string[]; limit?: number },
+  ): Promise<MediaFeedPage> {
+    const tree = await this.auth.subtreeIds(userId);
+    if (!tree.length) return { items: [], hasMore: false };
+    const take = Math.min(Math.max(Math.floor(opts.limit ?? 200), 1), MEDIA_FEED_MAX);
+
+    // Конкретные записи: порядок как у ленты, продолжения у такой страницы не бывает.
+    if (opts.ids && opts.ids.length) {
+      const ids = [...new Set(opts.ids)].slice(0, MEDIA_FEED_IDS_MAX);
+      const rows = await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
+        ${MediaFeedService.columns}
+        ${MediaFeedService.scope(tree)}
+          AND f."id" = ANY(${ids})
+        ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
+      `);
+      return { items: rows.map(MediaFeedService.mapRow), hasMore: false };
+    }
+
+    // Лишняя строка сверх страницы: только так видно, есть ли продолжение. Сравнивать длину
+    // страницы с `limit` нельзя — ровно полная страница не значит, что за ней что-то есть.
+    const probe = take + 1;
+
+    if (opts.before !== undefined) {
+      const c = opts.before;
+      // `at` каста в timestamp без зоны: колонка `capturedAt` хранит UTC без зоны, а литерал
+      // со смещением Postgres сначала приводит к timestamptz — и без `AT TIME ZONE 'UTC'`
+      // результат зависел бы от пояса сессии.
+      const rows = c && c.at
+        ? await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
+            ${MediaFeedService.columns}
+            ${MediaFeedService.scope(tree)}
+              AND (mm."capturedAt" < (${c.at}::timestamptz AT TIME ZONE 'UTC')
+                   ${c.id
+                     ? Prisma.sql`OR (mm."capturedAt" = (${c.at}::timestamptz AT TIME ZONE 'UTC') AND f."id" < ${c.id})`
+                     : Prisma.empty})
+            ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
+            LIMIT ${probe}
+          `)
+        // Хвост без даты: он идёт после всех датированных кадров, поэтому и курсор у него свой
+        // (`at = null`). Пустой `id` — начало хвоста (самый свежий его кадр).
+        : await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
+            ${MediaFeedService.columns}
+            ${MediaFeedService.scope(tree)}
+              AND mm."capturedAt" IS NULL
+              ${c && c.id ? Prisma.sql`AND f."id" < ${c.id}` : Prisma.empty}
+            ORDER BY f."id" DESC
+            LIMIT ${probe}
+          `);
+      return { items: rows.slice(0, take).map(MediaFeedService.mapRow), hasMore: rows.length > take };
+    }
+
+    if (opts.after !== undefined) {
+      const c = opts.after;
+      if (c && c.at) {
+        // ASC — чтобы взять именно примыкающие к окну кадры, а не начало ленты; в порядок
+        // ленты страница разворачивается ниже.
+        const rows = await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
+          ${MediaFeedService.columns}
+          ${MediaFeedService.scope(tree)}
+            AND mm."capturedAt" IS NOT NULL
+            AND (mm."capturedAt" > (${c.at}::timestamptz AT TIME ZONE 'UTC')
+                 ${c.id
+                   ? Prisma.sql`OR (mm."capturedAt" = (${c.at}::timestamptz AT TIME ZONE 'UTC') AND f."id" > ${c.id})`
+                   : Prisma.empty})
+          ORDER BY mm."capturedAt" ASC, f."id" ASC
+          LIMIT ${probe}
+        `);
+        const page = rows.slice(0, take).reverse();
+        return { items: page.map(MediaFeedService.mapRow), hasMore: rows.length > take };
+      }
+      // Курсор без даты: новее него идёт либо остаток хвоста (когда id назван), либо вся
+      // датированная часть ленты. Во втором случае берём САМЫЕ СТАРЫЕ кадры — они и примыкают
+      // к хвосту снизу; клиент, поднимающийся от хвоста вверх, ждёт именно их.
+      const rows = c && c.id
+        ? await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
+            ${MediaFeedService.columns}
+            ${MediaFeedService.scope(tree)}
+              AND mm."capturedAt" IS NULL
+              AND f."id" > ${c.id}
+            ORDER BY f."id" ASC
+            LIMIT ${probe}
+          `)
+        : await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
+            ${MediaFeedService.columns}
+            ${MediaFeedService.scope(tree)}
+              AND mm."capturedAt" IS NOT NULL
+            ORDER BY mm."capturedAt" ASC, f."id" ASC
+            LIMIT ${probe}
+          `);
+      const page = rows.slice(0, take).reverse();
+      return { items: page.map(MediaFeedService.mapRow), hasMore: rows.length > take };
+    }
+
+    // Ни одного курсора — начало ленты: самые свежие кадры (вместе с хвостом без даты, если
+    // датированных меньше страницы).
+    const rows = await this.prisma.$queryRaw<MediaRow[]>(Prisma.sql`
+      ${MediaFeedService.columns}
+      ${MediaFeedService.scope(tree)}
+      ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
+      LIMIT ${probe}
+    `);
+    return { items: rows.slice(0, take).map(MediaFeedService.mapRow), hasMore: rows.length > take };
+  }
+
+  /**
+   * Колонки строки ленты: ровно те, из которых собирается `MediaItem` (см. `MediaRow`).
+   *
+   * Общий кусок для `range` и `feed`: разъехавшись, они отдавали бы разные наборы полей,
+   * и клиент получал бы то без пояса съёмки, то без состояния задачи.
+   */
+  private static readonly columns = Prisma.sql`
+    SELECT f."id", f."name", a."sha256", a."mime", a."previewState", a."size", mm."capturedAt",
+           j."state" AS "jobState",
+           -- Пояс съёмки: у фото он в EXIF, у видео — в дате из Apple Keys. Достаём только
+           -- эти два ключа, а не весь raw: строк в ответе до 1000.
+           mm."raw"->>'offsetTime' AS "rawOffsetTime",
+           mm."raw"->>'createdAt' AS "rawCreatedAt"
+  `;
+
+  /**
+   * Таблицы и условия, одинаковые у всех запросов ленты: живые записи зоны «Фото» в поддереве
+   * пользователя. Запрос дописывает к этому свои `AND` и `ORDER BY`.
+   */
+  private static scope(tree: string[]) {
+    return Prisma.sql`
       FROM "MediaMeta" mm
       JOIN "Asset" a ON a."id" = mm."assetId"
       JOIN "FileEntry" f ON f."assetId" = a."id"
@@ -268,10 +469,7 @@ export class MediaFeedService {
       WHERE f."deletedAt" IS NULL
         AND f."zone" = ${ZONE_PHOTOS}
         AND f."folderId" = ANY(${tree})
-      ORDER BY mm."capturedAt" DESC NULLS LAST, f."id" DESC
-      LIMIT ${take} OFFSET ${skip}
-    `);
-    return rows.map(MediaFeedService.mapRow);
+    `;
   }
 
   /**

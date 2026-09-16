@@ -8,7 +8,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import '../features/files/files_screen.dart';
 import '../features/mail/mail_screen.dart';
 import '../features/map/map_screen.dart';
-import '../features/media/media_screen.dart';
+import '../features/gallery/gallery_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../factura/invoices_screen.dart';
 import '../features/trash/trash_screen.dart';
@@ -109,7 +109,7 @@ class _ShellState extends ConsumerState<Shell> {
   Widget _screenFor(AppTab tab) => _screens.putIfAbsent(tab, () => switch (tab) {
         AppTab.files => const FilesScreen(),
         AppTab.mail => const MailScreen(),
-        AppTab.media => const MediaScreen(),
+        AppTab.media => const GalleryScreen(),
         AppTab.map => const MapScreen(),
         AppTab.invoices => const InvoicesScreen(),
         AppTab.trash => const TrashScreen(),

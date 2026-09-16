@@ -557,7 +557,23 @@ class MediaItem {
     this.tzOffsetMin,
   });
 
-  /// Разбор элемента ответа `/media/range`.
+  /// Копия кадра с изменёнными полями.
+  ///
+  /// Нужна там, где по кадру приходит не весь кадр, а часть: опрос `/media/status` отдаёт только
+  /// состояние превью, а показать его надо на той же плитке, что уже на экране.
+  MediaItem copyWith({String? previewState, String? jobState}) => MediaItem(
+        entryId: entryId,
+        name: name,
+        capturedAt: capturedAt,
+        mime: mime,
+        sha256: sha256,
+        previewState: previewState ?? this.previewState,
+        jobState: jobState ?? this.jobState,
+        size: size,
+        tzOffsetMin: tzOffsetMin,
+      );
+
+  /// Разбор элемента ответа `/media/range` и `/media/feed`.
   factory MediaItem.fromJson(Map<String, dynamic> j) => MediaItem(
         entryId: j.s('entryId'),
         name: j.s('name'),
@@ -568,6 +584,73 @@ class MediaItem {
         jobState: j.sN('jobState'),
         size: j.i('size'),
         tzOffsetMin: j.iN('tzOffsetMin'),
+      );
+}
+
+/// Позиция кадра в ленте — курсор листания (ручка `/media/feed`).
+///
+/// Пара `(at, id)` адресует точку ленты ровно так же, как её упорядочивает сервер
+/// (`capturedAt DESC NULLS LAST, id DESC`): [at] — момент съёмки в UTC, [id] — id записи,
+/// который разрывает ничьи по одинаковому моменту и адресует хвост ленты без даты.
+///
+/// Курсор, а не номер кадра: библиотека живая (приложение само выгружает фото с телефона),
+/// и между двумя запросами состав ленты меняется — по номеру на уже показанном месте
+/// оказался бы чужой кадр.
+class MediaCursor {
+  /// Момент съёмки в UTC (ISO); `null` — кадр без даты, такие идут в конце ленты.
+  final String? at;
+  /// id записи (он же `entryId` кадра). Пустая строка допустима только у курсора без даты и
+  /// означает его край: «с начала хвоста» при листании вниз и «к самым старым датированным
+  /// кадрам» при листании вверх.
+  final String id;
+
+  const MediaCursor({required this.at, required this.id});
+
+  /// Курсор кадра ленты — по нему начинается страница «старше этого кадра» или «новее него».
+  factory MediaCursor.of(MediaItem item) => MediaCursor(at: item.capturedAt, id: item.entryId);
+
+  /// Разбор сохранённого вида `at|id` (мета синхронизации: там курсор лежит строкой).
+  ///
+  /// Разделитель — вертикальная черта: момента съёмки в нём быть не может (ISO её не содержит),
+  /// а id записи — uuid. Строка без разделителя считается испорченной и даёт `null`: продолжать
+  /// наполнение с непонятного места хуже, чем начать его заново.
+  static MediaCursor? decode(String? raw) {
+    if (raw == null) return null;
+    final i = raw.indexOf('|');
+    if (i < 0) return null;
+    final at = raw.substring(0, i);
+    return MediaCursor(at: at.isEmpty ? null : at, id: raw.substring(i + 1));
+  }
+
+  /// Сохранённый вид `at|id` (см. [decode]).
+  String encode() => '${at ?? ''}|$id';
+
+  /// Сравнение по значению: курсоры сверяются, чтобы не запрашивать одну и ту же страницу дважды.
+  @override
+  bool operator ==(Object other) =>
+      other is MediaCursor && other.at == at && other.id == id;
+
+  @override
+  int get hashCode => Object.hash(at, id);
+
+  @override
+  String toString() => encode();
+}
+
+/// Страница курсорной ленты `GET /media/feed`: кадры в порядке ленты и признак продолжения.
+class MediaFeedPage {
+  /// Кадры от свежих к старым — в том же порядке, что и вся лента.
+  final List<MediaItem> items;
+  /// Есть ли кадры дальше по направлению запроса: для `before` — старше последнего
+  /// отданного, для `after` — новее первого. `false` — направление исчерпано.
+  final bool hasMore;
+
+  MediaFeedPage({required this.items, required this.hasMore});
+
+  /// Разбор ответа `/media/feed`.
+  factory MediaFeedPage.fromJson(Map<String, dynamic> j) => MediaFeedPage(
+        items: j.lm('items').map(MediaItem.fromJson).toList(),
+        hasMore: j.b('hasMore'),
       );
 }
 
@@ -586,10 +669,10 @@ class MediaMonthBucket {
 
 /// Состояние сборки превью для одного кадра — ответ на точечный опрос `/media/status`.
 ///
-/// Задумывался как дешёвое обновление видимых плиток вместо перезагрузки всей ленты; сейчас
-/// приложение этот опрос не использует: сетка медиа читает `previewState` прямо из [MediaItem].
-/// Сервер при этом режет список id до 500 (`MEDIA_STATUS_MAX`) и оставшиеся молча игнорирует —
-/// если ручку подключат, об усечении клиенту придётся помнить самому.
+/// Галерея переспрашивает так видимые кадры, у которых превью ещё не собрано: состояние
+/// приходит вместе с кадром, но к моменту показа превью часто только в очереди. Сервер режет
+/// список id до 500 (`MEDIA_STATUS_MAX`) и оставшиеся молча игнорирует — клиент помнит об этом
+/// сам (`GalleryController` шлёт не больше 500 id за раз).
 class MediaStatusItem {
   /// id записи файла в дереве.
   final String entryId;

@@ -11,7 +11,7 @@ import '../../api/models.dart';
 import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/widgets.dart';
-import '../media/media_screen.dart';
+import '../media/media_viewer.dart';
 
 /// Размер клетки кластеризации в экранных пикселях.
 ///

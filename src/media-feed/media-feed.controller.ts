@@ -1,27 +1,30 @@
 import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
-import { MediaFeedService } from './media-feed.service';
+import { MediaCursor, MediaFeedService } from './media-feed.service';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
-import { notFound } from '../common/errors';
+import { badRequest, notFound } from '../common/errors';
 
 /**
- * Ручки раздела «Медиа». Изолированы от «Фото» (`MediaController` / `/timeline`):
- * общее число, срез по смещению и метаданные кадра. Отдача самих превью/оригиналов и
- * удаление — общие низкоуровневые ручки (`/previews/:sha`, `/files/:id`).
+ * Ручки раздела «Медиа»: курсорная лента, разбивка по месяцам, число кадров, статусы превью
+ * и метаданные кадра. Отдача самих превью/оригиналов и удаление — общие низкоуровневые ручки
+ * (`/previews/:sha`, `/files/:id`).
  */
 @Controller('media')
 export class MediaFeedController {
-  constructor(private readonly feed: MediaFeedService) {}
+  constructor(private readonly feedService: MediaFeedService) {}
 
-  /** Общее число медиа — клиент по нему считает полную высоту скролла. */
+  /** Общее число медиа — по нему прогрев миниатюр показывает ход работы. */
   @Get('count')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   count(@CurrentUser() user: RequestUser) {
-    return this.feed.count(user.id);
+    return this.feedService.count(user.id);
   }
 
-  /** Срез ленты по смещению: `offset` — позиция, `limit` — сколько взять. */
+  /**
+   * Срез ленты по смещению: `offset` — позиция, `limit` — сколько взять. Прокрутка галереи
+   * ходит в `feed`; эту ручку зовёт прогрев миниатюр, который идёт по библиотеке страницами.
+   */
   @Get('range')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
@@ -32,7 +35,56 @@ export class MediaFeedController {
   ) {
     const off = Number(offset);
     const lim = Number(limit);
-    return this.feed.range(user.id, Number.isFinite(off) ? off : 0, Number.isFinite(lim) ? lim : 300);
+    return this.feedService.range(user.id, Number.isFinite(off) ? off : 0, Number.isFinite(lim) ? lim : 300);
+  }
+
+  /**
+   * Курсорная лента: страница кадров старше (`before`) или новее (`after`) указанной позиции.
+   *
+   * Курсор — пара `(at, id)`: `at` — момент съёмки в UTC (ISO), `id` — id записи. Возможные
+   * виды курсора:
+   *  • `{at: iso, id}` — позиция кадра;
+   *  • `{at: iso, id: ''}` — граница момента: строго до/после него, без разрыва ничьих.
+   *    Так клиент прыгает к месяцу: `before` = начало следующего месяца в поясе зрителя;
+   *  • `{at: null, id: ''}` — начало хвоста ленты, то есть кадров без даты съёмки;
+   *  • `{at: null, id}` — позиция кадра в хвосте.
+   *
+   * `ids` (`?ids=a,b,c`) — выборка конкретных записей без курсора: так синхронизация клиента
+   * забирает изменившееся по журналу одним запросом.
+   *
+   * Объявлена до `:entryId`, иначе «feed» уйдёт в него как id записи.
+   */
+  @Get('feed')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(600, 60_000)
+  feed(
+    @CurrentUser() user: RequestUser,
+    @Query('limit') limit?: string,
+    @Query('before') before?: string,
+    @Query('beforeId') beforeId?: string,
+    @Query('after') after?: string,
+    @Query('afterId') afterId?: string,
+    @Query('ids') ids?: string,
+  ) {
+    const lim = Number(limit);
+    // Пустая строка — это тоже курсор, поэтому отсутствие параметра и пустое значение
+    // различаются: `undefined` — курсора нет вовсе, `{at: null}` — курсор без даты (хвост
+    // ленты), `{at: iso, id: ''}` — граница месяца: строго до этого момента, без разрыва ничьих.
+    const parseCursor = (at?: string, id?: string, label = 'курсор'): MediaCursor | undefined => {
+      if (at === undefined) return undefined;
+      const entryId = (id ?? '').trim();
+      const value = at.trim();
+      if (!value) return { at: null, id: entryId };
+      const ms = Date.parse(value);
+      if (!Number.isFinite(ms)) throw badRequest(`${label}: дата курсора не разобрана`);
+      return { at: new Date(ms).toISOString(), id: entryId };
+    };
+    return this.feedService.feed(user.id, {
+      limit: Number.isFinite(lim) ? lim : 200,
+      ids: ids ? ids.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+      before: parseCursor(before, beforeId, 'before'),
+      after: parseCursor(after, afterId, 'after'),
+    });
   }
 
   /**
@@ -47,7 +99,7 @@ export class MediaFeedController {
   @RateLimit(600, 60_000)
   months(@CurrentUser() user: RequestUser, @Query('tz') tz?: string) {
     const tzMin = Number(tz);
-    return this.feed.months(user.id, Number.isFinite(tzMin) ? tzMin : 0);
+    return this.feedService.months(user.id, Number.isFinite(tzMin) ? tzMin : 0);
   }
 
   /**
@@ -60,7 +112,7 @@ export class MediaFeedController {
   @RateLimit(1200, 60_000)
   status(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
     const ids = body && typeof body === 'object' ? (body as { entryIds?: unknown }).entryIds : undefined;
-    return this.feed.status(user.id, ids);
+    return this.feedService.status(user.id, ids);
   }
 
   /** Геометки всей ленты — для вкладки «Карта». Объявлена до `:entryId`, иначе «map» уйдёт в неё. */
@@ -68,13 +120,13 @@ export class MediaFeedController {
   @UseGuards(RateLimitGuard)
   @RateLimit(120, 60_000)
   map(@CurrentUser() user: RequestUser) {
-    return this.feed.mapPoints(user.id);
+    return this.feedService.mapPoints(user.id);
   }
 
   /** Метаданные кадра для футера модалки: своя ручка, а не общий /files/:id. */
   @Get(':entryId')
   async info(@Param('entryId') entryId: string, @CurrentUser() user: RequestUser) {
-    const info = await this.feed.info(user.id, entryId);
+    const info = await this.feedService.info(user.id, entryId);
     if (!info) throw notFound('media not found');
     return info;
   }

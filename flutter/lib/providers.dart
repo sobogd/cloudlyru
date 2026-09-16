@@ -8,8 +8,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import 'app_state.dart';
-import 'media/media_store.dart';
-import 'media/media_sync.dart';
+import 'features/gallery/data/gallery_store.dart';
+import 'features/gallery/data/gallery_sync.dart';
 import 'media/thumb_cache.dart';
 import 'media/thumb_store.dart';
 import 'storage/settings.dart';
@@ -97,17 +97,17 @@ final thumbCacheProvider = FutureProvider<ThumbCache>((ref) async {
   return ThumbCache(store: store, apiOf: () => ref.read(appStateProvider).api);
 });
 
-/// Локальный список ленты «Медиа» и его синхронизация с сервером.
+/// Локальный индекс галереи и его синхронизация с сервером.
 ///
-/// Список лежит в своей базе (`cloudly-media.db`) и читается с диска, поэтому открытие раздела
-/// не зависит от сети: с сервером сверяемся журналом изменений, а полный проход делается только
-/// когда список пуст или журнал этого требует.
+/// Индекс лежит в своей базе (`cloudly-gallery.db`) и читается с диска, поэтому окно кадров
+/// показывается без сети: сервер догоняет список журналом изменений и верхней страницей ленты,
+/// а полное наполнение индекса идёт фоном и продолжается между открытиями раздела.
 ///
 /// Журнал приходит по device-токену ([SyncController.api]), а лента — по веб-сессии: два разных
 /// доступа к одному аккаунту, и оба уже есть у приложения.
-final mediaFeedProvider = FutureProvider<MediaFeedSync>((ref) async {
-  final store = await MediaFeedStore.open();
-  return MediaFeedSync(
+final galleryProvider = FutureProvider<GallerySync>((ref) async {
+  final store = await GalleryStore.open();
+  return GallerySync(
     store: store,
     apiOf: () => ref.read(appStateProvider).api,
     changesApiOf: () => ref.read(syncControllerProvider).api,
