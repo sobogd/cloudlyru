@@ -28,20 +28,21 @@ class MediaSyncProgress {
 ///
 /// Две операции:
 ///
-///  * **полный проход** ([syncFull]) — страницами `/media/range` перечитывает всю медиатеку.
-///    Нужен на первом запуске, после сброса журнала (`resetRequired`), при переносах кадров и
-///    папок и когда изменений слишком много для точечных дозапросов. Стоит 60 запросов на
+///  * **полный проход** ([syncFull]) — читает всю медиатеку страницами `/media/range` и
+///    заменяет список. Нужен на первом запуске, после сброса журнала (`resetRequired`) и когда
+///    изменений накопилось больше, чем разумно догонять по одному. Стоит 60 запросов на
 ///    библиотеку в 60 тысяч кадров;
 ///  * **догон журнала** ([syncChanges]) — читает `/sync/changes` от своего курсора и применяет
-///    изменения: удаления снимает точечно, а для новых кадров дозапрашивает метаданные по
-///    одному (журнал не несёт времени съёмки и пояса, без них кадр не встанет на своё место).
+///    правки точечно: новые и перемещённые кадры дозапрашиваются по id, удаления снимаются без
+///    запроса. Журнал не несёт времени съёмки и пояса, поэтому кадр, добавленный точечно,
+///    приходит без даты — такие кадры добираются отдельным проходом ([_refreshMissingDates]),
+///    когда сервер разберёт метаданные.
 ///
-/// Курсор свой, отдельный от курсора зеркала: сервер курсоров не помнит, и два потребителя
-/// одного журнала не мешают друг другу (см. [MediaFeedStore.keyCursor]).
-///
-/// Журнал доступен только по device-токену (`/sync/*` — API для клиентов синхронизации),
-/// поэтому [changesApiOf] может вернуть null: без токена список живёт как есть, а при
-/// следующем запуске догон повторится.
+/// Про полный проход и перемещения: раньше любое `move` в зоне «Фото» заставляло перечитывать
+/// ленту целиком, а переносов в журнале бывает десятки тысяч (массовая операция) — экран при
+/// каждом открытии уходил в полный проход, список на это время усекался, и лента выглядела
+/// «криво». Теперь `move` проверяется точечно, как и остальные правки: кадр либо есть в зоне
+/// «Фото» (тогда он обновляется), либо его там нет (тогда строка снимается).
 class MediaFeedSync {
   MediaFeedSync({
     required this.store,
@@ -65,13 +66,17 @@ class MediaFeedSync {
   /// (`MEDIA_RANGE_MAX = 1000`, src/media-feed/media-feed.service.ts).
   static const int _page = 1000;
 
-  /// Сколько страниц журнала разбираем за один догон: предохранитель от бесконечного цикла,
-  /// если сервер будет отдавать `hasMore` без движения курсора.
-  static const int _maxChangePages = 200;
+  /// Сколько событий журнала берём за одну страницу: серверный потолок `/sync/changes`
+  /// (`MAX_CHANGES = 500`, src/sync/sync.service.ts).
+  static const int _changePage = 500;
 
-  /// Предел точечных дозапросов. Больше — дешевле перечитать ленту целиком (60 запросов против
-  /// сотен), поэтому при массовой заливке сразу идёт полный проход.
-  static const int _inlineLimit = 200;
+  /// Потолок страниц журнала за один догон. Массовые операции (перенос всей медиатеки) дают
+  /// десятки тысяч событий, и без потолка догон превратился бы в бесконечный цикл.
+  static const int _maxChangePages = 600;
+
+  /// Сколько правок догоняем точечно. Больше — дешевле перечитать ленту целиком (60 запросов
+  /// против сотен), поэтому при массовой операции сразу идёт полный проход.
+  static const int _inlineLimit = 300;
 
   /// Проход уже идёт: повторный запуск не нужен (и не должен дублировать запросы).
   bool _busy = false;
@@ -81,7 +86,16 @@ class MediaFeedSync {
     if (_busy) return;
     _busy = true;
     try {
-      if (await store.count() == 0) {
+      final local = await store.count();
+      if (local == 0) {
+        await syncFull();
+        return;
+      }
+      // Сверка числа кадров (один дешёвый запрос): если локально их меньше или больше, чем на
+      // сервере, список собираем заново. Это страховка от оборванного прохода (в базе остаётся
+      // часть строк) и от строк, переживших переезд кадров из медиатеки, — при расхождении
+      // лента показывала бы внизу пустые клетки, а ползунок упирался бы раньше конца.
+      if (await apiOf().mediaCount() != local) {
         await syncFull();
         return;
       }
@@ -95,41 +109,34 @@ class MediaFeedSync {
     }
   }
 
-  /// Полный проход: перечитать ленту страницами и заменить список.
+  /// Полный проход: перечитать ленту и заменить список.
   ///
-  /// Курсор журнала берётся **до** прохода: изменения, случившиеся во время чтения страниц,
-  /// останутся в журнале после этой отметки и будут догнаны следующим [syncChanges]. Иначе
-  /// кадр, залитый ровно в момент прохода, потерялся бы до следующего полного чтения.
+  /// Все страницы собираются в память и записываются ОДНОЙ транзакцией. Раньше первая страница
+  /// заменяла список, а остальные дописывались: оборванный проход (свернули приложение, сеть
+  /// отвалилась) оставлял в базе усечённый список — лента выглядела короче, чем на сервере,
+  /// а внизу показывала пустоту.
+  ///
+  /// Курсор журнала берётся **до** прохода: изменения, случившиеся во время чтения, останутся
+  /// в журнале после этой отметки и будут догнаны следующим [syncChanges].
   Future<void> syncFull() async {
     final api = apiOf();
     final head = await _head();
     final total = await api.mediaCount();
     progress.value = MediaSyncProgress(scanned: 0, total: total, running: true);
-    var scanned = 0;
-    var first = true;
+    final all = <MediaItem>[];
     try {
       for (var offset = 0; offset < total; offset += _page) {
         final page = await api.mediaRange(offset, _page);
         if (page.isEmpty) break;
-        // Первая страница заменяет список целиком (так уходят кадры, удалённые, пока приложение
-        // было закрыто), остальные добавляются: полная замена одних только первых страниц
-        // оставила бы в базе хвост прошлого прохода.
-        if (first) {
-          await store.replaceAll(page);
-          first = false;
-        } else {
-          await store.upsertAll(page);
-        }
-        scanned += page.length;
-        progress.value = MediaSyncProgress(scanned: scanned, total: total, running: true);
+        all.addAll(page);
+        progress.value = MediaSyncProgress(scanned: all.length, total: total, running: true);
         if (page.length < _page) break;
       }
-      // Лента пуста: список тоже должен опустеть, иначе на экране остались бы прежние кадры.
-      if (first) await store.replaceAll(const []);
+      await store.replaceAll(all);
       if (head != null) await store.setMeta(MediaFeedStore.keyCursor, '$head');
       await store.setMeta(MediaFeedStore.keyFullSyncAt, DateTime.now().toUtc().toIso8601String());
     } finally {
-      progress.value = MediaSyncProgress(scanned: scanned, total: total, running: false);
+      progress.value = MediaSyncProgress(scanned: all.length, total: total, running: false);
     }
   }
 
@@ -137,15 +144,15 @@ class MediaFeedSync {
   ///
   /// Что делается с каждой правкой:
   ///
-  ///  * `delete` — кадр снимается из списка точечно: удаление не зависит ни от даты съёмки,
-  ///    ни от зоны, поэтому полный проход тут не нужен;
-  ///  * `create`/`update` в зоне «Фото» — кадр дозапрашивается по id (`/media/:entryId`);
-  ///    ручка сама отвечает 404, если кадр не в зоне «Фото» или не в дереве пользователя,
-  ///    поэтому «дозапрос добавил лишнее» невозможно;
-  ///  * `move`/`restore` и любые правки папок — полный проход: перенос меняет состав ленты
-  ///    (кадр мог войти в зону «Фото» или выйти из неё), а по журналу это не видно;
-  ///  * правки в других зонах (`FILES`, `MAIL`) игнорируются: лента их не показывает, и
-  ///    заливка обычного файла не должна тянуть перечитывание медиатеки.
+  ///  * `delete` — строка снимается сразу: удаление не зависит ни от даты съёмки, ни от зоны;
+  ///  * `create`, `update`, `move`, `restore` в зоне «Фото» — кадр дозапрашивается по id
+  ///    (`/media/:entryId`). Эта ручка отвечает 404, если кадр не в зоне «Фото» или не в дереве
+  ///    пользователя: значит он уехал из медиатеки — строка снимается. Так перенос обрабатывается
+  ///    без перечитывания всей ленты;
+  ///  * правки в других зонах (`FILES`, `MAIL`) игнорируются: лента их не показывает, и заливка
+  ///    обычного файла не должна тянуть перечитывание медиатеки;
+  ///  * правки папок и `resetRequired` — полный проход: перенос папки меняет состав ленты
+  ///    целыми поддеревьями, а сброшенный курсор означает, что часть изменений уже не восстановить.
   Future<void> syncChanges() async {
     final changes = changesApiOf?.call();
     if (changes == null) {
@@ -157,10 +164,10 @@ class MediaFeedSync {
       return;
     }
     var since = int.tryParse(await store.meta(MediaFeedStore.keyCursor) ?? '') ?? 0;
-    final created = <String>{};
+    final touched = <String>{};
     var needFull = false;
     for (var page = 0; page < _maxChangePages; page++) {
-      final res = await changes.changes(since);
+      final res = await changes.changes(since, limit: _changePage);
       if (res.resetRequired) {
         // Журнал подрезан или курсор впереди него: часть правок восстановить нельзя,
         // поэтому список собирается заново — так советует и контракт ручки.
@@ -178,51 +185,90 @@ class MediaFeedSync {
             break;
           case 'move':
           case 'restore':
-            needFull = true;
-            break;
           case 'create':
           case 'update':
-            if (c.zone == 'PHOTOS') created.add(c.targetId);
+            if (c.zone == 'PHOTOS') touched.add(c.targetId);
             break;
         }
       }
       since = res.nextSeq;
       await store.setMeta(MediaFeedStore.keyCursor, '$since');
+      // Правок набралось больше, чем разумно догонять по одной: перечитать ленту дешевле, чем
+      // сделать сотни точечных запросов. Полный проход заодно сдвинет курсор на голову журнала.
+      if (touched.length > _inlineLimit) {
+        await syncFull();
+        return;
+      }
       if (!res.hasMore) break;
     }
+    // Журнал не догнан за отведённые страницы (так бывает после массовой операции, если её
+    // события ещё не разобраны): список собираем целиком, иначе он останется неполным.
     if (needFull) {
       await syncFull();
       return;
     }
-    if (created.isEmpty) return;
-    if (created.length > _inlineLimit) {
-      await syncFull();
-      return;
-    }
+    if (touched.isNotEmpty) await _applyTouched(touched);
+    await _refreshMissingDates();
+  }
+
+  /// Применить правки по перечисленным кадрам: обновить существующие, добавить новые, снять
+  /// уехавшие из медиатеки.
+  Future<void> _applyTouched(Set<String> ids) async {
     final items = <MediaItem>[];
-    for (final id in created) {
+    final gone = <String>[];
+    for (final id in ids) {
       try {
-        final info = await apiOf().mediaInfo(id);
-        items.add(MediaItem(
-          entryId: info.entryId,
-          name: info.name,
-          capturedAt: info.capturedAt,
-          mime: info.mime,
-          sha256: info.sha256,
-          // Состояние превью журнал не несёт: ставим «ещё нет» и даём опросу `/media/status`
-          // (он идёт по неготовым кадрам) подтянуть настоящее значение.
-          previewState: 'none',
-          size: info.size,
-          tzOffsetMin: info.tzOffsetMin,
-        ));
+        items.add(_fromInfo(await apiOf().mediaInfo(id)));
+      } on ApiException catch (e) {
+        // 404 — кадр больше не в зоне «Фото» (перенесли в «Файлы» или удалили): у себя его
+        // тоже снимаем. Остальные ошибки не трогают список: следующий догон повторит.
+        if (e.status == 404) gone.add(id);
       } catch (e) {
-        // Кадр мог уже уехать из зоны «Фото» или быть удалённым — тогда его в ленте и не надо;
-        // остальное исправит следующий полный проход.
         if (kDebugMode) debugPrint('media sync info $id: $e');
       }
     }
+    await store.removeEntries(gone);
     await store.upsertAll(items);
   }
+
+  /// Дозапросить дату у кадров, которые лежат без неё.
+  ///
+  /// Кадр, добавленный точечно сразу после заливки, приходит без `capturedAt`: метаданные
+  /// сервер разбирает при сборке превью. Такой кадр стоит в конце ленты, поэтому, когда разбор
+  /// закончился, дату надо забрать — иначе он останется в «хвосте без даты» навсегда.
+  ///
+  /// Берём только кадры с готовым превью: у остальных метаданных ещё нет, и запрос был бы
+  /// впустую. Их немного — это хвост недавних заливок, а не вся библиотека.
+  Future<void> _refreshMissingDates() async {
+    final ids = await store.entriesWithoutDate(limit: 200);
+    if (ids.isEmpty) return;
+    final fixed = <MediaItem>[];
+    for (final id in ids) {
+      try {
+        final info = await apiOf().mediaInfo(id);
+        if (info.capturedAt == null) continue;
+        fixed.add(_fromInfo(info));
+      } catch (e) {
+        if (kDebugMode) debugPrint('media sync date $id: $e');
+      }
+    }
+    await store.upsertAll(fixed);
+  }
+
+  /// Строка ленты из деталей кадра.
+  ///
+  /// Состояние превью детали не несут: для нового кадра ставим «ещё нет» — его подтянет опрос
+  /// `/media/status`, который идёт по неготовым кадрам.
+  MediaItem _fromInfo(MediaInfo info) => MediaItem(
+        entryId: info.entryId,
+        name: info.name,
+        capturedAt: info.capturedAt,
+        mime: info.mime,
+        sha256: info.sha256,
+        previewState: 'none',
+        size: info.size,
+        tzOffsetMin: info.tzOffsetMin,
+      );
 
   /// Голова журнала или null, если журнала в этой сборке нет (нет device-токена).
   Future<int?> _head() async {

@@ -193,6 +193,21 @@ class MediaFeedStore {
     });
   }
 
+  /// Кадры без даты съёмки.
+  ///
+  /// Их дата может появиться позже: сервер разбирает метаданные при сборке превью, и кадр,
+  /// добавленный точечно сразу после заливки, приходит ещё без `capturedAt`. Такой кадр стоит
+  /// в конце ленты (как и на сервере — `NULLS LAST`), поэтому без дозапроса он там и остаётся.
+  Future<List<String>> entriesWithoutDate({int limit = 200}) async {
+    final rows = await _db.query(
+      'media_items',
+      columns: ['entry_id'],
+      where: 'sort_key < 0',
+      limit: limit,
+    );
+    return rows.map((r) => r['entry_id'] as String).toList();
+  }
+
   /// Сколько кадров ещё ждут собранного превью — по ним идёт опрос `/media/status`.
   Future<int> pendingPreviewCount() async {
     final rows = await _db.rawQuery(
