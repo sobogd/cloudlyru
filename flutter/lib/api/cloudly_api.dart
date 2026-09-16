@@ -275,13 +275,6 @@ class CloudlyApi {
     return (s != null && s.isNotEmpty) ? {'Cookie': s} : const {};
   }
 
-  /// Абсолютный URL из пути ручки: `url('/files/x/content')`.
-  ///
-  /// Остался от первых версий клиента и сейчас нигде не вызывается. Рабочий способ собрать
-  /// ссылку — именованные методы ниже ([fileUrl], [thumbUrl], [previewUrl] и остальные): у них
-  /// видно, какая ручка имеется в виду, и не нужно помнить про префикс `/api/v1`.
-  String url(String path) => '$baseUrl$path';
-
   // ---------- базовые запросы ----------
 
   /// Один запрос к API: JSON-тело, произвольный метод, ошибки — в [ApiException].
@@ -640,26 +633,6 @@ class CloudlyApi {
   Future<Map<String, dynamic>> mediaMap({CancelToken? cancelToken}) async =>
       _m(await _req('/media/map', cancelToken: cancelToken));
 
-  // ---------- альбомы ----------
-
-  // Альбомы живут только этими четырьмя методами: интерфейса у них нет (`FLUTTER.md`,
-  // раздел «Рамки» — «альбомы остались только ручками API»). Поэтому ни один из них пока
-  // не вызывается.
-  /// Список альбомов со счётчиками кадров.
-  Future<List<AlbumInfo>> listAlbums() async =>
-      _lm(await _req('/albums')).map(AlbumInfo.fromJson).toList();
-
-  /// Содержимое альбома по его id.
-  Future<AlbumView> getAlbum(String id) async =>
-      AlbumView.fromJson(_m(await _req('/albums/$id')));
-
-  /// Создаёт пустой альбом с именем [name].
-  Future<AlbumInfo> createAlbum(String name) async =>
-      AlbumInfo.fromJson(_m(await _req('/albums', method: 'POST', body: {'name': name})));
-
-  /// Удаляет альбом; сами кадры остаются в медиатеке.
-  Future<void> deleteAlbum(String id) async => _req('/albums/$id', method: 'DELETE');
-
   // ---------- очередь превью ----------
 
   /// Состояние очереди превью: счётчики, оценка срока по видам задач и место на диске сервера.
@@ -741,13 +714,6 @@ class CloudlyApi {
   /// Ответ приходит сразу, а проход идёт в фоне — результат смотрят по [mailStatus].
   Future<Map<String, dynamic>> mailSync() async =>
       _m(await _req('/mail/sync', method: 'POST'));
-
-  /// Сводка по почте для бейджей: непрочитанные по папкам и аккаунты с их состоянием.
-  ///
-  /// Нигде не вызывается: бейджи считает [mailCount] по папкам, а состояние аккаунтов —
-  /// [mailAccounts]. Метод оставлен как готовая обёртка ручки.
-  Future<MailStatusView> mailStatus() async =>
-      MailStatusView.fromJson(_m(await _req('/mail/status')));
 
   /// Сколько писем в папке [box]; [account] ограничивает одним аккаунтом.
   ///

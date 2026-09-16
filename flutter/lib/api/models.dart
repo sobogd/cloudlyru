@@ -714,75 +714,6 @@ class MapPoint {
       MapPoint(entryId: j.s('entryId'), lat: j.d('lat'), lon: j.d('lon'));
 }
 
-// ===== альбомы =====
-//
-// Альбомы приложение пока не показывает (`FLUTTER.md`: «Альбомы и Шаринг не переносим»), но
-// ручки на сервере живые — модели оставлены, чтобы контракт был описан целиком. Читает их
-// сейчас только `cloudly_api.dart`.
-
-/// Альбом — пользовательская подборка кадров; в дереве файлов его нет.
-class AlbumInfo {
-  final String id;
-  final String name;
-  /// Время создания альбома (ISO-8601).
-  final String? createdAt;
-  /// Сколько кадров в альбоме. Приходит только от `/albums` (список) и `POST /albums`
-  /// (создание, всегда `0`); деталка альбома это поле не отдаёт — см. [AlbumView].
-  final int count;
-
-  AlbumInfo({required this.id, required this.name, this.createdAt, required this.count});
-
-  /// Разбор ответа `/albums` и результата создания альбома.
-  factory AlbumInfo.fromJson(Map<String, dynamic> j) =>
-      AlbumInfo(id: j.s('id'), name: j.s('name'), createdAt: j.sN('createdAt'), count: j.i('count'));
-}
-
-/// Кадр внутри альбома — та же сокращённая форма, что и в ленте «Медиа».
-class AlbumItem {
-  final String entryId;
-  final String name;
-  /// Размер содержимого в байтах.
-  final int size;
-  final String mime;
-  /// Время съёмки (ISO-8601); пусто, если EXIF её не сохранил.
-  final String? capturedAt;
-
-  AlbumItem({required this.entryId, required this.name, required this.size, required this.mime, this.capturedAt});
-
-  /// Разбор элемента `items` из ответа `/albums/:id`.
-  factory AlbumItem.fromJson(Map<String, dynamic> j) => AlbumItem(
-        entryId: j.s('entryId'),
-        name: j.s('name'),
-        size: j.i('size'),
-        mime: j.s('mime'),
-        capturedAt: j.sN('capturedAt'),
-      );
-}
-
-/// Содержимое альбома: имя и список кадров.
-class AlbumView {
-  final String id;
-  final String name;
-  /// Сколько кадров в альбоме. Сервер в деталке альбома поле `count` не отдаёт
-  /// (`GET /albums/:id` возвращает только `{id, name, items}`, в отличие от списка `/albums`),
-  /// поэтому значение считается по [items] — иначе оно всегда было бы нулём при непустом списке.
-  final int count;
-  final List<AlbumItem> items;
-
-  AlbumView({required this.id, required this.name, required this.count, required this.items});
-
-  /// Разбор ответа `/albums/:id`.
-  factory AlbumView.fromJson(Map<String, dynamic> j) {
-    final items = j.lm('items').map(AlbumItem.fromJson).toList();
-    return AlbumView(
-      id: j.s('id'),
-      name: j.s('name'),
-      count: items.length,
-      items: items,
-    );
-  }
-}
-
 // ===== очередь превью =====
 
 /// Оценка срока по виду задачи (с сервера): медианная длительность задачи за последние
@@ -1003,8 +934,9 @@ class MailCounts {
 
 /// Подключённый почтовый аккаунт целиком — строка списка `GET /mail/accounts`.
 ///
-/// Это единственная ручка, которая отдаёт [kind], [label], [counts] и [createdAt]: сокращённый
-/// ответ `/mail/status` описывается отдельным типом [MailStatusAccount], а не этим классом.
+/// Это единственная ручка, которая отдаёт [kind], [label], [counts] и [createdAt]: у `/mail/status`
+/// поля короче (только id, адрес, состояние и время синхронизации), и разбирать его этой моделью
+/// нельзя — отсутствующие поля молча стали бы `''` и `0`.
 ///
 /// Пароля здесь нет и быть не может — он остался на сервере.
 class MailAccountRow {
@@ -1053,63 +985,6 @@ class MailAccountRow {
         lastSyncAt: j.sN('lastSyncAt'),
         createdAt: j.sN('createdAt'),
         counts: MailCounts.fromJson(j.m('counts') ?? const {}),
-      );
-}
-
-/// Аккаунт в сокращённом виде — строка блока `accounts` из `GET /mail/status`.
-///
-/// `/mail/status` отдаёт только то, что нужно бейджу непрочитанных: без `kind`, `label`,
-/// `counts` и `createdAt`. Отдельный тип здесь не формальность: пока эти аккаунты разбирались
-/// как [MailAccountRow], отсутствующие поля молча становились `''` и `0`, и любой бейдж
-/// показывал бы «0 писем» там, где письма есть. Нужны полные данные — запрашивай `/mail/accounts`.
-class MailStatusAccount {
-  final String id;
-  final String email;
-  /// Включена ли синхронизация аккаунта в приложении.
-  final bool enabled;
-  /// Состояние синхронизации: `idle` | `syncing` | `error` (см. [MailAccountRow.status]).
-  final String status;
-  /// Текст последней ошибки синхронизации, если она была.
-  final String? statusError;
-  /// Когда аккаунт последний раз успешно синхронизировался (ISO-8601); пусто — ни разу.
-  final String? lastSyncAt;
-
-  MailStatusAccount({
-    required this.id,
-    required this.email,
-    required this.enabled,
-    required this.status,
-    this.statusError,
-    this.lastSyncAt,
-  });
-
-  /// Разбор элемента `accounts` ответа `/mail/status`.
-  factory MailStatusAccount.fromJson(Map<String, dynamic> j) => MailStatusAccount(
-        id: j.s('id'),
-        email: j.s('email'),
-        enabled: j.b('enabled'),
-        status: j.s('status'),
-        statusError: j.sN('statusError'),
-        lastSyncAt: j.sN('lastSyncAt'),
-      );
-}
-
-/// Короткая сводка по почте для бейджей: непрочитанные по папкам и аккаунты с их состоянием.
-///
-/// Сейчас приложение эту ручку не вызывает — непрочитанные считаются по `count`, — но контракт
-/// описан целиком, чтобы подключение бейджа не упёрлось в чужие поля (см. [MailStatusAccount]).
-class MailStatusView {
-  /// Непрочитанные по папкам; ключ — имя папки ('inbox' и т.п.).
-  final Map<String, int> unread;
-  /// Аккаунты в сокращённой форме: полных данных эта ручка не отдаёт.
-  final List<MailStatusAccount> accounts;
-
-  MailStatusView({required this.unread, required this.accounts});
-
-  /// Разбор ответа `/mail/status`.
-  factory MailStatusView.fromJson(Map<String, dynamic> j) => MailStatusView(
-        unread: (j.m('unread') ?? const {}).map((k, v) => MapEntry(k, toNum(v)?.toInt() ?? 0)),
-        accounts: j.lm('accounts').map(MailStatusAccount.fromJson).toList(),
       );
 }
 
