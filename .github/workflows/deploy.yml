@@ -113,11 +113,27 @@ jobs:
           MAIL_PURGE_DRY_RUN: ${{ secrets.MAIL_PURGE_DRY_RUN || 'false' }}
           # Потолок размера одного письма, МБ: больше — письмо пропускается с причиной в логе.
           MAIL_MAX_MESSAGE_MB: ${{ secrets.MAIL_MAX_MESSAGE_MB || '64' }}
+          # ===== Фактуры (раздел перенесён из сервиса iq-factura) =====
+          # Компания-эмитент. Раньше выбиралась из связки пользователь↔компания, теперь
+          # владелец один — id фиксируется секретом репозитория.
+          FACTURA_COMPANY_ID: ${{ secrets.FACTURA_COMPANY_ID }}
+          # Бакет с PDF инвойсов и сканами: креды общие (S3_FILES_*), имя бакета своё.
+          S3_INVOICES_BUCKET: ${{ secrets.S3_INVOICES_BUCKET || 'iq-factura-invoices' }}
+          # VeriFactu: disabled | local | submit, и окружение AEAT. До переноса данных
+          # держим disabled: сервис с включённой отправкой, но без компании и сертификата,
+          # не должен подниматься вовсе (это проверяет src/config/env.ts).
+          VERIFACTU_MODE: ${{ secrets.VERIFACTU_MODE || 'disabled' }}
+          VERIFACTU_ENV: ${{ secrets.VERIFACTU_ENV || 'sandbox' }}
+          # Мастер-ключ шифрования сертификата: переносится из iq-factura без изменений —
+          # иначе уже загруженный сертификат не расшифруется.
+          VERIFACTU_MASTER_KEY: ${{ secrets.VERIFACTU_MASTER_KEY }}
+          # Ключ Gemini: разбор сканов расходов и поданных деклараций, разбор текста контрагента.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB
+          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -197,6 +213,21 @@ jobs:
             MAIL_PURGE_ENABLED=${MAIL_PURGE_ENABLED:-false}
             MAIL_PURGE_DRY_RUN=${MAIL_PURGE_DRY_RUN:-false}
             MAIL_MAX_MESSAGE_MB=${MAIL_MAX_MESSAGE_MB:-64}
+
+            # ===== Фактуры =====
+            # Компания-эмитент: id из базы iq_factura (переносится вместе с данными).
+            FACTURA_COMPANY_ID=$FACTURA_COMPANY_ID
+            # Бакет с PDF инвойсов и сканами расходов; креды и endpoint — общие S3_FILES_*.
+            S3_INVOICES_BUCKET=${S3_INVOICES_BUCKET:-iq-factura-invoices}
+            # Отправка в AEAT. Значения по умолчанию безопасные: без явного секрета сервис
+            # поднимется с выключенным VeriFactu, а не начнёт отправлять в боевую налоговую.
+            VERIFACTU_MODE=${VERIFACTU_MODE:-disabled}
+            VERIFACTU_ENV=${VERIFACTU_ENV:-sandbox}
+            # Тот же мастер-ключ, что был в iq-factura: иначе сертификат не расшифруется.
+            VERIFACTU_MASTER_KEY=$VERIFACTU_MASTER_KEY
+            VERIFACTU_INSTALLATION_ID=
+            # Разбор сканов и текста (Gemini). Пусто — разбор отключён.
+            GEMINI_API_KEY=$GEMINI_API_KEY
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
-import { Logger, LogLevel, RequestMethod } from '@nestjs/common';
+import { Logger, LogLevel, RequestMethod, ValidationPipe } from '@nestjs/common';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -59,6 +59,25 @@ async function bootstrap() {
   // со своим лимитом, а через json проходят только небольшие служебные тела.
   app.use(express.json({ type: 'application/json', limit: '1mb' }));
   app.use(cookieParser());
+
+  // Валидация тел запросов — ровно как в исходном сервисе фактур: DTO описаны классами с
+  // декораторами class-validator, и без пайпа эти декораторы не делают ничего (невалидное тело
+  // доходило бы до Prisma и превращалось в 500 вместо 400).
+  //
+  // `whitelist: true` вырезает поля без декораторов — так в БД не попадает ничего лишнего.
+  // `transform: true` включает `@Type(() => Number)`: суммы и ставки приходят из JSON строками
+  // чаще, чем кажется, и без преобразования Prisma получила бы строку вместо числа.
+  //
+  // На собственные ручки облака это не влияет: пайп пропускает параметры без метатипа-класса
+  // (`Record<string, unknown>`, интерфейсы, примитивы), а контроллеры облака разбирают тела
+  // руками — DTO-классов у них нет вовсе. См. комментарий в `src/app.module.ts`.
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: false,
+    }),
+  );
 
   // nginx проксирует с 127.0.0.1; наружу порт не публикуем.
   await app.listen(env.PORT, '127.0.0.1');
