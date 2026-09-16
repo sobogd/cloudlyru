@@ -74,6 +74,9 @@ class MediaFeedSync {
   /// десятки тысяч событий, и без потолка догон превратился бы в бесконечный цикл.
   static const int _maxChangePages = 600;
 
+  /// Сколько раз пробуем прочитать одну страницу ленты, прежде чем считать проход неполным.
+  static const int _pageAttempts = 3;
+
   /// Сколько правок догоняем точечно. Больше — дешевле перечитать ленту целиком (60 запросов
   /// против сотен), поэтому при массовой операции сразу идёт полный проход.
   static const int _inlineLimit = 300;
@@ -132,20 +135,36 @@ class MediaFeedSync {
     final total = await api.mediaCount();
     progress.value = MediaSyncProgress(scanned: 0, total: total, running: true);
     var scanned = 0;
+    var complete = total == 0;
     await store.beginGeneration();
     try {
       for (var offset = 0; offset < total; offset += _page) {
-        final page = await api.mediaRange(offset, _page);
-        if (page.isEmpty) break;
+        final page = await _readPage(api, offset);
+        // Страницу не удалось прочитать (сеть, сбой сервера): проход обрывается, но прежние
+        // строки НЕ снимаются — список остаётся полным, каким он был.
+        if (page == null) break;
+        if (page.isEmpty) {
+          // Пустая страница на середине — аномалия (сервер отдаёт всё до конца): считаем
+          // проход неполным и оставляем прежний набор.
+          break;
+        }
         await store.upsertAll(page);
         scanned += page.length;
         progress.value = MediaSyncProgress(scanned: scanned, total: total, running: true);
-        if (page.length < _page) break;
+        // Короткая страница означает конец ленты (последняя порция может быть неполной).
+        if (page.length < _page) {
+          complete = true;
+          break;
+        }
       }
-      // Снимаем строки прежних поколений: то, что на сервере уже не в медиатеке.
-      await store.dropOtherGenerations();
-      if (head != null) await store.setMeta(MediaFeedStore.keyCursor, '$head');
-      await store.setMeta(MediaFeedStore.keyFullSyncAt, DateTime.now().toUtc().toIso8601String());
+      // Снимаем строки прежних поколений ТОЛЬКО после полного прохода. Иначе оборванный
+      // проход удалил бы всё, что не успел перечитать: список укорачивался бы с каждой
+      // синхронизацией — «чем дальше листаешь, тем меньше рядов, а в конце пусто».
+      if (complete) {
+        await store.dropOtherGenerations();
+        if (head != null) await store.setMeta(MediaFeedStore.keyCursor, '$head');
+        await store.setMeta(MediaFeedStore.keyFullSyncAt, DateTime.now().toUtc().toIso8601String());
+      }
     } finally {
       progress.value = MediaSyncProgress(scanned: scanned, total: total, running: false);
     }
@@ -220,6 +239,24 @@ class MediaFeedSync {
     }
     if (touched.isNotEmpty) await _applyTouched(touched);
     await _refreshMissingDates();
+  }
+
+  /// Прочитать страницу ленты с повторами.
+  ///
+  /// Возвращает список кадров, `null` — страницу прочитать не удалось даже с повторами.
+  /// Повторы нужны там, где лента уходила вглубь десятков тысяч кадров: один сорвавшийся
+  /// запрос на середине обрывал полный проход, и список оставался неполным.
+  Future<List<MediaItem>?> _readPage(CloudlyApi api, int offset) async {
+    for (var attempt = 1; attempt <= _pageAttempts; attempt++) {
+      try {
+        return await api.mediaRange(offset, _page);
+      } catch (e) {
+        if (kDebugMode) debugPrint('media range $offset попытка $attempt: $e');
+        if (attempt == _pageAttempts) return null;
+        await Future.delayed(Duration(milliseconds: 300 * attempt));
+      }
+    }
+    return null;
   }
 
   /// Применить правки по перечисленным кадрам: обновить существующие, добавить новые, снять
