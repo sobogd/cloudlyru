@@ -32,17 +32,15 @@ import type { MailCursor } from '@prisma/client';
  * за проход (`MAIL_PASS_BUDGET_MB`) и делится между его папками — иначе три-четыре папки
  * умножали бы лимит на своё число, а проходы идут каждые MAIL_SYNC_INTERVAL_SEC секунд.
  *
- * Свежее письмо приходит само: на каждый аккаунт держится отдельное соединение, открытое на
- * папку, через которую видно всё новое, — сервер в IDLE сам сообщает о новом письме, а рядом
- * идёт дешёвый опрос `STATUS (UIDNEXT)`, потому что сообщает он не всегда сразу (у Gmail —
- * до 16 с). По любому из двух поводов мы догружаем ТОЛЬКО эту папку и только новое
- * (`syncFresh`), своим соединением и без истории. Так письмо не ждёт ни чужой аккаунт, ни
- * текущий проход, ни порцию истории; внеочередной проход целиком тут был ошибкой — он шёл по
- * всем аккаунтам и всем папкам, а если проход уже шёл, событие пропадало и письмо ждало до
- * расписания. Сторожевое соединение отдельное от выборок, потому что открытая под IDLE папка
- * занята: по ней нельзя сделать выборку, не разорвав IDLE. Плановый проход по расписанию
- * остаётся страховкой на случай, когда сторож отвалился, а сервер не умеет IDLE (тогда
- * imapflow сам опрашивает папку NOOP'ом).
+ * Свежее письмо приходит само: на каждый аккаунт идёт опрос папки, через которую видно всё
+ * новое (`runWatchLoop` — раз в PROBE_INTERVAL_MS спрашиваем `UIDNEXT`), и при расхождении с
+ * курсором догружаем ТОЛЬКО эту папку и только новое (`syncFresh`), своим соединением и без
+ * истории. Так письмо не ждёт ни чужой аккаунт, ни текущий проход, ни порцию истории.
+ * Внеочередной проход целиком тут был ошибкой — он шёл по всем аккаунтам и всем папкам, а если
+ * проход уже шёл, повод пропадал и письмо ждало до расписания. IDLE мы не держим: он не даёт
+ * мгновенности, потому что сообщает сервер, и он это делает когда захочет (у Gmail — до 16 с
+ * после того, как письмо уже видно по IMAP). Плановый проход по расписанию остаётся страховкой
+ * на случай, когда опрос не поднялся из-за отказа входа или сети.
  *
  * Состояние аккаунта (`MailAccount.status`) принадлежит этому сервису и означает буквально
  * следующее: `syncing` — идёт проход, `idle` — проход закончился успешно, `error` — проход или
@@ -53,9 +51,9 @@ import type { MailCursor } from '@prisma/client';
  * Владение жизненным циклом и соединениями: у чистки сервера свой таймер
  * (`MailPurgeService`, MAIL_PURGE_ENABLED, каждые 5 минут) — она сознательно не ждёт приём
  * и не выключается вместе с этим сервисом, потому что её выключатель отдельный. На один
- * аккаунт одновременно живут: сторож (IDLE), соединение прохода, соединение догрузки нового
+ * аккаунт одновременно живут: соединение опроса, соединение прохода, соединение догрузки нового
  * и — пока идёт — одно соединение чистки; провайдеры считают одновременные подключения,
- * поэтому чистка свежих писем берёт семафор на аккаунт, а проходное соединение не уходит в IDLE.
+ * поэтому чистка свежих писем берёт семафор на аккаунт, а соединения выборок не уходят в IDLE.
  *
  * Восстановление после падения процесса: незавершённый проход продолжается с курсора (письма
  * перекачиваются только те, что не успели сохраниться); частично записанные вложения добирает
@@ -84,63 +82,34 @@ interface StoredRef {
 }
 
 /**
- * Задержка перед догрузкой нового после события сторожа, мс.
+ * Как часто спрашивать у сервера «прибавилось ли писем» в папке аккаунта, мс.
  *
- * Была 3 с — «письма приходят пачками, склеим в один проход». Платит её КАЖДОЕ письмо, а
- * склейка почти ничего не экономит: пачку всё равно разбирает одна догрузка, потому что
- * события, пришедшие во время неё, не теряются, а помечают папку «есть ещё» (`syncFresh`).
- * Остаток нужен только на то, чтобы два EXISTS одной доставки не подняли две догрузки.
+ * Раз в секунду — по замеру это предел полезного: письмо становится видно по IMAP только через
+ * несколько секунд после доставки (Gmail — через 5-7.5), и чаще спрашивать значит платить
+ * командами за то, чего на сервере ещё нет. Секунда — 60 команд `STATUS` в минуту на ящик.
  */
-const WAKE_DEBOUNCE_MS = 250;
-
-/**
- * Через сколько переустанавливать IDLE, мс.
- *
- * Провайдеры сами закрывают затянувшийся IDLE (Gmail — на 29-й минуте), поэтому разрываем и
- * заходим заново заранее: так пауза в приходе писем не зависит от прихотей сервера.
- */
-const IDLE_RESTART_MS = 24 * 60 * 1000;
-
-/**
- * Задержка перед входом в IDLE после открытия папки, мс.
- *
- * По умолчанию imapflow ждёт 15 с простоя — на сторожевом соединении простоять эти секунды
- * нечего, поэтому слушаем сразу.
- */
-const WATCH_AUTO_IDLE_DELAY_MS = 1000;
-
-/**
- * Как часто спрашивать у сервера «прибавилось ли писем» в папке сторожа, мс.
- *
- * IDLE мгновенности не гарантирует: Gmail сообщает о новом письме в All Mail то через секунду,
- * то через шестнадцать (замерено: письмо уже видно по IMAP, а EXISTS пришёл на 16-й секунде) —
- * и это его задержка уведомления, не наша. Поэтому рядом со сторожем идёт дешёвый опрос
- * `STATUS (UIDNEXT)`: 24 команды в минуту на ящик, зато приход письма перестаёт зависеть от
- * того, когда сервер соизволит сообщить. Меньше секунды смысла нет — мы упрёмся в то, что
- * письмо вообще становится видно по IMAP только через несколько секунд после доставки.
- */
-const WATCH_PROBE_MS = readPositiveInt('MAIL_WATCH_PROBE_MS', 2500);
+const PROBE_INTERVAL_MS = readPositiveInt('MAIL_PROBE_INTERVAL_MS', 1000);
 
 /**
  * Сколько отказов опроса подряд считаем смертью соединения, а не случайностью.
  *
- * Пять при периоде в [WATCH_PROBE_MS] — это около десяти секунд молчания; дольше держать цикл
+ * Пять при периоде в [PROBE_INTERVAL_MS] — это пять секунд молчания; дольше держать цикл
  * незачем: если соединение живо, а папка недоступна, это лечит не опрос.
  */
-const WATCH_PROBE_FAILURES = 5;
+const PROBE_FAILURES = 5;
 
 /**
  * Через сколько опрос вправе снова поднять догрузку по тому же «писем больше курсора», мс.
  *
  * Письмо может исчезнуть у провайдера раньше, чем мы его забрали (удалили с телефона, сработала
  * чистка) — тогда курсор встанет за ним навсегда, и без этого ограничения опрос поднимал бы
- * догрузку каждые [WATCH_PROBE_MS] всё время работы. Минута — цена одного письма, которого на
- * сервере уже нет; обычный случай сюда не попадает: у нового письма UIDNEXT больше прежнего.
+ * догрузку каждую секунду всё время работы. Минута — цена одного письма, которого на сервере уже
+ * нет; обычный случай сюда не попадает: у нового письма UIDNEXT больше прежнего.
  */
 const PROBE_RETRY_MS = 60_000;
 
 /**
- * Пауза перед переподключением сторожа, мс.
+ * Пауза перед повторным подъёмом опроса, мс.
  *
  * Именно столько нужно серверу, чтобы отпустить прошлое соединение (иначе новый логин
  * отклоняется как «слишком много подключений»); после неудач пауза растёт —
@@ -285,15 +254,14 @@ interface UnsavedLetter {
 export class MailSyncService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MailSyncService.name);
   private readonly clients = new Map<string, ImapFlow>();
-  /** Сторожевые соединения аккаунтов: по одному на аккаунт, живут постоянно, держат IDLE. */
+  /** Соединения опроса: по одному на аккаунт, живут постоянно, спрашивают `UIDNEXT`. */
   private readonly watchers = new Map<string, ImapFlow>();
   /** Аккаунты, для которых сторож сейчас поднимается: второй параллельный подъём не нужен. */
-  private readonly watchPending = new Set<string>();
-  /** Неудачи подъёма сторожа по аккаунту: пауза растёт, чтобы не долбить сервер логинами. */
+  /** Аккаунты, у которых цикл опроса уже идёт: второй такой же не нужен. */
+  private readonly watchLoops = new Set<string>();
+  /** Неудачи опроса по аккаунту: пауза растёт, чтобы не долбить сервер логинами. */
   private readonly watchFailures = new Map<string, { count: number; until: number }>();
   private timer: NodeJS.Timeout | null = null;
-  /** Отложенные догрузки нового: свой таймер на аккаунт, поэтому медленный ящик не держит чужой. */
-  private readonly wakeTimers = new Map<string, NodeJS.Timeout>();
   private watchRetryTimer: NodeJS.Timeout | null = null;
   /**
    * Соединения для короткой догрузки нового — своё у каждого аккаунта, отдельно от прохода.
@@ -301,16 +269,14 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
    * Отдельное, а не общее с проходом: у соединения выбранной может быть только одна папка, и
    * проход в это время сидит в своей (а история идёт по всем по очереди). Общее соединение
    * означало бы «догрузка ждёт конца прохода» — ровно та задержка, из-за которой этот путь и
-   * появился. Живут между событиями: логин на каждом письме стоил бы секунды, а провайдеры
-   * считают одновременные подключения (у аккаунта их теперь три: сторож, проход и это).
+   * появился. Живут между письмами: логин на каждом письме стоил бы секунды, а провайдеры
+   * считают одновременные подключения (у аккаунта их три: опрос, проход и это).
    */
   private readonly freshClients = new Map<string, ImapFlow>();
-  /** Папка, которую стережёт сторож аккаунта: по её событию и догружаем новое. */
+  /** Папка, которую опрашивает аккаунт: её же открывает догрузка нового (`syncFresh`). */
   private readonly watchFolders = new Map<string, MailSourceFolder>();
   /** «аккаунт:папка» — новые письма этой папки прямо сейчас добираются (кем-то одним). */
   private readonly freshBusy = new Set<string>();
-  /** За время догрузки пришло ещё событие: после неё нужен ещё один заход (иначе оно потеряно). */
-  private readonly freshDirty = new Set<string>();
   /** По какому UIDNEXT опрос уже поднимал догрузку и когда: чтобы не долбить одним и тем же. */
   private readonly probeTriggered = new Map<string, { uidNext: bigint; at: number }>();
   /**
@@ -350,7 +316,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     this.timer.unref();
     this.logger.log(
       `синхронизация почты запущена: проход каждые ${env.MAIL_SYNC_INTERVAL_SEC} с (страховка), ` +
-        `новые письма — по IDLE, истории за проход — ${env.MAIL_BACKFILL_PER_PASS} писем`,
+        `новые письма — опросом раз в ${PROBE_INTERVAL_MS / 1000} с, истории за проход — ${env.MAIL_BACKFILL_PER_PASS} писем`,
     );
     void this.runPass('старт');
   }
@@ -367,8 +333,6 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     this.stopped = true;
     this.passToken += 1;
     if (this.timer) clearInterval(this.timer);
-    for (const timer of this.wakeTimers.values()) clearTimeout(timer);
-    this.wakeTimers.clear();
     if (this.watchRetryTimer) clearTimeout(this.watchRetryTimer);
     if (this.passRunning) {
       await Promise.race([this.passRunning.catch(() => undefined), sleep(SHUTDOWN_WAIT_MS)]);
@@ -382,7 +346,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       }
       this.clients.delete(id);
     }
-    for (const id of [...this.watchers.keys()]) this.dropWatcher(id);
+    for (const id of [...this.watchers.keys()]) this.dropWatchClient(id);
     for (const id of [...this.freshClients.keys()]) this.dropFreshClient(id);
   }
 
@@ -411,13 +375,13 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // Сторожа поднимаем до проверки на занятость: проход может идти минутами, и всё это время
-    // новые письма должны приходить. Аккаунт, который выключили или удалили, лишается и
-    // сторожа, и постоянного соединения: держать аутентифицированное подключение к ящику,
-    // которым система уже не управляет, нельзя (и провайдеры считают такие соединения).
+    // Опрос поднимаем до проверки на занятость: проход может идти минутами, и всё это время
+    // новые письма должны приходить. Аккаунт, который выключили или удалили, лишается и опроса,
+    // и постоянных соединений: держать аутентифицированное подключение к ящику, которым система
+    // уже не управляет, нельзя (и провайдеры считают такие соединения).
     const enabled = new Set(accounts.map((a) => a.id));
     for (const id of [...this.watchers.keys()]) {
-      if (!enabled.has(id)) this.dropWatcher(id);
+      if (!enabled.has(id)) this.dropWatchClient(id);
     }
     for (const id of [...this.clients.keys()]) {
       if (!enabled.has(id)) this.dropClient(id);
@@ -425,10 +389,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     for (const id of [...this.freshClients.keys()]) {
       if (!enabled.has(id)) this.dropFreshClient(id);
     }
-    for (const account of accounts) {
-      if (!this.accounts.presetOf(account.kind).folders.length) continue;
-      void this.ensureWatcher(account);
-    }
+    for (const account of accounts) this.ensureWatcher(account);
 
     if (this.busy) {
       // Сторож по занятости: если проход идёт дольше PASS_WATCHDOG_MS, значит где-то завис
@@ -692,7 +653,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       greetingTimeout: 20_000,
       // IDLE этому соединению не нужен: оно живёт ради выборок во время прохода, а
       // автоматический IDLE через 15 с простоя держал бы его открытым вечно — в дополнение
-      // к сторожу и трём соединениям на аккаунт (провайдеры это считают).
+      // к опросу и догрузке (провайдеры считают соединения и такое поведение).
       disableAutoIdle: true,
     });
     client.on('error', (e: Error) => this.logger.warn(`IMAP ${account.email}: ${e.message}`));
@@ -705,133 +666,127 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Сторожевое соединение аккаунта: папка, через которую видно всё новое, открыта в IDLE.
+   * Опрос ящика: раз в [PROBE_INTERVAL_MS] спрашиваем у сервера UIDNEXT папки, через которую
+   * видно всё новое, и, если писем стало больше курсора, догружаем их.
    *
-   * Письмо не ждёт расписания: сервер в IDLE сам присылает EXISTS, событие будит внеочередной
-   * проход. Соединение живёт постоянно и не пересекается с проходом — папка, открытая под IDLE,
-   * занята (выборку по ней сервер не примет, пока не разорвём IDLE), поэтому у прохода своё
-   * соединение (`clients`), у сторожа своё (`watchers`).
+   * Почему опрос, а не IDLE. Мгновенности IDLE не даёт: «сообщить» — дело сервера, и он решает
+   * сам. Замерено на Gmail: письмо уже видно по IMAP, а EXISTS в IDLE приходит через 16 секунд
+   * (иногда через одну), а на письмо, отправленное самому себе, не приходит вовсе. Опрос раз в
+   * секунду убирает эту лотерею: наша часть задержки — интервал плюс сама выборка, около
+   * секунды. Папка при опросе не выбирается (`SELECT` не нужен, `STATUS` работает по имени),
+   * поэтому соединению не нужны ни выбранная папка, ни IDLE, ни переустановка IDLE каждые
+   * 24 минуты — только `STATUS` и `UIDNEXT`.
    *
-   * Подъём идёт в фоне и никогда не роняет проход: не получилось — попробуем на следующем
-   * расписании (повтор по своему таймеру — только для сторожа, который был и отвалился:
-   * биться в закрытую дверь каждые 15 секунд незачем).
+   * Цикл живёт на аккаунт, поднимается один раз и переживает обрывы: не получилось — пауза по
+   * нарастающей ([WATCH_RETRY_DELAYS_MS]) и снова, а причина видна в статусе аккаунта (см.
+   * `markWatchBroken`). Ни проход, ни догрузка им не блокируются: у каждого своё соединение.
    */
-  private async ensureWatcher(account: MailAccountRow): Promise<void> {
-    if (this.stopped) return;
-    if (this.watchers.get(account.id)?.usable) return;
-    if (this.watchPending.has(account.id)) return;
+  private async runWatchLoop(row: MailAccountRow): Promise<void> {
+    if (this.stopped || this.watchLoops.has(row.id)) return;
 
-    // Пауза после неудач. Без неё неверный пароль или удалённый аккаунт превращались в
-    // непрерывные попытки логина (каждые 15 с, ~5760 в сутки), на которые провайдеры
-    // отвечают блокировкой входа — то есть мы сами ломали себе доступ.
-    const failures = this.watchFailures.get(account.id);
-    if (failures && failures.until > Date.now()) return;
-
-    const folder = this.watchFolderOf(account.kind);
-    // Нечего стеречь: у аккаунта без IMAP папок нет вовсе.
-    if (!folder) return;
-
-    this.watchPending.add(account.id);
-    // Соединение, которое надо прикрыть при неудаче: подняться оно могло успеть, а папка — нет.
-    let opened: ImapFlow | null = null;
+    let account = row;
+    this.watchLoops.add(account.id);
+    let broken = 0;
     try {
-      this.dropWatcher(account.id);
+      while (!this.stopped) {
+        await sleep(PROBE_INTERVAL_MS);
+        if (this.stopped) return;
+        try {
+          // Аккаунт могли выключить или удалить, пока мы спали: держать аутентифицированное
+          // соединение к ящику, которым система уже не управляет, нельзя (и провайдеры считают
+          // такие подключения), поэтому читаем строку заново и выходим, если он выключен.
+          const fresh = await this.prisma.mailAccount.findUnique({ where: { id: account.id } });
+          if (!fresh?.enabled) return;
+          account = fresh;
 
-      const { login, password } = this.accounts.credentials(account);
-      const client = new ImapFlow({
-        host: account.imapHost,
-        port: account.imapPort,
-        // Флаг пресета, а не жёсткое true: у обычного IMAP-сервера бывает и STARTTLS.
-        secure: this.accounts.presetOf(account.kind).secure,
-        auth: { user: login, pass: password },
-        // Логгер imapflow пишет команды целиком — вместе с ним в лог уехал бы и пароль
-        logger: false,
-        clientInfo: { name: 'CloudlyRu', version: '0.1.0' },
-        // Таймаут простоя тут работает на пользу: пока мы в IDLE, imapflow посылает NOOP,
-        // то есть соединение ещё и не даёт себя молча прикрыть посреднику.
-        socketTimeout: 300_000,
-        greetingTimeout: 20_000,
-        maxIdleTime: IDLE_RESTART_MS,
-        autoIdleDelay: WATCH_AUTO_IDLE_DELAY_MS,
-      });
-      opened = client;
-      client.on('error', (e: Error) => this.logger.warn(`IMAP (сторож) ${account.email}: ${e.message}`));
-      // Событие говорит только «в папке прибавилось писем», поэтому аккаунт берём из замыкания,
-      // а папку — из `watchFolders` (её записали ниже, когда сервер назвал её своим именем).
-      client.on('exists', () => this.wake(account.id));
-      client.on('close', () => this.onWatcherClosed(account.id, client));
+          const existing = this.watchers.get(account.id);
+          const client = existing?.usable ? existing : await this.openWatchClient(account);
+          const folder = await this.watchFolder(account, client);
+          await this.probeNew(account, folder, client);
 
-      await client.connect();
-      // Имя системной папки локализовано («[Gmail]/Вся почта»), поэтому ищем её по метке
-      // RFC 6154, как и в проходе, а строку из настроек держим запасным вариантом.
-      const resolved = await this.resolveFolders(client, [folder]);
-      // Запоминаем папку в том виде, в каком её знает сервер: догрузка нового откроет ровно
-      // её и не будет ради этого делать LIST.
-      const target = resolved[0] ?? folder;
-      await client.mailboxOpen(target.path);
-
-      this.watchers.set(account.id, client);
-      this.watchFolders.set(account.id, target);
-      this.watchFailures.delete(account.id);
-      // Вместе со сторожем запускаем опрос папки: IDLE сообщает о новом письме не всегда сразу.
-      this.startWatchProbe(account, target, client);
-      this.logger.log(`${account.email}: сторож на папке ${target.path} — новые письма пойдут сразу`);
-    } catch (e) {
-      try {
-        opened?.close();
-      } catch {
-        /* уже закрыто */
-      }
-      this.dropWatcher(account.id);
-      const message = errorText(e, 400);
-      // Повтор — по нарастающей, а не «каждые 15 секунд»: последняя ступень это одна попытка
-      // в час, то есть фактическая остановка до вмешательства человека.
-      const count = (this.watchFailures.get(account.id)?.count ?? 0) + 1;
-      const delay = WATCH_RETRY_DELAYS_MS[Math.min(count, WATCH_RETRY_DELAYS_MS.length) - 1];
-      this.watchFailures.set(account.id, { count, until: Date.now() + delay });
-      this.logger.warn(
-        `${account.email}: сторож не поднялся (попытка ${count}) — ${message}; следующая через ${Math.round(delay / 1000)} с`,
-      );
-      if (count >= WATCH_RETRY_DELAYS_MS.length) {
-        // Отдельно и явно: причина видна в статусе аккаунта, а не только в логе — иначе
-        // «почта приходит с задержкой» выглядит как случайность.
-        await this.prisma.mailAccount
-          .update({
-            where: { id: account.id },
-            data: { status: 'error', statusError: `сторож не поднимается (${count} попыток): ${message}` },
-          })
-          .catch(() => undefined);
+          if (broken) {
+            broken = 0;
+            // Опрос снова работает — пауза после неудач больше не нужна.
+            this.watchFailures.delete(account.id);
+          }
+        } catch (e) {
+          broken += 1;
+          // Первый отказ показываем, дальше молчим: иначе обрыв связи превращает лог в поток
+          // строк по одной на каждый интервал опроса.
+          if (broken === 1) {
+            this.logger.warn(`${account.email}: опрос папки не удался — ${errorText(e, 200)}`);
+          }
+          // Соединение могло умереть: следующая попытка поднимет новое.
+          this.dropWatchClient(account.id);
+          if (broken >= PROBE_FAILURES) {
+            await this.markWatchBroken(account, errorText(e, 200));
+            return;
+          }
+        }
       }
     } finally {
-      this.watchPending.delete(account.id);
+      this.watchLoops.delete(account.id);
     }
   }
 
   /**
-   * За какой папкой следить.
+   * Поднять опрос аккаунта, если его ещё нет.
    *
-   * Соединение стережёт одну папку, поэтому берём ту, через которую видно всё новое: у Gmail
-   * это All Mail (в неё попадает любое письмо), у остальных — INBOX. Спам и корзину отдельно
-   * не стережём: письма оттуда добирает плановый проход.
+   * Сам цикл живёт в [runWatchLoop], а здесь — только проверки: у аккаунта без IMAP папок нет
+   * вовсе (почту приносит наш сервер), а после неудач положена пауза. Без паузы неверный пароль
+   * или удалённый аккаунт превращались в непрерывные попытки логина (каждые 15 с, ~5760 в
+   * сутки), на которые провайдеры отвечают блокировкой входа — то есть мы сами ломали себе доступ.
    */
-  private watchFolderOf(kind: string): MailSourceFolder | null {
-    const folders = this.accounts.presetOf(kind).folders;
-    return folders.find((f) => f.specialUse === '\\All') ?? folders.find((f) => f.path === 'INBOX') ?? null;
+  private ensureWatcher(account: MailAccountRow): void {
+    if (this.stopped || this.watchLoops.has(account.id)) return;
+    if (!this.watchFolderOf(account.kind)) return;
+    const failures = this.watchFailures.get(account.id);
+    if (failures && failures.until > Date.now()) return;
+    void this.runWatchLoop(account);
   }
 
-  private onWatcherClosed(accountId: string, client: ImapFlow): void {
-    if (this.watchers.get(accountId) !== client) return;
-    this.watchers.delete(accountId);
-    // Соединение закрылось само (сервер, сеть, простой) — возвращаемся через паузу, а не
-    // ждём следующего расписания: иначе письма «пропадают» до пяти минут.
-    this.scheduleWatchRetry();
+  /**
+   * Соединение опроса.
+   *
+   * Своё, отдельное от прохода и догрузки: у соединения выбранной может быть только одна папка,
+   * а здесь она и не выбирается вовсе — опросу нужен один `STATUS` по имени. Папку на новом
+   * соединении забываем: имя системной папки локализовано, и сервер может назвать её иначе.
+   */
+  private async openWatchClient(account: MailAccountRow): Promise<ImapFlow> {
+    this.dropWatchClient(account.id);
+
+    const { login, password } = this.accounts.credentials(account);
+    const client = new ImapFlow({
+      host: account.imapHost,
+      port: account.imapPort,
+      // Флаг пресета, а не жёсткое true: у обычного IMAP-сервера бывает и STARTTLS.
+      secure: this.accounts.presetOf(account.kind).secure,
+      auth: { user: login, pass: password },
+      // Логгер imapflow пишет команды целиком — вместе с ним в лог уехал бы и пароль.
+      logger: false,
+      clientInfo: { name: 'CloudlyRu', version: '0.1.0' },
+      // Между опросами проходит секунда, так что это только страховка от молча умершего
+      // соединения: несколько отказов подряд и так переподнимают его заново.
+      socketTimeout: 300_000,
+      greetingTimeout: 20_000,
+      // IDLE этому соединению не нужен: за новым письмом следит опрос (`probeNew`).
+      disableAutoIdle: true,
+    });
+    client.on('error', (e: Error) => this.logger.warn(`IMAP (опрос) ${account.email}: ${e.message}`));
+    client.on('close', () => {
+      if (this.watchers.get(account.id) === client) this.watchers.delete(account.id);
+    });
+    await client.connect();
+    this.watchers.set(account.id, client);
+    return client;
   }
 
-  private dropWatcher(accountId: string): void {
+  /** Закрыть соединение опроса аккаунта (обрыв, аккаунт выключили, остановка процесса). */
+  private dropWatchClient(accountId: string): void {
     const client = this.watchers.get(accountId);
     this.watchers.delete(accountId);
-    // Папку забываем вместе со сторожем: догружать новое в никуда нельзя, а после повторного
-    // подъёма сервер может назвать папку иначе (переименование, другая локаль).
+    // Папку забываем вместе с соединением: её читает и догрузка нового (`syncFresh`), а после
+    // переподключения сервер может назвать папку иначе.
     this.watchFolders.delete(accountId);
     if (!client) return;
     try {
@@ -841,7 +796,67 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Повтор подъёма сторожей — один таймер на всех: поднимаем то, чего не хватает. */
+  /**
+   * Папка, которую опрашиваем, в том виде, в каком её знает сервер.
+   *
+   * Имя системной папки локализовано («[Gmail]/Вся почта»), поэтому один раз делаем LIST и
+   * запоминаем то имя, которое назвал сервер (метка RFC 6154 — как и в проходе), а строку из
+   * настроек держим запасным вариантом. Запоминаем не только ради экономии LIST: эту же папку
+   * открывает догрузка нового (`syncFresh`), то есть опрос и выборка обязаны смотреть в одну
+   * папку.
+   */
+  private async watchFolder(account: MailAccountRow, client: ImapFlow): Promise<MailSourceFolder> {
+    const known = this.watchFolders.get(account.id);
+    if (known) return known;
+    const wanted = this.watchFolderOf(account.kind);
+    if (!wanted) throw new Error('у аккаунта нет папок для опроса');
+    const resolved = await this.resolveFolders(client, [wanted]);
+    const target = resolved[0] ?? wanted;
+    this.watchFolders.set(account.id, target);
+    this.logger.log(`${account.email}: опрашиваю папку ${target.path} каждые ${PROBE_INTERVAL_MS / 1000} с`);
+    return target;
+  }
+
+  /**
+   * За какой папкой следить.
+   *
+   * Смотрим одну папку — ту, через которую видно всё новое: у Gmail это All Mail (в неё попадает
+   * любое письмо), у остальных — INBOX. Спам и корзину отдельно не опрашиваем: письма оттуда
+   * добирает плановый проход.
+   */
+  private watchFolderOf(kind: string): MailSourceFolder | null {
+    const folders = this.accounts.presetOf(kind).folders;
+    return folders.find((f) => f.specialUse === '\\All') ?? folders.find((f) => f.path === 'INBOX') ?? null;
+  }
+
+  /**
+   * Опрос встал: считаем неудачу, ставим паузу и говорим об этом в статусе аккаунта.
+   *
+   * Повтор — по нарастающей ([WATCH_RETRY_DELAYS_MS]), последняя ступень — одна попытка в час,
+   * то есть фактическая остановка до вмешательства человека: биться в закрытую дверь (неверный
+   * пароль, удалённый ящик) бессмысленно, а провайдеры за такое блокируют вход. Причина при этом
+   * видна в интерфейсе, а не только в логе — иначе «почта приходит с задержкой» выглядит как
+   * случайность.
+   */
+  private async markWatchBroken(account: MailAccountRow, message: string): Promise<void> {
+    const count = (this.watchFailures.get(account.id)?.count ?? 0) + 1;
+    const delay = WATCH_RETRY_DELAYS_MS[Math.min(count, WATCH_RETRY_DELAYS_MS.length) - 1];
+    this.watchFailures.set(account.id, { count, until: Date.now() + delay });
+    this.logger.warn(
+      `${account.email}: опрос папки остановлен (попытка ${count}) — ${message}; следующая через ${Math.round(delay / 1000)} с`,
+    );
+    if (count >= WATCH_RETRY_DELAYS_MS.length) {
+      await this.prisma.mailAccount
+        .update({
+          where: { id: account.id },
+          data: { status: 'error', statusError: `почта не проверяется (${count} попыток): ${message}` },
+        })
+        .catch(() => undefined);
+    }
+    this.scheduleWatchRetry();
+  }
+
+  /** Повтор подъёма опроса — один таймер на всех: поднимаем то, чего не хватает. */
   private scheduleWatchRetry(): void {
     if (this.stopped || this.watchRetryTimer) return;
     this.watchRetryTimer = setTimeout(() => {
@@ -857,139 +872,24 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     try {
       accounts = await this.prisma.mailAccount.findMany({ where: { enabled: true } });
     } catch (e) {
-      // Раньше ошибка молча превращалась в «нет аккаунтов»: сторожей просто не было, и в логе
+      // Раньше ошибка молча превращалась в «нет аккаунтов»: опроса просто не было, и в логе
       // не оставалось ни следа причины.
-      this.logger.warn(`повторный подъём сторожей: список аккаунтов не получен — ${errorText(e, 200)}`);
+      this.logger.warn(`повторный подъём опроса: список аккаунтов не получен — ${errorText(e, 200)}`);
       return;
     }
-    for (const account of accounts) {
-      if (!this.accounts.presetOf(account.kind).folders.length) continue;
-      void this.ensureWatcher(account);
-    }
-  }
-
-  /**
-   * Сторож увидел новое письмо: короткая догрузка по этому аккаунту, а не общий проход.
-   *
-   * Раньше событие поднимало `runPass` — проход по ВСЕМ аккаунтам и всем их папкам, с историей
-   * и общим флагом занятости. Из-за этого письмо ждало чужой аккаунт (аккаунты идут по очереди)
-   * и текущую историю того же ящика, а если проход уже шёл, событие пропадало совсем («проход
-   * пропущен») и письмо ждало до расписания — до `MAIL_SYNC_INTERVAL_SEC` после конца прохода.
-   * Теперь событие несёт аккаунт, догружается только его папка, без истории и своим соединением.
-   *
-   * Задержка [WAKE_DEBOUNCE_MS] склеивает события одной доставки; таймер у каждого аккаунта свой,
-   * поэтому медленный ящик не откладывает событие другого.
-   */
-  private wake(accountId: string): void {
-    if (this.stopped || this.wakeTimers.has(accountId)) return;
-    const timer = setTimeout(() => {
-      this.wakeTimers.delete(accountId);
-      void this.syncFresh(accountId, 'новое письмо');
-    }, WAKE_DEBOUNCE_MS);
-    timer.unref();
-    this.wakeTimers.set(accountId, timer);
-  }
-
-  /**
-   * Догрузить новое в папке, за которой следит сторож, — коротким путём.
-   *
-   * Ни истории, ни других папок, ни других аккаунтов: письмо должно оказаться у нас через
-   * секунды после того, как сервер о нём сообщил. Проход по расписанию остаётся страховкой и
-   * продолжает заниматься историей — он идёт своим соединением и этой догрузке не мешает.
-   *
-   * Заходы по одной папке не пересекаются ([freshBusy]): два одновременных разбора одних и тех
-   * же UID качают письмо дважды, и один из них падает на уникальном ключе письма. Событие,
-   * пришедшее во время захода, не теряется — папка помечается «есть ещё» ([freshDirty]) и заход
-   * повторяется сразу после текущего.
-   *
-   * Ошибку не поднимаем в статус аккаунта: расписание повторит попытку через
-   * `MAIL_SYNC_INTERVAL_SEC`, а мигающий «error» из-за обрыва связи только пугал бы.
-   */
-  private async syncFresh(accountId: string, reason: string): Promise<void> {
-    if (this.stopped) return;
-    const folder = this.watchFolders.get(accountId);
-    // Сторож успел сняться (аккаунт выключили, соединение закрылось) — догружать нечего.
-    if (!folder) return;
-
-    const key = freshKey(accountId, folder.path);
-    if (this.freshBusy.has(key)) {
-      this.freshDirty.add(key);
-      return;
-    }
-    this.freshBusy.add(key);
-    try {
-      const account = await this.prisma.mailAccount.findUnique({ where: { id: accountId } });
-      // Аккаунт выключили между событием и заходом — писем у него уже не берём.
-      if (!account?.enabled || !this.accounts.presetOf(account.kind).folders.length) return;
-
-      const client = await this.connectFresh(account);
-      const fresh: StoredRef[] = [];
-      // Бюджет свой и только на новое: тот же потолок, что у догрузки в проходе, — защита от
-      // лавины писем с вложениями (остальное доберёт следующий заход).
-      const budget: PassBudget = { left: INCREMENTAL_BUDGET_BYTES };
-      const stored = await this.withFolder(client, account, folder, (ctx, cursor) =>
-        this.fetchNew(client, ctx, cursor, budget, fresh, () => this.stopped),
-      );
-      if (stored) this.logger.log(`${account.email}: ${reason} — сохранено писем ${stored}`);
-      // Копии у провайдера убираем тем же порядком, что и в проходе: письмо уже у нас целиком.
-      if (fresh.length) void this.purgeFresh(account, fresh);
-    } catch (e) {
-      // Соединение могло умереть (сервер закрыл, сеть) — следующему событию нужно новое.
-      this.dropFreshClient(accountId);
-      this.logger.warn(`догрузка нового по событию сторожа не удалась: ${errorText(e, 300)}`);
-    } finally {
-      this.freshBusy.delete(key);
-      // Пока шёл заход, пришли ещё письма: добираем их сразу, иначе событие пропало бы до
-      // следующего прохода по расписанию.
-      if (this.freshDirty.delete(key) && !this.stopped) void this.syncFresh(accountId, 'ещё письма');
-    }
-  }
-
-  /**
-   * Опрос папки сторожа, пока его соединение живо.
-   *
-   * Зачем опрос рядом с IDLE: сервер вправе сообщить о новом письме не сразу (у Gmail это до
-   * 16 с), а «письмо видно в Gmail, а у нас ещё нет» — ровно то, на что жалуется человек.
-   * Цена — один `STATUS` раз в [WATCH_PROBE_MS] на ящик; выгода — задержка перестаёт зависеть
-   * от чужой прихоти. Живёт на сторожевом соединении: `STATUS` не меняет выбранную папку, и
-   * imapflow сам заходит обратно в IDLE после команды.
-   *
-   * Цикл завершается вместе со сторожем (соединение закрылось, аккаунт выключили, процесс
-   * останавливается) — проверка `watchers.get(...) === client` и есть эта связь. Ошибки не
-   * сыплются в лог каждая: после нескольких подряд цикл просто выходит, а подъём сторожа —
-   * дело `onWatcherClosed` и повторного подъёма по таймеру.
-   */
-  private startWatchProbe(account: MailAccountRow, folder: MailSourceFolder, client: ImapFlow): void {
-    void (async () => {
-      let failures = 0;
-      while (!this.stopped && this.watchers.get(account.id) === client) {
-        await sleep(WATCH_PROBE_MS);
-        if (this.stopped || this.watchers.get(account.id) !== client) return;
-        try {
-          await this.probeNew(account, folder, client);
-          failures = 0;
-        } catch (e) {
-          failures += 1;
-          // Первый отказ показываем, дальше молчим: иначе обрыв связи превращает лог в поток
-          // строк по одной на каждые [WATCH_PROBE_MS].
-          if (failures === 1) {
-            this.logger.warn(`${account.email}: опрос папки сторожа не удался — ${errorText(e, 200)}`);
-          }
-          if (failures >= WATCH_PROBE_FAILURES) return;
-        }
-      }
-    })();
+    for (const account of accounts) this.ensureWatcher(account);
   }
 
   /**
    * Один опрос: стало ли в папке писем больше, чем мы уже прошли.
    *
    * Сверяемся с КУРСОРОМ из базы, а не с памятью: курсор двигают и проход, и догрузка, и любая
-   * наша память о нём рано или поздно разъедется с настоящим положением дел — а разъехавшись
+   * наша память о нём рано или поздно разъехалась бы с настоящим положением дел — а разъехавшись
    * вверх, она бы молча пропускала письма. Чтение — по уникальному ключу, одна строка.
    *
    * Курсора ещё нет — папку берёт первый проход, и мешать ему не нужно; проход же и создаст
-   * строку курса.
+   * строку курса. Догрузка идёт следом и ждёт своего конца: цикл последовательный, второго
+   * захода на те же письма не будет, а пришедшие во время выборки увидит следующий опрос.
    */
   private async probeNew(account: MailAccountRow, folder: MailSourceFolder, client: ImapFlow): Promise<void> {
     const status = await client.status(folder.path, { uidNext: true });
@@ -999,17 +899,64 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       where: { accountId_imapPath: { accountId: account.id, imapPath: folder.path } },
       select: { lastUid: true },
     });
-    if (cursor && uidNext - 1n > cursor.lastUid) {
-      // Один и тот же повод не поднимаем чаще [PROBE_RETRY_MS]: письмо могло исчезнуть у
-      // провайдера, и тогда курсор стоит за ним навсегда (см. PROBE_RETRY_MS).
-      const key = freshKey(account.id, folder.path);
-      const prev = this.probeTriggered.get(key);
-      if (prev && prev.uidNext >= uidNext && Date.now() - prev.at < PROBE_RETRY_MS) return;
-      this.probeTriggered.set(key, { uidNext, at: Date.now() });
-      // Дальше всё как у события IDLE: склейка в [WAKE_DEBOUNCE_MS] и короткая догрузка только
-      // этой папки (`syncFresh`) — опрос лишь повод, а не второй путь сохранения.
-      this.logger.log(`${account.email}: опрос папки: писем больше курсора — догружаю новое`);
-      this.wake(account.id);
+    if (!cursor || uidNext - 1n <= cursor.lastUid) return;
+
+    // Один и тот же повод не поднимаем чаще [PROBE_RETRY_MS]: письмо могло исчезнуть у
+    // провайдера раньше, чем мы его забрали, и тогда курсор стоит за ним навсегда.
+    const key = freshKey(account.id, folder.path);
+    const prev = this.probeTriggered.get(key);
+    if (prev && prev.uidNext >= uidNext && Date.now() - prev.at < PROBE_RETRY_MS) return;
+    this.probeTriggered.set(key, { uidNext, at: Date.now() });
+
+    this.logger.log(`${account.email}: опрос папки: писем больше курсора — догружаю новое`);
+    await this.syncFresh(account.id, 'новое письмо');
+  }
+
+  /**
+   * Догрузить новое в папке, которую опрашиваем, — коротким путём.
+   *
+   * Ни истории, ни других папок, ни других аккаунтов: письмо должно оказаться у нас через
+   * секунды после того, как сервер о нём сообщил. Проход по расписанию остаётся страховкой и
+   * продолжает заниматься историей — он идёт своим соединением и этой догрузке не мешает.
+   *
+   * Заходы по одной папке не пересекаются ([freshBusy]): два одновременных разбора одних и тех
+   * же UID скачивают письмо дважды, и один из них падает на уникальном ключе письма. Если папку
+   * прямо сейчас разбирает проход, заход не повторяем — следующий опрос придёт через секунду.
+   *
+   * Ошибку не поднимаем в статус аккаунта: опрос повторит попытку, а мигающий «error» из-за
+   * обрыва связи только пугал бы.
+   */
+  private async syncFresh(accountId: string, reason: string): Promise<void> {
+    if (this.stopped) return;
+    const folder = this.watchFolders.get(accountId);
+    // Соединение опроса снято (аккаунт выключили, обрыв) — догружать нечего.
+    if (!folder) return;
+
+    const key = freshKey(accountId, folder.path);
+    if (this.freshBusy.has(key)) return;
+    this.freshBusy.add(key);
+    try {
+      const account = await this.prisma.mailAccount.findUnique({ where: { id: accountId } });
+      // Аккаунт выключили между опросом и заходом — писем у него уже не берём.
+      if (!account?.enabled || !this.accounts.presetOf(account.kind).folders.length) return;
+
+      const client = await this.connectFresh(account);
+      const fresh: StoredRef[] = [];
+      // Бюджет свой и только на новое: тот же потолок, что у догрузки в проходе, — защита от
+      // лавины писем с вложениями (остальное доберёт следующий опрос).
+      const budget: PassBudget = { left: INCREMENTAL_BUDGET_BYTES };
+      const stored = await this.withFolder(client, account, folder, (ctx, cursor) =>
+        this.fetchNew(client, ctx, cursor, budget, fresh, () => this.stopped),
+      );
+      if (stored) this.logger.log(`${account.email}: ${reason} — сохранено писем ${stored}`);
+      // Копии у провайдера убираем тем же порядком, что и в проходе: письмо уже у нас целиком.
+      if (fresh.length) void this.purgeFresh(account, fresh);
+    } catch (e) {
+      // Соединение могло умереть (сервер закрыл, сеть) — следующий опрос поднимет новое.
+      this.dropFreshClient(accountId);
+      this.logger.warn(`догрузка нового не удалась: ${errorText(e, 300)}`);
+    } finally {
+      this.freshBusy.delete(key);
     }
   }
 
@@ -1032,7 +979,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       // медленном канале, а простой лечится NOOP'ом, который imapflow шлёт сам.
       socketTimeout: 300_000,
       greetingTimeout: 20_000,
-      // IDLE этому соединению не нужен: за папкой следит сторож, тут только выборки.
+      // IDLE этому соединению не нужен: папку опрашивает своё соединение, тут только выборки.
       disableAutoIdle: true,
     });
     client.on('error', (e: Error) => this.logger.warn(`IMAP (новое) ${account.email}: ${e.message}`));
