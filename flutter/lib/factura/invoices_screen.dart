@@ -6,6 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../util/format.dart';
 import 'declarations_screen.dart';
 import 'expenses_screen.dart';
+import 'factura_settings_screen.dart';
+import 'filed_declarations_screen.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
 import 'factura_providers.dart';
@@ -106,6 +108,18 @@ class _InvoicesScreenState extends ConsumerState<InvoicesScreen> {
               title: const Text('Декларации'),
               subtitle: const Text('Расчёт 303 / 130 / 349 за квартал'),
               onTap: () => Navigator.pop(ctx, const DeclarationsScreen()),
+            ),
+            ListTile(
+              leading: const Icon(Icons.checklist_outlined),
+              title: const Text('Поданные'),
+              subtitle: const Text('Журнал поданных деклараций и justificante'),
+              onTap: () => Navigator.pop(ctx, const FiledDeclarationsScreen()),
+            ),
+            ListTile(
+              leading: const Icon(Icons.tune),
+              title: const Text('Настройки фактур'),
+              subtitle: const Text('Реквизиты компании и сертификат AEAT'),
+              onTap: () => Navigator.pop(ctx, const FacturaSettingsScreen()),
             ),
           ],
         ),

@@ -361,6 +361,78 @@ class FacturaApi {
     return rows.map(BankAccountView.fromJson).toList();
   }
 
+  /// Журнал поданных деклараций: что уже отправлено в AEAT.
+  Future<List<FiledDeclarationView>> listFiledDeclarations() async {
+    final rows = await _list('/filed-declarations');
+    return rows.map(FiledDeclarationView.fromJson).toList();
+  }
+
+  /// Заводит запись о поданной декларации.
+  Future<void> createFiledDeclaration(Map<String, dynamic> body) =>
+      _json('POST', '/filed-declarations', body: body);
+
+  /// Правит запись журнала.
+  Future<void> updateFiledDeclaration(String id, Map<String, dynamic> body) =>
+      _json('PATCH', '/filed-declarations/$id', body: body);
+
+  /// Удаляет запись журнала вместе с приложенным файлом.
+  Future<void> deleteFiledDeclaration(String id) => _json('DELETE', '/filed-declarations/$id');
+
+  /// Загружает поданную декларацию (PDF или скан) и — по желанию — распознаёт её поля.
+  ///
+  /// Распознавание возвращает номер justificante, суммы и клетки: после подачи их обычно
+  /// переносят в журнал руками, а модель читает их из того же PDF, который выдала налоговая.
+  Future<({String key, String mime, String? fileName, ParsedFiledDeclarationDraft? parsed})>
+      uploadFiledDeclarationDoc({
+    required String base64,
+    required String mimeType,
+    String? fileName,
+    bool parse = true,
+  }) async {
+    final json = await _json('POST', '/filed-declarations/upload', body: {
+      'data': base64,
+      'mimeType': mimeType,
+      'fileName': ?fileName,
+      'parse': parse,
+    });
+    return (
+      key: '${json['fileS3Key']}',
+      mime: '${json['fileMime']}',
+      fileName: json['fileName'] == null ? null : '${json['fileName']}',
+      parsed: json['parsed'] is Map
+          ? ParsedFiledDeclarationDraft.fromJson(Map<String, dynamic>.from(json['parsed'] as Map))
+          : null,
+    );
+  }
+
+  /// Ссылка на приложенный файл поданной декларации (закрыта авторизацией).
+  String filedDeclarationFileUrl(String id) => '${cloudly.baseUrl}/filed-declarations/$id/file';
+
+  /// Правит профиль компании-эмитента (реквизиты, налоговый профиль, валюта).
+  ///
+  /// Правка влияет только на будущие фактуры: в уже выставленных реквизиты зафиксированы
+  /// снимком (`emitterSnapshot`), и PDF задним числом не меняются.
+  Future<CompanyProfile> updateCompany(Map<String, dynamic> body) async {
+    final json = await _json('PATCH', '/companies/me', body: body);
+    return CompanyProfile.fromJson(json);
+  }
+
+  /// Загружает сертификат компании для AEAT (.p12) с паролем к нему.
+  ///
+  /// Сертификат остаётся на сервере зашифрованным мастер-ключом; наружу отдаются только
+  /// метаданные (NIF, издатель, срок). Пароль сервер использует один раз при разборе файла
+  /// и не сохраняет. NIF в сертификате должен совпадать с налоговым номером компании.
+  Future<CompanyProfile> uploadCert({required String p12Base64, required String password}) async {
+    final json = await _json('POST', '/companies/me/verifactu-cert', body: {
+      'p12Base64': p12Base64,
+      'password': password,
+    });
+    return CompanyProfile.fromJson(json);
+  }
+
+  /// Удаляет сертификат: без него отправка в AEAT работать не будет.
+  Future<void> deleteCert() => _json('DELETE', '/companies/me/verifactu-cert');
+
   /// Профиль компании-эмитента (в том числе метаданные сертификата AEAT).
   Future<CompanyProfile> getCompany() async {
     final json = await _json('GET', '/companies/me');

@@ -412,10 +412,15 @@ class CompanyProfile {
     required this.taxId,
     required this.vatId,
     required this.addressLine1,
+    required this.addressLine2,
     required this.city,
     required this.postalCode,
     required this.region,
     required this.country,
+    required this.bankName,
+    required this.iban,
+    required this.swift,
+    required this.activityStartDate,
     required this.defaultIrpfRate,
     required this.activityType,
     required this.baseCurrency,
@@ -437,10 +442,19 @@ class CompanyProfile {
   final String? vatId;
 
   final String? addressLine1;
+  final String? addressLine2;
   final String? city;
   final String? postalCode;
   final String? region;
   final String? country;
+
+  /// Банковские реквизиты компании по умолчанию (печатаются в PDF, если у фактуры нет счёта).
+  final String? bankName;
+  final String? iban;
+  final String? swift;
+
+  /// Дата регистрации autónomo: вместе с типом деятельности даёт ставку IRPF 7% первые три года.
+  final DateTime? activityStartDate;
 
   /// Ручное переопределение ставки IRPF; `null` — считается по типу деятельности.
   final double? defaultIrpfRate;
@@ -471,10 +485,15 @@ class CompanyProfile {
         taxId: _str(json['taxId']),
         vatId: _str(json['vatId']),
         addressLine1: _str(json['addressLine1']),
+        addressLine2: _str(json['addressLine2']),
         city: _str(json['city']),
         postalCode: _str(json['postalCode']),
         region: _str(json['region']),
         country: _str(json['country']),
+        bankName: _str(json['bankName']),
+        iban: _str(json['iban']),
+        swift: _str(json['swift']),
+        activityStartDate: _date(json['activityStartDate']),
         defaultIrpfRate: _num(json['defaultIrpfRate']),
         activityType: _str(json['activityType']),
         baseCurrency: _str(json['baseCurrency']),
@@ -962,5 +981,102 @@ class ParsedExpenseDraft {
         nature: _str(json['nature']) ?? 'service',
         kind: _str(json['kind']) ?? 'invoice',
         description: _str(json['description']) ?? '',
+      );
+}
+
+
+/// Поданная декларация: журнал того, что уже отправлено в AEAT.
+///
+/// Ведётся руками (или заполняется распознаванием поданного PDF): у налоговой нет ручки,
+/// которая рассказала бы приложению о факте подачи. Смысл журнала — не подать одно и то же
+/// дважды и быстро найти номер justificante, когда он понадобится.
+class FiledDeclarationView {
+  const FiledDeclarationView({
+    required this.id,
+    required this.model,
+    required this.year,
+    required this.quarter,
+    required this.justificante,
+    required this.submittedAt,
+    required this.resultPaid,
+    required this.compensarNext,
+    required this.notes,
+    required this.hasDocument,
+    required this.fileName,
+  });
+
+  final String id;
+
+  /// Номер формы: `303`, `130`, `349`.
+  final String model;
+  final int year;
+  final int quarter;
+
+  /// Номер justificante из кабинета AEAT — им подтверждают подачу.
+  final String? justificante;
+
+  /// Дата подачи.
+  final DateTime? submittedAt;
+
+  /// Сколько уплачено (у 130 — клетка 07, у 303 — 71).
+  final double? resultPaid;
+
+  /// Сколько переносится к вычету в следующий период (у 303 — клетка 87).
+  final double? compensarNext;
+
+  final String? notes;
+
+  /// К декларации приложен поданный PDF.
+  final bool hasDocument;
+  final String? fileName;
+
+  /// Подпись периода для списка: `1T`, `2T`, …
+  String get quarterLabel => '$quarter' 'T';
+
+  /// Собирает запись журнала из ответа `/filed-declarations`.
+  factory FiledDeclarationView.fromJson(Map<String, dynamic> json) => FiledDeclarationView(
+        id: '${json['id']}',
+        model: _str(json['model']) ?? '',
+        year: (_num(json['year']) ?? 0).toInt(),
+        quarter: (_num(json['quarter']) ?? 0).toInt(),
+        justificante: _str(json['justificante']),
+        submittedAt: _date(json['submittedAt']),
+        resultPaid: _num(json['resultPaid']),
+        compensarNext: _num(json['compensarNext']),
+        notes: _str(json['notes']),
+        hasDocument: _str(json['fileS3Key']) != null,
+        fileName: _str(json['fileName']),
+      );
+}
+
+/// Поля, которые сервер распознал в поданной декларации (PDF из кабинета AEAT).
+class ParsedFiledDeclarationDraft {
+  const ParsedFiledDeclarationDraft({
+    required this.model,
+    required this.year,
+    required this.quarter,
+    required this.justificante,
+    required this.submittedAt,
+    required this.resultPaid,
+    required this.compensarNext,
+  });
+
+  final String model;
+  final int year;
+  final int quarter;
+  final String justificante;
+  final String submittedAt;
+  final double resultPaid;
+  final double compensarNext;
+
+  /// Собирает распознанные поля; неизвестное остаётся нулём или пустой строкой.
+  factory ParsedFiledDeclarationDraft.fromJson(Map<String, dynamic> json) => ParsedFiledDeclarationDraft(
+        model: _str(json['model']) ?? '',
+        year: (_num(json['year']) ?? 0).toInt(),
+        quarter: (_num(json['quarter']) ?? 0).toInt(),
+        justificante: _str(json['justificante']) ?? '',
+        submittedAt: _str(json['submittedAt']) ?? '',
+        resultPaid: _num(json['resultPaid']) ?? 0,
+        compensarNext: _num(json['compensarNext']) ?? 0,
       );
 }
