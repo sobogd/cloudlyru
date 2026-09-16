@@ -76,6 +76,19 @@ class _ThumbImageState extends ConsumerState<ThumbImage> {
     super.dispose();
   }
 
+  @override
+  /// Плитка досталась другому кадру (список перестроился и переиспользовал элемент).
+  ///
+  /// Тогда и пауза, и признак «уже просил» относятся к ПРЕЖНЕМУ содержимому: без сброса новый
+  /// кадр не запрашивался бы вовсе, а плитка так и осталась бы серой.
+  void didUpdateWidget(ThumbImage old) {
+    super.didUpdateWidget(old);
+    if (old.sha == widget.sha) return;
+    _settle?.cancel();
+    _requested = false;
+    _settle = Timer(_settleDelay, _request);
+  }
+
   /// Попросить миниатюру у очереди и перерисоваться, когда она появится.
   ///
   /// Если хранилище ещё открывается (первый кадр после запуска), просьба повторяется через
@@ -92,8 +105,12 @@ class _ThumbImageState extends ConsumerState<ThumbImage> {
       return;
     }
     _requested = true;
+    debugPrint('cloudly-thumb: просьба ${widget.sha.substring(0, 8)}');
     unawaited(cache.request(widget.sha, background: widget.background).then((_) {
-      if (mounted) setState(() {});
+      if (mounted) {
+        setState(() {});
+        debugPrint('cloudly-thumb: ответ ${widget.sha.substring(0, 8)} файл=${cache.file(widget.sha) != null}');
+      }
     }));
   }
 

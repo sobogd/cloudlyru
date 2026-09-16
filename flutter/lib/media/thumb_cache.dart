@@ -127,12 +127,12 @@ class ThumbCache {
   /// в памяти ради работы, которая всё равно идёт по нескольку загрузок за раз.
   static const int _warmBacklog = 400;
 
-  /// Потолок фоновой очереди. Фоновые задачи ставит и прогрев библиотеки, и подгрузка окна
-  /// ленты; при быстрой прокрутке очередь росла бы до десятков тысяч записей — это и память,
-  /// и задержка для того кадра, который человек видит сейчас (фон обгонял бы его в очереди).
-  /// Упершись в потолок, новые фоновые задачи не берём: нужный кадр попросит сам видимый
-  /// ряд, а остальные подхватит следующий вызов.
-  static const int _lowLimit = 300;
+
+  /// Сколько миниатюр ещё не на диске из тех, что уже поставлены или поставятся.
+  ///
+  /// Нужно панели настроек: «в очереди» показывает только текущий хвост, а человеку важно
+  /// видеть, сколько осталось до конца прогрева.
+  int get pending => _high.length + _low.length + _running;
 
   /// Сколько раз пробовать одну миниатюру, прежде чем признать неудачу.
   static const int _attempts = 3;
@@ -155,9 +155,9 @@ class ThumbCache {
     if (file(sha) != null || _missing.contains(sha)) return Future.value();
     final existing = _waiting[sha];
     if (existing != null) return existing.future;
-    // Фоновая задача сверх потолка не ставится: видимый кадр всё равно попросит себя сам,
-    // а раздутая очередь фона только отодвигала бы его.
-    if (background && _low.length >= _lowLimit) return Future.value();
+    // Фоновые задачи НЕ отбрасываются никогда: прогрев библиотеки ставит их быстрее, чем они
+    // качаются, и раньше «лишние» просто терялись — из 51 тысячи миниатюр скачивалось две с
+    // половиной. Размер очереди регулирует сам прогрев, дожидаясь её опустошения (warmLibrary).
     final completer = Completer<void>();
     _waiting[sha] = completer;
     (background ? _low : _high).add(sha);
@@ -201,6 +201,14 @@ class ThumbCache {
       warm.value = ThumbWarmProgress(scanned: 0, total: total, running: true);
       for (var offset = 0; offset < total; offset += _warmPage) {
         if (_stopped) break;
+        // Ждём, пока очередь опустится, ДО постановки следующей страницы: иначе задачи
+        // копились бы в памяти десятками тысяч, а качались всё равно по нескольку за раз.
+        // Именно ожидание, а не отбрасывание: отброшенная задача не вернётся, и прогрев
+        // оставался неполным.
+        while (!_stopped && _waiting.length > _warmBacklog) {
+          await Future.delayed(const Duration(milliseconds: 200));
+        }
+        if (_stopped) break;
         final page = await api.mediaRange(offset, _warmPage);
         if (page.isEmpty) break;
         for (final item in page) {
@@ -210,11 +218,6 @@ class ThumbCache {
         }
         scanned += page.length;
         warm.value = ThumbWarmProgress(scanned: scanned, total: total, running: true);
-        // Придерживаем очередь: страницы идут быстрее, чем качаются миниатюры, и без этого
-        // весь список оказался бы в памяти сразу.
-        while (!_stopped && _waiting.length > _warmBacklog) {
-          await Future.delayed(const Duration(milliseconds: 200));
-        }
       }
       // Дожидаемся конца очереди: иначе полоса прогресса исчезнет с ещё идущей загрузкой.
       while (!_stopped && (_running > 0 || _waiting.isNotEmpty)) {
@@ -273,8 +276,12 @@ class ThumbCache {
         if (bytes.isEmpty) throw ApiException(0, 'empty_body', 'пустой ответ');
         await store.put(sha, bytes);
         _done++;
+        if (_done % 25 == 0) {
+          debugPrint('cloudly-thumb: скачано $_done, в очереди ${_high.length + _low.length}, слотов занято $_running');
+        }
         break;
       } on ApiException catch (e) {
+        if (e.status != 404) debugPrint('cloudly-thumb: ошибка ${sha.substring(0, 8)} — ${e.status} ${e.code}');
         if (e.status == 404) {
           _missing.add(sha);
           break;
