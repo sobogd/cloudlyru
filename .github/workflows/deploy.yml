@@ -31,6 +31,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: "Секреты, без которых прод не поднимется"
+        env:
+          ADMIN_LOGIN: ${{ secrets.ADMIN_LOGIN }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          # src/config/env.ts в проде отказывается стартовать без ADMIN_LOGIN/ADMIN_PASSWORD
+          # (иначе на пустой БД создаётся владелец admin/admin). Проверяем ДО выкладки: pm2
+          # reload с процессом, который падает на старте, — это уже недоступный сервис, а
+          # здесь деплой просто останавливается, и прод продолжает работать на прошлой версии.
+          # Значения секретов не печатаем.
+          miss=0
+          for name in ADMIN_LOGIN ADMIN_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::секрет репозитория $name не задан"
+              miss=1
+            fi
+          done
+          [ "$miss" = 0 ]
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
@@ -68,7 +86,6 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
           ADMIN_LOGIN: ${{ secrets.ADMIN_LOGIN }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
@@ -78,7 +95,7 @@ jobs:
           # то, что записано в .env (dotenv не перезаписывает уже заданные переменные).
           CONVERT_PHOTO_PARALLEL: ${{ secrets.CONVERT_PHOTO_PARALLEL || '3' }}
           # Почта. Ключ шифрования паролей аккаунтов — обязательный секрет репозитория;
-          # без него раздел работает, но аккаунт добавить нельзя (форма скажет об этом).
+          # без него раздел работает, но добавить аккаунт нельзя (ручки создания в API нет).
           MAIL_SECRET_KEY: ${{ secrets.MAIL_SECRET_KEY }}
           # Синхронизация с серверами почты. `|| 'true'` — как у CONVERT_PHOTO_PARALLEL:
           # без явного секрета берём рабочее значение, а не пустоту.
@@ -86,11 +103,21 @@ jobs:
           # Токен ручки приёма почты от своего Postfix. Ручка без сессии, поэтому токен
           # обязателен; снаружи путь ещё закрыт в nginx.
           MAIL_INBOUND_TOKEN: ${{ secrets.MAIL_INBOUND_TOKEN }}
+          # Необратимая чистка копий писем у провайдера. Раньше она работала всегда, вместе
+          # с синхронизацией; теперь это отдельный выключатель, и по умолчанию ВЫКЛЮЧЕН, чтобы
+          # разрушительная операция не оставалась включённой «сама собой». Включение/выключение
+          # идёт секретом репозитория, а не правкой .env на сервере: этот файл перезаписывается
+          # при каждом деплое.
+          MAIL_PURGE_ENABLED: ${{ secrets.MAIL_PURGE_ENABLED || 'false' }}
+          # «Только отчёт»: кандидаты на удаление отбираются и логируются, ничего не удаляется.
+          MAIL_PURGE_DRY_RUN: ${{ secrets.MAIL_PURGE_DRY_RUN || 'false' }}
+          # Потолок размера одного письма, МБ: больше — письмо пропускается с причиной в логе.
+          MAIL_MAX_MESSAGE_MB: ${{ secrets.MAIL_MAX_MESSAGE_MB || '64' }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,SESSION_SECRET,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN
+          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -117,10 +144,11 @@ jobs:
             PORT=8305
             BASE_URL=https://files.iq-factura.com
             DATABASE_URL=$DATABASE_URL
-            SESSION_SECRET=$SESSION_SECRET
             SESSION_TTL_DAYS=30
             API_TOKEN_TTL_DAYS=180
             COOKIE_NAME=cl_session
+            # Первый владелец: приложение отказывается стартовать, если пароль — дефолт,
+            # плейсхолдер CHANGE_ME* или совпадает с логином (см. src/config/env.ts)
             ADMIN_LOGIN=$ADMIN_LOGIN
             ADMIN_PASSWORD=$ADMIN_PASSWORD
             S3_FILES_ACCESS_KEY=$S3_FILES_ACCESS_KEY
@@ -162,6 +190,13 @@ jobs:
             MAIL_SYNC_INTERVAL_SEC=120
             # Токен приёма от своего SMTP-сервера (Postfix → приложение)
             MAIL_INBOUND_TOKEN=$MAIL_INBOUND_TOKEN
+            # Чистка копий писем у провайдера: по умолчанию выключена (см. комментарий выше).
+            # Включать осознанно и лучше сначала в режиме отчёта:
+            #   gh secret set MAIL_PURGE_DRY_RUN --body true   → посмотреть лог отбора
+            #   gh secret set MAIL_PURGE_ENABLED  --body true   → включить удаление
+            MAIL_PURGE_ENABLED=${MAIL_PURGE_ENABLED:-false}
+            MAIL_PURGE_DRY_RUN=${MAIL_PURGE_DRY_RUN:-false}
+            MAIL_MAX_MESSAGE_MB=${MAIL_MAX_MESSAGE_MB:-64}
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

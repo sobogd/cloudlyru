@@ -1,7 +1,7 @@
 // Проверка контракта синхронизации (M3.0/M3.1) на локальной БД без S3 и без сервера.
 //
 // Запуск (из каталога приложения, там же node_modules и собранный dist):
-//   DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
+//   DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev \
 //     node scripts/m3-sync-check.mjs
 //
 // Что проверяется: создание/перезапись записи в дереве, журнал изменений (create/update/
@@ -48,7 +48,6 @@ const s3 = {
   deleteObject: async () => {},
   copyObject: async () => {},
   putObject: async () => {},
-  presignedGet: async () => '',
   createMultipartUpload: async () => 's3-init',
   abortMultipartUpload: async () => {},
 };

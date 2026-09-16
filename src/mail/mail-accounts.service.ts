@@ -10,6 +10,12 @@ import { notFound } from '../common/errors';
  * Аккаунты заведены один раз на сервере и из приложения не редактируются: пароль приложения
  * хранится в БД зашифрованным (AES-256-GCM), в открытом виде он живёт только в памяти процесса
  * на время подключения к IMAP/SMTP и не попадает ни в ответы API, ни в логи.
+ *
+ * Провижининг — ручной и в репозитории не автоматизирован: строку `MailAccount` вставляет
+ * оператор, а в поле `secretEnc` обязана попасть строка от `encryptSecret()` из
+ * `mail-crypto.ts` (не пароль в открытом виде). Ни API, ни скрипта добавления аккаунта нет;
+ * если такой скрипт появится, он должен сам вызывать `encryptSecret()`, а не просить строку
+ * «уже зашифрованной».
  */
 
 export type MailKind = 'gmail' | 'icloud' | 'imap' | 'smtp';
@@ -36,6 +42,7 @@ export interface MailKindPreset {
   label: string;
   imapHost: string;
   imapPort: number;
+  /** Шифрование с первого байта (IMAPS, порт 993). Читается при подключении к IMAP. */
   secure: boolean;
   smtpHost: string;
   smtpPort: number;
@@ -44,6 +51,10 @@ export interface MailKindPreset {
    * Пароли приложений провайдеры показывают группами («abcd efgh ijkl mnop» у Google,
    * «abcd-efgh-ijkl-mnop» у Apple), а для входа нужны слитно. Иначе самая частая ошибка
    * выглядит как «неверный пароль» при внешне правильном.
+   *
+   * Флаг читается в `credentials()`/`smtpCredentials()`. У Gmail и iCloud это верно (у них
+   * пароль приложения — только буквы), у чужого сервера и у ключа релея (Brevo) пароль может
+   * содержать дефис осмысленно, поэтому там флаг снят.
    */
   stripSeparators: boolean;
 }
@@ -136,7 +147,14 @@ export interface MailAccountView {
   counts: { inbox: number; sent: number };
 }
 
-/** Строка аккаунта из БД (для внутреннего использования). */
+/**
+ * Строка аккаунта из БД (для внутреннего использования).
+ *
+ * Внутренний тип, а не публичный: здесь лежит `secretEnc` — шифртекст пароля. Наружу (в ответ
+ * API) отдаётся только `MailAccountView`, а секрет достаётся исключительно через
+ * `credentials()`/`smtpCredentials()`: `return account` из контроллера или `JSON.stringify`
+ * этой строки унесут шифртекст клиенту.
+ */
 export interface MailAccountRow {
   id: string;
   userId: string;
@@ -209,7 +227,7 @@ export class MailAccountsService {
 
   /** Расшифрованные данные для подключения: живут только внутри процесса синхронизации. */
   credentials(account: MailAccountRow): { login: string; password: string } {
-    return { login: account.login, password: decryptSecret(account.secretEnc) };
+    return { login: account.login, password: this.unwrapPassword(account.kind, account.secretEnc) };
   }
 
   /**
@@ -218,8 +236,17 @@ export class MailAccountsService {
    */
   smtpCredentials(account: MailAccountRow): { login: string; password: string } {
     if (account.smtpLogin && account.smtpSecretEnc) {
-      return { login: account.smtpLogin, password: decryptSecret(account.smtpSecretEnc) };
+      return { login: account.smtpLogin, password: this.unwrapPassword(account.kind, account.smtpSecretEnc) };
     }
-    return { login: account.login, password: decryptSecret(account.secretEnc) };
+    return { login: account.login, password: this.unwrapPassword(account.kind, account.secretEnc) };
+  }
+
+  /** Расшифровать секрет и, если провайдер так показывает пароль, убрать разделители. */
+  private unwrapPassword(kind: string, secretEnc: string): string {
+    const password = decryptSecret(secretEnc);
+    if (!this.presetOf(kind).stripSeparators) return password;
+    // Пробелы и дефисы в пароле приложения — только форматирование выдачи провайдера:
+    // у Gmail это «abcd efgh ijkl mnop», у Apple «abcd-efgh-ijkl-mnop».
+    return password.replace(/[\s-]+/g, '');
   }
 }

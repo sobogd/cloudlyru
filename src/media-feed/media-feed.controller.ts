@@ -35,15 +35,26 @@ export class MediaFeedController {
     return this.feed.range(user.id, Number.isFinite(off) ? off : 0, Number.isFinite(lim) ? lim : 300);
   }
 
-  /** Индекс по месяцам — для подписи у ползунка и прыжка к месяцу. */
+  /**
+   * Индекс по месяцам — для подписи у ползунка и прыжка к месяцу.
+   *
+   * `tz` — сдвиг пояса клиента в минутах на восток от UTC (Москва: `tz=180`). Месяц считается
+   * в поясе клиента, иначе кадр, снятый 01.01 в 01:30 +03:00, попадал в бакет предыдущего
+   * месяца, хотя в просмотрщике дата 01.01. Без параметра — UTC, как было до этой правки.
+   */
   @Get('months')
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
-  months(@CurrentUser() user: RequestUser) {
-    return this.feed.months(user.id);
+  months(@CurrentUser() user: RequestUser, @Query('tz') tz?: string) {
+    const tzMin = Number(tz);
+    return this.feed.months(user.id, Number.isFinite(tzMin) ? tzMin : 0);
   }
 
-  /** Статусы превью по списку записей: клиент переспрашивает только неготовые снимки. */
+  /**
+   * Статусы превью по списку записей: клиент переспрашивает только неготовые снимки.
+   * Список сверх MEDIA_STATUS_MAX обрезается (в логе предупреждение), поэтому присылать
+   * id нужно пачками не больше этого числа.
+   */
   @Post('status')
   @UseGuards(RateLimitGuard)
   @RateLimit(1200, 60_000)

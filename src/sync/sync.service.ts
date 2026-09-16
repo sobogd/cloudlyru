@@ -90,6 +90,11 @@ export class SyncService {
     //  • журнал пуст, а курсор ненулевой (всё вычищено);
     //  • курсор впереди журнала (БД восстановили из бэкапа, клиента переключили на другой
     //    инстанс) — без этого клиент залипает навсегда: новые seq меньше его курсора.
+    // resetRequired — часть контракта: получив его, клиент обязан забыть свой курсор и сделать
+    // полный проход по дереву (сняв голову /sync/head до него), а не догонять журнал дальше.
+    // Курсор впереди журнала — не ошибка данных: так бывает после восстановления БД из бэкапа
+    // или переключения клиента на другой инстанс, и без рескана он залип бы навсегда: все новые
+    // seq меньше его курсора, и «изменений нет» стало бы вечным ответом.
     const resetRequired =
       (minSeq === null && sinceN > 0n) ||
       (maxSeq !== null && sinceN > BigInt(maxSeq)) ||
@@ -148,21 +153,29 @@ export class SyncService {
     // Только живое дерево: содержимое, лежащее в корзине, «есть» не считается — иначе клиент
     // пропустил бы заливку, не создал запись в целевой папке, а после retention объект бы исчез.
     // Плюс это согласует ответ с дедуп-путём init (там тоже проверяется только живая запись).
-    const tree = await this.auth.subtreeIds(userId);
+    //
+    // Фильтр по дереву выполняется в БД одним рекурсивным CTE: раньше сюда приезжал список id
+    // всего дерева (subtreeIds), и на дереве в десятки тысяч папок первый скан телефона гнал
+    // через сеть и Postgres IN-список из десятков тысяч uuid на каждый запрос.
+    const rootId = await this.auth.rootIdOrNull(userId);
+    if (!rootId) return { present: [] };
     const assets = await this.prisma.asset.findMany({
       where: { sha256: { in: shas } },
       select: { id: true, sha256: true, size: true, mime: true },
     });
     if (!assets.length) return { present: [] };
 
-    const owned = await this.prisma.fileEntry.findMany({
-      where: {
-        assetId: { in: assets.map((a) => a.id) },
-        folderId: { in: tree },
-        deletedAt: null,
-      },
-      select: { assetId: true },
-    });
+    const owned = await this.prisma.$queryRaw<Array<{ assetId: string }>>`
+      WITH RECURSIVE tree AS (
+        SELECT f.id FROM "Folder" f WHERE f.id = ${rootId} AND f."deletedAt" IS NULL
+        UNION
+        SELECT f.id FROM "Folder" f JOIN tree ON f."parentId" = tree.id WHERE f."deletedAt" IS NULL
+      )
+      SELECT DISTINCT fe."assetId" AS "assetId"
+      FROM "FileEntry" fe
+      JOIN tree ON tree.id = fe."folderId"
+      WHERE fe."deletedAt" IS NULL AND fe."assetId" = ANY(${assets.map((a) => a.id)})
+    `;
     const ownedIds = new Set(owned.map((o) => o.assetId));
 
     return {

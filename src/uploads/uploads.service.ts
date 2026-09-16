@@ -32,6 +32,14 @@ export function firstMissingPart(received: number[], total: number): number {
 /** Принятая часть multipart: ETag отдаёт S3, клиент передаёт его серверу. */
 /** Минимальный размер части multipart в S3 (кроме последней). */
 const MIN_RELAY_PART_BYTES = 5 * 1024 * 1024;
+/** Больше частей S3 в одном multipart не принимает. */
+const MAX_PARTS = 10_000;
+/**
+ * Сессия с принятыми частями, которую не трогали столько времени, считается брошенной: её
+ * обновляет каждая принятая часть (и релей, и прямая загрузка — регистрацией ETag), поэтому
+ * «час тишины» означает, что клиент про неё забыл, а не то, что он медленно льёт.
+ */
+const IDLE_SESSION_MS = 60 * 60 * 1000;
 
 interface StoredPart {
   partNumber: number;
@@ -42,6 +50,12 @@ interface StoredPart {
 interface LiveSession {
   /** Инкрементальный sha256 — только для релея (чанки идут через сервер по порядку). */
   hash: Hash;
+  /**
+   * Покрывает ли `hash` ВЕСЬ поток байтов сессии. false — сессия продолжена после рестарта
+   * (или её начал другой процесс): хвост чанков в хэше, а начало — нет, поэтому такой хэш
+   * использовать нельзя, и `complete` считает sha256 по объекту в S3.
+   */
+  hashValid: boolean;
   /** digest() вызывается один раз, а complete может повториться (ретрай клиента) — кэшируем. */
   sha256?: string;
   /** multipart уже финализирован — повторный complete не должен финализировать снова. */
@@ -69,11 +83,31 @@ type SessionRow = {
   result: unknown;
 };
 
+/** Результат завершённой загрузки — то же, что отдаётся клиенту и лежит в сессии. */
+interface FinishResult {
+  entry: { id: string };
+  asset: { sha256: string; size: number; mime: string };
+  deduped: boolean;
+  replaced: boolean;
+  zone: string;
+}
+
 /** sha256 в нижнем регистре; всё, что не 64 hex-символа, — не хэш. */
 function normalizeSha(v: unknown): string | undefined {
   if (typeof v !== 'string') return undefined;
   const s = v.trim().toLowerCase();
   return /^[0-9a-f]{64}$/.test(s) ? s : undefined;
+}
+
+/** Машинный код ошибки из ApiError (в теле ответа лежит `code`): нужен, чтобы не глотать лишнее. */
+function errorCode(e: unknown): string | undefined {
+  const getResponse = (e as { getResponse?: () => unknown })?.getResponse;
+  if (typeof getResponse !== 'function') return undefined;
+  const res = getResponse.call(e);
+  if (res && typeof res === 'object' && typeof (res as { code?: unknown }).code === 'string') {
+    return (res as { code: string }).code;
+  }
+  return undefined;
 }
 
 /** ETag из ответа S3 приходит в кавычках; weak-префикс и пробелы не нужны. */
@@ -110,8 +144,13 @@ function storedParts(raw: unknown): StoredPart[] {
  *      считает sha256 по факту (ключ объекта content-addressed: доверять хэшу клиента нельзя,
  *      ошибка клиента отравила бы дедуп для всего хранилища), дедупит и кладёт запись в дерево.
  * Релей-путь (PUT /uploads/:id/chunks/:n — чанки через сервер) сохранён как фолбэк: он нужен
- * там, где браузер не может ходить в S3 (нет CORS и т.п.). Части в обоих путях пишутся в БД,
- * поэтому рестарт сервиса больше не убивает сессию загрузки.
+ * там, где браузер не может ходить в S3 (нет CORS и т.п.).
+ *
+ * Части в обоих путях пишутся в БД, поэтому рестарт сервиса сессию не убивает: `nextPart`
+ * считается по частям из БД, и докачка продолжается. Чего рестарт не переживает — состояние
+ * инкрементального хэша релея (оно в памяти): у продолженной после рестарта сессии хэш
+ * помечается неполным (`hashValid: false`), и `complete` пересчитывает sha256 по объекту в S3
+ * (полное чтение, как при прямой загрузке), а не доверяет хвосту потока.
  */
 @Injectable()
 export class UploadsService implements OnModuleInit, OnModuleDestroy {
@@ -174,31 +213,51 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Потолок одновременных сессий на пользователя: телефон с ретраями иначе наплодит
-   * незавершённых multipart'ов (каждый висит в S3 до очистки и держит запись в БД).
-   * Брошенные сессии сначала подчищаем — они не должны занимать лимит.
+   * Потолок одновременных НЕЗАВЕРШЁННЫХ сессий на пользователя: телефон с ретраями иначе
+   * наплодит незавершённых multipart'ов (каждый висит в S3 до очистки и держит запись в БД).
+   *
+   * Завершённые сессии (completedAt) в счёт не входят, хотя и живут ещё час: они нужны только
+   * для идемпотентного повтора `complete` и места не занимают. Раньше они попадали в подсчёт,
+   * и путь «лимит превышен» срабатывал при обычной пакетной загрузке десятков мелких файлов.
+   *
+   * Вытесняем только заведомо брошенное: сначала сессии без единой принятой части, затем —
+   * с частями, но не трогавшиеся больше часа (сессию обновляет каждая принятая часть, в том
+   * числе при загрузке прямо в S3). Живую загрузку не вытесняем никогда: раньше под нож
+   * попадала самая старая по updatedAt, то есть как раз идущая — её следующий чанк получал
+   * 404, и клиент начинал файл заново. Если вытеснять нечего, честно просим подождать.
    */
   private async assertSessionQuota(userId: string): Promise<void> {
-    let active = await this.prisma.uploadSession.count({ where: { userId } });
+    const open = { userId, completedAt: null };
+    let active = await this.prisma.uploadSession.count({ where: open });
     if (active < MAX_UPLOAD_SESSIONS_PER_USER) return;
     // Сначала убираем заведомо брошенные: сессия без единой части, о которой забыли
     // (клиент начал загрузку и не смог отправить байты — например, хранилище недоступно),
     // не должна навсегда занимать место и блокировать новые загрузки.
     await this.sweepAbandoned(userId);
     await this.sweepStale(userId);
-    active = await this.prisma.uploadSession.count({ where: { userId } });
+    active = await this.prisma.uploadSession.count({ where: open });
     if (active < MAX_UPLOAD_SESSIONS_PER_USER) return;
-    // Место всё равно занято — освобождаем принудительно, начиная с самой старой сессии:
-    // блокировать клиента насмерть хуже, чем отменить чужую брошенную загрузку (части в S3
-    // всё равно не собраны и объектом не стали).
-    const oldest = await this.prisma.uploadSession.findFirst({
-      where: { userId },
-      orderBy: { updatedAt: 'asc' },
-    });
-    if (oldest) {
-      this.logger.warn(`лимит сессий загрузки: отменяю самую старую (${oldest.name}) ради новой`);
-      await this.cleanup(oldest as SessionRow);
+    // Место всё равно занято — освобождаем принудительно, начиная с самой старой брошенной:
+    // блокировать клиента насмерть хуже, чем отменить чужую загрузку (части в S3 всё равно
+    // не собраны и объектом не стали).
+    const idleCutoff = new Date(Date.now() - IDLE_SESSION_MS);
+    const victim =
+      (await this.prisma.uploadSession.findFirst({
+        where: { ...open, partCount: 0 },
+        orderBy: { updatedAt: 'asc' },
+      })) ??
+      (await this.prisma.uploadSession.findFirst({
+        where: { ...open, updatedAt: { lt: idleCutoff } },
+        orderBy: { updatedAt: 'asc' },
+      }));
+    if (!victim) {
+      // Все незавершённые сессии обновлялись только что — значит это живые загрузки, и любая
+      // из них кому-то нужна. Отвечаем понятной ошибкой с задержкой, а не убиваем чужую работу.
+      this.logger.warn(`лимит сессий загрузки: ${active} активных, вытеснять нечего — прошу подождать`);
+      throw tooMany('слишком много незавершённых загрузок — дождитесь завершения текущих', 'too_many_uploads', 300);
     }
+    this.logger.warn(`лимит сессий загрузки: отменяю брошенную (${victim.name}) ради новой`);
+    await this.cleanup(victim as SessionRow);
   }
 
   /** Сессии без принятых частей, о которых забыли: считаем брошенными через 15 минут. */
@@ -252,6 +311,11 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     if (partNumber > total) {
       throw badRequest(`part ${partNumber} out of range — файл разбит на ${total} частей`);
     }
+  }
+
+  /** Сумма размеров уже принятых частей (неизвестные размеры считаем нулём). */
+  private receivedBytes(parts: StoredPart[]): number {
+    return parts.reduce((n, p) => n + (p.size ?? 0), 0);
   }
 
   /**
@@ -345,10 +409,16 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     // и целость: дробный size раньше падал 500'кой на BigInt(size) ниже.
     if (!Number.isInteger(size) || size < 0) throw badRequest('invalid size');
     if (size > MAX_FILE_BYTES) throw payloadTooLarge('file too large');
-    if (Math.ceil(size / DIRECT_PART_BYTES) > 10000) {
-      // S3 не принимает multipart больше 10 000 частей — это конфиг, а не ошибка клиента
+    const direct = body.mode !== 'relay' && this.s3.configured;
+    // Прямая загрузка идёт частями DIRECT_PART_BYTES, поэтому их число известно уже здесь:
+    // S3 не принимает multipart больше 10 000 частей, и упереться в это после многочасовой
+    // заливки нельзя — отвергаем сразу (это конфиг, а не ошибка клиента).
+    if (direct && Math.ceil(size / DIRECT_PART_BYTES) > MAX_PARTS) {
       throw badRequest('файл слишком велик для текущего размера части: увеличьте UPLOAD_DIRECT_PART_MB');
     }
+    // У релея размер части выбирает клиент, и на init он его не сообщает: отвергать здесь
+    // «по минимально допустимым 5 МБ» значило бы отказывать и тем, кто льёт крупными частями.
+    // Поэтому предел проверяется на первой же части — см. putChunk.
     const folderId = await this.resolveFolder(body.folderId, userId);
     // предусловие проверяем сразу: иначе клиент зальёт гигабайты, а на complete получит 409
     if (expect) await this.files.assertExpectedVersion(folderId, name, expect, { allowTrashed: replaceTrashed });
@@ -357,7 +427,6 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     // запись из корзины — своя, и клиент явно разрешил её занять
     if (!replaceTrashed) await this.files.assertNameNotInTrash(folderId, name);
     const declared = normalizeSha(body.sha256);
-    const direct = body.mode !== 'relay' && this.s3.configured;
 
     // Дедуп до передачи байтов: клиент посчитал sha256, объект с таким содержимым уже лежит
     // в S3 (и размер совпадает) — заливать нечего, создаём только запись в дереве.
@@ -416,7 +485,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    this.live.set(session.id, { hash: createHash('sha256') });
+    this.live.set(session.id, { hash: createHash('sha256'), hashValid: true });
     return {
       uploadId: session.id,
       folderId,
@@ -435,20 +504,28 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
   async status(uploadId: string, userId: string) {
     const row = await this.requireSession(uploadId, userId);
     const parts = storedParts(row.parts);
+    const received = parts.map((p) => p.partNumber);
+    // Первая НЕДОСТАЮЩАЯ часть, а не «сколько принято»: части идут параллельно, и при обрыве
+    // одной из них счётчик сдвинулся бы за дырку — клиент продолжил бы с дыркой и complete
+    // вечно отвечал бы «missing part N».
+    //
+    // Общее число частей известно только у прямой загрузки (размер части задаёт сервер). У релея
+    // размер части выбирает клиент, поэтому считаем по фактически принятым: иначе `partCount`
+    // по 16 МБ занижал бы итог, и клиент с чанками по 5 МБ получил бы nextPart, указывающий
+    // внутрь уже принятого.
+    const total = row.direct
+      ? this.partCount(Number(row.size))
+      : received.length
+        ? Math.max(...received)
+        : 0;
     return {
       uploadId,
       direct: row.direct,
       partSize: DIRECT_PART_BYTES,
       chunkMaxBytes: CHUNK_MAX_BYTES,
-      // Первая НЕДОСТАЮЩАЯ часть, а не «сколько принято»: части идут параллельно, и при обрыве
-      // одной из них счётчик сдвинулся бы за дырку — клиент продолжил бы с дыркой и complete
-      // вечно отвечал бы «missing part N».
-      nextPart: firstMissingPart(
-        parts.map((p) => p.partNumber),
-        this.partCount(Number(row.size)),
-      ),
+      nextPart: firstMissingPart(received, total),
       receivedParts: parts.length,
-      parts: parts.map((p) => p.partNumber),
+      parts: received,
       size: Number(row.size),
       name: row.name,
       folderId: row.folderId,
@@ -473,7 +550,13 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  /** ETag части, залитой клиентом прямо в S3 (сервер — источник истины по частям). */
+  /**
+   * ETag части, залитой клиентом прямо в S3 (сервер — источник истины по частям).
+   *
+   * `size` клиент сообщает сам, в S3 за него не смотрим: по этим размерам `complete` проверяет,
+   * что части покрывают объявленный размер файла (раньше ошибка всплывала только после сборки
+   * multipart — «в S3 N байт, ожидалось M», уже потеряв всю заливку).
+   */
   async registerPart(
     uploadId: string,
     partNumber: number,
@@ -486,6 +569,11 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     this.assertPartNumber(Number(row.size), partNumber);
     const clean = normalizeEtag(etag);
     if (!clean) throw badRequest('etag required');
+    // Часть залита в S3 мимо сервера: инкрементальный хэш релея после этого покрывает не весь
+    // поток, и sha256 по нему считаться не должен (см. hashValid). Для прямой сессии хэш и так
+    // не ведётся — там sha256 всегда считается по объекту.
+    const live = this.live.get(uploadId);
+    if (live && !row.direct) live.hashValid = false;
     const parts = await this.savePart(row, {
       partNumber,
       etag: clean,
@@ -494,24 +582,54 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     return { uploadId, partNumber, receivedParts: parts.length, parts: parts.map((p) => p.partNumber) };
   }
 
-  /** Чанк через сервер (фолбэк, если браузер не может ходить в S3). Части строго по порядку. */
+  /**
+   * Чанк через сервер (фолбэк, если браузер не может ходить в S3). Части строго по порядку.
+   *
+   * Состояние инкрементального хэша живёт в памяти, поэтому после рестарта (деплой, pm2 reload,
+   * OOM) продолжить релей «как раньше» нельзя: раньше такой чанк получал 409
+   * `upload_session_lost` и клиент начинал файл заново. Теперь сессию продолжает новый
+   * LiveSession с `hashValid: false` — части из БД на месте (докачка с `nextPart` работает), а
+   * `complete` пересчитывает sha256 по объекту в S3, не доверяя хэшу хвоста.
+   */
   async putChunk(uploadId: string, partNumber: number, chunk: Buffer, userId: string) {
     if (chunk.length > CHUNK_MAX_BYTES) throw payloadTooLarge('chunk too large');
     const row = await this.requireSession(uploadId, userId);
     this.assertNotCompleted(row);
+    const size = Number(row.size);
+    if (partNumber > MAX_PARTS) {
+      throw badRequest(`part ${partNumber} out of range — S3 принимает не больше ${MAX_PARTS} частей`);
+    }
+    const before = storedParts(row.parts);
+    const uploaded = this.receivedBytes(before);
+    // «Последняя ли это часть» считается по достигнутому объёму, а не по partCount(DIRECT_PART_BYTES):
+    // клиент релея сам выбирает размер чанка, и по константе сервера его короткий хвост выглядел
+    // не последней частью — загрузка падала на «часть N меньше 5 МБ» уже в самом конце.
+    const isLast = uploaded + chunk.length >= size;
     // S3 требует не меньше 5 МБ на часть, кроме последней: иначе complete падал бы 500'кой
-    if (partNumber < this.partCount(Number(row.size)) && chunk.length < MIN_RELAY_PART_BYTES) {
+    if (!isLast && chunk.length < MIN_RELAY_PART_BYTES) {
       throw badRequest(`часть ${partNumber} меньше 5 МБ — S3 такую не примет`);
     }
-
-    const live = this.live.get(uploadId);
-    if (!live) {
-      throw conflict('upload session expired (server restart) — re-init upload', 'upload_session_lost');
+    // Предел S3 — 10 000 частей на multipart. Размер части релея выбирает клиент, поэтому
+    // ловим несовместимость на ПЕРВОЙ же части (а не на complete после многочасовой заливки):
+    // при таких чанках частей выйдет больше предела, и собрать файл не получится вообще.
+    // Короткий последний чанк не проверяем — по нему оценка числа частей была бы завышена.
+    if (!isLast && chunk.length > 0 && Math.ceil(size / chunk.length) > MAX_PARTS) {
+      throw badRequest(
+        `части по ${chunk.length} байт дадут больше ${MAX_PARTS} частей, а S3 столько не принимает: ` +
+          `льёте частями от ${Math.ceil(size / MAX_PARTS)} байт`,
+      );
     }
-    const expected = storedParts(row.parts).length + 1;
+
+    const live = this.live.get(uploadId) ?? this.resumeRelay(uploadId, before.length);
+    const expected = before.length + 1;
     if (partNumber < expected) {
       // идемпотентность: повторный/дублирующийся чанк — считаем успешным
-      return { uploadId, nextPart: expected, duplicate: true };
+      return {
+        uploadId,
+        nextPart: expected,
+        duplicate: true,
+        receivedBytes: uploaded,
+      };
     }
     if (partNumber > expected) {
       throw badRequest(`missing part ${expected} (got ${partNumber}) — upload out of order`);
@@ -519,10 +637,37 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
 
     const etag = await this.s3.uploadPart(row.uploadKey, row.s3UploadId, partNumber, chunk);
     live.hash.update(chunk);
-    await this.savePart(row, { partNumber, etag, size: chunk.length });
-    return { uploadId, nextPart: partNumber + 1, receivedBytes: partNumber * chunk.length };
+    const parts = await this.savePart(row, { partNumber, etag, size: chunk.length });
+    // receivedBytes — объём принятого, а не «номер части × длину последнего чанка»: чанки
+    // бывают разного размера (последний короче), и от такого умножения клиент показывал
+    // прогресс больше файла или врал на многогигабайтной загрузке.
+    return { uploadId, nextPart: partNumber + 1, receivedBytes: this.receivedBytes(parts) };
   }
 
+  /**
+   * Сессия релея после рестарта процесса: части лежат в БД, а инкрементального хэша нет.
+   * Заводим новый и помечаем его неполным — `complete` по такому хэшу sha256 не считает.
+   */
+  private resumeRelay(uploadId: string, alreadyParts: number): LiveSession {
+    const live: LiveSession = { hash: createHash('sha256'), hashValid: false };
+    this.live.set(uploadId, live);
+    this.logger.warn(
+      `сессия загрузки ${uploadId} продолжена после рестарта (частей уже ${alreadyParts}): ` +
+        'инкрементальный хэш потерян, sha256 будет пересчитан по объекту в S3',
+    );
+    return live;
+  }
+
+  /**
+   * Собрать загрузку: объект в S3 → запись в дереве.
+   *
+   * Повторный вызов идемпотентен (и это часть контракта: клиент на плохой сети повторяет
+   * `complete` после потерянного ответа) — пока `finish` не отработал, tmp-объект остаётся
+   * на месте, поэтому повтор проходит по тому же пути, а не упирается в «объекта нет в S3».
+   * Дорогая часть повтора — sha256: он считается полным чтением объекта из S3 (см. шаг 3),
+   * это осознанная цена за то, что ключ объекта content-addressed и доверять хэшу клиента
+   * нельзя (для 50 ГБ это десятки минут трафика из бакета).
+   */
   async complete(uploadId: string, userId: string, body: { sha256?: unknown } = {}) {
     const row = await this.requireSession(uploadId, userId);
     // повторный complete (ретрай после потерянного ответа) — отдаём тот же результат
@@ -541,6 +686,17 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       if (parts[i].partNumber !== i + 1) {
         throw badRequest(`missing part ${i + 1} — загрузка неполная`);
       }
+    }
+    // Сумму зарегистрированных размеров сверяем ДО финализации: клиент заявляет размер части
+    // сам, и если он меньше факта, ошибка иначе всплывёт только после сборки multipart в S3
+    // («в S3 N байт, ожидалось M» — уже потратив всю заливку). Недобор — отказ сразу, с числом
+    // недостающих байт; перебор оставляем проверке размера по факту (шаг 2), чтобы объявленный
+    // клиентом размер не мог отвергнуть корректную загрузку.
+    const declaredBytes = this.receivedBytes(parts);
+    if (!emptyWithoutParts && parts.every((p) => (p.size ?? 0) > 0) && declaredBytes < size) {
+      throw badRequest(
+        `части покрывают ${declaredBytes} байт из ${size} — не хватает ${size - declaredBytes}, загрузка неполная`,
+      );
     }
 
     // 1. Собираем объект. Повторный complete (сетевой ретрай клиента или рестарт сервиса
@@ -568,6 +724,8 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     //    headObject отдельно от objectSize: у отсутствующего объекта размер тоже 0,
     //    и пустой файл (size 0) прошёл бы сверку, вообще не доехав до S3.
     if (!(await this.s3.headObject(row.uploadKey))) {
+      const replayed = await this.replayFinish(row);
+      if (replayed) return replayed;
       await this.cleanup(row);
       throw badRequest('объекта нет в S3 — загрузка неполная');
     }
@@ -581,10 +739,13 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     //    не видел — считаем хэш по объекту в S3. Ключ content-addressed, поэтому заявленный
     //    клиентом хэш только проверяется, но никогда не используется «на веру».
     const claimed = normalizeSha(body.sha256) ?? normalizeSha(row.declaredSha256);
-    // Инкрементальный хэш верен только для релея: при прямой загрузке сервер байтов не видел,
-    // и digest() отдал бы sha256 пустого буфера — тогда файл получил бы чужое содержимое
-    // (или отравил бы дедуп), если клиент не объявил sha256.
-    let sha256 = live?.sha256 ?? (row.direct ? undefined : live?.hash.digest('hex'));
+    // Инкрементальный хэш верен только для релея, который шёл в этом же процессе целиком
+    // (hashValid): при прямой загрузке сервер байтов не видел и digest() отдал бы sha256
+    // пустого буфера, а у продолженной после рестарта сессии хэш покрывает только хвост —
+    // в обоих случаях sha256 считается по объекту в S3, иначе файл получил бы чужое
+    // содержимое и отравил бы дедуп для всего хранилища.
+    const incremental = !row.direct && live?.hashValid !== false ? live?.hash.digest('hex') : undefined;
+    let sha256 = live?.sha256 ?? (row.direct ? undefined : incremental);
     if (live && sha256) live.sha256 = sha256;
     if (!sha256 || (claimed && claimed !== sha256)) {
       const computed = await this.s3.hashObject(row.uploadKey);
@@ -611,7 +772,6 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
       }
       assetId = await this.files.ensureAsset(sha256, size, mime, this.extOf(row.name));
     }
-    await this.s3.deleteObject(row.uploadKey).catch(() => undefined);
 
     const done = await this.finish({
       userId,
@@ -631,6 +791,12 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
           : { sha256: row.expectedSha256, updatedAt: row.expectedUpdatedAt },
     });
 
+    // tmp-объект убираем ТОЛЬКО после успешного finish: если запись в дерево упала
+    // (конфликт версий, гонка в БД, ошибка Prisma), повторный complete должен пройти тот же
+    // путь и завершиться успехом — а не ответить «объекта нет в S3» и удалить сессию, потеряв
+    // уже залитые байты (они лежат под finalKey, но клиент по такому ответу начинает заново).
+    await this.s3.deleteObject(row.uploadKey).catch(() => undefined);
+
     // сессию не удаляем: сохраняем результат, чтобы ретрай complete был идемпотентным
     await this.prisma.uploadSession.update({
       where: { id: uploadId },
@@ -644,6 +810,41 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     const row = await this.requireSession(uploadId, userId);
     await this.cleanup(row);
     return { ok: true };
+  }
+
+  /**
+   * Повтор complete, когда tmp-объекта уже нет, а сессия ещё жива: значит предыдущий вызов
+   * успел собрать объект и записать запись в дерево, но не успел отметить сессию завершённой
+   * (обрыв на последнем запросе, ошибка БД). Отдаём тот же результат, а не «загрузка
+   * неполная»: иначе клиент по контракту начинает файл заново, хотя он уже в облаке.
+   *
+   * Запись ищем по паре (папка, имя) и требуем совпадения sha256 с объявленным клиентом: без
+   * объявленного хэша отличить свою запись от чужой одноимённой нельзя, и тогда отвечаем как
+   * раньше — «объекта нет в S3». Сессию при этом ещё не удалял cleanup (tmp пропал после
+   * успешного finish), поэтому путать этот случай с «загрузку отменили» не приходится.
+   */
+  private async replayFinish(row: SessionRow): Promise<FinishResult | null> {
+    const declared = normalizeSha(row.declaredSha256);
+    if (!declared) return null;
+    const folderId = row.folderId ?? (await this.auth.rootFolderId(row.userId));
+    const existing = await this.prisma.fileEntry.findFirst({
+      where: { folderId, name: row.name, deletedAt: null },
+      include: { asset: { select: { sha256: true, size: true, mime: true } } },
+    });
+    if (!existing || existing.asset.sha256 !== declared) return null;
+    const done: FinishResult = {
+      entry: { id: existing.id },
+      asset: { sha256: declared, size: Number(existing.asset.size), mime: existing.asset.mime },
+      deduped: true,
+      replaced: Boolean(row.replace),
+      zone: existing.zone,
+    };
+    await this.prisma.uploadSession
+      .update({ where: { id: row.id }, data: { completedAt: new Date(), result: done as unknown as Prisma.InputJsonValue } })
+      .catch(() => undefined);
+    this.live.delete(row.id);
+    this.logger.warn(`complete ${row.id}: tmp-объекта нет, но запись уже в дереве — отдаю результат прошлого вызова`);
+    return done;
   }
 
   /**
@@ -664,13 +865,7 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
     restoreDeleted?: boolean;
     clientMtime?: Date | null;
     expect?: { sha256?: string | null; updatedAt?: Date | null };
-  }): Promise<{
-    entry: { id: string };
-    asset: { sha256: string; size: number; mime: string };
-    deduped: boolean;
-    replaced: boolean;
-    zone: string;
-  }> {
+  }): Promise<FinishResult> {
     const folderId = params.folderId ?? (await this.auth.rootFolderId(params.userId));
     let entry: { id: string; deduped: boolean; zone: string; replaced: boolean };
     try {
@@ -683,11 +878,15 @@ export class UploadsService implements OnModuleInit, OnModuleDestroy {
         asset: { sha256: params.sha256, size: params.size, mime: params.mime },
       });
     } catch (e) {
-      // повторный complete (после сетевого ретрая) — запись уже создана, это успех
+      // Успехом считаем ТОЛЬКО повторный complete, то есть конфликт имени, когда рядом уже
+      // лежит живая запись с тем же содержимым. Раньше здесь глоталась любая ошибка, если
+      // такая запись находилась: расхождение версий (`stale_version`) и запись из корзины
+      // (`in_trash`) превращались в «успех с replaced: false», и клиент синхронизации молча
+      // получал не то, что просил («замени версию X» — а версия другая).
       const existing = await this.prisma.fileEntry.findFirst({
         where: { folderId, name: params.name, deletedAt: null },
       });
-      if (existing && existing.assetId === params.assetId) {
+      if (errorCode(e) === 'conflict' && params.expect === undefined && existing?.assetId === params.assetId) {
         entry = { id: existing.id, deduped: true, zone: existing.zone, replaced: false };
       } else {
         throw e;

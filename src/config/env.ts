@@ -5,17 +5,44 @@ const booleanish = z
   .optional()
   .transform((v) => v === undefined || v === '' || v === 'true' || v === '1');
 
+/**
+ * «Выключатель», который остаётся СТРОКОЙ 'true'/'false'. Так сделано потому, что потребители
+ * сравнивают его именно со строкой (`src/queue/queue.service.ts`): boolean здесь молча выключил
+ * бы конвертацию навсегда, потому что `false !== 'true'`. Значение '1' понимаем наравне с 'true'
+ * — как это делают booleanish-настройки (MAIL_SYNC_ENABLED, KEEP_ORIGINALS); раньше '1' молча
+ * означал «выключено». Пустая строка остаётся «выключено» (в отличие от booleanish, где пусто =
+ * «не задано»): инвертировать смысл пустого значения на проде никто не просил, а включить
+ * конвертацию там, где бинарей может не быть, — худший сюрприз.
+ */
+const boolString = (def: 'true' | 'false') =>
+  z
+    .string()
+    .optional()
+    .transform((v) => (v === 'true' || v === '1' ? 'true' : 'false'))
+    .default(def);
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8305),
   BASE_URL: z.string().url().default('http://127.0.0.1:8305'),
   DATABASE_URL: z.string().min(1),
-  SESSION_SECRET: z.string().min(16).default('dev-only-secret-change-me'),
+  // Отдельного секрета для сессий здесь нет намеренно: сессия — это 32 случайных байта, а в БД
+  // лежит их sha256 (auth.service), подписывать нечего. Переменная SESSION_SECRET стояла тут,
+  // в .env.example и в деплое, но код не читал её ни разу — деплой при этом выглядел так, будто
+  // сессии защищены ключом. Если однажды понадобится подписанная cookie, секрет заводится
+  // вместе с кодом, который его читает, а не заранее.
   SESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
   // Срок жизни app-токена (WebDAV/клиенты), дней. Раньше токены были бессрочными.
   API_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(180),
   COOKIE_NAME: z.string().default('cl_session'),
 
+  // Своя ручка уровня логирования: по умолчанию в проде нужны только события и ошибки, а
+  // 'debug'/'verbose' (в том числе полный лог запросов) включаются на время разбора.
+  LOG_LEVEL: z.enum(['error', 'warn', 'log', 'debug', 'verbose']).default('log'),
+
+  // Дефолты 'admin'/'admin' — только для локального запуска и тестов: в проде они запрещены
+  // проверкой в load() ниже, потому что на пустой БД первый владелец создаётся именно этим
+  // паролем (AuthService.onModuleInit).
   ADMIN_LOGIN: z.string().default('admin'),
   ADMIN_PASSWORD: z.string().min(1).default('admin'),
 
@@ -32,8 +59,10 @@ const envSchema = z.object({
   S3_FILES_FORCE_PATH_STYLE: booleanish.default('true'),
 
   UPLOAD_CHUNK_MAX_MB: z.coerce.number().positive().default(20),
-  // Размер части при прямой загрузке в S3 (браузер → S3 мимо сервера). Части идут
-  // параллельно, поэтому крупная часть = меньше round-trip'ов на высоком пинге.
+  // Размер части при прямой загрузке в S3 (клиент → S3 мимо сервера). Клиент шлёт части
+  // последовательно, поэтому крупная часть = меньше round-trip'ов на высоком пинге, но больше
+  // памяти на клиенте и дольше повтор одной части. Значение уходит клиенту в `chunkMaxBytes`
+  // при `init`, поэтому сервер и клиент всегда считают части одинаково.
   UPLOAD_DIRECT_PART_MB: z.coerce.number().positive().default(16),
   // Срок жизни presigned-ссылки на часть, минуты.
   UPLOAD_PART_URL_TTL_MIN: z.coerce.number().positive().default(15),
@@ -43,7 +72,7 @@ const envSchema = z.object({
   MAX_UPLOAD_SESSIONS_PER_USER: z.coerce.number().int().positive().default(16),
   TRASH_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
 
-  CONVERT_ENABLED: z.string().default('false'),
+  CONVERT_ENABLED: boolString('false'),
   // Лимит виртуальной памяти (RLIMIT_AS) на один внешний процесс задачи. Это именно адресное
   // пространство, а не RSS: libaom резервирует арены на потоки, и на 1536 МБ процесс упирался
   // в потолок при реальных ~0.5 ГБ (VmPeak = 99.6% лимита) — то есть лимит давил не на память,
@@ -73,7 +102,7 @@ const envSchema = z.object({
   ),
   // Пускать видео параллельно фото. По умолчанию нет: AV1 занимает все ядра, и фото рядом
   // с ним идут в разы медленнее. Имеет смысл на машине с большим числом ядер.
-  CONVERT_VIDEO_ALONGSIDE_PHOTOS: z.string().default('false'),
+  CONVERT_VIDEO_ALONGSIDE_PHOTOS: boolString('false'),
   // Хранить оригинал в S3 после успешной конвертации (по умолчанию — да).
   // Оригинал нужен, чтобы пересобрать мастер с лучшими параметрами/метаданными:
   // сами метаданные (ICC, gain map, MPF, MakerNotes) после конвертации невосстановимы.
@@ -82,8 +111,7 @@ const envSchema = z.object({
   // ===== Почта =====
   // Ключ шифрования паролей почтовых аккаунтов (AES-256-GCM). Годится и hex на 64 символа
   // (openssl rand -hex 32), и любая строка-парольная фраза — тогда ключ выводится sha256.
-  // Сами app-пароли в окружении не живут: их вводят в веб-интерфейсе, и они ложатся в БД
-  // зашифрованными этим ключом.
+  // Сами app-пароли в окружении не живут: они ложатся в БД зашифрованными этим ключом.
   MAIL_SECRET_KEY: z.string().default(''),
   // Токен ручки приёма почты от своего SMTP-сервера. Ручка без сессии (её дёргает Postfix),
   // поэтому единственная защита — этот токен плюс запрет пути в nginx. Пусто — приём закрыт.
@@ -99,8 +127,18 @@ const envSchema = z.object({
   // Сколько писем истории добирать за один проход. У Gmail лимит на скачивание по IMAP
   // (порядка 2.5 ГБ в сутки на аккаунт), поэтому история идёт порциями, а не залпом.
   MAIL_BACKFILL_PER_PASS: z.coerce.number().int().positive().default(200),
-  // Потолок трафика одного прохода, МБ: предохранитель от «одна папка на 40 ГБ».
+  // Потолок трафика на ОДНУ папку, МБ. Счётчик заводится внутри обхода папки, а не перед
+  // обходом всех, поэтому фактический потолок прохода — это значение, умноженное на число
+  // папок и аккаунтов; для Gmail с его суточным лимитом на скачивание это важно помнить.
+  // Потолок «на проход/аккаунт» требует счётчика в src/mail — там же, где заводится budget.
   MAIL_PASS_BUDGET_MB: z.coerce.number().positive().default(300),
+
+  // Лимит по умолчанию для ручек, которые не помечены @RateLimit, запросов в минуту на IP.
+  // Гард частоты глобальный именно из-за отсутствия такого потолка у целых разделов
+  // (файлы, WebDAV, /apk). Значение заведомо выше рабочих лимитов существующих ручек
+  // (самый щедрый из явных — 3000/мин у превью), а 0 полностью выключает дефолт и
+  // оставляет только явные @RateLimit: это аварийный выход, если лимит кому-то помешает.
+  RATE_LIMIT_DEFAULT_PER_MIN: z.coerce.number().int().nonnegative().default(1200),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -113,19 +151,50 @@ function load(): Env {
     throw new Error('Invalid environment configuration');
   }
   const e = parsed.data;
+  // Политика проверок намеренно узкая: в проде обязательны ключи S3 (без них не работает всё
+  // остальное: файлы, фото, вложения писем — сервис мёртв целиком) и учётные данные первого
+  // владельца. DATABASE_URL дефолта не имеет: без неё приложение не поднимется нигде.
   if (e.NODE_ENV === 'production') {
     const missing: string[] = [];
     if (!e.S3_FILES_ACCESS_KEY) missing.push('S3_FILES_ACCESS_KEY');
     if (!e.S3_FILES_SECRET_KEY) missing.push('S3_FILES_SECRET_KEY');
+    // ADMIN_LOGIN/ADMIN_PASSWORD обязательны именно в проде: на пустой БД первый владелец
+    // создаётся из этих значений (AuthService.onModuleInit), а /auth/login — публичная ручка
+    // с лимитом лишь 5 попыток в минуту на IP. Дефолтная пара admin/admin означала бы, что
+    // сервис открыт любому, кто знает адрес, и смены пароля в приложении для этого нет.
+    // Проверяем сам процесс (process.env), а не результат схемы: иначе не отличить «владелец
+    // задал admin» от «ничего не задал и сработал дефолт».
+    if (!process.env.ADMIN_LOGIN?.trim()) missing.push('ADMIN_LOGIN');
+    if (!process.env.ADMIN_PASSWORD?.trim()) missing.push('ADMIN_PASSWORD');
     if (missing.length) {
       throw new Error(`[env] production требует: ${missing.join(', ')}`);
+    }
+    // Фатально только то, что небезопасно при любом раскладе: дефолт, плейсхолдер из шаблона
+    // и пароль, равный логину (такой «секрет» виден из одного поля). Длину отдельно НЕ требуем:
+    // владелец мог давно поставить короткий пароль, и отказ старта на нём означал бы, что
+    // следующий деплой не поднимается вовсе. Вместо этого — заметное предупреждение в лог.
+    const password = e.ADMIN_PASSWORD.trim();
+    const looksPlaceholder = password.toLowerCase().startsWith('change_me');
+    if (password.toLowerCase() === 'admin' || looksPlaceholder || password === e.ADMIN_LOGIN.trim()) {
+      throw new Error(
+        '[env] production: ADMIN_PASSWORD — дефолт, плейсхолдер или совпадает с ADMIN_LOGIN. ' +
+          'Задайте пароль секретом репозитория ADMIN_PASSWORD и перезапустите сервис.',
+      );
+    }
+    if (password.length < 12) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[env] ВНИМАНИЕ: ADMIN_PASSWORD короче 12 символов. Вход ограничен 5 попытками в минуту ' +
+          'на IP и пароль перебирается по словарю — смените его на длинный и случайный.',
+      );
     }
     // Ключа почты в этом списке намеренно нет. Сначала здесь был отказ старта (пароли
     // аккаунтов негде хранить — значит, работать нельзя), но у этого решения цена выше
     // пользы: без ключа падал бы весь сервис, включая файлы и фото, из-за раздела, который
     // сам по себе необязательный. Поэтому деградируем: синхронизация не запустится
-    // (MailSyncService это проверяет и пишет в лог), а форма добавления аккаунта честно
-    // скажет, чего не хватает.
+    // (MailSyncService это проверяет и пишет в лог), а добавить аккаунт сейчас можно только
+    // вручную в БД — ручки создания аккаунта в API нет (см. src/mail: encryptSecret не
+    // вызывается ниоткуда).
     if (e.MAIL_SYNC_ENABLED && !e.MAIL_SECRET_KEY) {
       // eslint-disable-next-line no-console
       console.error(
@@ -144,6 +213,8 @@ export const DIRECT_PART_BYTES = Math.floor(env.UPLOAD_DIRECT_PART_MB * 1024 * 1
 export const PART_URL_TTL_SEC = Math.floor(env.UPLOAD_PART_URL_TTL_MIN * 60);
 export const MAX_FILE_BYTES = Math.floor(env.MAX_FILE_SIZE_MB * 1024 * 1024);
 export const CONVERT_MAX_BYTES = Math.floor(env.CONVERT_MAX_MB * 1024 * 1024);
+// Осознанный псевдоним той же настройки: код, который работает с байтами и потолками, берёт
+// их из этого файла, а не через env.*, — значение одно, отдельной переменной окружения нет.
 export const MAX_UPLOAD_SESSIONS_PER_USER = env.MAX_UPLOAD_SESSIONS_PER_USER;
 export const TRASH_RETENTION_MS = env.TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 

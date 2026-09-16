@@ -33,10 +33,50 @@ export class AuthController {
     return { user: result.user };
   }
 
+  /**
+   * Выход. Cookie чистится ВСЕГДА, даже если сессии в БД уже нет: иначе мёртвая cookie
+   * живёт в браузере ещё 30 дней, а `AuthGuard` смотрит cookie первой и до Bearer не
+   * доходит — все запросы получают 401, и повторный вход по токену недостижим.
+   *
+   * Ручка публичная намеренно: иначе при мёртвой сессии `AuthGuard` отвечает 401 и до
+   * `clearCookie` дело не доходит вовсе — то есть выйти и избавиться от просроченной cookie
+   * было бы нельзя. Опасного здесь ничего нет: без валидного токена метод ничего не удаляет,
+   * а POST от чужого сайта отсекает OriginGuard (проверка Origin/Referer/Sec-Fetch-Site).
+   */
+  @Public()
   @HttpCode(200)
   @Post('logout')
-  async logout(@Req() req: Request) {
-    return this.auth.logout(String(req.cookies?.[env.COOKIE_NAME] ?? ''));
+  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    const result = await this.auth.logout(String(req.cookies?.[env.COOKIE_NAME] ?? ''), req.ip);
+    res.clearCookie(env.COOKIE_NAME, {
+      httpOnly: true,
+      secure: env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+    });
+    return result;
+  }
+
+  /**
+   * Смена пароля владельца: только веб-сессия (у device-токена нет пароля, а смена пароля
+   * из украденного токена — это захват аккаунта). Гасит все прочие сессии: смысл смены
+   * пароля в том числе в том, чтобы выкинуть того, кто мог войти со старым.
+   */
+  @SessionOnly()
+  @HttpCode(200)
+  @Post('password')
+  changePassword(
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: RequestUser,
+    @Req() req: Request,
+  ) {
+    return this.auth.changePassword(
+      user.id,
+      body.currentPassword,
+      body.newPassword,
+      String(req.cookies?.[env.COOKIE_NAME] ?? ''),
+      req.ip,
+    );
   }
 
   @Get('me')
@@ -56,6 +96,9 @@ export class AuthController {
     return this.auth.createToken(user.id, label);
   }
 
+  // Список токенов — тоже только веб-сессия: метки, scope и даты всех устройств не должен
+  // видеть сам device-токен (по нему видно, сколько устройств и когда ими пользовались).
+  @SessionOnly()
   @Get('tokens')
   listTokens(@CurrentUser() user: RequestUser) {
     return this.auth.listTokens(user.id);

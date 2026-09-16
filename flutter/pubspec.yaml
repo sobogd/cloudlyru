@@ -40,8 +40,6 @@ dependencies:
   flutter_riverpod: ^3.4.3
   shared_preferences: ^2.5.5
   intl: ^0.20.3
-  freezed_annotation: ^3.1.0
-  json_annotation: ^4.12.0
   dio_cookie_manager: ^3.5.0
   cookie_jar: ^4.0.9
   cached_network_image: ^4.0.0
@@ -62,18 +60,27 @@ dependencies:
   flutter_secure_storage: ^11.1.1
 
 dev_dependencies:
-  flutter_test:
-    sdk: flutter
-
+  # Тестов в проекте нет намеренно (решение владельца): `flutter_test` и каталог `test/`
+  # удалены, шаг `flutter test` убран из `.github/workflows/android.yml`. Остаётся
+  # `flutter analyze` — он в проекте обязателен и должен быть чистым.
+  #
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
-  build_runner: ^2.16.1
-  freezed: ^4.0.1
-  json_serializable: ^6.14.1
+
+  # Генераторов кода здесь нет намеренно: модели (`lib/api/models.dart`) написаны руками,
+  # и `freezed`/`json_serializable` были объявлены, но не использовались ни одним файлом —
+  # ни одного `part '*.g.dart'`, ни одной аннотации. Мёртвые зависимости убраны, чтобы
+  # `pubspec.yaml` не обещал того, чего в коде нет (в `FLUTTER.md` строка про
+  # «freezed + json_serializable» осталась — её правит владелец документа).
+  #
+  # Если генераторы всё же понадобятся, порядок такой: сначала `json_serializable`
+  # с конвертерами (число строкой, отсутствующее обязательное поле — сейчас хелперы `JsonX`
+  # подставляют дефолты, а генератор по умолчанию на этом упадёт), потом `freezed` ради
+  # `copyWith`/`==`. Вместе с `build_runner`.
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

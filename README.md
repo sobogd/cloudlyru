@@ -14,11 +14,15 @@ SHA-256 (одинаковое содержимое не дублируется),
 | `src/` | API (NestJS + Prisma): авторизация, файлы и папки, загрузки (в том числе частями прямо в S3), превью и конвертация медиа, корзина, WebDAV, журнал изменений для клиентов |
 | `flutter/` | Мобильное приложение (Flutter, Android): файлы, почта, медиа, карта, корзина, настройки и синхронизация папок телефона |
 | `deploy/` | nginx-конфиг, pm2-процесс, серверные скрипты (бэкап БД, уборка сирот в бакете) |
-| `scripts/` | Утилиты: публикация APK, локальные проверки контрактов и медиа-метаданных |
+| `scripts/` | Утилиты: публикация APK, локальные проверки контрактов и медиа-метаданных, backfill'ы метаданных, выгрузка Google Takeout |
 | `prisma/` | Схема БД и миграции |
 
 Веб-клиента и нативного Android-клиента в проекте больше нет: браузерных страниц сервер не
 отдаёт вовсе, единственный клиент — приложение из `flutter/`.
+
+Раздел «Медиа» — не вся зона «Фото», а ровно то, у чего есть строка `MediaMeta` (её заводит
+разбор метаданных для любого `image/*` и `video/*`). PDF, архивы и прочее в ленту не попадают
+вовсе, BMP/JXL попадают без превью (`previewState = 'impossible'`); всё это видно в «Файлах».
 
 Документация: [`DEPLOY.md`](DEPLOY.md) — деплой и эксплуатация, [`FLUTTER.md`](FLUTTER.md) —
 как устроено и почему так сделано мобильное приложение, [`PLAN.md`](PLAN.md) — план развития
@@ -28,7 +32,7 @@ SHA-256 (одинаковое содержимое не дублируется),
 
 ```bash
 pnpm install
-cp .env.example .env          # DATABASE_URL, SESSION_SECRET, ADMIN_PASSWORD; ключи S3 — по желанию
+cp .env.example .env          # DATABASE_URL, ADMIN_LOGIN/ADMIN_PASSWORD; ключи S3 — по желанию
 pnpm exec prisma migrate deploy
 pnpm build && pnpm start      # http://127.0.0.1:8305
 ```
@@ -48,7 +52,9 @@ pnpm build && pnpm start      # http://127.0.0.1:8305
 
 **Скачать приложение: <https://files.iq-factura.com/apk>** — ссылка постоянная и всегда
 отдаёт последнюю опубликованную сборку. Версию, размер и sha256 этой сборки отдаёт
-`GET /api/v1/app/android` (там же — `published: false`, если сборки ещё нет).
+`GET /api/v1/app/android`; если сборки ещё нет (или рядом с APK нет описания `latest.json`),
+ручка отвечает 404 с кодом `no_release`. Состояние публикации видно и без авторизации:
+`GET /apk/version` → `{published: true, …}` либо `{published: false[, fileAvailable: true]}`.
 
 В приложении есть «Проверить обновление» (проверяется и само при старте): если на сервере
 лежит сборка с большим `versionCode`, появляется карточка с кнопкой **«Обновить»** — она
@@ -64,8 +70,9 @@ pnpm build && pnpm start      # http://127.0.0.1:8305
 
 1. Поднять `versionCode` (и `versionName`) в `flutter/pubspec.yaml` (`version: 1.0.0+45`).
 2. Push в `main`, если менялся `flutter/**` (или `gh workflow run android.yml`).
-3. GitHub Actions (`.github/workflows/android.yml`) прогоняет юнит-тесты, собирает
-   подписанный релиз и публикует его в релизный артефакт S3 — `/apk` сразу отдаёт новую сборку.
+3. GitHub Actions (`.github/workflows/android.yml`) собирает подписанный релиз и публикует его
+   в релизный артефакт S3 — `/apk` сразу отдаёт новую сборку. Тестов в проекте нет: перед
+   выпуском прогоняется `flutter analyze`, а работу приложения проверяет владелец на телефоне.
 
 Если `versionCode` не поднят, шаг публикации падает с понятным сообщением: сборка с тем же
 номером не появится в приложении как обновление, а тихо подменять файл по ссылке — значит
@@ -92,14 +99,10 @@ flutter build apk --release
 ## Проверки
 
 ```bash
-pnpm build                                                 # сервер компилируется
-cd flutter && flutter analyze && flutter test              # анализ и юнит-тесты клиента
+pnpm build                                    # сервер компилируется
+cd flutter && flutter analyze                 # статический анализ клиента
 
-# контрактные проверки на локальной БД (не на проде):
-DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
-  node scripts/m3-sync-check.mjs
-DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
-  node scripts/media-meta-check.mjs
-DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
-  node scripts/timeline-check.mjs
+# контрактные проверки на локальной БД (не на проде), нужен собранный dist:
+DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev node scripts/m3-sync-check.mjs
+DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev node scripts/media-meta-check.mjs
 ```

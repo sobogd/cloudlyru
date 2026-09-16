@@ -1,7 +1,8 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, Req } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Req, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
 import { UploadsService } from './uploads.service';
-import { CurrentUser, RequestUser } from '../common/decorators';
+import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
+import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { CHUNK_MAX_BYTES } from '../config/env';
 import { badRequest, payloadTooLarge } from '../common/errors';
 
@@ -12,8 +13,14 @@ export class UploadsController {
   /**
    * Начать загрузку. Если клиент прислал sha256 уже существующего объекта, сервер сразу
    * создаёт запись в дереве (`deduped: true`, `uploadId: null`) — байты не передаются вообще.
+   *
+   * Ограничение частоты — только на init (создание multipart-сессии в S3 и строки в БД):
+   * окно щедрое, потому что это защита от цикла запросов, а не бюджет загрузок. Части и
+   * `complete` лимита не требуют: их число ограничено размером файла и проверками частей.
    */
   @Post()
+  @UseGuards(RateLimitGuard)
+  @RateLimit(600, 60_000)
   init(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {
     return this.uploads.init(
       {

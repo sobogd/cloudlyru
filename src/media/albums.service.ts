@@ -52,6 +52,11 @@ export class AlbumsService {
     return { ok: true, inAlbum: added };
   }
 
+  /**
+   * Альбом с содержимым. `count` отдаём наравне с `list`/`create`: клиент читает это поле
+   * одной моделью (`AlbumView`), и без него в пустом на вид альбоме показывался бы «0 файлов»
+   * при непустом списке. Считаем по уже отфильтрованным items, отдельного запроса не нужно.
+   */
   async get(userId: string, albumId: string) {
     const album = await this.prisma.album.findFirst({ where: { id: albumId, userId } });
     if (!album) throw notFound('album not found');
@@ -69,18 +74,20 @@ export class AlbumsService {
         },
       },
     });
+    const visible = items
+      .filter((i) => i.entry)
+      .map((i) => ({
+        entryId: i.entry.id,
+        name: i.entry.name,
+        size: Number(i.entry.asset.size),
+        mime: i.entry.asset.mime,
+        capturedAt: i.entry.asset.media?.capturedAt ?? null,
+      }));
     return {
       id: album.id,
       name: album.name,
-      items: items
-        .filter((i) => i.entry)
-        .map((i) => ({
-          entryId: i.entry.id,
-          name: i.entry.name,
-          size: Number(i.entry.asset.size),
-          mime: i.entry.asset.mime,
-          capturedAt: i.entry.asset.media?.capturedAt ?? null,
-        })),
+      count: visible.length,
+      items: visible,
     };
   }
 

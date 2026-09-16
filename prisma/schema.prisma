@@ -1,5 +1,8 @@
 // CloudlyRu — Prisma-схема (PostgreSQL).
-// M0: пользователь/сессии, файловое дерево (soft delete), Asset = объект в S3 (дедуп по sha256).
+// Пользователь, сессии и device-токены, файловое дерево (soft delete, корзина), Asset = объект
+// в S3 (дедуп по sha256), сессии multipart-загрузок, журнал изменений для синхронизации клиентов,
+// очередь конвертации медиа (плюс её статистика, состояние и распаковка архивов), альбомы и EXIF,
+// аудит, почта (аккаунты, курсоры синка, письма, вложения, логотипы отправителей).
 
 generator client {
   provider      = "prisma-client-js"
@@ -45,6 +48,9 @@ model Session {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  // Протухшие сессии подчищает таймер AuthService (и кап при логине) — по expiresAt,
+  // поэтому индекс именно тут: без него уборка идёт сканом всей таблицы сессий.
+  @@index([expiresAt])
 }
 
 model ApiToken {
@@ -53,6 +59,9 @@ model ApiToken {
   label      String
   tokenHash  String    @unique
   scope      String    @default("files:rw") // files:rw | files:ro (проверяется в resolveApiToken)
+  // Колонка добавлена позже (миграция 0010), когда токены уже были выпущены и жили бессрочно:
+  // проставить им срок задним числом значило бы выдумать дату, поэтому поле nullable, а NULL
+  // честно читается как «бессрочный» — так и живут токены, выпущенные до появления TTL.
   expiresAt  DateTime? // null = бессрочный (легаси-токены)
   lastUsedAt DateTime?
   revokedAt  DateTime?
@@ -80,6 +89,11 @@ model Folder {
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   deletedAt DateTime?
+  // Физическое удаление (purge корзины) уносит только саму строку: FK на родителя объявлен
+  // ON DELETE SET NULL (миграция 0001_init), поэтому у пережившего ребёнка parentId становится
+  // NULL и поддерево выпадает из дерева пользователя. RESTRICT тут не годится: purge удаляет
+  // папки одним deleteMany по списку id, порядок строк внутри него не определён, и запрет
+  // удалять родителя с живым ребёнком валил бы всю транзакцию чистки.
   parent    Folder?     @relation("FolderTree", fields: [parentId], references: [id])
   children  Folder[]    @relation("FolderTree")
   entries   FileEntry[]
@@ -249,7 +263,7 @@ model ChangeLog {
   seq         BigInt   @id @default(autoincrement())
   userId      String
   target      String // entry | folder
-  op          String // create | update | move | delete | restore | pin
+  op          String // create | update | move | delete | restore
   targetId    String // id FileEntry или Folder (у tombstone — уже не существующий)
   folderId    String? // родительская папка цели на момент события
   name        String
@@ -315,7 +329,8 @@ model ConvertStat {
   @@index([kind, finishedAt])
 }
 
-// ===== Разархивирование архивов внутри хранилища (без диска) =====// ZIP читается из S3 по Range-запросам, файлы кладутся обратно в S3
+// ===== Разархивирование архивов внутри хранилища (без диска) =====
+// ZIP читается из S3 по Range-запросам, файлы кладутся обратно в S3
 // (content-addressed, с дедупом), в дерево добавляется папка с именем архива.
 
 model UnzipJob {
@@ -459,7 +474,18 @@ model MailMessage {
   // УНИКАЛЬНЫМ и частичным (WHERE gmailMsgId IS NOT NULL) — так дедуп защищён на уровне БД,
   // а в схеме частичный уникальный индекс не выражается.
   @@index([accountId, messageId])
+  // Корзина ленты: порядок по deletedAt при фильтре по пользователю. Индекс ленты сортирует
+  // по sortAt и в этом запросе не помогает, а `deletedAt` в одиночку не селективен.
+  @@index([userId, deletedAt])
   @@index([deletedAt])
+  // Письмо бывает сразу в двух папках (см. alsoBoxes), и лента ищет его условием
+  // `box = X OR X = ANY(alsoBoxes)`: индекс ленты покрывает только первую половину, а по массиву
+  // Postgres без GIN идёт перебором строк. Массив маленький (обычно 0–1 элемент), поэтому
+  // индекс дешёвый и по размеру, и по записи.
+  @@index([alsoBoxes], type: Gin)
+  // Индекс под догоняющую чистку (accountId + createdAt, только письма с живой копией
+  // у провайдера) тоже объявлен в миграции: он частичный (WHERE "remoteDeletedAt" IS NULL),
+  // а частичный индекс в схеме не выражается. См. 20260916000100_mail_purge_index.
 }
 
 // Вложение письма = обычная запись дерева в скрытой зоне MAIL плюс связь с письмом.

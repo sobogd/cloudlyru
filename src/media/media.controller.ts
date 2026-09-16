@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { FULL_SIZE, MediaService } from './media.service';
+import { FULL_SIZE, MediaService, VIDEO_MIMES, isVideoMime } from './media.service';
 import { AlbumsService } from './albums.service';
 import { S3Service } from '../s3/s3.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -14,6 +14,17 @@ import { badRequest, notFound } from '../common/errors';
 /** Превью неизменяемы (ключ = sha256), но приватны — кэширует только браузер пользователя. */
 const PREVIEW_CACHE = 'private, max-age=600';
 
+/**
+ * Тип, под которым отдаём оригинал видео inline. Только из белого списка: `normalizeMime`
+ * пропускает любой `video/*`, то есть объявленный клиентом тип доверять нельзя (иначе это
+ * готовый stored XSS на своём домене), а `nosniff` спасает лишь от исполнения чужого типа —
+ * Content-Type мы ставим сами. Незнакомое значение сводим к `video/mp4`.
+ */
+function inlineVideoMime(mime: unknown): string {
+  const m = String(mime ?? '').toLowerCase();
+  return VIDEO_MIMES.includes(m) ? m : 'video/mp4';
+}
+
 @Controller()
 export class MediaController {
   constructor(
@@ -26,17 +37,35 @@ export class MediaController {
 
   /**
    * Свой ли это ассет. Чужой и несуществующий не отличаем — оба 404.
-   * Раньше эти ручки были @Public(): картинку по одной ссылке мог открыть кто угодно
-   * без входа в аккаунт, а следом уходила presigned-ссылка на сам S3.
+   * Раньше (до коммита 407a490) эти ручки были @Public(), и картинку по одной ссылке мог
+   * открыть кто угодно без входа в аккаунт, а следом уходила presigned-ссылка на сам S3;
+   * сейчас шаринга и presigned-отдачи нет, но проверка владельца осталась.
+   *
+   * Проверка одним запросом по поддереву, а не через `auth.ownsAsset`: тот сначала поднимает
+   * все записи ассета, а потом на каждую поднимается по дереву папок — на галерею в 500 плиток
+   * это лишняя тысяча запросов к БД.
    */
   private async ownAsset(sha: string, user: RequestUser) {
-    const asset = await this.prisma.asset.findUnique({ where: { sha256: sha } });
+    const asset = await this.prisma.asset.findUnique({
+      where: { sha256: sha },
+      select: { id: true, mime: true, ext: true, pageCount: true },
+    });
     if (!asset) return null;
-    return (await this.auth.ownsAsset(user.id, asset.id)) ? asset : null;
+    const tree = await this.auth.subtreeIds(user.id);
+    if (!tree.length) return null;
+    const entry = await this.prisma.fileEntry.findFirst({
+      where: { assetId: asset.id, deletedAt: null, folderId: { in: tree } },
+      select: { id: true },
+    });
+    return entry ? asset : null;
   }
 
   /**
-   * Превью для списка: ?w=512 (фото — квадрат 50×50, видео — постер 50×50); PDF — ?page=N.
+   * Превью для списка или для полного экрана: `?w` — порог размера (фото: `w >= 1080` —
+   * полноэкранное 1080, всё меньшее — квадрат сетки GRID_SIZE×GRID_SIZE; видео — постер
+   * сетки). Промежуточных размеров нет: в S3 лежат ровно два производных на ассет, поэтому
+   * `?w=512` (значение по умолчанию у клиента) — это тот же сеточный вариант, а не отдельный
+   * размер. PDF — `?page=N` (страница рисуется только в 1080).
    *
    * Лимит щедрый (3000/мин), но он есть: галерея законно просит сотни превью подряд, а
    * зацикленный клиент или украденная сессия без лимита выедали бы и БД, и S3.
@@ -76,7 +105,7 @@ export class MediaController {
       );
       return sent ? undefined : res.status(404).end();
     }
-    // Фото: сетка (квадрат 50×50) — по умолчанию, полный экран — 1080.
+    // Фото: сетка (квадрат GRID_SIZE×GRID_SIZE) — по умолчанию, полный экран — 1080.
     // Всё, что клиент просит от 1080 и выше, отдаём одним и тем же превью 1080: 2048
     // больше не собирается (это лишний вес на телефоне), а старые клиенты и ассеты
     // со старым превью продолжают работать через легаси-ключи.
@@ -115,12 +144,15 @@ export class MediaController {
     if (!asset) return res.status(404).end();
     // ?src=original — фолбэк для браузеров, которым превью не по зубам: собирается оно сейчас
     // в H.264 (играется везде), но у ассетов, пересобранных до этого, в S3 лежит AV1, а Safari
-    // и iOS умеют его лишь с 17.0 и не на всяком железе. Без этого параметра такой браузер
-    // остался бы без картинки вовсе: производное есть, но не декодируется.
+    // и iOS умеют его лишь с 17.0 и не на всяком железе. Производное при этом есть — просто
+    // не декодируется, поэтому без параметра такой браузер остаётся без картинки.
+    // (Приложение «Медиа» этот параметр пока не передаёт — страховка работает только у тех
+    // клиентов, кто её просит: см. деталку файла, где фолбэк двухстадийный.)
     if (srcRaw === 'original') {
-      if (!String(asset.mime).startsWith('video/')) return res.status(404).end();
+      // только видео: оригинал фото отдаётся ручкой `/originals/:sha` (на скачивание)
+      if (!isVideoMime(asset.mime)) return res.status(404).end();
       return sendObjectOr404(req, res, this.s3, S3Service.assetKey(sha), {
-        mime: String(asset.mime),
+        mime: inlineVideoMime(asset.mime),
         disposition: 'inline',
         cache: 'private, no-store',
       });
@@ -138,17 +170,24 @@ export class MediaController {
       { disposition: 'inline', cache: PREVIEW_CACHE },
     );
     if (sent1080) return undefined;
-    // превью ещё не собрано — играем оригинал (он и есть мастер). Тип не берём из
-    // объявленного при загрузке mime: под ним может приехать что угодно, а отдаём
-    // мы это со своего домена.
+    // превью ещё не собрано — играем оригинал (он и есть мастер). Тип берём из белого списка
+    // видео, а не из того, что объявил клиент при загрузке: `normalizeMime` пропускает любой
+    // `video/*`, и под ним со своего домена может уехать что угодно (nosniff тут не помогает:
+    // браузер поверит нашему Content-Type).
     return sendObjectOr404(req, res, this.s3, S3Service.assetKey(sha), {
-      mime: String(asset.mime).startsWith('video/') ? asset.mime : 'video/mp4',
+      mime: inlineVideoMime(asset.mime),
       disposition: 'inline',
       cache: 'private, no-store',
     });
   }
 
-  /** «Оригинал»: всегда исходный файл, как он был загружен. Только на скачивание. */
+  /**
+   * «Оригинал»: исходный файл, как он был загружен. Только на скачивание.
+   *
+   * Если оригинала в S3 уже нет (легаси: его удаляли после конвертации), отдаём производное,
+   * но помечаем это заголовком `X-Cloudly-Original: derived` — иначе «Скачать оригинал»
+   * молча отдаёт урезанную картинку, и отличить её от настоящего оригинала нечем.
+   */
   @Get('originals/:sha')
   @UseGuards(RateLimitGuard)
   @RateLimit(300, 60_000)
@@ -162,6 +201,7 @@ export class MediaController {
     if (!asset) throw notFound('asset not found');
     const filename = asset.ext ? `original.${asset.ext}` : 'original';
     if (await this.s3.headObject(S3Service.assetKey(sha)).catch(() => false)) {
+      res.setHeader('X-Cloudly-Original', 'stored');
       return sendObjectOr404(req, res, this.s3, S3Service.assetKey(sha), {
         mime: 'application/octet-stream',
         disposition: 'attachment',
@@ -169,13 +209,14 @@ export class MediaController {
       });
     }
     // Легаси: у части старых ассетов оригинал был удалён после конвертации — отдаём мастер.
-    const legacy = String(asset.mime).startsWith('video/')
+    const legacy = isVideoMime(asset.mime)
       ? [MediaService.legacyVideoMasterKey(sha), MediaService.video1080Key(sha)]
       : [MediaService.legacyPhotoMasterKey(sha), MediaService.photoFullKey(sha)];
     for (const key of legacy) {
       if (await this.s3.headObject(key).catch(() => false)) {
         const mime = key.endsWith('.avif') ? 'image/avif' : key.endsWith('.mp4') ? 'video/mp4' : 'image/webp';
         const ext = mime === 'image/avif' ? 'avif' : mime === 'video/mp4' ? 'mp4' : 'webp';
+        res.setHeader('X-Cloudly-Original', 'derived');
         return sendObjectOr404(req, res, this.s3, key, {
           mime: 'application/octet-stream',
           disposition: 'attachment',

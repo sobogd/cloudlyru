@@ -10,7 +10,7 @@
 //   2) видео: ffprobe по presigned-ссылке на сервере не работает, теги читаются с локального файла.
 //
 // Запуск (нужны ffmpeg и собранный dist):
-//   DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev SESSION_SECRET=dev-secret-0123456789 \
+//   DATABASE_URL=postgresql://user@127.0.0.1:5432/cloudly_dev \
 //     node scripts/media-meta-check.mjs
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';

@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
+
 import '../data/mirror_store.dart';
 import '../data/selection.dart';
 import '../device/native_fs.dart';
@@ -11,7 +13,13 @@ import 'mirror_engine.dart';
 ///
 /// Это только ускоритель. События теряются при перезапуске процесса, после перезагрузки и в Doze,
 /// поэтому истина — периодический проход, а наблюдатель лишь сокращает задержку.
+///
+/// Создаётся [SyncController] один раз на приложение и живёт дольше проходов: наблюдение
+/// ставится при старте и при каждой смене выбора папок, а что делать по событию, решает
+/// [onPass] — его назначает [MirrorLive.bindWatcher].
 class MirrorWatcher {
+  /// Мост приходит готовым: наблюдателей может быть несколько (движок фона заводит свои),
+  /// поэтому объект ничего не заводит сам.
   MirrorWatcher(this._native);
 
   final NativeFs _native;
@@ -25,14 +33,31 @@ class MirrorWatcher {
 
   StreamSubscription<dynamic>? _subscription;
   Timer? _timer;
+
+  /// Когда прошёл последний проход по событиям: от него считается [minGapMs].
+  ///
+  /// Выставляется по завершении прохода, а не по его началу: иначе выдержка отсчитывалась бы
+  /// от попытки, которая ничем не закончилась.
   int _lastPassAt = 0;
+
+  /// События, пришедшие во время прохода. Файл, записанный после того, как обход уже прошёл
+  /// его папку, иначе ждал бы следующего события или задания системы (15 минут).
+  bool _dirty = false;
+
+  /// Наблюдение стоит. Снимается, когда папок нет или система наблюдателя не дала.
   bool _watching = false;
 
   /// Сколько папок взято под наблюдение в последний раз: 0 — система не дала наблюдателя.
   int watchedDirs = 0;
 
   /// Поставить наблюдение за деревом выбранных папок раздела «Файлы».
-  Future<void> watch(Selection selection, MirrorStore store) async {
+  ///
+  /// @param selection текущий выбор папок — берётся только раздел «Файлы».
+  /// Побочные эффекты: вызов моста `watch` (системный наблюдатель) и подписка на поток
+  /// событий. Повторный вызов переставляет наблюдение заново, подписка при этом
+  /// переиспользуется. Если папок нет или мост вернул 0, наблюдение снимается — вызывающий
+  /// узнаёт об этом по [watchedDirs] и [watching], а не по ошибке.
+  Future<void> watch(Selection selection) async {
     final paths = selection.paths(Section.files).toList();
     if (paths.isEmpty) {
       await stop();
@@ -43,38 +68,100 @@ class MirrorWatcher {
       await stop();
       return;
     }
-    _subscription ??= _native.fileChanges.listen((_) => onLocalChange(store));
+    // Подписка одна на всё время жизни: поток событий широковещательный, а после stop()
+    // ссылка обнуляется и здесь заводится заново. База в замыкание не попадает: она нужна
+    // проходу, а не наблюдателю, — иначе после выхода из аккаунта подписка держала бы
+    // закрытое хранилище
+    _subscription ??= _native.fileChanges.listen((_) => onLocalChange());
     _watching = true;
   }
 
   /// Изменение в папках телефона: проход почти сразу, но не чаще, чем раз в полминуты.
-  void onLocalChange(MirrorStore store) {
+  ///
+  /// Побочных эффектов, кроме таймера, нет: сам проход дёргает [onPass]. Первое событие
+  /// из всплеска заводит таймер, остальные до его срабатывания ничего не делают — одного
+  /// прохода на всплеск достаточно, потому что сверка смотрит состояние, а не события.
+  void onLocalChange() {
+    // событие во время прохода не теряем: после прохода будет ещё один (см. _runPass)
+    _dirty = true;
     _timer ??= Timer(const Duration(milliseconds: debounceMs), () {
       _timer = null;
-      final sinceLast = DateTime.now().millisecondsSinceEpoch - _lastPassAt;
-      if (sinceLast < minGapMs) {
-        _timer = Timer(Duration(milliseconds: minGapMs - sinceLast), () {
-          _timer = null;
-          _lastPassAt = DateTime.now().millisecondsSinceEpoch;
-          onPass?.call();
-        });
-        return;
-      }
-      _lastPassAt = DateTime.now().millisecondsSinceEpoch;
-      onPass?.call();
+      _schedulePass(DateTime.now().millisecondsSinceEpoch);
     });
   }
 
-  /// Что делать по событию файловой системы: проход зеркала.
-  void Function()? onPass;
+  /// Проход, если с прошлого прошло не меньше [minGapMs]; иначе — тот же проход, но позже.
+  void _schedulePass(int now) {
+    final sinceLast = now - _lastPassAt;
+    if (sinceLast < minGapMs) {
+      // прошлый проход был только что: откладываем ровно остаток промежутка, а не
+      // переносим на целую выдержку — иначе частые события сдвигали бы проход вечно
+      _timer ??= Timer(Duration(milliseconds: minGapMs - sinceLast), () {
+        _timer = null;
+        unawaited(_runPass());
+      });
+      return;
+    }
+    unawaited(_runPass());
+  }
 
+  /// Запустить проход и разобраться с событиями, пришедшими за время его работы.
+  Future<void> _runPass() async {
+    final pass = onPass;
+    // потребителя нет: наблюдатель работает и без него, проход не запускается
+    if (pass == null) return;
+    _dirty = false;
+    final at = DateTime.now().millisecondsSinceEpoch;
+    var ran = false;
+    try {
+      ran = await pass();
+    } catch (e) {
+      // Проход не должен ронять наблюдателя: исключение из чужого кода — это «прохода не было»,
+      // и событие останется необработанным до следующей попытки
+      debugPrint('cloudly-sync: проход по событию упал: $e');
+    }
+    if (!ran) {
+      // Проход не состоялся — его отбил замок «один проход за раз». Выдержку не сдвигаем
+      // (прохода не было), но и не крутимся в цикле: вернёмся через ту же выдержку
+      _dirty = true;
+      _timer ??= Timer(const Duration(milliseconds: minGapMs), () {
+        _timer = null;
+        unawaited(_runPass());
+      });
+      return;
+    }
+    _lastPassAt = at;
+    if (_dirty) {
+      // во время прохода что-то изменилось: файл, записанный после обхода своей папки,
+      // должен уехать сейчас, а не через четверть часа
+      _dirty = false;
+      _schedulePass(DateTime.now().millisecondsSinceEpoch);
+    }
+  }
+
+  /// Что делать по событию файловой системы: проход зеркала.
+  ///
+  /// Возвращает `true`, если проход действительно состоялся, и `false`, если его отбил замок
+  /// движка: по этому признаку решается, сдвигать ли выдержку между проходами и повторять ли
+  /// событие после.
+  ///
+  /// Пока никто не назначил, события только сбрасывают таймер: наблюдатель работает и без
+  /// потребителя, а проход не запускается.
+  Future<bool> Function()? onPass;
+
+  /// Наблюдение стоит: система дала хотя бы одну папку.
   bool get watching => _watching;
 
+  /// Снять наблюдение: отписка, сброс таймера, `unwatch` у моста и обнуление [watchedDirs].
+  ///
+  /// События, пришедшие после отписки, теряются — это и есть смысл остановки: следующий
+  /// проход состоится по периодическому заданию.
   Future<void> stop() async {
     await _subscription?.cancel();
     _subscription = null;
     _timer?.cancel();
     _timer = null;
+    _dirty = false;
     _watching = false;
     watchedDirs = 0;
     await _native.unwatch();
@@ -83,19 +170,48 @@ class MirrorWatcher {
 
 /// Держит сроки повторного прохода: файл, изменённый только что, ещё пишется — к нему
 /// возвращаемся через окно стабильности, а не выгружаем недописанное.
+///
+/// Метку кладёт движок (когда в плане остались неустоявшиеся файлы или проход не влез
+/// в бюджет времени), а достаёт — тик мгновенного режима, единственный, кто зовёт [runIfDue]:
+/// без него работа стояла бы до следующего события файловой системы.
 class MirrorRetryClock {
+  /// Движок приходит готовым: проход запускается тем же движком, что и обычные проходы,
+  /// поэтому и замок «один проход за раз» у них общий.
   const MirrorRetryClock(this.engine);
 
   final MirrorEngine engine;
 
   /// Запустить проход, если срок подошёл. Возвращает true, если проход состоялся.
+  ///
+  /// Побочные эффекты: чтение (и, если метка испорчена, удаление) в базе и сам проход зеркала —
+  /// со всей его работой (сеть, диск, запись состояния). Метку снимаем **после** прохода, а не
+  /// до: снятая заранее метка теряла бы отложенную работу, если проход отбил замок «один проход
+  /// за раз» или он сорвался. Нечитаемое значение метки удаляем сразу: сравнить его не с чем,
+  /// и мгновенный режим застрял бы на нём навсегда.
+  ///
+  /// Ошибки прохода наружу не выходят — движок возвращает их в отчёте. Проход идёт без
+  /// колбэка прогресса и без отмены: вызывающий ждёт его целиком, поэтому в тике он и стоит
+  /// перед опросом головы.
   Future<bool> runIfDue(MirrorStore store) async {
     final raw = await store.meta(MirrorStore.keyRetryAt);
-    final retryAt = int.tryParse(raw ?? '');
-    if (retryAt == null) return false;
+    if (raw == null) return false;
+    final retryAt = int.tryParse(raw);
+    if (retryAt == null) {
+      // мусор вместо срока: «никогда» — и убрать, иначе он остался бы тут навсегда
+      await store.clearMeta(MirrorStore.keyRetryAt);
+      return false;
+    }
     if (DateTime.now().millisecondsSinceEpoch < retryAt) return false;
-    await store.clearMeta(MirrorStore.keyRetryAt);
-    await engine.pass();
+    final report = await engine.pass();
+    if (report.finishedAt == 0) {
+      // проход не начинался (его отбил замок): метку не трогаем, повторим следующим тиком
+      return true;
+    }
+    // Проход состоялся. Если он не докончен, новую метку он уже положил сам (см. _finish),
+    // и трогать её нельзя; если докончен и обо всём позаботился — метки в базе уже нет
+    if (!report.stopped && report.error == null) {
+      await store.clearMeta(MirrorStore.keyRetryAt);
+    }
     return true;
   }
 }

@@ -14,14 +14,30 @@ import type { MailBox } from './mail-accounts.service';
  * Ровно та же схема, что у ленты «Медиа» (`MediaFeedService`): клиент знает общее число,
  * по нему считает высоту скролла целиком, а данные догружает куском видимой области.
  * OFFSET вместо keyset-курсора выбран по той же причине: он умеет прыгнуть в любую точку,
- * а это и нужно ползунку по датам. На десятках тысяч писем это дешево (индекс
- * (userId, box, sortAt DESC, id DESC) отдаёт и порядок, и фильтр), на миллионах — уже нет.
+ * а это и нужно ползунку по датам.
+ *
+ * Про цену этого решения честно: страница ленты стоит не «индекс + LIMIT». Цепочки считаются
+ * группировкой по всей папке (`row_number()`/`DISTINCT ON` по `COALESCE(threadKey, id)`), то
+ * есть каждый срез — это скан папки со сортировкой, и на больших папках он будет заметен.
+ * Дешевле только материализация цепочек (отдельная таблица/флаг головы, обновляемые при
+ * ingest) вместе с keyset-курсором (`sortAt, id`) для скролла — это правка схемы и синхронизации,
+ * а не только чтения.
  */
 
 /** Сколько символов тела отдаём в списке: хватает на две строки превью. */
 const PREVIEW_CHARS = 200;
 /** Потолок одного среза ленты. */
 export const MAIL_RANGE_MAX = 500;
+/** Сколько писем корзины удаляем за раз: порция влезает и в память, и в транзакцию. */
+const PURGE_BATCH = 200;
+/** Сколько ассетов проверяем/чистим параллельно (по два round-trip на каждый, но не подряд). */
+const ASSET_POOL = 8;
+/**
+ * Потолок сырья, которое разбираем для показа тела. Разбор держит в памяти и письмо, и все
+ * его части, поэтому проверяем размер объекта ДО разбора, а не после (потолок ручки inbound
+ * выше — 64 МБ): иначе одно открытие письма съедало бы сотни мегабайт.
+ */
+const MAX_PARSE_BYTES = 32 * 1024 * 1024;
 
 /**
  * Условие «письмо лежит в папке» для сырого SQL.
@@ -101,10 +117,13 @@ export class MailFeedService {
   /**
    * Срез ленты по абсолютному смещению — но уже по цепочкам, а не по письмам.
    *
-   * Каждая строка — самая свежая письмо цепочки (`row_number` внутри группы по threadKey),
-   * плюс сколько писем в цепочке. Письмо без threadKey — цепочка из одного письма, поэтому
-   * группируем по COALESCE(threadKey, id), чтобы одиночные письма не слиплись в одну кучу.
-   * Порядок — от свежих к старым, как и прежде.
+   * Каждая строка — самое свежее письмо цепочки (`DISTINCT ON` по `COALESCE(threadKey, id)`),
+   * плюс сколько писем в цепочке (счётчик окном в том же проходе). Письмо без threadKey —
+   * цепочка из одного письма, поэтому группируем по COALESCE(threadKey, id), чтобы одиночные
+   * письма не слиплись в одну кучу. Порядок — от свежих к старым, как и прежде.
+   *
+   * Строки письма и аккаунта джойнятся уже после LIMIT/OFFSET: в папке их десятки тысяч, а в
+   * ответе — только страница.
    */
   async range(userId: string, box: string, offset = 0, limit = 100, accountId?: string | null): Promise<MailListItem[]> {
     const take = Math.min(Math.max(Math.floor(limit) || 1, 1), MAIL_RANGE_MAX);
@@ -112,7 +131,8 @@ export class MailFeedService {
     const acc = accountId ?? null;
     // Корзина сортируется по времени удаления, обычные папки — по дате письма.
     const headOrder = box === 'trash' ? Prisma.sql`"deletedAt" DESC, id DESC` : Prisma.sql`"sortAt" DESC, id DESC`;
-    const listOrder = box === 'trash' ? Prisma.sql`m."deletedAt" DESC, m.id DESC` : Prisma.sql`m."sortAt" DESC, m.id DESC`;
+    const pageOrder = box === 'trash' ? Prisma.sql`"deletedAt" DESC, id DESC` : Prisma.sql`"sortAt" DESC, id DESC`;
+    const listOrder = box === 'trash' ? Prisma.sql`p."deletedAt" DESC, p.id DESC` : Prisma.sql`p."sortAt" DESC, p.id DESC`;
 
     const rows = await this.prisma.$queryRaw<
       Array<{
@@ -133,38 +153,29 @@ export class MailFeedService {
       }>
     >(Prisma.sql`
       WITH base AS (
-        SELECT *
+        SELECT id, "threadKey", "sortAt", "deletedAt",
+          (count(*) OVER (PARTITION BY COALESCE("threadKey", id)))::int AS cnt
         FROM "MailMessage"
         WHERE "userId" = ${userId} AND ${boxConditionSql(box as MailBox)}
           AND (${acc}::text IS NULL OR "accountId" = ${acc})
       ),
       heads AS (
-        SELECT id FROM (
-          SELECT id,
-            row_number() OVER (
-              PARTITION BY COALESCE("threadKey", id)
-              ORDER BY ${headOrder}
-            ) AS rn
-          FROM base
-        ) h
-        WHERE rn = 1
-      ),
-      grouped AS (
-        SELECT COALESCE("threadKey", id) AS grp, count(*)::int AS cnt
+        SELECT DISTINCT ON (COALESCE("threadKey", id)) id, "sortAt", "deletedAt", cnt
         FROM base
-        GROUP BY 1
+        ORDER BY COALESCE("threadKey", id), ${headOrder}
+      ),
+      page AS (
+        SELECT id, cnt, "sortAt", "deletedAt" FROM heads ORDER BY ${pageOrder} LIMIT ${take} OFFSET ${skip}
       )
       SELECT
         m.id, m.box, m."accountId", m.subject, m."fromName", m."fromAddr",
         m."bodyText", m."sortAt", m.seen, m.flagged, m."hasAttachments", m.size,
         a.email AS "accountEmail",
-        g.cnt AS "threadCount"
-      FROM "MailMessage" m
+        p.cnt AS "threadCount"
+      FROM page p
+      JOIN "MailMessage" m ON m.id = p.id
       JOIN "MailAccount" a ON a.id = m."accountId"
-      JOIN grouped g ON g.grp = COALESCE(m."threadKey", m.id)
-      WHERE m.id IN (SELECT id FROM heads)
       ORDER BY ${listOrder}
-      LIMIT ${take} OFFSET ${skip}
     `);
 
     return rows.map((r) => ({
@@ -188,6 +199,11 @@ export class MailFeedService {
   /**
    * Индекс по месяцам для подписи у ползунка: строка на месяц в порядке ленты.
    * Считаем по цепочкам (по их голове), чтобы высота скролла совпадала со списком.
+   *
+   * `month` тут всегда строка, а не null: у письма есть и `receivedAt`, и `sortAt` (для входящих
+   * — время прихода, для исходящих — `sentAt` с откатом на `receivedAt`), поэтому «хвоста без
+   * даты», как в ленте медиа (`MediaMonthBucket.month` nullable — там дата берётся из EXIF и
+   * может отсутствовать), у почты не бывает.
    */
   async months(userId: string, box: string, accountId?: string | null): Promise<Array<{ month: string; count: number }>> {
     // В корзине индекс месяцев считается по времени удаления (совпадает с порядком ленты).
@@ -241,6 +257,7 @@ export class MailFeedService {
         flagged: true,
         hasAttachments: true,
         size: true,
+        deletedAt: true,
         account: { select: { email: true } },
         attachments: {
           orderBy: { partIndex: 'asc' },
@@ -259,9 +276,20 @@ export class MailFeedService {
     });
     if (!row) throw notFound('mail message not found');
     // Сколько писем в цепочке этого письма — для бейджа при просмотре (1 — одиночное).
-    const threadCount = await this.prisma.mailMessage.count({
-      where: row.threadKey ? { userId, threadKey: row.threadKey, deletedAt: null } : { id: row.id },
-    });
+    // Считаем ровно так же, как лента: цепочка внутри той же папки (у письма в корзине — среди
+    // удалённых). Иначе один и тот же бейдж означал бы в списке и в открытом письме разное
+    // (письмо, отправленное себе, показывало бы 1 в списке и 2 внутри).
+    const threadCount = row.threadKey
+      ? await this.prisma.mailMessage.count({
+          where: {
+            userId,
+            threadKey: row.threadKey,
+            ...(row.deletedAt
+              ? { deletedAt: { not: null } }
+              : { deletedAt: null, ...inBox(row.box as MailBox) }),
+          },
+        })
+      : 1;
     return {
       id: row.id,
       box: row.box,
@@ -303,29 +331,40 @@ export class MailFeedService {
    *
    * Разбираем сырое письмо из S3 при каждом открытии: тело в БД не храним, чтобы не держать
    * две версии одного и того же и не расходиться с .eml, который и есть источник истины.
-   * Разбор одного письма — миллисекунды; тяжёлые письма с картинками в data: ограничены
-   * потолком размера (иначе ответ раздувается в разы).
+   * Разбор идёт в память, поэтому размер объекта проверяется ДО разбора (`objectSize`), а не
+   * после: потолок размера готового HTML защищает от раздувания ответа, а не от раздувания RSS.
    *
    * `asText` — просьба клиента отдать текстовую версию даже у письма с разметкой: у части
    * рассылок вёрстка нечитаема ни в одном движке, и текстовый вариант — единственный выход.
+   * Отдаём полный текст письма, а не превью из БД: обрезанное «как текст» выглядит как
+   * потерянные данные. Если разобрать письмо не удалось, отдаём превью и говорим об этом
+   * полем `truncated`.
    */
   async body(
     userId: string,
     id: string,
     allowRemote: boolean,
     asText = false,
-  ): Promise<{ html: string; blockedRemote: number; kind: 'html' | 'text' }> {
+  ): Promise<{ html: string; blockedRemote: number; kind: 'html' | 'text'; truncated: boolean }> {
     const row = await this.prisma.mailMessage.findFirst({
       where: { id, userId },
       select: { id: true, bodyText: true, rawAsset: { select: { sha256: true } } },
     });
     if (!row) throw notFound('mail message not found');
 
-    let parsed: { html: string | null; bodyText: string } | null = null;
+    let parsed: { html: string | null; text: string } | null = null;
     try {
-      const source = await this.s3.getObjectBytes(S3Service.assetKey(row.rawAsset.sha256));
-      const full = await parseMessage(source);
-      parsed = { html: full.html, bodyText: full.bodyText };
+      const key = S3Service.assetKey(row.rawAsset.sha256);
+      const size = await this.s3.objectSize(key);
+      if (size > MAX_PARSE_BYTES) {
+        this.logger.warn(
+          `тело письма ${id}: сырьё ${Math.round(size / 1024 / 1024)} МБ больше предела разбора (${MAX_PARSE_BYTES / 1024 / 1024} МБ) — отдаём превью из БД`,
+        );
+      } else {
+        const source = await this.s3.getObjectBytes(key, MAX_PARSE_BYTES);
+        const full = await parseMessage(source);
+        parsed = { html: full.html, text: full.fullText };
+      }
     } catch (e) {
       // Содержимого нет в хранилище или письмо не разобралось — отдаём превью из БД:
       // пустой экран тут хуже, чем текст без оформления.
@@ -334,9 +373,12 @@ export class MailFeedService {
 
     if (!asText && parsed?.html && htmlWithinLimit(parsed.html)) {
       const { html, blockedRemote } = sanitizeMailHtml(parsed.html, allowRemote);
-      return { html, blockedRemote, kind: 'html' };
+      return { html, blockedRemote, kind: 'html', truncated: false };
     }
-    return { html: textToHtml(parsed?.bodyText || row.bodyText || ''), blockedRemote: 0, kind: 'text' };
+    const full = parsed?.text ?? '';
+    const text = full || row.bodyText || '';
+    // truncated — только когда пришлось взять превью из БД: там первые SNAPSHOT_CHARS символов.
+    return { html: textToHtml(text), blockedRemote: 0, kind: 'text', truncated: !full && Boolean(row.bodyText) };
   }
 
   /** Сырой .eml: ключ объекта для отдачи файлом (содержимое письма как оно пришло). */
@@ -381,16 +423,20 @@ export class MailFeedService {
     };
   }
 
-  /** Отметить прочитанным/непрочитанным (локально; сервер не трогаем — это фаза чистки). */
+  /**
+   * Отметить прочитанным/непрочитанным (локально; сервер не трогаем — это фаза чистки).
+   * `deletedAt` тут не фильтруется намеренно: письмо открывают и из корзины, а 404 на такую
+   * пометку клиент глушит — и письмо оставалось бы непрочитанным, а счётчик раздела не сходился.
+   */
   async setSeen(userId: string, id: string, seen: boolean): Promise<{ ok: true; seen: boolean }> {
-    const res = await this.prisma.mailMessage.updateMany({ where: { id, userId, deletedAt: null }, data: { seen } });
+    const res = await this.prisma.mailMessage.updateMany({ where: { id, userId }, data: { seen } });
     if (!res.count) throw notFound('mail message not found');
     return { ok: true, seen };
   }
 
-  /** Флаг «важное» — единственная метка, которую мы себе позволяем. */
+  /** Флаг «важное» — единственная метка, которую мы себе позволяем (в корзине тоже работает). */
   async setFlagged(userId: string, id: string, flagged: boolean): Promise<{ ok: true; flagged: boolean }> {
-    const res = await this.prisma.mailMessage.updateMany({ where: { id, userId, deletedAt: null }, data: { flagged } });
+    const res = await this.prisma.mailMessage.updateMany({ where: { id, userId }, data: { flagged } });
     if (!res.count) throw notFound('mail message not found');
     return { ok: true, flagged };
   }
@@ -435,15 +481,32 @@ export class MailFeedService {
     return { ok: true, purged };
   }
 
-  /** Очистить корзину почты целиком (или только старше N дней — для уборки по расписанию). */
+  /**
+   * Очистить корзину почты целиком (или только старше N дней — для уборки по расписанию).
+   *
+   * Письма удаляются порциями: в корзине могут лежать десятки тысяч писем, и один запрос
+   * «все id корзины + все их вложения» не влезает ни в память, ни в одну транзакцию.
+   */
   async purgeTrash(userId: string, olderThanDays?: number): Promise<{ purged: number }> {
     const days = Number.isFinite(olderThanDays) ? Math.max(0, Number(olderThanDays)) : undefined;
     const cutoff = days === undefined ? undefined : new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const rows = await this.prisma.mailMessage.findMany({
-      where: { userId, deletedAt: { not: null }, ...(cutoff ? { deletedAt: { lt: cutoff } } : {}) },
-      select: { id: true },
-    });
-    return { purged: await this.hardDelete(userId, rows.map((r) => r.id)) };
+    const where = { userId, deletedAt: { not: null }, ...(cutoff ? { deletedAt: { lt: cutoff } } : {}) };
+    let purged = 0;
+    for (;;) {
+      // Порция берётся заново на каждом шаге: предыдущую мы уже удалили, поэтому OFFSET не нужен.
+      const rows = await this.prisma.mailMessage.findMany({
+        where,
+        select: { id: true },
+        orderBy: { deletedAt: 'asc' },
+        take: PURGE_BATCH,
+      });
+      if (!rows.length) break;
+      const done = await this.hardDelete(userId, rows.map((r) => r.id));
+      purged += done;
+      // Ничего не удалилось — дальше будет то же самое; выходим, чтобы не крутиться вечно.
+      if (!done) break;
+    }
+    return { purged };
   }
 
   /**
@@ -465,7 +528,13 @@ export class MailFeedService {
     });
     if (!rows.length) return 0;
     const entryIds = rows.flatMap((r) => r.attachments.map((a) => a.entry.id));
-    const assets = rows.flatMap((r) => [r.rawAsset, ...r.attachments.map((a) => a.entry.asset)]);
+    // Ассеты могут повторяться (дедуп по sha): по одному id на запись, иначе один и тот же
+    // объект проверялся бы и удалялся столько раз, сколько на него ссылок.
+    const assets = new Map<string, { id: string; sha256: string }>();
+    for (const r of rows) {
+      assets.set(r.rawAsset.id, r.rawAsset);
+      for (const a of r.attachments) assets.set(a.entry.asset.id, a.entry.asset);
+    }
     await this.prisma.$transaction(
       async (tx) => {
         if (entryIds.length) await tx.fileEntry.deleteMany({ where: { id: { in: entryIds } } });
@@ -475,16 +544,40 @@ export class MailFeedService {
     );
     // Объекты S3 чистим после коммита и только у реально осиротевших ассетов: на тот же sha
     // может ссылаться обычный файл пользователя (дедуп), и его байты трогать нельзя.
-    for (const a of assets) {
-      const res = await this.prisma.asset.deleteMany({ where: { id: a.id, entries: { none: {} }, mailRaw: { none: {} } } });
-      if (res.count > 0) {
-        await this.s3.deleteObjects([S3Service.assetKey(a.sha256)]).catch((e: Error) => {
-          this.logger.warn(`S3 не удалил объект письма ${a.sha256}: ${e.message}`);
-        });
-      }
+    // Условие «осиротел» стоит в самом DELETE, а не в отдельном чтении: между чтением и
+    // удалением строка могла появиться снова, и тогда мы снесли бы байты живого файла.
+    const orphans: string[] = [];
+    await pool([...assets.values()], ASSET_POOL, async (a) => {
+      const res = await this.prisma.asset.deleteMany({
+        where: { id: a.id, entries: { none: {} }, mailRaw: { none: {} } },
+      });
+      if (res.count > 0) orphans.push(S3Service.assetKey(a.sha256));
+    });
+    if (orphans.length) {
+      const failed = await this.s3.deleteObjects(orphans).catch((e: Error) => {
+        this.logger.warn(`S3 не удалил объекты писем (${orphans.length}): ${e.message}`);
+        return [] as string[];
+      });
+      if (failed.length) this.logger.warn(`S3 не удалил ${failed.length} из ${orphans.length} объектов писем`);
     }
     return rows.length;
   }
+}
+
+/**
+ * Пул на N одновременных задач: очистка корзины делает по два round-trip на каждый ассет,
+ * и подряд они растягивают удаление одного письма на десятки запросов.
+ */
+async function pool<T>(items: T[], limit: number, run: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      await run(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, () => worker()));
 }
 
 /** Превью: тело письма в одну строку, без переносов. */

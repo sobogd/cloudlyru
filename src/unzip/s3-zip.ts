@@ -19,6 +19,31 @@ export interface RangeSource {
   readRange(start: number, endInclusive: number): Promise<Buffer>;
 }
 
+/**
+ * Архив как контейнер нечитаем: нет EOCD, битый центральный каталог, превышен потолок числа
+ * записей. Повторять такую задачу бессмысленно — вызывающий помечает её failed сразу.
+ */
+export class ZipFormatError extends Error {}
+
+/**
+ * Не читается отдельный член архива: метод сжатия не поддержан (AES/Zip64-сжатие), не сошёлся
+ * CRC32 или размер. Остальные члены архива при этом читаются, поэтому такой член надо
+ * пропускать, а не валить всю задачу (см. обработку в unzip.service.ts).
+ */
+export class ZipEntryError extends Error {}
+
+/** Предохранители чтения. Значения задаёт вызывающий (см. src/unzip/unzip.limits.ts). */
+export interface RemoteZipLimits {
+  /**
+   * Потолок числа записей центрального каталога. Размер каталога называет сам архив:
+   * `totalEntries` берётся из EOCD/ZIP64 (в ZIP64 — до 2^64) и ограничен только размером
+   * файла, то есть 5-гигабайтный архив с каталогом из минимальных 46-байтовых записей даёт
+   * десятки миллионов объектов и OOM ещё до распаковки. Суммарный распакованный объём,
+   * коэффициент сжатия и глубину путей проверяет вызывающий — здесь только каталог.
+   */
+  maxEntries?: number;
+}
+
 export interface ZipEntryInfo {
   name: string;
   /** 0 = stored, 8 = deflate */
@@ -29,9 +54,10 @@ export interface ZipEntryInfo {
   localHeaderOffset: number;
   isDirectory: boolean;
   /**
-   * Время изменения файла из архива. Google Takeout кладёт сюда дату самого снимка, а не
-   * дату упаковки, поэтому это единственный способ узнать реальную дату файла при импорте:
-   * без него все распакованные файлы получали дату импорта.
+   * Время изменения файла из архива (DOS-дата/время или extended timestamp). Это НЕ дата
+   * съёмки: Google Takeout кладёт сюда время упаковки архива, поэтому для Takeout-выгрузок
+   * дата берётся из сайдкара, а DOS-дата используется только для обычных архивов
+   * (см. `isTakeout ? null : e.lastModified` в unzip.service.ts).
    */
   lastModified: Date | null;
 }
@@ -117,8 +143,16 @@ export function crc32(buf: Buffer, seed = 0): number {
 export class RemoteZip {
   private readonly blockSize = 8 * 1024 * 1024;
   private cache: { start: number; data: Buffer } | null = null;
+  private readonly maxEntries: number;
 
-  constructor(private readonly src: RangeSource) {}
+  constructor(
+    private readonly src: RangeSource,
+    limits: RemoteZipLimits = {},
+  ) {
+    // потолок по умолчанию нужен и самому читателю: без него `entries()` — открытая дверь
+    // для мусорного каталога (см. RemoteZipLimits.maxEntries)
+    this.maxEntries = limits.maxEntries ?? 20_000;
+  }
 
   /** Последовательное чтение с буфером на blockSize: одна S3-операция на блок. */
   private async readAt(pos: number, len: number): Promise<Buffer> {
@@ -147,7 +181,7 @@ export class RemoteZip {
         if (i + 22 + commentLen === tail.length) { eocd = i; break; }
       }
     }
-    if (eocd < 0) throw new Error('EOCD не найден — это не ZIP или файл обрезан');
+    if (eocd < 0) throw new ZipFormatError('EOCD не найден — это не ZIP или файл обрезан');
 
     let totalEntries = tail.readUInt16LE(eocd + 10);
     let cdSize = tail.readUInt32LE(eocd + 12);
@@ -159,13 +193,22 @@ export class RemoteZip {
       for (let i = eocd - 20; i >= 0; i--) {
         if (tail.readUInt32LE(i) === SIG_EOCD64_LOCATOR) { locator = i; break; }
       }
-      if (locator < 0) throw new Error('ZIP64 locator не найден');
+      if (locator < 0) throw new ZipFormatError('ZIP64 locator не найден');
       const z64Offset = Number(tail.readBigUInt64LE(locator + 8));
       const z64 = await this.src.readRange(z64Offset, z64Offset + 55);
-      if (z64.readUInt32LE(0) !== SIG_EOCD64) throw new Error('ZIP64 EOCD повреждён');
+      if (z64.readUInt32LE(0) !== SIG_EOCD64) throw new ZipFormatError('ZIP64 EOCD повреждён');
       totalEntries = Number(z64.readBigUInt64LE(32));
       cdSize = Number(z64.readBigUInt64LE(40));
       cdOffset = Number(z64.readBigUInt64LE(48));
+    }
+
+    // каталог целиком внутри файла? иначе дальше пошли бы Range-запросы за границей объекта
+    if (cdOffset + cdSize > size) {
+      throw new ZipFormatError(`центральный каталог выходит за границы файла (${cdOffset}+${cdSize} > ${size})`);
+    }
+    // потолок проверяем ДО разбора каталога: он и защищает от «миллионов записей»
+    if (totalEntries > this.maxEntries) {
+      throw new ZipFormatError(`в архиве ${totalEntries} записей — больше потолка ${this.maxEntries}`);
     }
 
     const out: ZipEntryInfo[] = [];
@@ -185,7 +228,7 @@ export class RemoteZip {
     while (pos < cdEnd && out.length < totalEntries) {
       await ensure(46);
       let off = pos - blockStart;
-      if (block.readUInt32LE(off) !== SIG_CENTRAL) throw new Error(`центральный каталог повреждён на ${pos}`);
+      if (block.readUInt32LE(off) !== SIG_CENTRAL) throw new ZipFormatError(`центральный каталог повреждён на ${pos}`);
 
       const method = block.readUInt16LE(off + 10);
       const crc = block.readUInt32LE(off + 16);
@@ -249,7 +292,7 @@ export class RemoteZip {
    */
   private async *compressedChunks(entry: ZipEntryInfo): AsyncGenerator<Buffer> {
     const lh = await this.readAt(entry.localHeaderOffset, 30);
-    if (lh.readUInt32LE(0) !== SIG_LOCAL) throw new Error(`локальный заголовок повреждён: ${entry.name}`);
+    if (lh.readUInt32LE(0) !== SIG_LOCAL) throw new ZipFormatError(`локальный заголовок повреждён: ${entry.name}`);
     const nameLen = lh.readUInt16LE(26);
     const extraLen = lh.readUInt16LE(28);
     const dataStart = entry.localHeaderOffset + 30 + nameLen + extraLen;
@@ -263,7 +306,11 @@ export class RemoteZip {
     }
   }
 
-  /** Распакованное содержимое файла как поток. */
+  /**
+   * Распакованное содержимое файла как поток.
+   * Неподдержанный метод сжатия — ошибка ОДНОГО члена (ZipEntryError): AES-шифрованные
+   * записи и Deflate64 распространены в чужих архивах, и валить из-за них всю задачу нельзя.
+   */
   readEntryStream(entry: ZipEntryInfo): Readable {
     const source = Readable.from(this.compressedChunks(entry));
     if (entry.method === 0) return source;
@@ -273,7 +320,7 @@ export class RemoteZip {
       source.pipe(inflater);
       return inflater;
     }
-    throw new Error(`метод сжатия ${entry.method} не поддерживается (${entry.name})`);
+    throw new ZipEntryError(`метод сжатия ${entry.method} не поддерживается (${entry.name})`);
   }
 
   /** Полностью распаковать файл в память (для небольших файлов + самопроверки CRC). */
@@ -282,34 +329,33 @@ export class RemoteZip {
     for await (const c of this.readEntryStream(entry)) chunks.push(Buffer.from(c));
     const buf = Buffer.concat(chunks);
     if (entry.uncompressedSize && buf.length !== entry.uncompressedSize) {
-      throw new Error(`${entry.name}: размер ${buf.length} ≠ ожидаемого ${entry.uncompressedSize}`);
+      throw new ZipEntryError(`${entry.name}: размер ${buf.length} ≠ ожидаемого ${entry.uncompressedSize}`);
     }
-    if (entry.crc32 && crc32(buf) !== entry.crc32) throw new Error(`${entry.name}: CRC32 не совпал`);
+    if (entry.crc32 && crc32(buf) !== entry.crc32) throw new ZipEntryError(`${entry.name}: CRC32 не совпал`);
     return buf;
   }
 }
 
-/** sha256 потока (для content-addressed ключа и дедупа). */
-export async function hashStream(stream: AsyncIterable<Buffer>): Promise<{ sha256: string; size: number }> {
+/**
+ * Трансформ: считает sha256, размер и CRC32 на лету, пропуская данные дальше.
+ * Нужен, чтобы заливать крупный член архива в S3 одним проходом: ключ объекта
+ * content-addressed, поэтому хэш узнаётся уже после загрузки (заливка идёт во временный
+ * ключ, см. unzip.service.ts), а `crc32` сверяется с центральным каталогом.
+ */
+export function hashTee(): {
+  transform: Transform;
+  result: () => { sha256: string; size: number; crc32: number };
+} {
   const hash = createHash('sha256');
   let size = 0;
-  for await (const b of stream) {
-    hash.update(b);
-    size += b.length;
-  }
-  return { sha256: hash.digest('hex'), size };
-}
-
-/** Трансформ: считает sha256 и размер на лету, пропуская данные дальше. */
-export function hashTee(): { transform: Transform; result: () => { sha256: string; size: number } } {
-  const hash = createHash('sha256');
-  let size = 0;
+  let sum = 0;
   const transform = new Transform({
     transform(chunk, _enc, cb) {
       hash.update(chunk);
+      sum = crc32(chunk, sum);
       size += chunk.length;
       cb(null, chunk);
     },
   });
-  return { transform, result: () => ({ sha256: hash.digest('hex'), size }) };
+  return { transform, result: () => ({ sha256: hash.digest('hex'), size, crc32: sum }) };
 }

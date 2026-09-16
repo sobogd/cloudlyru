@@ -5,7 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { AuthService } from '../auth/auth.service';
 import { badRequest, notFound } from '../common/errors';
-import { MailAccountsService, type MailAccountRow } from './mail-accounts.service';
+import { MailAccountsService } from './mail-accounts.service';
 import { MailIngestService, uidOfMessageId } from './mail-ingest.service';
 import { parseMessage } from './mail-parse';
 import { createSmtpTransport } from './mail-smtp';
@@ -29,6 +29,13 @@ const MAX_MESSAGE_BYTES = 20 * 1024 * 1024;
 /** Потолок вложений: у письма с двадцатью файлами вряд ли есть адресат, готовый их ждать. */
 const MAX_ATTACHMENTS = 20;
 
+/**
+ * Потолок получателей одной отправки (to + cc вместе). Без него одна сессия превращает наш
+ * сервер и наш обратный адрес в открытый релей для рассылки: лимит ручки — 60 запросов
+ * в минуту по IP, то есть тысячи адресов за минуту.
+ */
+const MAX_RECIPIENTS = 50;
+
 export interface SendInput {
   accountId: string;
   to: string;
@@ -42,11 +49,16 @@ export interface SendInput {
 }
 
 export interface SendResult {
-  /** id письма в «Исходящих». */
-  id: string;
+  /**
+   * id письма в «Исходящих»; null — письмо ушло, а копию сохранить не удалось (тогда в ответе
+   * `copyStored: false`). Пустой строки тут быть не должно: клиент не отличил бы её от ошибки.
+   */
+  id: string | null;
   messageId: string;
   accepted: string[];
   rejected: string[];
+  /** Лежит ли копия письма в «Исходящих»: без неё письмо есть у получателя, но не в приложении. */
+  copyStored: boolean;
 }
 
 @Injectable()
@@ -103,12 +115,15 @@ export class MailSendService {
   /** Отправить письмо и сохранить его копию в «Исходящие». */
   async send(userId: string, input: SendInput): Promise<SendResult> {
     const account = await this.accounts.require(userId, String(input.accountId ?? ''));
-    if (!(account as MailAccountRow & { enabled: boolean }).enabled) {
+    if (!account.enabled) {
       throw badRequest('аккаунт выключен — отправка с него недоступна', 'mail_account_disabled');
     }
     const to = parseAddressList(input.to);
     const cc = parseAddressList(input.cc ?? '');
     if (!to.length) throw badRequest('не указан получатель', 'mail_no_recipient');
+    if (to.length + cc.length > MAX_RECIPIENTS) {
+      throw badRequest(`слишком много получателей: ${to.length + cc.length}, предел ${MAX_RECIPIENTS}`, 'mail_too_many_recipients');
+    }
     const text = String(input.text ?? '');
     if (!text.trim() && !(input.attachEntryIds ?? []).length) {
       throw badRequest('письмо пустое', 'mail_empty');
@@ -177,31 +192,47 @@ export class MailSendService {
     // Сохраняем копию тем же путём, что и входящие: сырьё — Asset, вложения — файлы в «Почте».
     // Folder path «local:sent» — не папка IMAP, а пометка «это наша отправка»: синхронизация
     // потом встретит письмо на сервере и перепишет координаты на настоящие (дедуп по Message-ID).
-    const stored = await this.ingest.ingest({
-      userId,
-      account,
-      box: 'sent',
-      folderPath: 'local:sent',
-      // uid из Message-ID: он должен быть уникальным среди наших отправок и одинаковым при
-      // повторной обработке того же письма
-      uid: uidOfMessageId(messageId),
-      uidValidity: 0n,
-      source: raw,
-      seen: true,
-      flagged: false,
-      emailId: null,
-      threadId: null,
-      receivedAt: new Date(),
-    });
+    //
+    // Падение сохранения копии НЕ отменяет отправку: письмо уже у получателя, и 500 после
+    // успешной доставки означает, что пользователь нажмёт «отправить» ещё раз и у получателя
+    // будет дубль. Поэтому ошибку только логируем и честно сообщаем copyStored: false.
+    let copy = 'НЕ сохранена';
+    try {
+      // Результат ingest ("stored"/"skipped") оставляем в логе: по нему видно, новая это копия
+      // или дедуп по Message-ID.
+      copy = String(
+        await this.ingest.ingest({
+          userId,
+          account,
+          box: 'sent',
+          folderPath: 'local:sent',
+          // uid из Message-ID: он должен быть уникальным среди наших отправок и одинаковым при
+          // повторной обработке того же письма
+          uid: uidOfMessageId(messageId),
+          uidValidity: 0n,
+          source: raw,
+          seen: true,
+          flagged: false,
+          emailId: null,
+          threadId: null,
+          receivedAt: new Date(),
+        }),
+      );
+    } catch (e) {
+      this.logger.error(`письмо ${messageId} ушло с ${account.email}, но копию сохранить не удалось: ${(e as Error).message}`);
+    }
+    const stored = copy !== 'НЕ сохранена';
 
-    const message = await this.prisma.mailMessage.findFirst({
-      where: { accountId: account.id, messageId: messageId.replace(/^<|>$/g, '') },
-      select: { id: true, messageId: true },
-    });
+    const message = stored
+      ? await this.prisma.mailMessage.findFirst({
+          where: { accountId: account.id, messageId: messageId.replace(/^<|>$/g, '') },
+          select: { id: true, messageId: true },
+        })
+      : null;
     this.logger.log(
-      `письмо ${messageId} отправлено с ${account.email}: принято ${accepted.length}, отклонено ${rejected.length}, копия ${stored}`,
+      `письмо ${messageId} отправлено с ${account.email}: принято ${accepted.length}, отклонено ${rejected.length}, копия ${copy}`,
     );
-    return { id: message?.id ?? '', messageId, accepted, rejected };
+    return { id: message?.id ?? null, messageId, accepted, rejected, copyStored: stored };
   }
 
   /** Вложения из хранилища: читаем байты по sha256, имя берём из записи дерева. */
@@ -209,18 +240,30 @@ export class MailSendService {
     userId: string,
     entryIds: string[],
   ): Promise<Array<{ filename: string; content: Buffer; contentType: string }>> {
-    const ids = [...new Set(entryIds)].slice(0, MAX_ATTACHMENTS);
+    const ids = [...new Set(entryIds)];
+    // Молча выбросить лишние нельзя: пользователь нажал «отправить», а часть файлов не уехала —
+    // это худший вариант, чем честный отказ до отправки.
+    if (ids.length > MAX_ATTACHMENTS) {
+      throw badRequest(`слишком много вложений: ${ids.length}, предел ${MAX_ATTACHMENTS}`, 'mail_too_many_attachments');
+    }
     if (!ids.length) return [];
     const out: Array<{ filename: string; content: Buffer; contentType: string }> = [];
-    let total = 0;
+    // `declared` — сумма размеров из БД (проверяется до выгрузки), `loaded` — то, что реально
+    // прочитано: одно из двух может разойтись, поэтому потолок проверяется по обоим.
+    let declared = 0;
+    let loaded = 0;
     for (const id of ids) {
       // Свой ли это файл: чужой id (или удалённый) неотличим от несуществующего —
       // иначе можно было бы приложить к письму файлы другого пользователя по подбору id.
       const entry = await this.auth.ownEntry(userId, id);
       if (!entry) throw notFound('attachment not found');
-      const content = await this.s3.getObjectBytes(S3Service.assetKey(entry.asset.sha256));
-      total += content.length;
-      if (total > MAX_MESSAGE_BYTES) throw badRequest('вложения не помещаются в письмо', 'mail_too_large');
+      // Размер проверяем ДО выгрузки: `getObjectBytes` тянет объект целиком, и файл на гигабайт
+      // убил бы процесс раньше, чем сработал бы потолок письма (`ownEntry` уже знает размер).
+      declared += Number(entry.asset.size ?? 0);
+      if (declared > MAX_MESSAGE_BYTES) throw badRequest('вложения не помещаются в письмо', 'mail_too_large');
+      const content = await this.s3.getObjectBytes(S3Service.assetKey(entry.asset.sha256), MAX_MESSAGE_BYTES);
+      loaded += content.length;
+      if (loaded > MAX_MESSAGE_BYTES) throw badRequest('вложения не помещаются в письмо', 'mail_too_large');
       out.push({ filename: entry.name, content, contentType: entry.asset.mime });
     }
     return out;
@@ -301,18 +344,24 @@ export class MailSendService {
     };
   }
 
-  /** Текст исходного письма для цитаты: из превью письма (оно и есть начало тела). */
+  /**
+   * Текст исходного письма для цитаты — целиком, а не превью из БД.
+   *
+   * В `bodyText` лежат только первые SNAPSHOT_CHARS символов (это превью для списка), поэтому
+   * в цитату они не годятся: письмо обрывалось бы на середине без всякого признака обрезки.
+   * Разбираем сырьё из S3 и берём `fullText`; превью остаётся запасным вариантом на случай,
+   * когда письма нет в хранилище или оно не разобралось.
+   */
   private async quotedText(userId: string, id: string): Promise<string> {
     const row = await this.prisma.mailMessage.findFirst({
       where: { id, userId },
       select: { bodyText: true, rawAsset: { select: { sha256: true } } },
     });
     if (!row) return '';
-    // Превью короткое (2 КБ) — для цитаты этого мало, поэтому пробуем разобрать само письмо
     try {
       const source = await this.s3.getObjectBytes(S3Service.assetKey(row.rawAsset.sha256));
       const parsed = await parseMessage(source);
-      return (parsed.bodyText || '').trim() || (row.bodyText ?? '');
+      return (parsed.fullText || '').trim() || (row.bodyText ?? '');
     } catch {
       return (row.bodyText ?? '').trim();
     }

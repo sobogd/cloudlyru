@@ -6,6 +6,10 @@ export class ApiError extends HttpException {
   }
 }
 
+// 400, а не 404: часть «не найдено» здесь — это не отсутствие ресурса по адресу, а расхождение
+// с тем, что прислал сам клиент (отсутствующий токен в запросе, id токена, который он же взял
+// из /auth/tokens). 404 на этих ручках означал бы опечатку в маршруте, а клиенту нужен признак
+// «запрос не тот».
 export const badRequest = (msg: string, code = 'bad_request') => new ApiError(HttpStatus.BAD_REQUEST, msg, code);
 export const unauthorized = (msg = 'unauthorized', code = 'unauthorized') => new ApiError(HttpStatus.UNAUTHORIZED, msg, code);
 export const forbidden = (msg = 'forbidden', code = 'forbidden') => new ApiError(HttpStatus.FORBIDDEN, msg, code);

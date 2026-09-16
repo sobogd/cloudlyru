@@ -21,6 +21,24 @@ import '../sync_controller.dart';
 /// приложение открыто, и в фоне заданием системы. Ручным остаётся только запуск конкретного
 /// файла из очереди («Фото» выгружается по кнопке, как и раньше) и предохранитель от
 /// массового удаления: если движок его приостановил, подтверждение должно быть доступно.
+///
+/// Открывается из «Настроек» → «Синхронизация» (см. `features/settings/sync_panel.dart`).
+/// Все данные берутся у [SyncController] и из базы очереди; своих копий экран не держит,
+/// кроме того, что показывает прямо сейчас.
+///
+/// ## Где живёт состояние очереди (и почему это не одно место)
+///
+/// Источник правды — [SyncController]: он владеет базой очереди, наполняет её, выгружает
+/// строки и знает состояние зеркала. Экран **читает** строки и счётчики прямо из `QueueStore`
+/// (одним запросом на перерисовку) и подписан на состояние контроллера: перечитывание
+/// запускают изменения `waiting` (сколько ждёт выгрузки), `activity` (работа началась или
+/// закончилась) и предохранителя удалений. Прогресс ручной выгрузки — третий источник,
+/// и он живёт на экране ([_progress]).
+///
+/// Из этого следует ограничение: строки, которые изменились, не тронув ни `waiting`,
+/// ни `activity`, экран увидит только при следующем перечитывании. Правильное решение —
+/// один владелец и поток изменений из стора, экран рисует то, что пришло; это правка
+/// `sync_controller.dart` (владелец файла), сюда она не входит.
 class QueueScreen extends ConsumerStatefulWidget {
   const QueueScreen({super.key});
 
@@ -28,18 +46,36 @@ class QueueScreen extends ConsumerStatefulWidget {
   ConsumerState<QueueScreen> createState() => _QueueScreenState();
 }
 
+/// Состояние экрана: строки очереди, счётчики по состояниям и текущая выгрузка.
+///
+/// Список перечитывается после каждой операции и по сигналу контроллера: очередь наполняется
+/// в фоне, и держать её в памяти экрана значило бы показывать устаревшее.
 class _QueueScreenState extends ConsumerState<QueueScreen> {
+  /// Строки очереди: база отдаёт их не больше 2000 за раз и в порядке «сначала то, что
+  /// выгружается, потом ожидающее, потом ошибки, потом всё остальное» (`QueueStore.items`).
+  /// [total] — сколько строк в очереди всего: по нему видно, что список показан не целиком.
   List<QueueItem> _items = const [];
   Map<QueueState, int> _counts = const {};
   int _total = 0;
+
+  /// Первое чтение ещё не закончилось / идёт проверка синхронизации по кнопке или при открытии.
   bool _loading = true;
   bool _checking = false;
-  UploadProgress? _progress;
+
+  /// Выгрузка одного файла, запущенная вручную: пока она идёт, строка показывает проценты.
+  /// `null` — ручной выгрузки нет.
+  ///
+  /// [ValueNotifier], а не поле состояния экрана: `onProgress` зовётся на каждый отправленный
+  /// кусок, и `setState` на каждое такое сообщение перестраивал бы весь список ради одной
+  /// строки. Слушает его только та строка, чей файл сейчас выгружается (см. [_row]).
+  final ValueNotifier<UploadProgress?> _progress = ValueNotifier(null);
 
   /// Сколько удалений в облаке движок приостановил и почему. Живёт в базе зеркала, поэтому
   /// читается заново после каждого прохода, а не помнится с прошлого раза.
   (int, String)? _blocked;
 
+  /// Контроллер синхронизации: у него — база очереди, состояние зеркала и все действия
+  /// (проверка, выгрузка файла, подтверждение удалений).
   SyncController get _sync => ref.read(syncControllerProvider);
 
   @override
@@ -55,6 +91,18 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     unawaited(_check(initial: true));
   }
 
+  @override
+  void dispose() {
+    // notifier живёт ровно столько же, сколько экран: без dispose он пережил бы его
+    _progress.dispose();
+    super.dispose();
+  }
+
+  /// Прочитать очередь из базы, если она уже открыта.
+  ///
+  /// База появляется только после входа в аккаунт: до него `queueStore` равен `null`, и экран
+  /// просто перестаёт показывать загрузку — [_body] в этом случае показывает, что нужно войти.
+  /// `mounted` проверяется после каждого `await`: чтение базы переживает закрытие экрана.
   Future<void> _reload() async {
     final store = _sync.queueStore;
     if (store == null) {
@@ -74,6 +122,8 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     });
   }
 
+  /// Перечитать сведения о приостановленных удалениях: движок мог поставить предохранитель
+  /// или снять его. Возвращает `null`, если удаления не приостановлены.
   Future<void> _refreshBlocked() async {
     final info = await _sync.blockedInfo();
     if (mounted) setState(() => _blocked = info);
@@ -100,6 +150,8 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     }
   }
 
+  /// Убрать из списка строки, которые уже не ждут выгрузки. Действие только над базой очереди:
+  /// сами файлы и облако не трогаются.
   Future<void> _clearFinished() async {
     await _sync.queueStore?.clearFinished();
     await _reload();
@@ -115,25 +167,23 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
   /// Выгрузка одного файла. Пока она идёт, состояние строки показываем по байтам, а не
   /// «в очереди»: иначе непонятно, работает ли что-нибудь вообще.
   Future<void> _upload(int id, {bool retry = false}) async {
-    if (_progress != null) return;
+    if (_progress.value != null) return;
     if (retry) await _sync.queueStore?.markPending(id);
     await _reload();
-    setState(
-      () => _progress = UploadProgress(id: id, name: '', sent: 0, total: 0),
-    );
+    _progress.value = UploadProgress(id: id, name: '', sent: 0, total: 0);
     try {
       await _sync.uploadItem(
         id,
-        onProgress: (p) {
-          if (mounted) setState(() => _progress = p);
-        },
+        onProgress: (p) => _progress.value = p,
       );
     } finally {
-      if (mounted) setState(() => _progress = null);
+      _progress.value = null;
       await _reload();
     }
   }
 
+  /// Сколько ждёт выгрузки: в очереди и с ошибкой. Оба состояния требуют внимания, а
+  /// «выгружен» и «уже в облаке» — нет, поэтому в шапке считается только это.
   int get _waiting =>
       (_counts[QueueState.pending] ?? 0) + (_counts[QueueState.failed] ?? 0);
 
@@ -143,6 +193,12 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     // единственный признак, по которому экран надо перечитать
     ref.listen(syncControllerProvider.select((c) => c.waiting), (prev, next) {
       if (prev != next) unawaited(_reload());
+    });
+    // Работа закончилась (`activity` стал пустым) — строки могли сменить состояние, не изменив
+    // счётчик ожидающих: `running → done` его не двигает, и «грузится» осталось бы на экране
+    // до перезахода. Пустой текст — единственный признак «ядро свободно», который у экрана есть
+    ref.listen(syncControllerProvider.select((c) => c.activity), (prev, next) {
+      if (prev != null && next == null) unawaited(_reload());
     });
     // предохранитель ставит движок по ходу прохода: экран узнаёт об этом из состояния, а не
     // из собственного опроса базы
@@ -185,6 +241,10 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     );
   }
 
+  /// Тело экрана: сводка, предохранитель, список строк и полоска проверки.
+  ///
+  /// Проверка идёт поверх списка (`Stack`), потому что она не должна сдвигать строки: список
+  /// во время проверки остаётся читаемым, а полоска только говорит, что нажатие сработало.
   Widget _body(SyncController sync) {
     if (sync.queueStore == null) {
       return _centered('Синхронизация не запущена: войдите в аккаунт');
@@ -263,6 +323,19 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(color: C.fg3, fontSize: 11),
           ),
+          // Что вышло у последней проверки очереди: сколько файлов просмотрено, сколько строк
+          // поставлено и — главное — не упёрся ли обход в предел (`DeviceFiles.hardMax`).
+          // Без этой строки о пределе не было сказано нигде: файлы сверх него в очередь
+          // не попадают никогда, а человек видел просто короткую очередь и не знал причины.
+          if ((sync.queueNote ?? '').isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              'очередь: ${sync.queueNote}',
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: C.fg3, fontSize: 11),
+            ),
+          ],
           const SizedBox(height: 4),
           const Text(
             'Выгружается само; play на строке — если хочешь поторопить.',
@@ -343,84 +416,99 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     return parts.join(' · ');
   }
 
+  /// Строка списка: иконка по типу файла, имя, подпись (куда и сколько) и кнопки.
+  ///
+  /// Запустить файл вручную можно только у ждущего и у упавшего: у «выгружается» работа уже
+  /// идёт, у «выгружен» — нечего делать. [busy] передаётся сверху и запрещает запуск, пока
+  /// ядро занято чем-то своим: иначе две выгрузки одного файла пошли бы наперегонки.
+  ///
+  /// Подпись строки подписана на [_progress]: проценты меняются на каждый кусок, и перерисовка
+  /// нужна только той строке, чей файл выгружается, — остальные от notifier не зависят.
   Widget _row(QueueItem item, bool busy) {
-    final progress = _progress?.id == item.id ? _progress : null;
-    final canStart =
-        !busy &&
-        _progress == null &&
-        (item.state == QueueState.pending || item.state == QueueState.failed);
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
-          child: Row(
-            children: [
-              Icon(
-                MediaRules.isVideo(item.name)
-                    ? Icons.movie_outlined
-                    : (MediaRules.isImage(item.name)
-                          ? Icons.image_outlined
-                          : Icons.insert_drive_file_outlined),
-                color: C.accent,
-                size: 20,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      item.name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: C.fg, fontSize: 15),
+    return ValueListenableBuilder<UploadProgress?>(
+      valueListenable: _progress,
+      builder: (context, running, _) {
+        final progress = running?.id == item.id ? running : null;
+        final canStart =
+            !busy &&
+            running == null &&
+            (item.state == QueueState.pending || item.state == QueueState.failed);
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+              child: Row(
+                children: [
+                  Icon(
+                    MediaRules.isVideo(item.name)
+                        ? Icons.movie_outlined
+                        : (MediaRules.isImage(item.name)
+                              ? Icons.image_outlined
+                              : Icons.insert_drive_file_outlined),
+                    color: C.accent,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          item.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: C.fg, fontSize: 15),
+                        ),
+                        Text(
+                          progress == null
+                              ? _subtitle(item)
+                              // размер известен не с первого байта: пока его нет, «0% из 0 Б»
+                              // читалось бы как сломанный счётчик
+                              : (progress.total <= 0
+                                    ? 'выгрузка…'
+                                    : 'выгрузка: ${progress.percent}% из ${fmt(progress.total)}'),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: C.fg3, fontSize: 11),
+                        ),
+                        if (item.state == QueueState.failed &&
+                            (item.lastError ?? '').isNotEmpty)
+                          Text(
+                            item.lastError!,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: C.danger, fontSize: 11),
+                          ),
+                      ],
                     ),
-                    Text(
-                      progress == null
-                          ? _subtitle(item)
-                          // размер известен не с первого байта: пока его нет, «0% из 0 Б»
-                          // читалось бы как сломанный счётчик
-                          : (progress.total <= 0
-                                ? 'выгрузка…'
-                                : 'выгрузка: ${progress.percent}% из ${fmt(progress.total)}'),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: C.fg3, fontSize: 11),
+                  ),
+                  // «повторить» отличается от «play» только тем, что снимает состояние ошибки:
+                  // так видно, что попытка не первая
+                  if (item.state == QueueState.failed)
+                    IconButton(
+                      tooltip: 'Повторить',
+                      onPressed: canStart
+                          ? () => unawaited(_upload(item.id, retry: true))
+                          : null,
+                      icon: const Icon(Icons.replay, color: C.fg3, size: 20),
                     ),
-                    if (item.state == QueueState.failed &&
-                        (item.lastError ?? '').isNotEmpty)
-                      Text(
-                        item.lastError!,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(color: C.danger, fontSize: 11),
-                      ),
-                  ],
-                ),
+                  IconButton(
+                    tooltip: 'Поторопить: выгрузить сейчас',
+                    onPressed: canStart ? () => unawaited(_upload(item.id)) : null,
+                    icon: const Icon(Icons.play_arrow, color: C.accent),
+                  ),
+                ],
               ),
-              // «повторить» отличается от «play» только тем, что снимает состояние ошибки:
-              // так видно, что попытка не первая
-              if (item.state == QueueState.failed)
-                IconButton(
-                  tooltip: 'Повторить',
-                  onPressed: canStart
-                      ? () => unawaited(_upload(item.id, retry: true))
-                      : null,
-                  icon: const Icon(Icons.replay, color: C.fg3, size: 20),
-                ),
-              IconButton(
-                tooltip: 'Поторопить: выгрузить сейчас',
-                onPressed: canStart ? () => unawaited(_upload(item.id)) : null,
-                icon: const Icon(Icons.play_arrow, color: C.accent),
-              ),
-            ],
-          ),
-        ),
-        const Divider(height: 1),
-      ],
+            ),
+            const Divider(height: 1),
+          ],
+        );
+      },
     );
   }
 
+  /// Пустая очередь. Это не «ничего не происходит»: синхронизация работает сама, поэтому
+  /// в тексте сказано и про это, а кнопка оставлена для случая, когда что-то всё же встало.
   Widget _empty() {
     return Padding(
       padding: const EdgeInsets.all(24),
@@ -449,6 +537,8 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     );
   }
 
+  /// Строка для случая, когда синхронизация ещё не запущена (не выполнен вход в аккаунт):
+  /// показывать пустую очередь тут нельзя — это выглядело бы как «выгружать нечего».
   Widget _centered(String text) {
     return Center(
       child: Padding(
@@ -458,12 +548,16 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     );
   }
 
+  /// Подпись строки: раздел, место в облаке, размер и состояние. `relDir` может быть пустым —
+  /// это значит, что файл лежит прямо в выбранной папке, и вместо пустоты пишем «плоско».
   String _subtitle(QueueItem item) {
     final where = item.section == Section.photos ? 'Фото' : 'Файлы';
     final place = item.relDir.isEmpty ? 'плоско' : item.relDir;
     return '$where · $place · ${fmt(item.size)} · ${_stateText(item.state)}';
   }
 
+  /// Состояние строки словами. `switch` без `default` намеренно: новое состояние в [QueueState]
+  /// сломает сборку, а не покажется человеку пустой подписью.
   String _stateText(QueueState state) => switch (state) {
     QueueState.pending => 'в очереди',
     QueueState.running => 'грузится',
@@ -472,6 +566,8 @@ class _QueueScreenState extends ConsumerState<QueueScreen> {
     QueueState.failed => 'ошибка',
   };
 
+  /// Фаза прохода зеркала словами: этим отвечает строка «сейчас: …», когда ядро сообщает только
+  /// фазу, без имени файла.
   String _phaseText(MirrorPhase phase) => switch (phase) {
     MirrorPhase.scan => 'обхожу папки',
     MirrorPhase.cloud => 'сверяюсь с облаком',

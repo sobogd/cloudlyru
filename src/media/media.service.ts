@@ -1,15 +1,31 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { execFileSync } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
-import { readFile } from 'fs/promises';
+import { readFile, statfs } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import * as exifr from 'exifr';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 
+/**
+ * Фото, которые мы умеем конвертировать: `mediaKindOf` ставит на них задачу 'photo' (sharp).
+ *
+ * Это НЕ список того, что видно в ленте «Медиа»: лента строится по строкам `MediaMeta`
+ * (`src/media-feed/media-feed.service.ts`), а их получает любой `image/*` — RAW камер,
+ * BMP, JXL (см. captureAny). Такие файлы попадают в раздел «Медиа», просто без превью.
+ */
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
-export const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm', 'video/x-matroska', 'video/avi', 'video/ogg', 'video/mpeg'];
+/**
+ * Видео, которые считаем медиа и ставим на конвертацию. Тип объявляет клиент, и кроме mp4/mov
+ * от телефонов приходят 3GP/3GP2 со старых аппаратов (`video/3gpp` — так его называет и наш
+ * Flutter-клиент для `.3gp`): пока их тут не было, файл не считался медиа вообще — ни строки
+ * `MediaMeta` (не появлялся в ленте), ни задачи (очередь помечала «превью не собираются»).
+ */
+export const VIDEO_MIMES = [
+  'video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm', 'video/x-matroska', 'video/avi', 'video/ogg', 'video/mpeg',
+  'video/3gpp', 'video/3gpp2', 'video/mp4v-es', 'video/mpeg4', 'video/x-msvideo',
+];
 /** PDF рендерим сами (poppler): в списке — миниатюра первой страницы, в деталке — все страницы. */
 export const PDF_MIMES = ['application/pdf'];
 /** Ширина превью страницы PDF. */
@@ -17,21 +33,45 @@ export const PDF_PAGE_WIDTH = 1080;
 /** Сколько страниц рисует одна задача: большое PDF иначе держало бы воркер минутами. */
 export const PDF_PAGES_PER_JOB = 40;
 
-/** Вид задачи конвейера по MIME; null — для такого типа превью не собираются. */
+/** Это видео? Решаем по префиксу: контейнер ffmpeg всё равно определяет по содержимому файла. */
+export function isVideoMime(mime: unknown): boolean {
+  return String(mime ?? '').toLowerCase().startsWith('video/');
+}
+
+/** Это картинка? Любой `image/*`: RAW камер (DNG/CR2/NEF) и BMP sharp не конвертирует, но в ленте им быть. */
+export function isImageMime(mime: unknown): boolean {
+  return String(mime ?? '').toLowerCase().startsWith('image/');
+}
+
+/**
+ * Вид задачи конвейера по MIME; null — конвертировать нечем (превью не будет, но в ленте файл
+ * остаётся).
+ *
+ * Видео — по префиксу: объявленный клиентом тип бывает и `video/3gpp`, и `video/x-msvideo`,
+ * а ffmpeg разбирает контейнер по содержимому. Для фото список остаётся точным: sharp умеет
+ * не всё, и задача на BMP/JXL только занимала бы очередь заведомо провальной работой.
+ */
 export function mediaKindOf(mime: unknown): 'photo' | 'video' | 'pdf' | null {
   const m = String(mime ?? '').toLowerCase();
   if (IMAGE_MIMES.includes(m)) return 'photo';
-  if (VIDEO_MIMES.includes(m)) return 'video';
+  if (isVideoMime(m)) return 'video';
   if (PDF_MIMES.includes(m)) return 'pdf';
   return null;
 }
 /**
- * Размер превью для списка (сетка галереи): квадрат 50×50. В сетке такое превью
- * никогда не растягивается больше 50 px, поэтому больше пикселей не нужно.
- * Ключ в S3 остался историческим `-512.webp`: у уже собранных ассетов там лежит
- * старое превью 512 px, и оно продолжает отдаваться без пересборки.
+ * Размер превью для списка (сетка галереи): квадрат GRID_SIZE×GRID_SIZE.
+ *
+ * Число — про физические пиксели, а не логические: ячейка сетки в приложении — 50 dp
+ * (`flutter/lib/features/media/media_screen.dart`, `_cell = 50.0`), то есть на экране с DPR 3
+ * это 150 px, и квадрат 50×50 растягивался втрое — сетка выглядела мыльной. 200 px покрывает
+ * DPR до 4 и остаётся мелким файлом (единицы–десяток КБ WebP).
+ *
+ * Ключ в S3 остался историческим `-512.webp` (менять его нельзя — сломается кэш и старые
+ * клиенты): под ним лежат и превью прежних версий пайплайна — 512 px и 50×50. Они отдаются
+ * как есть, без пересборки; чтобы получить 200 px у старой библиотеки, нужен пересчёт файла
+ * (`POST /queue/retry` с `entryId`) — сам он не запускается.
  */
-export const GRID_SIZE = 50;
+export const GRID_SIZE = 200;
 /**
  * Начало файла для EXIF. Для JPEG этого всегда хватает, а у HEIC/HEIF новых телефонов и у
  * файлов из архивов Takeout теги лежат глубже — тогда читаем объект целиком (см.
@@ -40,8 +80,6 @@ export const GRID_SIZE = 50;
 const EXIF_HEAD_BYTES = 4 * 1024 * 1024;
 /** Ширина полноэкранного превью фото (и превью страницы PDF — та же величина). */
 export const FULL_SIZE = 1080;
-/** Сколько байт читаем из начала объекта, прежде чем тянуть его целиком. */
-const HEAD_PARSE_BYTES = 4 * 1024 * 1024;
 /**
  * Голова объекта для быстрого разбора метаданных: EXIF и GPS лежат в начале JPEG/HEIC/MP4.
  * 512 КБ вместо 4 МБ — на библиотеке в десятки тысяч фото это десятки гигабайт чтения из
@@ -55,20 +93,77 @@ const MAX_PARSE_BYTES = 150 * 1024 * 1024;
  * контейнера лежат и в конце файла. Разбор идёт один раз на ассет и кэшируется в БД.
  */
 const VIDEO_META_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+/**
+ * Запас свободного места во временном каталоге, который оставляем после скачивания видео для
+ * разбора тегов: параллельно в том же каталоге работает очередь конвертации, и забить диск
+ * под ноль означает уронить и воркер, и всё остальное на VPS.
+ */
+const TMP_FREE_RESERVE_BYTES = 512 * 1024 * 1024;
 
 /**
- * Разбор дал что-то полезное? В `raw` есть служебный `kind` и поля; если кроме `kind` ничего
+ * Разбор дал хоть что-то? В `raw` есть служебный `kind` и поля; если кроме `kind` ничего
  * нет — это не метаданные, а след неудачного разбора. Так выглядит обрезанное начало файла:
  * exifr на неполном HEIC/HEIF возвращает объект с одной ошибкой (`{errors:[…]}`), из которого
  * не извлекается ни одного поля. Раньше такой `raw` считался готовыми метаданными, и фото
  * навсегда оставалось без даты, камеры и кадра — ни запасной полный разбор, ни ленивый
  * разбор при открытии деталки больше не запускались.
+ *
+ * Этого ответа мало для вопроса «разбор закончен»: у HEIC голова отдаёт только Make/Model,
+ * и такой частичный `raw` тоже непустой. См. hasCompleteRaw.
  */
 export function hasUsefulRaw(raw: unknown): boolean {
   if (!raw || typeof raw !== 'object') return false;
   return Object.entries(raw as Record<string, unknown>).some(
     ([k, v]) => k !== 'kind' && v !== undefined && v !== null && v !== '',
   );
+}
+
+const rawFilled = (v: unknown): boolean => v !== undefined && v !== null && v !== '';
+
+/**
+ * Разбор ЗАКОНЧЕН? Проверяем не «в raw что-то есть», а «есть то, ради чего разбор делается»:
+ * дата, координаты или размер кадра. Иначе частичный результат (например, из головы файла
+ * достались только Make/Model/Software) закрывал бы дорогу к полному разбору — и фото из
+ * архива Takeout оставалось без даты и без точки на карте навсегда.
+ */
+export function hasCompleteRaw(raw: unknown): boolean {
+  if (!hasUsefulRaw(raw)) return false;
+  const r = raw as Record<string, unknown>;
+  if (r.kind === 'image') return rawFilled(r.dateTimeOriginal) || r.latitude != null || r.width != null;
+  if (r.kind === 'video') return r.durationSec != null || r.width != null || rawFilled(r.createdAt);
+  return true;
+}
+
+/**
+ * Дата в `raw` пришла из тегов файла (EXIF `DateTimeOriginal` / теги контейнера видео), а не
+ * поставлена «на глаз» при загрузке или распаковке? Именно эти ключи и только они попадают
+ * в колонку `capturedAt` (см. storeImageMeta / storeVideoMeta).
+ */
+export function rawHasCapturedDate(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  const r = raw as Record<string, unknown>;
+  return rawFilled(r.dateTimeOriginal) || rawFilled(r.createdAt);
+}
+
+/**
+ * Смещение пояса съёмки в минутах на восток от UTC или null, если в файле его не было.
+ *
+ * Фото: EXIF `OffsetTimeOriginal` («+03:00»). Видео: `com.apple.quicktime.creationdate`
+ * («2023-11-18T12:24:00+0300») — в нём пояс записи; `creation_time` всегда UTC и пояса
+ * съёмки не знает, поэтому «Z» даёт null (неизвестно), а не 0.
+ *
+ * Нужно клиенту: `capturedAt` — истинный UTC-момент, и чтобы показать «время как в файле»,
+ * приложению нужен именно этот сдвиг, а не пояс устройства.
+ */
+export function parseTzOffsetMin(v: unknown): number | null {
+  if (typeof v !== 'string') return null;
+  const m = /([+-])(\d{2}):?(\d{2})$/.exec(v.trim());
+  if (!m) return null;
+  const hours = Number(m[2]);
+  const minutes = Number(m[3]);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || hours > 14 || minutes > 59) return null;
+  const total = hours * 60 + minutes;
+  return m[1] === '-' ? -total : total;
 }
 
 const MS_PER_MIN = 60_000;
@@ -88,6 +183,11 @@ function subSecMs(v: unknown): number {
  * Без поправки на OffsetTime* момент уезжает ровно на часовой пояс съёмки: фото с
  * OffsetTimeOriginal=+03:00 попадало в таймлайн на 3 часа позже — ломая порядок ленты
  * и группировку поездок.
+ *
+ * ВАЖНО про пояс процесса: fallback (когда OffsetTime* в файле нет) возвращает Date как есть,
+ * а он читается в поясе сервера — прод обязан работать с TZ=UTC, иначе у фото без OffsetTime*
+ * (сканер, старый телефон) и у `raw.dateTimeOriginal` (он пишется как ISO этого же Date)
+ * уезжает время. Пояс нигде в репозитории не выставляется — его нужно задать в окружении.
  */
 export function exifInstant(revived: unknown, offset: unknown, subSec?: unknown): Date | undefined {
   const off = typeof offset === 'string' ? /^([+-])(\d{2}):?(\d{2})$/.exec(offset.trim()) : null;
@@ -147,6 +247,42 @@ function asStr(v: unknown): string | undefined {
   return t ? t.slice(0, 300) : undefined;
 }
 
+/**
+ * Выдержка строкой для деталки: «1/120» короче секунды, иначе «2.5 с».
+ * Ноль и мусор отдаём как «нет данных»: `1/ExposureTime` при нуле давал «1/Infinity».
+ */
+function exposureText(v: unknown): string | undefined {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return n < 1 ? `1/${Math.round(1 / n)}` : `${n} с`;
+}
+
+/**
+ * Свободно байт во временном каталоге (null — не смогли узнать: тогда скачивание не
+ * блокируем, разбор тегов важнее консервативной проверки).
+ */
+async function freeTmpBytes(): Promise<number | null> {
+  try {
+    const st = await statfs(tmpdir());
+    return Number(st.bsize) * Number(st.bavail);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ключи производных в S3 и разбор метаданных (EXIF фото / ffprobe видео).
+ *
+ * Владелец разбора — этот сервис: и путь загрузки (`captureAny` — читает объект из S3),
+ * и путь архива (`captureMetaFromFile` — читает локальный файл воркера), и ленивый разбор
+ * при открытии деталки (`extractDetail`) ходят в одни и те же `storeImageMeta`/
+ * `storeVideoMeta`, поэтому и колонки, и `raw` заполняются одинаково.
+ *
+ * Очередь (`src/queue/queue.service.ts`) — второй автор `MediaMeta`: она пишет дату загрузки
+ * при постановке задачи и умеет разобрать теги видео сама (свой ffprobe, `raw` не пишет).
+ * Пока это дублирование не устранено, «разбор закончен» считается здесь и по `hasCompleteRaw`,
+ * а не по «в raw что-то есть».
+ */
 @Injectable()
 export class MediaService {
   private readonly logger = new Logger(MediaService.name);
@@ -159,7 +295,7 @@ export class MediaService {
   static viewKey(sha256: string, suffix: string): string {
     return `view/${sha256}${suffix}`;
   }
-  /** Превью для списка (сетка галереи): квадрат 50×50, фото и видео одинаково. */
+  /** Превью для списка (сетка галереи): квадрат GRID_SIZE×GRID_SIZE, фото и видео одинаково. */
   static gridKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-512.webp');
   }
@@ -167,7 +303,7 @@ export class MediaService {
   static photoFullKey(sha256: string): string {
     return MediaService.viewKey(sha256, `-${FULL_SIZE}.avif`);
   }
-  /** Постер видео для списка (тот же квадрат 50×50). */
+  /** Постер видео для списка (тот же квадрат GRID_SIZE×GRID_SIZE). */
   static videoPosterKey(sha256: string): string {
     return MediaService.viewKey(sha256, '-poster.webp');
   }
@@ -179,7 +315,6 @@ export class MediaService {
   static pdfPageKey(sha256: string, page: number): string {
     return MediaService.viewKey(sha256, `-p${page}-${PDF_PAGE_WIDTH}.webp`);
   }
-  private static readonly EXIF_HEAD_BYTES = EXIF_HEAD_BYTES;
 
   // ===== Устаревшие ключи: мастер-версии старого пайплайна =====
   // Больше не создаются (оригинал и есть мастер), но остаются в derivativeKeys(),
@@ -206,8 +341,12 @@ export class MediaService {
    * до этого осиротевшие view/* не удалял никто, и они оставались в S3 навсегда.
    * Лишние ключи безвредны: удаление несуществующего объекта S3 игнорирует.
    *
-   * pageCount нужен только для PDF: страничные превью — это переменный набор ключей,
-   * и перечислить их можно лишь по числу страниц из БД (оно там после рендера).
+   * pageCount нужен только для PDF: страничные превью — это переменный набор ключей, и
+   * перечислить их по числу страниц можно лишь тогда, когда рендер дошёл до конца (`pageCount`
+   * пишет только finishPdf в очереди). Если задача PDF упала на середине, уже нарисованные
+   * страницы тут не перечислятся и останутся в бакете — их подберёт ручной sweep-orphans.
+   * Чтобы удалять их сразу, вызывающему нужно перечислять ключи по префиксу
+   * (`S3Service.listKeys('view/<sha>-p')` — так это делает convertPdf).
    */
   static derivativeKeys(sha256: string, pageCount?: number | null): string[] {
     const pages = pageCount && pageCount > 0
@@ -227,82 +366,24 @@ export class MediaService {
     ];
   }
 
-  /** EXIF → MediaMeta (дата/GPS/камера); тяжёлые производные делает очередь. */
-  async captureMeta(assetId: string, sha256: string, size: number, mime: string): Promise<void> {
-    if (size <= 0 || size > MAX_PARSE_BYTES) return;
-    // видео: без EXIF — помечаем датой загрузки, чтобы попало в таймлайн
-    if (VIDEO_MIMES.includes(mime)) {
-      await this.prisma.mediaMeta
-        .upsert({
-          where: { assetId },
-          create: { assetId, capturedAt: new Date() },
-          update: {},
-        })
-        .catch(() => undefined);
-      return;
-    }
-    if (!IMAGE_MIMES.includes(mime)) return;
-    try {
-      // Метаданные лежат в начале файла, поэтому сначала читаем только голову: полный объект
-      // (до 150 МБ) на каждое фото — это лишний трафик из S3 и память на VPS, а на пути complete
-      // клиент ещё и ждёт ответа.
-      const head = await this.s3.readRange(S3Service.assetKey(sha256), 0, HEAD_PARSE_BYTES - 1).catch(() => null);
-      if (head && (await this.parseAndStoreImageMeta(assetId, head))) return;
-      // не получилось из головы (метаданные в конце или формат хитрый) — читаем целиком
-      const buf = await this.s3.getObjectBytes(S3Service.assetKey(sha256), MAX_PARSE_BYTES);
-      await this.parseAndStoreImageMeta(assetId, buf);
-    } catch (e) {
-      this.logger.debug(`EXIF skip: ${(e as Error).message}`);
-    }
-  }
-
   /**
-   * То же, но из ЛОКАЛЬНОГО файла. Воркер очереди уже скачал сырьё, поэтому повторный
-   * трафик S3 не нужен. Нужно для медиа из архивов: при распаковке captureMeta() не
-   * вызывается, и без этого фото из ZIP не попадали бы в таймлайн.
+   * То же, но из ЛОКАЛЬНОГО файла: воркер очереди уже скачал сырьё под конвертацию, поэтому
+   * повторный трафик S3 не нужен. Нужно для медиа, у которого строки `MediaMeta` ещё нет —
+   * прежде всего для фото из архивов (при распаковке разбор идёт фоном и может не успеть).
+   *
+   * Разбор здесь тот же, что и для объекта из S3 (`storeImageMeta`), вместе с записью `raw`:
+   * раньше этот путь писал только колонки, и в деталке кадра не было ни объектива, ни
+   * диафрагмы, ни ISO — хотя EXIF был прочитан (деталка читает параметры из `raw`).
    */
   async captureMetaFromFile(assetId: string, filePath: string, size: number, mime: string): Promise<void> {
     if (size <= 0 || size > MAX_PARSE_BYTES) return;
-    if (!IMAGE_MIMES.includes(mime)) return; // видео разберёт воркер (storeVideoMeta из ffprobe)
+    if (!IMAGE_MIMES.includes(mime)) return; // видео разберёт воркер (captureVideoFromFile → ffprobe)
     try {
       const buf = await readFile(filePath);
-      await this.parseAndStoreImageMeta(assetId, buf);
-
+      await this.storeImageMeta(assetId, buf);
     } catch (e) {
       this.logger.debug(`EXIF skip (local): ${(e as Error).message}`);
     }
-  }
-
-  /** EXIF фото → MediaMeta. Первичный проход: существующие значения не перетираем. */
-  private async parseAndStoreImageMeta(assetId: string, buf: Buffer): Promise<boolean> {
-    const [gps, core] = await Promise.all([
-      exifr.gps(buf).catch(() => null),
-      exifr.parse(buf, { segments: ['exif', 'ifd0'], mergeOutput: true } as never).catch(() => null),
-    ]);
-    const capturedAt = exifInstant(
-      core?.DateTimeOriginal,
-      core?.OffsetTimeOriginal ?? core?.OffsetTime,
-      core?.SubSecTimeOriginal,
-    );
-    const width = Number(core?.ExifImageWidth ?? core?.ImageWidth) || undefined;
-    const height = Number(core?.ExifImageHeight ?? core?.ImageHeight) || undefined;
-    let latitude: number | undefined;
-    let longitude: number | undefined;
-    if (gps?.latitude != null && gps?.longitude != null) {
-      const la = Number(gps.latitude);
-      const lo = Number(gps.longitude);
-      if (Number.isFinite(la) && Number.isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
-        latitude = la;
-        longitude = lo;
-      }
-    }
-    await this.prisma.mediaMeta.upsert({
-      where: { assetId },
-      create: { assetId, capturedAt, latitude, longitude, make: core?.Make || null, model: core?.Model || null, width, height },
-      update: {},
-    });
-    // «что-то нашли» — сигнал вызывающему, что читать объект целиком не нужно
-    return Boolean(capturedAt || latitude != null || width != null || core?.Make || core?.Model);
   }
 
   /**
@@ -315,21 +396,26 @@ export class MediaService {
    * Фото разбираем на месте (читается только начало объекта). Видео — фоном: ffprobe ходит
    * в хранилище, и заставлять клиента ждать этого на complete незачем.
    *
-   * Разбираем ЛЮБОЙ image/*, а не только те типы, что умеет sharp: RAW камер (DNG, CR2, NEF,
-   * ARW) не конвертируется, но exifr читает его TIFF-производные теги, а без строки MediaMeta
-   * такой файл вообще не появлялся в ленте «Фото» — владелец видел «часть фото пропала».
+   * Разбираем ЛЮБОЙ image/* и ЛЮБОЙ video/*, а не только те типы, что умеет sharp: RAW камер
+   * (DNG, CR2, NEF, ARW) не конвертируется, но exifr читает его TIFF-производные теги, а
+   * 3GP/BMP/JXL не попадали в ленту «Медиа» вообще — и владелец видел «часть фото пропала».
+   *
+   * Про дату: `capturedAt` — истинный UTC-момент съёмки, а не «время как в файле». Если даты
+   * в файле нет (видео без creation_time, скриншот), сюда попадает дата загрузки или архива,
+   * и отличить её от настоящей съёмки в контракте нечем. Такая «на глаз» поставленная дата
+   * не блокирует настоящую: см. fillDateAndGeo.
    */
   async captureAny(assetId: string, sha256: string, size: number, mime: string): Promise<void> {
     if (size <= 0 || size > MAX_PARSE_BYTES) return;
-    const isVideo = VIDEO_MIMES.includes(mime);
-    const isImage = mime.startsWith('image/');
+    const isVideo = isVideoMime(mime);
+    const isImage = isImageMime(mime);
     if (!isVideo && !isImage) return;
     if (await this.hasDetailedMeta(assetId)) return;
     if (isVideo) {
-      // дата загрузки сразу: видео должно быть в ленте, даже если ffprobe не ответит
-      await this.prisma.mediaMeta
-        .upsert({ where: { assetId }, create: { assetId, capturedAt: new Date() }, update: {} })
-        .catch(() => undefined);
+      // Строка MediaMeta нужна сразу: лента «Медиа» строится по ней, и без строки видео не
+      // видно в разделе, пока воркер не соберёт теги. Дата — дата загрузки: настоящую дату
+      // съёмки она не блокирует (fillDateAndGeo перетирает дату, не подтверждённую тегами).
+      await this.ensureMediaRow(assetId, new Date());
       void this.extractDetail(assetId, sha256, size, mime).catch(() => undefined);
       return;
     }
@@ -339,14 +425,34 @@ export class MediaService {
       .readRange(S3Service.assetKey(sha256), 0, Math.min(size, META_HEAD_BYTES) - 1)
       .catch(() => null);
     if (head && (await this.storeImageMeta(assetId, head))) return;
-    await this.extractDetail(assetId, sha256, size, mime).catch(() => undefined);
+    if (IMAGE_MIMES.includes(mime)) {
+      // метаданные лежат дальше головы — читаем 4 МБ, потом объект целиком
+      await this.extractDetail(assetId, sha256, size, mime).catch(() => undefined);
+    }
+    // Строка MediaMeta обязана быть у любого фото: у BMP/JXL/PNG без EXIF разбирать нечего,
+    // но лента «Медиа» строится по MediaMeta — без строки файл из «Фото» просто исчезает
+    // из раздела (превью у него всё равно не будет: mediaKindOf скажет «не собираются»).
+    await this.ensureMediaRow(assetId);
+  }
+
+  /** Строка MediaMeta есть? Создаём минимальную: лента «Медиа» строится по ней (см. captureAny). */
+  private async ensureMediaRow(assetId: string, capturedAt?: Date): Promise<void> {
+    await this.prisma.mediaMeta
+      .upsert({ where: { assetId }, create: { assetId, capturedAt }, update: {} })
+      .catch(() => undefined);
   }
 
   /**
    * Проставить дату съёмки и координаты, если разбор их не нашёл. Нужно для файлов без EXIF
    * (скриншоты, картинки из мессенджеров) и для видео без creation_time: иначе у них нет даты
-   * вообще, и в ленте они не появляются. Уже найденные значения не перетираем: EXIF и ffprobe
-   * точнее, чем дата из архива или сайдкара.
+   * вообще, и в ленте они не появляются.
+   *
+   * Дату из тегов не перетираем: EXIF и ffprobe точнее, чем дата из архива или сайдкара.
+   * Но перетираем дату, которой в файле не было: видео, залитое в 2024-м, получает на загрузке
+   * `capturedAt = new Date()` (иначе его нет в ленте), и раньше этот «сейчас» навсегда
+   * закрывал дорогу настоящей дате съёмки из Takeout-архива — ролик 2015 года вставал первым
+   * в ленте, в текущем месяце индекса и в начале выдачи карты. Признак «дата пришла из тегов»
+   * — сам `raw` (его пишут только storeImageMeta/storeVideoMeta), см. rawHasCapturedDate.
    */
   async fillDateAndGeo(
     assetId: string,
@@ -355,10 +461,14 @@ export class MediaService {
   ): Promise<void> {
     if (!capturedAt && !geo) return;
     const known = await this.prisma.mediaMeta
-      .findUnique({ where: { assetId }, select: { capturedAt: true, latitude: true, longitude: true } })
+      .findUnique({
+        where: { assetId },
+        select: { capturedAt: true, latitude: true, longitude: true, raw: true },
+      })
       .catch(() => null);
+    const keepDate = Boolean(known?.capturedAt) && rawHasCapturedDate(known?.raw);
     const patch = {
-      ...(known?.capturedAt || !capturedAt ? {} : { capturedAt }),
+      ...(keepDate || !capturedAt ? {} : { capturedAt }),
       ...(known?.latitude != null || !geo ? {} : { latitude: geo.latitude, longitude: geo.longitude }),
     };
     if (!Object.keys(patch).length) return;
@@ -368,17 +478,19 @@ export class MediaService {
   }
 
   /**
-   * Разбор уже дал подробности: `raw` есть и в нём есть поля, кроме `kind`.
+   * Разбор уже дал подробности — те, ради которых он и делается (дата, координаты, кадр).
    *
    * Проверять только `raw != null` нельзя: пустой `raw` остаётся после неудачного разбора
    * обрезанного начала файла, и тогда и повторная загрузка того же содержимого, и ленивый
-   * разбор при открытии деталки решали, что ходить в хранилище незачем.
+   * разбор при открытии деталки решали, что ходить в хранилище незачем. Одного «в raw что-то
+   * есть» тоже мало (hasUsefulRaw): частичный результат из головы файла так же закрывает
+   * дорогу полному разбору — см. hasCompleteRaw.
    */
   async hasDetailedMeta(assetId: string): Promise<boolean> {
     const known = await this.prisma.mediaMeta
       .findUnique({ where: { assetId }, select: { raw: true } })
       .catch(() => null);
-    return hasUsefulRaw(known?.raw);
+    return hasCompleteRaw(known?.raw);
   }
 
   /**
@@ -392,7 +504,7 @@ export class MediaService {
         return;
       }
 
-      if (VIDEO_MIMES.includes(mime)) {
+      if (isVideoMime(mime)) {
         await this.captureVideoFromObject(assetId, sha256, size);
       }
     } catch (e) {
@@ -409,7 +521,7 @@ export class MediaService {
    */
   private async storeImageMetaFromObject(assetId: string, sha256: string, size: number): Promise<void> {
     const key = S3Service.assetKey(sha256);
-    const head = await this.s3.readRange(key, 0, Math.min(size, MediaService.EXIF_HEAD_BYTES) - 1);
+    const head = await this.s3.readRange(key, 0, Math.min(size, EXIF_HEAD_BYTES) - 1);
     if (await this.storeImageMeta(assetId, head)) return;
     if (size <= head.length) return; // голова была всем файлом — читать больше нечего
     const whole = await this.s3.getObjectBytes(key, MAX_PARSE_BYTES);
@@ -421,10 +533,22 @@ export class MediaService {
    * (внешний хост S3 не резолвится), из-за чего видео оставалось без длительности и кодеков
    * в деталке. Уже скачанное сырьё воркер отдаёт через captureVideoFromFile — без второго
    * скачивания из S3.
+   *
+   * Объект скачивается целиком (потолок VIDEO_META_MAX_BYTES): метаданные контейнера лежат
+   * и в конце файла, а читать их head/tail-диапазонами — угадывать, где именно. Поэтому перед
+   * скачиванием проверяем свободное место: вызов прилетает фоном с пути загрузки, и пачка
+   * больших видео иначе выедала бы диск у воркера конвертации.
    */
   private async captureVideoFromObject(assetId: string, sha256: string, size: number): Promise<void> {
     if (size <= 0 || size > VIDEO_META_MAX_BYTES) {
       this.logger.debug(`видео ${sha256.slice(0, 8)}: ${size} байт — теги не читаем, слишком большой файл`);
+      return;
+    }
+    const free = await freeTmpBytes();
+    if (free != null && free < size + TMP_FREE_RESERVE_BYTES) {
+      this.logger.warn(
+        `видео ${sha256.slice(0, 8)}: ${Math.round(size / 1024 / 1024)} МБ тегов пропущено — свободно ${Math.round(free / 1024 / 1024)} МБ во временном каталоге`,
+      );
       return;
     }
     const dir = mkdtempSync(join(tmpdir(), 'clq-vmeta-'));
@@ -474,7 +598,8 @@ export class MediaService {
       lens: str(core.LensModel) ?? str(core.Lens),
       software: str(core.Software),
       fNumber: num(core.FNumber),
-      exposureTime: core.ExposureTime != null ? (Number(core.ExposureTime) < 1 ? `1/${Math.round(1 / Number(core.ExposureTime))}` : `${num(core.ExposureTime)} с`) : undefined,
+      // Выдержка строкой: при ExposureTime = 0 «1/∞» превращалось в «1/Infinity».
+      exposureTime: exposureText(core.ExposureTime),
       iso: num(core.ISO),
       focalLength: num(core.FocalLength),
       focalLength35: num(core.FocalLengthIn35mmFormat),
@@ -506,13 +631,13 @@ export class MediaService {
     await this.prisma.mediaMeta.upsert({
       where: { assetId },
       create: { assetId, capturedAt, latitude, longitude, make, model, width, height, raw: raw as never },
-      // update тоже правит колонки: строку мог создать captureMeta/enqueue (дата загрузки,
-      // без GPS), и тогда таймлайн оставался с неверным моментом съёмки навсегда.
+      // update тоже правит колонки: строку мог создать captureAny/enqueue (дата загрузки,
+      // без GPS), и тогда лента оставалась с неверным моментом съёмки навсегда.
       update: { raw: raw as never, capturedAt, latitude, longitude, make, model, width, height },
     });
-    // Нашли ли что-то по-настоящему: пустой raw вызывающему нужно трактовать как «не разобрали»
-    // и читать файл дальше или целиком (см. hasUsefulRaw).
-    return hasUsefulRaw(raw);
+    // Нашли ли что-то по-настоящему: и пустой raw, и частичный (только Make/Model) вызывающему
+    // нужно трактовать как «не разобрали» и читать файл дальше или целиком (см. hasCompleteRaw).
+    return hasCompleteRaw(raw);
   }
 
   /** ffprobe по локальному файлу: длительность, кодек, GPS, дата съёмки. */

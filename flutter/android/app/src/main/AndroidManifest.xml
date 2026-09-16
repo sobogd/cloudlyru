@@ -9,8 +9,30 @@
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage"/>
-    <!-- Мгновенный режим зеркала: постоянный сервис с уведомлением держит процесс живым,
-         пока приложение выгружено из памяти. -->
+    <!-- Android 10: разрешения появились в Android 11, поэтому на десятом доступ к пользовательским
+         папкам дают обычные разрешения на хранилище — и читать дерево, и писать в него скачанное
+         (зеркало кладёт файлы прямо в выбранные папки). Без них `hasAllFilesAccess` отвечал бы
+         «доступ есть», а дерево и разделы выглядели бы пустыми без единой подсказки.
+         `maxSdkVersion="29"` — на 11 и выше эти разрешения не нужны и не запрашиваются вовсе.
+         `tools:replace` обязателен: ту же пару разрешений объявляет `open_filex` (у него
+         `maxSdkVersion="32"`), и слияние манифестов падает на расхождении значений —
+         проверено сборкой. Наше значение точнее: на 11 и выше доступ даёт
+         `MANAGE_EXTERNAL_STORAGE`, а не эти разрешения.
+         `requestLegacyExternalStorage` включает на Android 10 прежнюю модель хранилища: без неё
+         приложение с targetSdk 30+ видит только свои файлы (на 11 и выше флаг игнорируется). -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29"
+        tools:replace="android:maxSdkVersion"/>
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29"
+        tools:replace="android:maxSdkVersion"/>
+    <!-- Разрешения на постоянный сервис с уведомлением оставлены с прежнего замысла и сейчас
+         не используются: постоянного сервиса нет — в манифесте объявлена только служба задания
+         `.SyncJobService` (это `JobService`, а не foreground-сервис), `startForeground`
+         не вызывается нигде, и уведомления приложение не показывает вовсе. Пока приложение
+         выгружено из памяти, работает периодическое задание системы, а не сервис. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
@@ -20,7 +42,9 @@
     <application
         android:label="Cloudly"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:requestLegacyExternalStorage="true"
+        tools:ignore="ScopedStorage">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -43,10 +67,13 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        <!-- Периодический проход зеркала: раз в пятнадцать минут, когда приложения нет
-             на экране или его процесс выгружен. Служба поднимает свой движок Flutter, ставит
-             мост к Android (номер файла нужен, чтобы переименование не выглядело как повторная
-             выгрузка) и запускает точку входа в Dart (см. SyncJobService). -->
+        <!-- Периодический проход зеркала, когда приложения нет на экране или его процесс
+             выгружен. Пятнадцать минут — минимум JobScheduler, а не расписание: в Doze и при
+             экономии батареи система сдвигает запуск (см. SyncJobScheduler). Служба поднимает
+             свой движок Flutter, ставит мост к Android (номер файла нужен, чтобы переименование
+             не выглядело как повторная выгрузка) и запускает точку входа в Dart (см.
+             SyncJobService). Это JobService, а не постоянный сервис: он живёт только на время
+             прохода и уведомлений не показывает. -->
         <service
             android:name=".SyncJobService"
             android:exported="false"

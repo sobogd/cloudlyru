@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import nodemailer, { type Transporter } from 'nodemailer';
 
 /**
@@ -8,6 +9,9 @@ import nodemailer, { type Transporter } from 'nodemailer';
  * ссылались бы друг на друга, и Nest не смог бы их собрать без forwardRef — то есть круговая
  * зависимость подсказывала, что общая часть вообще не про них.
  */
+
+/** Лог модуля: сюда уходит сырой ответ чужого SMTP-сервера (в ответ клиенту — не уходит). */
+const logger = new Logger('MailSmtp');
 
 export interface SmtpCredentials {
   smtpHost: string;
@@ -60,11 +64,15 @@ function portsToTry(port: number): number[] {
 }
 
 export interface SmtpVerifyResult {
-  /** Текст ошибки или null, если доступ есть. */
+  /** Человеческая формулировка причины отказа (её и показываем клиенту) или null, если доступ есть. */
   error: string | null;
   /** Порт, на котором получилось (или заявленный, если не получилось ни на одном). */
   port: number;
-  /** Что происходило на каждой попытке — это уходит в текст ошибки, чтобы причина была видна. */
+  /**
+   * Что происходило на каждой попытке — сырой текст ответа чужого SMTP-сервера. Нужен для
+   * разбора (баннер, версия, «слишком много попыток»), поэтому уходит только в лог: в
+   * `statusError` и в интерфейс он не попадает.
+   */
   attempts: string[];
 }
 
@@ -73,6 +81,9 @@ export interface SmtpVerifyResult {
  *
  * Делается при добавлении аккаунта: «почта читается, а письма не уходят» — не то, что стоит
  * выяснять, когда письмо уже написано и нажато «отправить».
+ *
+ * Ответ сервера (баннер, версия, текст отказа — часто англоязычный и длинный) остаётся в
+ * `attempts` и в логе; клиенту уходит короткая человеческая формулировка из `error`.
  */
 export async function verifySmtpAccess(account: SmtpCredentials): Promise<SmtpVerifyResult> {
   const attempts: string[] = [];
@@ -86,12 +97,16 @@ export async function verifySmtpAccess(account: SmtpCredentials): Promise<SmtpVe
       const err = e as Error & { response?: string; code?: string };
       const text = String(err.response || err.message || e).slice(0, 200);
       attempts.push(`${port}: ${text}`);
+      // Сырой текст — в лог: в ответе он не нужен, а разбираться по нему всё равно серверу.
+      logger.warn(`SMTP ${account.smtpHost}:${port}: ${text}`);
     } finally {
       transport.close();
     }
   }
   return {
-    error: attempts.join('; ') || 'не удалось подключиться',
+    error:
+      `не удалось подключиться к ${account.smtpHost || 'SMTP-серверу'} ` +
+      `(порты ${ports.join(', ')}): проверьте адрес сервера, пароль приложения и разрешение отправки по SMTP`,
     port: account.smtpPort,
     attempts,
   };

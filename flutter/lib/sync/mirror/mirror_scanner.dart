@@ -7,26 +7,52 @@ import '../data/selection_rules.dart';
 import '../device/media_rules.dart';
 import '../device/native_fs.dart';
 import 'mirror_models.dart';
+import 'mirror_rules.dart';
 
 /// Снимок выбранных папок раздела «Файлы» для сверки.
 ///
 /// Отдельно от `DeviceFiles.scan`, хотя обход похож: у зеркала другие требования. Здесь нужны
 /// папки (чтобы в облаке повторялась и пустая структура), номер файла в файловой системе (иначе
 /// переименование неотличимо от удаления с повторной выгрузкой) и честный счётчик нечитаемых
-/// папок — по нему принимается решение, можно ли вообще удалять что-то в облаке в этом проходе.
+/// папок — вместе с признаком неполного обхода он и решает, можно ли вообще удалять что-то
+/// в облаке в этом проходе ([MirrorRules.deletionsAllowed]).
 /// Сортировка не нужна: зеркало не показывает список, а сравнивает множества.
+///
+/// Создаётся движком на каждый проход (`MirrorEngine._pushLocal`); снимок живёт в памяти
+/// прохода и целиком держится там же, поэтому и есть предел [hardMax].
 class MirrorScanner {
+  /// @param native мост к Android: нужен за номерами файлов, подменяется в тестах.
   MirrorScanner({NativeFs? native}) : _native = native ?? NativeFs();
 
   final NativeFs _native;
 
   /// Предел на всякий случай: снимок держится в памяти целиком.
+  ///
+  /// Источник числа — оценка памяти (строка пути, имя, размеры, номер файла на файл при
+  /// потолке снимка), а не замер на устройстве: точное значение стоит подобрать по расходу
+  /// памяти на телефоне с большой галереей.
   static const int hardMax = 200000;
 
   /// Сколько путей спрашивать у моста за один вызов: пачка не должна быть настолько большой,
   /// чтобы ответ не влез в сообщение канала.
+  ///
+  /// Источник числа — размер ответа канала (2000 чисел), а не замер: сколько `Os.stat` в пачке
+  /// терпимо по времени, зависит от устройства и стоит измерить.
   static const int inodeBatch = 2000;
 
+  /// Обойти выбранные папки и вернуть снимок для сверки.
+  ///
+  /// @param paths выбранные папки (подпапки внутри других выбранных отбрасываются правилами);
+  ///        @param onProgress текст о ходе обхода — вызывается примерно раз на сто папок;
+  ///        @param isCancelled опрос отмены: проверяется перед каждой папкой и каждым файлом.
+  /// @return снимок файлов и папок вместе со счётчиком нечитаемых папок и признаком упора
+  ///         в [hardMax]. Пишет только в память: диск читается, но не меняется, сеть не
+  ///         трогается вовсе. Отменённый обход возвращает то, что успел собрать, и помечается
+  ///         [LocalSnapshot.capped]: по обрезанному снимку удалять нельзя, иначе всё
+  ///         несобранное выглядело бы удалённым. Номера файлов в таком снимке не спрашиваются
+  ///         вовсе — второй проход начинается только у полного обхода.
+  /// Нечитаемая папка не роняет обход: [LocalSnapshot.unreadable] растёт, а её содержимое
+  /// в снимок не попадает.
   Future<LocalSnapshot> snapshot(
     Iterable<String> paths, {
     void Function(String)? onProgress,
@@ -41,13 +67,20 @@ class MirrorScanner {
     var unreadable = 0;
     var visited = 0;
     var capped = false;
+    // отмена и предел — разные причины неполного снимка, но запрет на удаления у них общий
+    var aborted = false;
 
     for (final root in SelectionRules.scanRoots(paths.toSet())) {
       if (capped || cancelled()) break;
       final rootName = p.basename(root);
+      // обход в глубину: относительный путь копится от выбранной папки вместе с её именем —
+      // ровно он и станет структурой папок в облаке
       final queue = <(String, String)>[(root, rootName)];
       while (queue.isNotEmpty && !capped) {
-        if (cancelled()) break;
+        if (cancelled()) {
+          aborted = true;
+          break;
+        }
         final (dir, relDir) = queue.removeLast();
         List<FileSystemEntity> children;
         try {
@@ -57,6 +90,8 @@ class MirrorScanner {
           unreadable += 1;
           continue;
         }
+        // папка попадает в снимок целиком, независимо от содержимого: пустая структура тоже
+        // должна доехать до облака
         dirs.add(LocalDir(dir, relDir));
         visited += 1;
         if (visited % 100 == 0) {
@@ -64,31 +99,41 @@ class MirrorScanner {
         }
         final parentName = p.basename(dir);
         for (final child in children) {
-          if (cancelled()) break;
+          if (cancelled()) {
+            aborted = true;
+            break;
+          }
           final name = p.basename(child.path);
           // Символическая ссылка уводит за пределы выбранной папки: содержимое чужого каталога
           // уехало бы в облако как «файлы выбранной папки». Не ходим по ссылкам.
           if (child is Link) continue;
           if (child is Directory) {
-            if (MediaRules.skipDir(name, parentName)) continue;
+            if (MediaRules.skipDir(name, parentName) || MirrorRules.ignored(name)) {
+              continue;
+            }
             queue.add((child.path, '$relDir/$name'));
             continue;
           }
           if (child is! File) continue;
-          if (MediaRules.isHidden(name) || MediaRules.isJunk(name)) continue;
+          // скрытое и служебное сверка не показывает вовсе; такие же имена не удаляются
+          // в облаке (см. MirrorRules.excluded)
+          if (MirrorRules.ignored(name)) continue;
           final stat = await child.stat();
+          // файл исчез между листингом и stat: `stat` не бросает, а отвечает «не найден»
+          // с размером -1. Такой фантом в снимке выглядел бы файлом, который «ждёт выгрузки»
+          if (stat.type == FileSystemEntityType.notFound || stat.size < 0) continue;
           gathered.add(
             _Gathered(
               path: child.path,
               name: name,
               dir: dir,
-              relDir: relDir,
-              root: root,
               size: stat.size,
               mtime: stat.modified.millisecondsSinceEpoch,
             ),
           );
           if (gathered.length >= hardMax) {
+            // предел выбран по памяти снимка, а не по времени: часть дерева осталась
+            // непройденной, и по такому снимку удалять нельзя (см. deletionsAllowed)
             capped = true;
             break;
           }
@@ -96,28 +141,37 @@ class MirrorScanner {
       }
     }
 
+    // Второй проход — за номерами файлов: обход диска отдельно, мост отдельно, чтобы
+    // пачка путей уходила одним вызовом, а не по одному на файл.
+    // Отменённый обход второго прохода не делает: снимок всё равно неполный, а номера файлов
+    // никому не понадобятся — удалять по нему нельзя, а план выгрузки движок не строит
     final files = <LocalFile>[];
-    for (var start = 0; start < gathered.length; start += inodeBatch) {
-      if (cancelled()) break;
-      final chunk = gathered.sublist(
-        start,
-        math.min(start + inodeBatch, gathered.length),
-      );
-      final inodes = await _native.inodes([for (final g in chunk) g.path]);
-      for (var i = 0; i < chunk.length; i++) {
-        final g = chunk[i];
-        files.add(
-          LocalFile(
-            path: g.path,
-            name: g.name,
-            dir: g.dir,
-            relDir: g.relDir,
-            root: g.root,
-            size: g.size,
-            mtime: g.mtime,
-            inode: i < inodes.length ? inodes[i] : 0,
-          ),
+    if (!aborted) {
+      for (var start = 0; start < gathered.length; start += inodeBatch) {
+        if (cancelled()) {
+          aborted = true;
+          break;
+        }
+        final chunk = gathered.sublist(
+          start,
+          math.min(start + inodeBatch, gathered.length),
         );
+        final inodes = await _native.inodes([for (final g in chunk) g.path]);
+        for (var i = 0; i < chunk.length; i++) {
+          final g = chunk[i];
+          files.add(
+            LocalFile(
+              path: g.path,
+              name: g.name,
+              dir: g.dir,
+              size: g.size,
+              mtime: g.mtime,
+              // 0 — «номер неизвестен»: тогда переименование не распознаётся и файл уедет
+              // заново. Ответ моста может быть короче запроса, и это не роняет снимок
+              inode: i < inodes.length ? inodes[i] : 0,
+            ),
+          );
+        }
       }
     }
 
@@ -125,19 +179,20 @@ class MirrorScanner {
       files: files,
       dirs: dirs,
       unreadable: unreadable,
-      capped: capped,
+      capped: capped || aborted,
     );
   }
 }
 
 /// Файл, найденный обходом, до того как узнан его номер в файловой системе.
+///
+/// Промежуточная запись на время обхода: размер и дата берутся из `stat`, потому что
+/// спрашивать их у моста вместе с номером файла — лишний обмен на каждый файл.
 class _Gathered {
   const _Gathered({
     required this.path,
     required this.name,
     required this.dir,
-    required this.relDir,
-    required this.root,
     required this.size,
     required this.mtime,
   });
@@ -145,8 +200,6 @@ class _Gathered {
   final String path;
   final String name;
   final String dir;
-  final String relDir;
-  final String root;
   final int size;
   final int mtime;
 }

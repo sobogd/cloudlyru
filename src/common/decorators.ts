@@ -27,7 +27,11 @@ export interface RateLimitOptions {
   windowMs: number;
 }
 
-/** Ограничение частоты запросов на IP. */
+/**
+ * Ограничение частоты запросов на IP для конкретной ручки. Задаёт своё окно и перебивает общий
+ * дефолт гарда (RATE_LIMIT_DEFAULT_PER_MIN): у ручек с декоратором лимит строже общего, потому
+ * что цена ошибки тут выше — перебор пароля, отправка почты, тяжёлые выборки.
+ */
 export const RateLimit = (limit: number, windowMs: number) =>
   SetMetadata(RATE_LIMIT_KEY, { limit, windowMs } satisfies RateLimitOptions);
 

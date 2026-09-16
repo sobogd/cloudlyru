@@ -55,10 +55,19 @@ if [ -z "$TOKEN" ]; then
   exit 75
 fi
 
+# Получатель для query-строки: каждый байт уходит процентами. Без этого адрес `user+tag@domain`
+# теряет смысл — Express/qs декодирует `+` в пробел, и аккаунт по такому адресу не находится.
+# Кодируем всё, а не только «опасные» символы: обратное декодирование вернёт адрес один в один,
+# а вычислять набор опасных символов вручную — лишний повод ошибиться. `od`/`tr`/`sed` есть
+# в любом базовом окружении, в отличие от `curl --url-query` (появился только в curl 7.87).
+urlencode() {
+  printf '%s' "$1" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g'
+}
+
 # --max-time с запасом: приложение разбирает письмо, кладёт вложения в S3 и пишет в БД.
 # Письмо читается со stdin и уходит как есть, поэтому Content-Type — сам тип письма.
 CODE=$(curl -sS --max-time 180 -o "$OUT_TMP" -w '%{http_code}' \
-  -X POST "$URL?to=$RECIPIENT" \
+  -X POST "$URL?to=$(urlencode "$RECIPIENT")" \
   -H "X-Mail-Inbound-Token: $TOKEN" \
   -H 'Content-Type: message/rfc822' \
   --data-binary @- 2>"$ERR_TMP")

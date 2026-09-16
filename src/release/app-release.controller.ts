@@ -18,7 +18,10 @@ export class AppReleaseController {
   @Get()
   async latest() {
     const release = await this.release.latest();
-    if (!release) throw notFound('сборка ещё не опубликована', 'no_release');
+    // metaKnown=false — APK лежит в бакете без описания: отдать приложению versionCode 0
+    // и sha256 '' значило бы соврать про сборку. Клиент обязан увидеть тот же `no_release`,
+    // что и при пустом бакете, а скачать файл руками по-прежнему можно через /apk.
+    if (!release || !release.metaKnown) throw notFound('сборка ещё не опубликована', 'no_release');
     return release;
   }
 }

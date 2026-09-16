@@ -27,6 +27,15 @@ export function asOptionalString(v: unknown, field: string): string | undefined 
 }
 
 /**
+ * Управляющие символы направления текста (bidi): невидимы, но переставляют куски имени при
+ * отображении, поэтому «счёт<U+202E>fdp.exe» в списке файлов читается как «счётexe.pdf».
+ * Отдельного вреда файловой системе тут нет — подмена адресована человеку, который смотрит
+ * на список, и именно поэтому символы запрещаются, а не вырезаются: клиент должен получить
+ * внятную ошибку, а не имя, молча изменённое на другое.
+ */
+const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
+/**
  * Валидация имён папок/файлов: запрет разделителей пути и управляющих символов.
  * Длина — в БАЙТАХ utf8, а не в символах: 255 — это предел файловых систем телефона
  * (ext4/f2fs/APFS), и имя из 200 кириллических символов (400 байт) создавалось в облаке,
@@ -40,6 +49,7 @@ export function assertSafeName(name: string): void {
   if (name.includes('/') || name.includes('\\') || name.includes('\0')) {
     throw badRequest('name contains path separators');
   }
+  if (BIDI_CONTROLS.test(name)) throw badRequest('name contains bidi control characters');
   if (name === '.' || name === '..') throw badRequest('invalid name');
 }
 

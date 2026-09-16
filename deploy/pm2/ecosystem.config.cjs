@@ -12,6 +12,11 @@ module.exports = {
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
+      // Потолок памяти процесса API. На него ориентируются лимиты распаковки архивов
+      // (UNZIP_BUFFER_LIMIT_MB, дефолт 64 МБ: файл читается в память одним проходом, то есть
+      // в пике живут буфер и Buffer.concat) — поднимать 600M имеет смысл только вместе с ними.
+      // CONVERT_MEM_MB к этому потолку отношения не имеет: это RLIMIT_AS отдельного процесса
+      // конвертера, а не память API.
       max_memory_restart: '600M',
       env: {
         NODE_ENV: 'production',

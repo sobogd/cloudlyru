@@ -18,6 +18,18 @@ import type { MailAccountRow, MailBox } from './mail-accounts.service';
  * Порядок здесь важнее скорости: сначала байты письма гарантированно легли в хранилище,
  * только потом появляется строка в БД. Обратный порядок дал бы «письмо есть, содержимого нет» —
  * а именно такие строки потом удаляются с сервера в фазе очистки, то есть теряются навсегда.
+ *
+ * Ключи, по которым письмо считается уже сохранённым, делятся на две группы, и разница
+ * принципиальна:
+ *   * сильные — координаты на сервере (`folderPath` + `uidValidity` + `uid`) и X-GM-MSGID:
+ *     их назначает сервер, подделать их отправитель не может;
+ *   * слабый — заголовок Message-ID: его пишет отправитель, и повторить чужой он может.
+ * Совпадение только по слабому ключу — это повод заподозрить дубль, а не признать его: письмо
+ * сохраняется отдельно (иначе третья сторона тихо выкидывала бы из архива и чужие письма,
+ * повторяя их Message-ID). Дублем считаем те случаи, когда видно, что это буквально то же
+ * письмо: совпал размер сырья (одна и та же копия в двух папках сервера) или найденная строка —
+ * наша собственная отправленная копия (`local:sent`), к которой провайдер мог дописать свои
+ * заголовки.
  */
 
 /** Что делать с письмом по итогам прохода. */
@@ -54,6 +66,57 @@ export interface IngestInput {
 export const MAIL_BOX_FOLDER: Record<MailBox, string> = { inbox: 'Входящие', sent: 'Исходящие', trash: 'Корзина' };
 
 /**
+ * Что нужно, чтобы разложить части письма по дереву: только координаты.
+ *
+ * Отдельный тип, а не `IngestInput` с пустым буфером: добор вложений идёт по уже сохранённому
+ * сырью из хранилища, и подсовывать в общий путь фиктивное `source` нельзя — первое же
+ * обращение к нему (сейчас или после правки) молча сохранило бы пустое письмо.
+ */
+interface AttachmentTarget {
+  userId: string;
+  box: MailBox;
+  accountId: string;
+  folderPath: string;
+  uid: bigint;
+  uidValidity: bigint;
+  emailId: string | null;
+}
+
+/** Поля уже сохранённого письма, нужные и дедупу, и добору вложений. */
+const EXISTING_FIELDS = {
+  id: true,
+  deletedAt: true,
+  box: true,
+  alsoBoxes: true,
+  folderPath: true,
+  uid: true,
+  uidValidity: true,
+  seen: true,
+  rawAssetId: true,
+  hasAttachments: true,
+  sortAt: true,
+  size: true,
+  _count: { select: { attachments: true } },
+} as const;
+
+/** Строка письма, найденная дедупом (структурно совпадает с выборкой EXISTING_FIELDS). */
+interface ExistingLetter {
+  id: string;
+  deletedAt: Date | null;
+  box: string;
+  alsoBoxes: string[];
+  folderPath: string;
+  uid: bigint;
+  uidValidity: bigint;
+  seen: boolean;
+  rawAssetId: string;
+  hasAttachments: boolean;
+  sortAt: Date;
+  size: number;
+  _count: { attachments: number };
+}
+
+/**
  * Псевдо-папка для писем, пришедших не по IMAP: наша отправка и приём своим сервером.
  * Курсоров у неё нет — это просто координата, чтобы строка письма была полной.
  *
@@ -75,11 +138,24 @@ export function uidOfMessageId(messageId: string): number {
 /** Длинная строка MIME в БД не нужна: тип части — это ярлык для интерфейса. */
 const MAX_MIME = 120;
 
+/**
+ * Сколько живёт кэш id папки «Почта/Входящие».
+ *
+ * Кэш нужен, чтобы не искать папку на каждое письмо, но вечным он быть не может: папку можно
+ * удалить и пересоздать (например, очисткой зоны MAIL), и мёртвый id ломал бы сохранение
+ * вложений до перезапуска процесса.
+ */
+const BOX_FOLDER_TTL_MS = 5 * 60 * 1000;
+
 @Injectable()
 export class MailIngestService {
   private readonly logger = new Logger(MailIngestService.name);
-  /** Кэш папок-корзин на время прохода: иначе на каждое письмо два лишних запроса. */
-  private readonly boxFolders = new Map<string, string>();
+  /**
+   * Кэш папок-корзин: иначе на каждое письмо два лишних запроса. Живёт ограниченное время
+   * (BOX_FOLDER_TTL_MS): папку могут удалить и пересоздать, а мёртвый id в кэше ломал бы
+   * сохранение вложений до перезапуска процесса.
+   */
+  private readonly boxFolders = new Map<string, { id: string; at: number }>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -92,7 +168,7 @@ export class MailIngestService {
   private async boxFolderId(userId: string, box: MailBox): Promise<string> {
     const cacheKey = `${userId}:${box}`;
     const cached = this.boxFolders.get(cacheKey);
-    if (cached) return cached;
+    if (cached && Date.now() - cached.at < BOX_FOLDER_TTL_MS) return cached.id;
 
     const rootId = await this.auth.mailFolderId(userId);
     const name = MAIL_BOX_FOLDER[box];
@@ -106,8 +182,58 @@ export class MailIngestService {
         if (!folder) throw new Error(`не удалось создать папку «${name}» в «Почте»`);
       }
     }
-    this.boxFolders.set(cacheKey, folder.id);
+    this.boxFolders.set(cacheKey, { id: folder.id, at: Date.now() });
     return folder.id;
+  }
+
+  /**
+   * Письмо, которое уже лежит у нас, по СИЛЬНЫМ ключам: координаты на сервере и X-GM-MSGID.
+   *
+   * Message-ID здесь намеренно не участвует: он от отправителя, и совпадение по нему ещё не
+   * значит «это то же письмо» (см. шапку файла).
+   */
+  private async findExisting(input: IngestInput, uid: bigint): Promise<ExistingLetter | null> {
+    return this.prisma.mailMessage.findFirst({
+      where: {
+        accountId: input.account.id,
+        OR: [
+          { folderPath: input.folderPath, uidValidity: input.uidValidity, uid },
+          ...(input.emailId ? [{ gmailMsgId: input.emailId }] : []),
+        ],
+      },
+      select: EXISTING_FIELDS,
+    });
+  }
+
+  /**
+   * Похоже ли, что найденное по Message-ID письмо — то же самое, а не подделка заголовка.
+   *
+   * Два случая, когда это точно то же письмо:
+   *   * наша собственная отправленная копия (`local:sent`): провайдер мог дописать к письму
+   *     свои заголовки, поэтому размеры могут отличаться, а совпадения Message-ID достаточно;
+   *   * сырьё совпало байт в байт — на сервере это буквально одна и та же копия в двух папках.
+   * Во всех остальных случаях письмо сохраняется отдельно: у разных писем одинаковый размер —
+   * совпадение, а вот у одной копии в двух папках он обязан совпасть. Цена ошибки в другую
+   * сторону выше: задвоенная строка видна в интерфейсе, а выброшенное письмо — нет.
+   */
+  private looksLikeSameLetter(row: ExistingLetter, input: IngestInput): boolean {
+    if (row.folderPath.startsWith(LOCAL_PREFIX) && row.box === 'sent') return true;
+    return row.size === input.source.length;
+  }
+
+  /**
+   * Сколько частей в письме по его же разбору. Нужно, чтобы поймать оборванный прошлый проход:
+   * строки частей могли создаться не все, и «parts > 0» такую неполноту не видит.
+   * Разбор не должен ронять сохранение: не получилось — считаем, что сведений нет.
+   */
+  private async expectedAttachments(source: Buffer): Promise<number> {
+    if (!source.length) return 0;
+    try {
+      return (await parseMessage(source)).attachments.length;
+    } catch (e) {
+      this.logger.warn(`разбор письма для сверки вложений не удался — ${errorText(e)}`);
+      return 0;
+    }
   }
 
   /**
@@ -119,9 +245,25 @@ export class MailIngestService {
    * Без аккаунта в ключе второе письмо упиралось в «file name already exists» и роняло
    * весь проход синхронизации.
    */
-  private identityOf(input: IngestInput): string {
-    const own = input.emailId ?? `${input.folderPath}:${input.uidValidity}:${input.uid}`;
-    return `${input.account.id}:${own}`;
+  private identityOf(target: AttachmentTarget): string {
+    const own = target.emailId ?? `${target.folderPath}:${target.uidValidity}:${target.uid}`;
+    return `${target.accountId}:${own}`;
+  }
+
+  /**
+   * Координаты письма, нужные для раскладки частей (само письмо для этого не нужно).
+   * `uid` передаём явно: в редком случае коллизии он отличается от `input.uid`.
+   */
+  private targetOf(input: IngestInput, uid: bigint): AttachmentTarget {
+    return {
+      userId: input.userId,
+      box: input.box,
+      accountId: input.account.id,
+      folderPath: input.folderPath,
+      uid,
+      uidValidity: input.uidValidity,
+      emailId: input.emailId ?? null,
+    };
   }
 
   /**
@@ -129,41 +271,55 @@ export class MailIngestService {
    *   stored             — письма у нас ещё не было;
    *   skipped            — уже есть (обычный случай повторного прохода);
    *   trashed            — есть, но лежит в корзине: удалённое не воскрешаем;
-   *   attachments-repaired — строка была, вложений не было (прошлый проход оборвался).
+   *   attachments-repaired — строка была, а частей у неё меньше, чем в письме (прошлый проход
+   *                          оборвался посередине): недостающие добрали.
    */
   async ingest(input: IngestInput): Promise<IngestResult> {
-    const uid = BigInt(input.uid);
-    // Message-ID достаём из заголовков заранее, до разбора: он третий ключ дедупа и
-    // единственный, который ловит письмо, встреченное в другой папке источника (или свою же
-    // отправленную копию, которую синхронизация нашла на сервере).
+    let uid = BigInt(input.uid);
+    // Message-ID достаём из заголовков заранее, до разбора: это слабый ключ дедупа — он ловит
+    // письмо, встреченное в другой папке источника (или свою же отправленную копию, которую
+    // синхронизация нашла на сервере), но подделать его может кто угодно (см. шапку файла).
     const messageId = headerMessageId(input.source);
-    const existing = await this.prisma.mailMessage.findFirst({
-      where: {
-        accountId: input.account.id,
-        OR: [
-          { folderPath: input.folderPath, uidValidity: input.uidValidity, uid },
-          ...(input.emailId ? [{ gmailMsgId: input.emailId }] : []),
-          ...(messageId ? [{ messageId }] : []),
-        ],
-      },
-      select: {
-        id: true,
-        deletedAt: true,
-        box: true,
-        alsoBoxes: true,
-        folderPath: true,
-        uid: true,
-        uidValidity: true,
-        seen: true,
-        rawAssetId: true,
-        hasAttachments: true,
-        sortAt: true,
-        _count: { select: { attachments: true } },
-      },
-    });
+    const existing = await this.findExisting(input, uid);
 
-    if (existing) {
-      if (existing.deletedAt) return 'trashed';
+    // Координата локального письма — не UID сервера, а хеш от Message-ID (48 бит): совпадение
+    // по ней без совпадения размера означает коллизию, а не то же письмо. Тогда берём
+    // координату от содержимого — она детерминирована (повторная доставка того же письма даст
+    // её же), но два разных письма с одинаковым Message-ID больше не столкнутся.
+    const coordinateCollision =
+      existing !== null &&
+      input.folderPath.startsWith(LOCAL_PREFIX) &&
+      existing.size !== input.source.length;
+    if (coordinateCollision) {
+      uid = BigInt(uidOfMessageId(`${messageId ?? ''}#${sha256Hex(input.source)}`));
+      this.logger.warn(
+        `письмо ${messageId ?? '(без Message-ID)'}: координаты заняты другим письмом (${existing?.size} против ${input.source.length} байт) — сохраняю отдельно`,
+      );
+    }
+
+    // Совпадение только по Message-ID: дублем признаём, лишь когда видно, что это то же письмо.
+    // Иначе отправитель, повторив чужой заголовок, тихо выкидывал бы письмо из архива.
+    let match = coordinateCollision ? null : existing;
+    if (!match && messageId) {
+      const twin = await this.prisma.mailMessage.findFirst({
+        where: {
+          accountId: input.account.id,
+          messageId,
+          ...(existing ? { NOT: { id: existing.id } } : {}),
+        },
+        select: EXISTING_FIELDS,
+      });
+      if (twin && this.looksLikeSameLetter(twin, input)) {
+        match = twin;
+      } else if (twin) {
+        this.logger.warn(
+          `письмо ${messageId}: Message-ID уже занят письмом ${twin.id} (${twin.size} байт против ${input.source.length}) — сохраняю как отдельное письмо`,
+        );
+      }
+    }
+
+    if (match) {
+      if (match.deletedAt) return 'trashed';
       // Письмо переехало между папками (спам → входящие, перенос метки в Gmail): обновляем
       // координаты, иначе следующий проход будет считать его новым в старой папке.
       //
@@ -172,22 +328,22 @@ export class MailIngestService {
       // отправленное себе, приходит обратно именно так — это не переезд, а вторая папка.
       const moved =
         !input.folderPath.startsWith(LOCAL_PREFIX) &&
-        (existing.folderPath !== input.folderPath ||
-          existing.uid !== uid ||
-          existing.uidValidity !== input.uidValidity);
+        (match.folderPath !== input.folderPath ||
+          match.uid !== uid ||
+          match.uidValidity !== input.uidValidity);
       // Папки, которых у письма ещё нет: вторая копия того же письма (отправленное себе,
       // две копии у iCloud) — это то же письмо в другой папке, а не другое письмо.
       const extraBoxes = [...new Set([input.box, ...(input.alsoBoxes ?? [])])].filter(
-        (b) => b !== existing.box && !existing.alsoBoxes.includes(b),
+        (b) => b !== match.box && !match.alsoBoxes.includes(b),
       );
       // Прочитанность берём с сервера только в одну сторону: «там прочитано» — значит и у нас
       // прочитано; «там не прочитано» локальную отметку не снимает. Иначе письмо, прочитанное
       // в нашем интерфейсе (флаги на сервер мы пока не пишем), каждым проходом снова
       // становилось бы непрочитанным.
-      const adoptSeen = input.seen && !existing.seen;
+      const adoptSeen = input.seen && !match.seen;
       if (moved || adoptSeen || extraBoxes.length) {
         await this.prisma.mailMessage.update({
-          where: { id: existing.id },
+          where: { id: match.id },
           data: {
             ...(moved
               ? {
@@ -197,6 +353,13 @@ export class MailIngestService {
                   // У своей отправленной копии X-GM-MSGID неизвестен: подставляем, когда
                   // синхронизация встретила то же письмо на сервере.
                   ...(input.emailId ? { gmailMsgId: input.emailId } : {}),
+                  // Письмо теперь лежит по новым координатам — значит у провайдера появилась
+                  // ещё одна копия, и прежняя отметка «копий нет» к нему больше не относится:
+                  // снимаем её, иначе письмо навсегда выпадет из очереди чистки (она выбирает
+                  // кандидатов по `remoteDeletedAt: null`).
+                  remoteDeletedAt: null,
+                  remotePurgeTries: 0,
+                  remotePurgeError: null,
                 }
               : {}),
             ...(extraBoxes.length ? { alsoBoxes: { push: extraBoxes } } : {}),
@@ -204,11 +367,15 @@ export class MailIngestService {
           },
         });
       }
-      // Вложения могли не доехать в прошлый раз (обрыв между строкой письма и частями).
-      // Сырьё у нас уже есть в S3, поэтому перебираем части из хранилища, а не с сервера.
-      if (existing.hasAttachments && existing._count.attachments === 0) {
-        await this.repairAttachments(input.userId, existing.id, existing.rawAssetId, existing.sortAt, input);
-        return 'attachments-repaired';
+      // Вложения могли не доехать в прошлый раз: обрыв случился между строкой письма и частями,
+      // поэтому частей меньше, чем в самом письме (а не обязательно ноль). Сверяем с разбором
+      // того же сырья — оно у нас в руках, из хранилища его доставать не нужно.
+      if (match.hasAttachments) {
+        const expected = await this.expectedAttachments(input.source);
+        if (expected > 0 && match._count.attachments < expected) {
+          await this.repairAttachments(input.userId, match.id, match.rawAssetId, match.sortAt, this.targetOf(input, uid));
+          return 'attachments-repaired';
+        }
       }
       return 'skipped';
     }
@@ -264,7 +431,7 @@ export class MailIngestService {
 
     // 3. Вложения. Падение тут не откатывает письмо: строка останется, а следующий проход
     //    доберёт части (см. ветку attachments-repaired выше) — терять письмо нельзя.
-    await this.storeAttachments(input, created.id, sortAt, parsed.attachments);
+    await this.storeAttachments(this.targetOf(input, uid), created.id, sortAt, parsed.attachments);
 
     return 'stored';
   }
@@ -273,12 +440,19 @@ export class MailIngestService {
    * Письмо, которое принёс наш собственный сервер (Postfix → pipe → эта ручка).
    *
    * Отличие от IMAP-пути только в координатах: у письма нет ни UID сервера, ни папки,
-   * поэтому uid берём из Message-ID, а вместо папки ставим пометку «локальная». Дедуп
-   * по Message-ID не даёт одному и тому же письму появиться дважды при повторе доставки.
+   * поэтому uid берём из Message-ID, а вместо папки ставим пометку «локальная». Повтор
+   * доставки ловится координатой (тот же Message-ID даёт тот же uid), а не Message-ID как
+   * ключом — совпадение по нему одного письма с другим не значит «это дубль».
+   *
+   * Получатель приходит из адреса доставки, и сравнивать его нужно без учёта регистра: в схеме
+   * адрес уникален только в пределах пользователя (`@@unique([userId, email])`), поэтому
+   * «User@Example.com» и «user@example.com» — это две разные строки. Если под один адрес
+   * подходит несколько аккаунтов, письмо не отдаём ни одному: отдать чужую переписку хуже,
+   * чем попросить администратора развести адреса (Postfix на этом ответе повторит доставку).
    */
   async ingestInbound(recipient: string, source: Buffer): Promise<'stored' | 'duplicate' | 'unknown-account'> {
     const email = String(recipient ?? '').trim().toLowerCase();
-    const account = await this.prisma.mailAccount.findFirst({ where: { email } });
+    const account = await this.accountForRecipient(email);
     // Аккаунт ещё не заведён в приложении: отвечаем «временно не можем», чтобы Postfix
     // подержал письмо в очереди и повторил — терять его из-за настройки нельзя.
     if (!account) return 'unknown-account';
@@ -299,6 +473,44 @@ export class MailIngestService {
       receivedAt: new Date(),
     });
     return result === 'skipped' || result === 'attachments-repaired' ? 'duplicate' : 'stored';
+  }
+
+  /**
+   * Аккаунт по адресу доставки.
+   *
+   * Сравнение без учёта регистра и с запасной попыткой без plus-метки: `user+tag@домен` — это
+   * тот же ящик (`user@домен`), и если такого аккаунта нет, письмо уходило бы в отказ, а
+   * Postfix — в ретраи и bounce.
+   */
+  private async accountForRecipient(email: string): Promise<MailAccountRow | null> {
+    const candidates = await this.accountsByEmail(email);
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length > 1) {
+      this.logger.error(
+        `письмо на ${email}: под адрес подходит аккаунтов — ${candidates.length}; доставку не выполняю, разведите адреса`,
+      );
+      return null;
+    }
+    const plus = email.indexOf('+');
+    const at = email.lastIndexOf('@');
+    if (plus > 0 && at > plus) {
+      const base = `${email.slice(0, plus)}${email.slice(at)}`;
+      const fallback = await this.accountsByEmail(base);
+      if (fallback.length === 1) return fallback[0];
+      if (fallback.length > 1) {
+        this.logger.error(`письмо на ${email}: под адрес ${base} подходит аккаунтов — ${fallback.length}; доставку не выполняю`);
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /** Поиск аккаунта по адресу без учёта регистра; больше двух совпадений нам знать не нужно. */
+  private async accountsByEmail(email: string): Promise<MailAccountRow[]> {
+    return this.prisma.mailAccount.findMany({
+      where: { email: { equals: email, mode: 'insensitive' } },
+      take: 2,
+    });
   }
 
   /**
@@ -332,26 +544,15 @@ export class MailIngestService {
     if (!row) return 0;
     const account = row.account as MailAccountRow;
     const before = await this.prisma.mailAttachment.count({ where: { messageId: row.id } });
-    await this.repairAttachments(
+    await this.repairAttachments(userId, row.id, row.rawAssetId, row.sortAt, {
       userId,
-      row.id,
-      row.rawAssetId,
-      row.sortAt,
-      {
-        userId,
-        account,
-        box: row.box as MailBox,
-        folderPath: row.folderPath,
-        uid: Number(row.uid),
-        uidValidity: row.uidValidity,
-        source: Buffer.alloc(0), // сырьё берём из хранилища, а не из письма
-        seen: row.seen,
-        flagged: row.flagged,
-        emailId: row.gmailMsgId,
-        threadId: null,
-        receivedAt: row.receivedAt,
-      },
-    );
+      box: row.box as MailBox,
+      accountId: account.id,
+      folderPath: row.folderPath,
+      uid: row.uid,
+      uidValidity: row.uidValidity,
+      emailId: row.gmailMsgId,
+    });
     return (await this.prisma.mailAttachment.count({ where: { messageId: row.id } })) - before;
   }
 
@@ -361,7 +562,7 @@ export class MailIngestService {
     messageId: string,
     rawAssetId: string,
     sortAt: Date,
-    input: IngestInput,
+    target: AttachmentTarget,
   ): Promise<void> {
     const asset = await this.prisma.asset.findUnique({ where: { id: rawAssetId }, select: { sha256: true } });
     if (!asset) {
@@ -370,28 +571,35 @@ export class MailIngestService {
     }
     const source = await this.s3.getObjectBytes(S3Service.assetKey(asset.sha256));
     const parsed = await parseMessage(source);
-    await this.storeAttachments(input, messageId, sortAt, parsed.attachments);
+    await this.storeAttachments(target, messageId, sortAt, parsed.attachments);
     this.logger.log(`письмо ${messageId}: вложения добраны (${parsed.attachments.length}) для ${userId}`);
   }
 
   /** Сохранить части письма: S3 → Asset → запись дерева в «Почте» → связь с письмом. */
   private async storeAttachments(
-    input: IngestInput,
+    target: AttachmentTarget,
     messageId: string,
     sortAt: Date,
     attachments: ParsedAttachment[],
   ): Promise<void> {
     if (!attachments.length) return;
-    const folderId = await this.boxFolderId(input.userId, input.box);
-    const identity = this.identityOf(input);
+    const folderId = await this.boxFolderId(target.userId, target.box);
+    const identity = this.identityOf(target);
+
+    // Что уже сохранено — одним запросом на письмо, а не по запросу на часть: у письма с
+    // тремя десятками вложений это была бы сотня round-trip внутри прохода.
+    const existingParts = new Set(
+      (
+        await this.prisma.mailAttachment.findMany({
+          where: { messageId },
+          select: { partIndex: true },
+        })
+      ).map((r) => r.partIndex),
+    );
 
     for (const att of attachments) {
       // Идемпотентность: та же часть того же письма уже сохранена — выходим.
-      const already = await this.prisma.mailAttachment.findUnique({
-        where: { messageId_partIndex: { messageId, partIndex: att.index } },
-        select: { id: true },
-      });
-      if (already) continue;
+      if (existingParts.has(att.index)) continue;
 
       const mime = safeMime(att.mime);
       const sha = sha256Hex(att.content);
@@ -404,7 +612,10 @@ export class MailIngestService {
       // Имя: приставка даты письма + исходное имя части. Про имя из письма известно только
       // то, что оно недоверенное, поэтому его чистит safeAttachmentName (внутри attachmentName).
       const baseName = att.filename?.trim() || `file-${att.index + 1}${extensionForMime(mime)}`;
-      const entryId = await this.resolveAttachmentEntry(folderId, baseName, assetId, sortAt, identity, att, input.userId);
+      const entryId = await this.resolveAttachmentEntry(folderId, baseName, assetId, sortAt, identity, att, target.userId);
+      // Имя подобрать не удалось (заняты все варианты): письмо из-за одной части не теряем —
+      // часть останется неразобранной, причина уже в логе.
+      if (!entryId) continue;
 
       await this.prisma.mailAttachment.create({
         data: {
@@ -418,6 +629,7 @@ export class MailIngestService {
           inline: att.inline,
         },
       });
+      existingParts.add(att.index);
     }
   }
 
@@ -440,30 +652,34 @@ export class MailIngestService {
     identity: string,
     att: ParsedAttachment,
     userId: string,
-  ): Promise<string> {
+  ): Promise<string | null> {
     const candidates = [
       attachmentName(sortAt, baseName),
       attachmentName(sortAt, baseName, sha256Hex(`${identity}#${att.index}`)),
     ];
 
-    for (const name of candidates) {
-      const existing = await this.prisma.fileEntry.findFirst({
-        where: { folderId, name, deletedAt: null },
-        select: { id: true },
+    // Оба имени проверяем одним запросом, а связи — ещё одним: по запросу на имя было бы
+    // четыре round-trip на каждую часть письма.
+    const named = await this.prisma.fileEntry.findMany({
+      where: { folderId, name: { in: candidates }, deletedAt: null },
+      select: { id: true },
+    });
+    if (named.length) {
+      const links = await this.prisma.mailAttachment.findMany({
+        where: { entryId: { in: named.map((e) => e.id) } },
+        select: { entryId: true },
       });
-      if (!existing) continue;
-      const linked = await this.prisma.mailAttachment.findUnique({
-        where: { entryId: existing.id },
-        select: { id: true },
-      });
-      // связь есть — имя занято другим письмом, пробуем следующий вариант имени;
-      // связи нет — это наш осиротевший файл от оборванного прохода, забираем его
-      if (!linked) return existing.id;
+      const linked = new Set(links.map((l) => l.entryId));
+      // связи нет — это наш осиротевший файл от оборванного прохода, забираем его;
+      // связь есть — имя занято другим письмом, пробуем варианты ниже
+      const orphan = named.find((e) => !linked.has(e.id));
+      if (orphan) return orphan.id;
     }
 
     // Приставка «-N» на случай, когда заняты оба осмысленных имени (например, тёзка лежит
     // в корзине и слот имени всё равно занят). До этого был тупик: письмо попадало в историю
-    // и каждый проход умирал на нём же, не добирая остальную почту.
+    // и каждый проход умирал на нём же, не добирая остальную почту. Теперь тупик не роняет
+    // сохранение письма: часть останется неразобранной, а причина попадёт в лог.
     for (let attempt = 0; attempt < 6; attempt++) {
       const name = attempt < candidates.length ? candidates[attempt] : `${candidates[candidates.length - 1]}-${attempt - candidates.length + 2}`;
       try {
@@ -474,7 +690,8 @@ export class MailIngestService {
         throw e;
       }
     }
-    throw new Error('не удалось подобрать имя вложения');
+    this.logger.error(`часть ${att.index} письма: не удалось подобрать имя вложения — оставляю неразобранной`);
+    return null;
   }
 }
 
@@ -484,4 +701,9 @@ function safeMime(raw: string): string {
   if (!mime || mime.length > MAX_MIME || /[\u0000-\u001f\u007f]/.test(mime)) return 'application/octet-stream';
   // Тип идёт не только в БД, но и в заголовок отдачи — проверяем и по белому списку
   return normalizeMime(mime);
+}
+
+/** Текст ошибки для лога: `throw 'строка'` и `throw {}` тоже встречаются. */
+function errorText(e: unknown): string {
+  return (e instanceof Error ? e.message : String(e)).slice(0, 200);
 }

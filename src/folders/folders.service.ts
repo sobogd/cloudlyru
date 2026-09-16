@@ -15,6 +15,13 @@ const isRoot = (f: { name: string }) => f.name === ROOT_FOLDER_NAME;
 const CHILDREN_PAGE = 1000;
 const CHILDREN_PAGE_MAX = 5000;
 
+/** Разбиение длинных `IN`-списков: у Postgres лимит параметров запроса — 65 535. */
+function chunksOf<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 @Injectable()
 export class FoldersService {
   constructor(
@@ -64,6 +71,12 @@ export class FoldersService {
    * Список содержимого папки. `after` — keyset-пагинация по имени: плоская «Фото» на десятки
    * тысяч записей иначе отдавалась бы одним ответом в десятки мегабайт (клиент синхронизации
    * читает это на каждом проходе). Без `after` отдаём первую порцию и признак `hasMore`.
+   *
+   * Взаимодействие с мягким удалением: keyset идёт по (имя > after) и фильтрует `deletedAt`,
+   * поэтому запись, восстановленная из корзины с именем ≤ `after`, в текущем проходе уже не
+   * появится — клиент увидит её только со следующим полным обходом. Для удалений это безопасно
+   * (tombstone в журнале), а вот восстановление в середину уже прочитанной страницы клиент
+   * увидит не сразу: полагаться на «после восстановления файл тут же в листинге» нельзя.
    */
   async listChildren(parentId: string | undefined, userId: string, after?: string, limit?: number) {
     const parent = await this.resolveAccessible(parentId, userId);
@@ -130,9 +143,12 @@ export class FoldersService {
   /** Метаданные папки для деталки: путь, счётчики, даты. */
   async meta(id: string, userId: string) {
     const folder = await this.resolveAccessible(id, userId);
+    // Скрытые зоны считаем так же, как листинг (listChildren): иначе в корне пользователя
+    // счётчик папок включал бы невидимую «Почту», и «Папок: N» не сходилось бы со списком N−1.
+    const visible = { notIn: [...HIDDEN_ZONES] };
     const [folderCount, entryCount] = await Promise.all([
-      this.prisma.folder.count({ where: { parentId: folder.id, deletedAt: null } }),
-      this.prisma.fileEntry.count({ where: { folderId: folder.id, deletedAt: null } }),
+      this.prisma.folder.count({ where: { parentId: folder.id, deletedAt: null, zone: visible } }),
+      this.prisma.fileEntry.count({ where: { folderId: folder.id, deletedAt: null, zone: visible } }),
     ]);
     return {
       id: folder.id,
@@ -244,21 +260,33 @@ export class FoldersService {
         throw badRequest(`invalid path segment: ${s}`);
       }
     }
-    // запросы с других клиентов могут прислать системный корень первым сегментом — он не создаётся
-    // системный корень может прийти только первым сегментом; в середине пути это обычное имя
+    // Системный корень приходит первым сегментом (`__root__/2025/07`): он не создаётся, а
+    // просто отбрасывается — дальше путь строится от корня пользователя. В середине пути это
+    // имя зарезервировано, как и в create/rename (assertNotReservedName в цикле ниже).
     const wanted = segments[0] === ROOT_FOLDER_NAME ? segments.slice(1) : segments;
 
     let current = await this.resolveAccessible(parentId, userId);
     let createdCount = 0;
     for (const name of wanted) {
+      // Зарезервированные имена проверяем теми же правилами, что create/rename. Без этого
+      // `POST /folders/ensure-path {path:"Почта"}` заводил в корне пользовательскую папку с
+      // именем системной папки вложений, а первый же заход почтового модуля «усыновлял» её
+      // (AuthService.mailFolderId ищет папку по имени), ставил зону MAIL и переводил в скрытую
+      // зону всё поддерево: файлы пользователя исчезали из «Файлов», поиска, WebDAV и журнала.
+      this.assertNotReservedName(name);
       const existing = await this.prisma.folder.findFirst({ where: { parentId: current.id, name } });
       if (existing) {
         if (existing.deletedAt) {
           throw conflict(`folder ${name} is in trash — restore or purge it first`);
         }
+        // Внутрь скрытой зоны путь не продолжаем и её id наружу не отдаём: клиенту не положено
+        // даже знать, что такая папка существует (её видно только по ссылке из письма).
+        if (isHiddenZone(existing.zone)) throw notFound('folder not found');
         current = existing;
         continue;
       }
+      // зона новой папки наследуется от уже проверенного на скрытость родителя, поэтому
+      // созданная папка скрытой быть не может — отдельная проверка после create не нужна
       const zone = zoneOf(current.zone);
       try {
         const created = await this.prisma.$transaction(async (tx) => {
@@ -294,35 +322,98 @@ export class FoldersService {
     return { id: current.id, name: current.name, parentId: current.parentId, zone: current.zone, created: createdCount };
   }
 
-  /** Правка папки одним запросом (клиент синхронизации): имя и переезд. */
+  /**
+   * Правка папки одним запросом (клиент синхронизации): имя и переезд.
+   *
+   * Обе правки — в ОДНОЙ транзакции: раньше это были два независимых вызова (rename и move),
+   * каждый со своей транзакцией и своим событием журнала, поэтому падение переезда после
+   * удачного переименования оставляло клиента с состоянием, которого на сервере нет
+   * (имя уже новое, папка ещё на месте). Событие тоже одно: если папка переехала — `move`
+   * с итоговым именем, иначе `update`.
+   */
   async patch(
     id: string,
     body: { name?: string; parentId?: string },
     userId: string,
   ) {
-    let renamed: { id: string; name: string } | null = null;
-    let moved: { id: string; parentId: string | null; zone: string } | null = null;
-    if (body.name !== undefined) renamed = await this.rename(id, body.name, userId);
-    if (body.parentId !== undefined) {
-      const res = await this.move(id, body.parentId, userId);
-      moved = { id: res.id, parentId: res.parentId, zone: res.zone };
+    const wantsRename = body.name !== undefined;
+    const wantsMove = body.parentId !== undefined;
+    const folder = await this.resolveAccessible(id, userId);
+
+    if (wantsRename) {
+      await this.assertCanRename(folder, body.name!, userId);
+      await this.assertNameFree(folder.parentId!, body.name!, id);
     }
-    const folder = await this.prisma.folder.findUnique({
+    let target: { id: string; zone: string } | null = null;
+    if (wantsMove) {
+      await this.assertNotSystemRoot(folder, userId, 'move');
+      if (isRoot(folder)) throw badRequest('cannot move root');
+      target = await this.resolveAccessible(body.parentId, userId);
+      await this.assertNameFree(target.id, body.name ?? folder.name, id);
+    }
+    if (!wantsRename && !wantsMove) {
+      const current = await this.prisma.folder.findUnique({
+        where: { id },
+        select: { id: true, name: true, parentId: true, zone: true },
+      });
+      return { ok: true, renamed: null, moved: null, folder: current };
+    }
+
+    const newZone = target ? zoneOf(target.zone) : null;
+    let changedIds: string[] = [];
+    const res = await this.runNameConflictMapped(() =>
+      this.prisma.$transaction(async (tx) => {
+        const renamed = wantsRename
+          ? await tx.folder.update({ where: { id }, data: { name: body.name! }, select: { id: true, name: true } })
+          : null;
+        let moved: { id: string; parentId: string | null; zone: string } | null = null;
+        if (target && newZone) {
+          const zoneBefore = folder.zone;
+          const movedRes = await this.applyMove(tx, id, target.id, newZone, zoneBefore);
+          moved = movedRes.row;
+          changedIds = movedRes.changedIds;
+        }
+        await this.changes.record(
+          {
+            userId,
+            target: 'folder',
+            op: moved ? 'move' : 'update',
+            targetId: id,
+            folderId: moved ? moved.parentId : folder.parentId,
+            name: renamed ? renamed.name : folder.name,
+            zone: moved ? moved.zone : folder.zone,
+          },
+          tx,
+        );
+        return { renamed, moved };
+      }),
+    );
+    if (target && newZone === ZONE_PHOTOS && folder.zone !== newZone) void this.reprocessAsMedia(changedIds);
+    const current = await this.prisma.folder.findUnique({
       where: { id },
       select: { id: true, name: true, parentId: true, zone: true },
     });
-    return { ok: true, renamed, moved, folder };
+    return { ok: true, renamed: res.renamed, moved: res.moved, folder: current };
+  }
+
+  /** Проверки переименования (общие для patch и rename). */
+  private async assertCanRename(
+    folder: { id: string; name: string; parentId: string | null },
+    name: string,
+    userId: string,
+  ): Promise<void> {
+    assertSafeName(name);
+    this.assertNotReservedName(name);
+    await this.assertNotSystemRoot(folder, userId, 'rename');
+    if (isRoot(folder)) throw badRequest('cannot rename root');
   }
 
   async rename(id: string, name: string, userId: string) {
-    assertSafeName(name);
-    this.assertNotReservedName(name);
     const folder = await this.resolveAccessible(id, userId);
-    await this.assertNotSystemRoot(folder, userId, 'rename');
-    if (isRoot(folder)) throw badRequest('cannot rename root');
+    await this.assertCanRename(folder, name, userId);
     await this.assertNameFree(folder.parentId!, name, id);
-    try {
-      return await this.prisma.$transaction(async (tx) => {
+    return this.runNameConflictMapped(() =>
+      this.prisma.$transaction(async (tx) => {
         const renamed = await tx.folder.update({
           where: { id },
           data: { name },
@@ -341,10 +432,8 @@ export class FoldersService {
           tx,
         );
         return renamed;
-      });
-    } catch (e) {
-      throw this.asNameConflict(e, 'folder');
-    }
+      }),
+    );
   }
 
   async move(id: string, newParentId: string, userId: string) {
@@ -352,22 +441,13 @@ export class FoldersService {
     await this.assertNotSystemRoot(folder, userId, 'move');
     if (isRoot(folder)) throw badRequest('cannot move root');
     const target = await this.resolveAccessible(newParentId, userId);
-    const subtree = await this.collectSubtreeIds(id);
-    if (subtree.includes(target.id)) throw badRequest('cannot move folder into its own subtree');
     await this.assertNameFree(target.id, folder.name, id);
 
     const newZone = zoneOf(target.zone);
+    let changedIds: string[] = [];
     const moved = await this.prisma.$transaction(async (tx) => {
-      const row = await tx.folder.update({
-        where: { id },
-        data: { parentId: target.id },
-        select: { id: true, parentId: true, zone: true },
-      });
-      // папка переехала между зонами — пересчитываем зону всего поддерева (папки + файлы)
-      if (folder.zone !== newZone) {
-        await tx.folder.updateMany({ where: { id: { in: subtree } }, data: { zone: newZone } });
-        await tx.fileEntry.updateMany({ where: { folderId: { in: subtree } }, data: { zone: newZone } });
-      }
+      const res = await this.applyMove(tx, id, target.id, newZone, folder.zone);
+      changedIds = res.changedIds;
       await this.changes.record(
         {
           userId,
@@ -380,10 +460,90 @@ export class FoldersService {
         },
         tx,
       );
-      return row;
+      return res.row;
     });
-    if (folder.zone !== newZone && newZone === ZONE_PHOTOS) void this.reprocessAsMedia(subtree);
+    if (folder.zone !== newZone && newZone === ZONE_PHOTOS) void this.reprocessAsMedia(changedIds);
     return { id: moved.id, parentId: moved.parentId, zone: newZone };
+  }
+
+  /**
+   * Переезд папки внутри уже открытой транзакции.
+   *
+   * Инвариант дерева держит ЭТА транзакция, а не проверка до неё: «цель не внутри собственного
+   * поддерева» проверяется под блокировкой строк перемещаемой папки и цели, в той же транзакции,
+   * что и запись `parentId`. Раньше проверка стояла вне транзакции, и два встречных перемещения
+   * (A в поддерево B и B в поддерево A) проходили обе проверки и коммитились: `A.parent=B`,
+   * `B.parent=A`. Такой цикл не переживает рекурсивный CTE `AuthService.subtreeIds` (UNION ALL
+   * без ограничения глубины) — запрос не завершается и занимает соединение, а корзина, лента и
+   * синхронизация этого пользователя перестают работать.
+   */
+  private async applyMove(
+    tx: Prisma.TransactionClient,
+    id: string,
+    targetId: string,
+    newZone: string,
+    zoneBefore: string,
+  ): Promise<{ row: { id: string; parentId: string | null; zone: string }; changedIds: string[] }> {
+    await this.lockFolders(tx, [id, targetId]);
+    if (await this.isInSubtree(tx, targetId, id)) {
+      throw badRequest('cannot move folder into its own subtree');
+    }
+    const row: { id: string; parentId: string | null; zone: string } = await tx.folder.update({
+      where: { id },
+      data: { parentId: targetId },
+      select: { id: true, parentId: true, zone: true },
+    });
+    // Папка переехала между зонами — пересчитываем зону живого поддерева (папки + записи).
+    // Строки из корзины не трогаем: их зона остаётся той, что была на момент удаления, иначе
+    // после восстановления подпапка оказалась бы в медиа-зоне, которой у неё никогда не было.
+    let changedIds: string[] = [];
+    if (zoneBefore !== newZone) {
+      changedIds = await this.liveSubtreeIds(tx, id);
+      for (const chunk of chunksOf(changedIds, 1000)) {
+        await tx.folder.updateMany({
+          where: { id: { in: chunk }, deletedAt: null },
+          data: { zone: newZone },
+        });
+        await tx.fileEntry.updateMany({
+          where: { folderId: { in: chunk }, deletedAt: null },
+          data: { zone: newZone },
+        });
+      }
+    }
+    return { row, changedIds };
+  }
+
+  /**
+   * Блокировка строк папок в детерминированном порядке (по id): два встречных перемещения
+   * берут одни и те же строки, и без сортировки они бы заклинились взаимным ожиданием.
+   */
+  private async lockFolders(tx: Prisma.TransactionClient, ids: string[]): Promise<void> {
+    const sorted = [...new Set(ids)].sort();
+    await tx.$queryRaw`SELECT id FROM "Folder" WHERE id IN (${Prisma.join(sorted)}) ORDER BY id FOR UPDATE`;
+  }
+
+  /** Лежит ли папка внутри поддерева rootId: подъём по parentId (потолок — страховка от цикла). */
+  private async isInSubtree(tx: Prisma.TransactionClient, folderId: string, rootId: string): Promise<boolean> {
+    let cur: string | null = folderId;
+    for (let depth = 0; cur && depth < 128; depth++) {
+      if (cur === rootId) return true;
+      const row: { parentId: string | null } | null = await tx.folder.findUnique({
+        where: { id: cur },
+        select: { parentId: true },
+      });
+      if (!row) return false;
+      cur = row.parentId;
+    }
+    return false;
+  }
+
+  /** Гонка на @@unique([parentId, name]) должна давать 409, а не 500 от Prisma. */
+  private async runNameConflictMapped<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      throw this.asNameConflict(e, 'folder');
+    }
   }
 
   /** Мягкое удаление папки вместе со всем поддеревом. */
@@ -393,7 +553,11 @@ export class FoldersService {
     if (isRoot(folder)) throw badRequest('cannot delete root');
     const ids = await this.collectSubtreeIds(id);
     await this.prisma.$transaction(async (tx) => {
-      await tx.folder.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
+      // Порциями: id всего дерева — это десятки тысяч значений в одном `IN`, а список
+      // параметров Postgres ограничен 65 535.
+      for (const chunk of chunksOf(ids, 5000)) {
+        await tx.folder.updateMany({ where: { id: { in: chunk } }, data: { deletedAt: new Date() } });
+      }
       // одно событие на корень поддерева: «папка удалена» означает «всего её содержимого нет»
       await this.changes.recordFolderTreeDeleted(userId, id, tx);
     });
@@ -401,38 +565,72 @@ export class FoldersService {
   }
 
   /**
-   * Восстановление папки: само поддерево, но не выше (родитель уже мог быть удалён).
+   * Восстановление папки: само поддерево, но не выше.
    * Удаление журналируется одним событием на поддерево («папки нет» ⇒ содержимого нет),
    * поэтому на восстановлении наоборот нужны события по детям: иначе клиент знает только
    * про саму папку и не может восстановить её содержимое.
+   *
+   * Родитель удалён — отказываем так же, как `files.restore`: иначе папка оживает вне дерева
+   * (`folderOwnedBy` по ней уже false, в корзине её тоже не видно — она отфильтрована как
+   * «ребёнок удалённого родителя»), а при следующем purge родителя её `parentId` обнулился бы
+   * по `ON DELETE SET NULL` и поддерево выпало бы из дерева пользователя навсегда.
    */
   async restore(id: string, userId: string) {
     const root = await this.resolveAccessibleOrDeleted(id, userId);
+    if (root.deletedAt && root.parentId) {
+      const parent = await this.prisma.folder.findUnique({
+        where: { id: root.parentId },
+        select: { deletedAt: true },
+      });
+      if (parent?.deletedAt) throw conflict('parent folder is deleted — restore folder first');
+    }
     const ids = await this.collectSubtreeIds(id);
     // Возвращаем только то, что удалили вместе с папкой: подпапки, удалённые пользователем
     // отдельно (раньше), остаются в корзине, иначе они воскресали бы без спроса.
+    // «Минус 1000 мс» — потому что softDelete проставляет всему поддереву один и тот же
+    // `new Date()`: у детей время удаления совпадает с временем корня, а у отдельно удалённых
+    // подпапок оно строго раньше, поэтому небольшой запас в прошлое ничего лишнего не захватит.
     const cutoff = root.deletedAt ? new Date(root.deletedAt.getTime() - 1000) : null;
-    const folders = await this.prisma.folder.findMany({
-      where: {
-        id: { in: ids },
-        ...(cutoff ? { OR: [{ deletedAt: null }, { deletedAt: { gte: cutoff } }] } : {}),
-      },
-      select: { id: true, parentId: true, name: true, zone: true },
-    });
+    const folders: Array<{ id: string; parentId: string | null; name: string; zone: string }> = [];
+    for (const chunk of chunksOf(ids, 5000)) {
+      folders.push(
+        ...(await this.prisma.folder.findMany({
+          where: {
+            id: { in: chunk },
+            ...(cutoff ? { OR: [{ deletedAt: null }, { deletedAt: { gte: cutoff } }] } : {}),
+          },
+          select: { id: true, parentId: true, name: true, zone: true },
+        })),
+      );
+    }
     const restoreIds = folders.map((f) => f.id);
-    const entries = await this.prisma.fileEntry.findMany({
-      where: { folderId: { in: restoreIds }, deletedAt: null },
-      select: {
-        id: true,
-        folderId: true,
-        name: true,
-        zone: true,
-        clientMtime: true,
-        asset: { select: { sha256: true, size: true, mime: true } },
-      },
-    });
+    const entries: Array<{
+      id: string;
+      folderId: string;
+      name: string;
+      zone: string;
+      clientMtime: Date | null;
+      asset: { sha256: string; size: bigint; mime: string };
+    }> = [];
+    for (const chunk of chunksOf(restoreIds, 5000)) {
+      entries.push(
+        ...(await this.prisma.fileEntry.findMany({
+          where: { folderId: { in: chunk }, deletedAt: null },
+          select: {
+            id: true,
+            folderId: true,
+            name: true,
+            zone: true,
+            clientMtime: true,
+            asset: { select: { sha256: true, size: true, mime: true } },
+          },
+        })),
+      );
+    }
     await this.prisma.$transaction(async (tx) => {
-      await tx.folder.updateMany({ where: { id: { in: restoreIds } }, data: { deletedAt: null } });
+      for (const chunk of chunksOf(restoreIds, 5000)) {
+        await tx.folder.updateMany({ where: { id: { in: chunk } }, data: { deletedAt: null } });
+      }
       for (const f of folders) {
         await this.changes.record(
           {
@@ -516,16 +714,43 @@ export class FoldersService {
 
   /** BFS всех id поддерева, включая саму папку. */
   async collectSubtreeIds(rootId: string): Promise<string[]> {
+    return this.subtreeIdsIn(this.prisma, rootId, false);
+  }
+
+  /** То же, но только живые папки: для пересчёта зон строки из корзины не трогаем. */
+  private async liveSubtreeIds(tx: Prisma.TransactionClient, rootId: string): Promise<string[]> {
+    return this.subtreeIdsIn(tx, rootId, true);
+  }
+
+  /**
+   * BFS всех id поддерева, включая саму папку. `aliveOnly` — не спускаться в удалённые папки.
+   *
+   * `seen` защищает только сам обход в памяти (без отметок BFS разросся бы до OOM, если в
+   * дереве уже есть цикл), но НЕ инвариант дерева: цикл в БД эти отметки не лечат, а
+   * `AuthService.subtreeIds` (рекурсивный CTE без ограничения глубины) на таком цикле не
+   * завершается. Инвариант держит `applyMove` — проверка поддерева под блокировкой в одной
+   * транзакции с записью `parentId`.
+   */
+  private async subtreeIdsIn(
+    client: Prisma.TransactionClient,
+    rootId: string,
+    aliveOnly: boolean,
+  ): Promise<string[]> {
     const all: string[] = [rootId];
-    // seen защищает от вечного цикла: два конкурентных перемещения могли сделать папку
-    // своим же предком, и тогда BFS без отметок рос бы бесконечно (OOM процесса)
     const seen = new Set<string>([rootId]);
     let frontier = [rootId];
-    while (frontier.length) {
-      const children = await this.prisma.folder.findMany({
-        where: { parentId: { in: frontier } },
-        select: { id: true },
-      });
+    // Потолок глубины — страховка от цикла в parentId (легаси-данные): 128 уровней
+    // хватает с запасом (у AuthService.folderOwnedBy тот же предел).
+    for (let depth = 0; frontier.length && depth < 128; depth++) {
+      const children: Array<{ id: string }> = [];
+      for (const chunk of chunksOf(frontier, 5000)) {
+        children.push(
+          ...(await client.folder.findMany({
+            where: { parentId: { in: chunk }, ...(aliveOnly ? { deletedAt: null } : {}) },
+            select: { id: true },
+          })),
+        );
+      }
       const ids = children.map((c) => c.id).filter((cid) => !seen.has(cid));
       if (!ids.length) break;
       for (const cid of ids) seen.add(cid);

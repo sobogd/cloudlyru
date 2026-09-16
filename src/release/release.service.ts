@@ -23,9 +23,18 @@ export interface AndroidRelease {
   size: number;
   sha256: string;
   minSdk: number;
+  /** Пустая строка — «в описании сборки даты нет»; null тут не бывает, поэтому проверять `!= null` бессмысленно. */
   builtAt: string;
   /** Постоянная публичная ссылка на APK (её открывает и браузер, и само приложение). */
   url: string;
+  /**
+   * false — сборка найдена в бакете без описания latest.json (её выложил кто-то руками или
+   * старый скрипт): файл скачать можно, но versionCode/sha256/versionName неизвестны —
+   * записывать их нулями и пустой строкой означало бы отдать приложению заведомо неверную
+   * сумму. Ручки обязаны трактовать такое как «сборка не опубликована» (`no_release`),
+   * а не как сборку с versionCode 0.
+   */
+  metaKnown: boolean;
 }
 
 /**
@@ -52,8 +61,12 @@ export class ReleaseService {
     let value: AndroidRelease | null = null;
     try {
       value = await this.readMeta();
-      // APK без описания (публикация скриптом старой версии) — файл отдать можно,
+      // APK без описания (публикация скриптом старой версии или руками) — файл отдать можно,
       // но версии в нём нет: приложение такую сборку обновлением не считает.
+      // «Сборка есть, latest.json нет» — это осознанная деградация: url ведёт на настоящий
+      // файл (скачать руками можно), а versionCode 0 не больше текущего у приложения, поэтому
+      // обновление по ней не предложится. Клиент должен читать это как «версия неизвестна»,
+      // а не как «вышла новая сборка» — поэтому metaKnown=false вместо правдоподобных нулей.
       if (!value && (await this.s3.headObject(APK_KEY))) {
         value = {
           applicationId: '',
@@ -64,6 +77,7 @@ export class ReleaseService {
           minSdk: 0,
           builtAt: '',
           url: this.publicUrl,
+          metaKnown: false,
         };
       }
     } catch (e) {
@@ -92,6 +106,7 @@ export class ReleaseService {
       minSdk: Number(parsed.minSdk ?? 0),
       builtAt: String(parsed.builtAt ?? ''),
       url: this.publicUrl,
+      metaKnown: true,
     };
   }
 }

@@ -2,6 +2,9 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
+// kDebugMode приходит из foundation: material его больше не реэкспортирует, а без него
+// отладочную печать в проглатываемой ошибке пришлось бы либо печатать всегда, либо убрать.
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -15,10 +18,68 @@ import '../../util/download.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
 
+/// Размер клетки сетки и зазор между ними.
+///
+/// `_row` (клетка + зазор) — не только вёрстка: по этой высоте считается, какие кадры попадают
+/// в видимое окно (`_fetchVisible`) и какой месяц показан в заголовке (`_updateMonth`).
+/// Поэтому значения должны совпадать с `mainAxisSpacing`/`crossAxisSpacing` в `build`.
+///
+/// Числа — логические пиксели, а сеточное превью сервер отдаёт фиксированного размера
+/// (`GRID_SIZE = 50 px`, src/queue/queue.service.ts) и выбирает его по `w` только как «сетка
+/// или 1080» (`src/media/media.controller.ts`). На экране с DPR 3 клетка — это 150 физических
+/// пикселей, то есть картинка растягивается втрое и выглядит мыльной. Подобрать размер под
+/// DPR клиент не может: нужного размера сервер не собирает — это правка серверной части,
+/// передана её владельцу.
 const _cell = 50.0;
 const _gap = 3.0;
 const _row = _cell + _gap;
 
+/// Задержка перед загрузкой окна после последнего события скролла, мс (см. `_onScroll`).
+const _fetchDebounceMs = 400;
+
+/// Сколько строк сетки берётся в запас сверху и снизу от видимого окна (см. `_visibleRange`).
+const _viewRowsMargin = 3;
+
+/// Высота видимой части сетки до первой раскладки, px: у скролла ещё нет ни позиции, ни
+/// размеров, а первый запрос окна должен уйти с правдоподобными числами, иначе он накроет
+/// одну строку. 900 — типовой экран телефона, лишнее просто отсеется следующим расчётом.
+const _fallbackViewport = 900.0;
+
+/// Сколько кадров просить одной страницей `mediaRange`.
+///
+/// Половина серверного потолка одного запроса (`MEDIA_RANGE_MAX = 1000`,
+/// src/media-feed/media-feed.service.ts): при клетке 53 px порция накрывает три-четыре экрана
+/// сетки, поэтому одна остановка скролла обычно обходится одним запросом.
+const _rangeChunk = 500;
+
+/// Период опроса статусов неготовых превью, мс (см. `_pollStatuses`).
+const _statusPollMs = 5000;
+
+/// Предел попыток опроса на один кадр: 24 × 5 с — две минуты ожидания в открытом разделе.
+const _statusMaxTries = 24;
+
+/// Потолок числа id в одном `/media/status` — серверный `MEDIA_STATUS_MAX = 500`
+/// (src/media-feed/media-feed.service.ts): более длинный список сервер обрежет и только
+/// предупредит об этом в логе, признака усечения в ответе нет.
+const _statusBatchMax = 500;
+
+/// Высота полосы метаданных в просмотрщике: одна строка значков и подписей.
+const _footerH = 46.0;
+
+/// Прозрачность подложки футера поверх кадра.
+const _footerAlpha = 0.6;
+
+/// Экран «Медиа»: сплошная сетка кадров зоны «Фото» (фото и видео вперемешку, от свежих
+/// к старым) с заголовком-месяцем.
+///
+/// Сетка виртуальная, как и почтовый список: сервер знает только общее число (`mediaCount`)
+/// и разбивку по месяцам (`mediaMonths`), а сами кадры приходят по абсолютному смещению
+/// (`mediaRange`) — только для того, что попало в окно скролла. Весь расчёт высоты и индексов
+/// держится на двух допущениях: все клетки одного размера и порядок кадров на сервере не
+/// меняется, пока экран открыт.
+///
+/// Экран же служит источником кадров для `MediaViewer`: он открывает просмотрщик, отдаёт ему
+/// свой кэш по индексам и сам переживает удаление кадра.
 class MediaScreen extends ConsumerStatefulWidget {
   const MediaScreen({super.key});
 
@@ -26,18 +87,62 @@ class MediaScreen extends ConsumerStatefulWidget {
   ConsumerState<MediaScreen> createState() => _MediaScreenState();
 }
 
+/// Состояние ленты: счётчик, разбивка по месяцам, загруженные кадры и сигнал просмотрщику.
 class _MediaScreenState extends ConsumerState<MediaScreen> {
-  int? _total;
+  /// Ответ на `mediaCount` уже пришёл (до него показывается спиннер, а не «медиа нет»).
+  bool _loaded = false;
+  /// Сколько всего кадров в ленте. Меняется при удалении кадра: у сервера лента становится
+  /// короче, у нас — тоже.
+  ///
+  /// Не `int`, а `ValueNotifier`, потому что это число — общий контракт с просмотрщиком:
+  /// он берёт из него `itemCount` и границы листания (см. `total` у `MediaViewer`). Пока
+  /// число лежало в поле, просмотрщик замораживал его на момент открытия и после удаления
+  /// кадра оставался с лишней страницей-спиннером.
+  final ValueNotifier<int> _total = ValueNotifier(0);
+  /// Разбивка по месяцам от сервера: сколько кадров в каждом. Из неё считаются диапазоны
+  /// индексов для поиска месяца по позиции скролла (`_monthCum`).
   List<MediaMonthBucket> _months = const [];
+  /// Загруженные кадры по абсолютному индексу в ленте.
   final Map<int, MediaItem> _items = {};
-  int _cols = 1;
-  String _month = '';
+  /// Сколько колонок в сетке. Считается во время раскладки (`LayoutBuilder`), а читается
+  /// при расчёте окна загрузки и месяца: индексы кадров получаются из строк умножением
+  /// на число колонок, и без него окно посчиталось бы по неправильным индексам.
+  ///
+  /// `ValueNotifier`, а не поле: писать его приходится из раскладки, а значение нужно уже
+  /// в следующем кадре — из `addPostFrameCallback` и из таймера дебаунса. Слушателей у него
+  /// нет (перерисовку и так вызывает `LayoutBuilder`), поэтому запись в раскладке никого
+  /// не будит и остаётся обычным обновлением числа для следующего расчёта.
+  final ValueNotifier<int> _cols = ValueNotifier(1);
+  /// Подпись в заголовке: месяц, к которому относится верхняя видимая строка.
+  ///
+  /// Стартовое значение — общее «Медиа»: подпись месяца появляется сразу после первой загрузки
+  /// (`_load` → `_updateMonth`), а до неё в шапке должно стоять хоть что-то осмысленное.
+  String _month = 'Медиа';
+  /// Скролл сетки: из его позиции считаются видимые строки.
   final ScrollController _sc = ScrollController();
+  /// Задержка перед загрузкой окна (см. `_onScroll`).
   Timer? _debounce;
+  /// Запрос окна уже в полёте: без этого быстрый скролл порождал бы параллельные запросы
+  /// одних и тех же индексов (`_fetchVisible` зовётся из дебаунса, из таймера статусов и из
+  /// `ensure` просмотрщика).
+  bool _fetching = false;
+  /// Пока запрос был в полёте, окно успело сдвинуться: по завершении окно пересчитывается
+  /// ещё раз, иначе последний сдвиг остался бы не загруженным до следующего скролла.
+  bool _refetch = false;
+  /// Опрос статусов неготовых превью (см. `_pollStatuses`); `null` — опрос не идёт.
+  Timer? _statusTimer;
+  /// Сколько раз статус каждого кадра уже спрашивали: `entryId` → число попыток.
+  final Map<String, int> _statusTries = {};
   /// Сигнал открытому просмотрщику, что кадры подгрузились.
+  ///
+  /// Контракт: инкрементит только владелец ленты — здесь после каждой страницы `mediaRange`
+  /// (и в `map_screen` после догрузки кадра), слушает `MediaViewer` через `revision`
+  /// и на каждое изменение перерисовывается. Так просмотрщик узнаёт, что серый слайд,
+  /// который он показывает, теперь можно отрисовать.
   final ValueNotifier<int> _revision = ValueNotifier(0);
 
   @override
+  /// Подписка на скролл и первая загрузка: счётчик, месяцы, видимое окно.
   void initState() {
     super.initState();
     _sc.addListener(_onScroll);
@@ -45,47 +150,91 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   }
 
   @override
+  /// Снимаем таймеры, контроллер скролла и общие с просмотрщиком сигналы.
   void dispose() {
     _debounce?.cancel();
+    _statusTimer?.cancel();
     _sc.dispose();
     _revision.dispose();
+    _total.dispose();
+    _cols.dispose();
     super.dispose();
   }
 
+  /// Читает счётчик и разбивку по месяцам, после чего просит видимое окно.
+  ///
+  /// Разбивка нужна не для красоты: по ней считается месяц в заголовке и, что важнее, она
+  /// подтверждает порядок ленты — кадры идут от свежих к старым, и индекс в ней совпадает
+  /// с индексом сетки.
+  ///
+  /// Запрос окна уходит после кадра (`addPostFrameCallback`): до первой раскладки неизвестно
+  /// ни число колонок, ни позиция скролла. Там же обновляется подпись месяца — иначе в шапке
+  /// до первого движения пальцем стояло бы пустое место.
+  /// Ошибку показываем подсказкой — сетке без данных показать нечего, пустая она выглядела бы
+  /// как «медиа нет».
+  /// Побочно: `_loaded`, `_total`, `_months`, затем `_fetchVisible` и `_updateMonth`.
   Future<void> _load() async {
     final api = ref.read(appStateProvider).api;
     try {
       final n = await api.mediaCount();
-      final m = await api.mediaMonths();
-      if (mounted) setState(() {
-        _total = n;
-        _months = m;
-      });
+      // Пояс передаём свой: бакет месяца сервер считает как `capturedAt + tz`, иначе кадр,
+      // снятый вечером последнего числа, уезжает в следующий месяц. В подписи просмотрщика
+      // при этом показывается пояс САМОГО снимка (`tzOffsetMin` кадра) — для фото из другой
+      // поездки эти два пояса расходятся, и это осознанно: бакет один на всю ленту, а подпись
+      // у каждого кадра своя.
+      final m = await api.mediaMonths(
+        tzOffsetMin: DateTime.now().timeZoneOffset.inMinutes,
+      );
+      if (mounted) {
+        setState(() {
+          _total.value = n;
+          _months = m;
+          _loaded = true;
+        });
+      }
       // После кадра: к этому моменту сетка уже посчитала колонки и привязала скролл.
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _fetchVisible();
+        if (!mounted) return;
+        _fetchVisible();
+        _updateMonth();
       });
     } catch (e) {
-      debugPrint('media load error: $e');
       if (mounted) snack(context, e.toString());
     }
   }
 
+  /// Ставит задержку перед загрузкой окна и сразу обновляет месяц в заголовке.
+  ///
+  /// Событие приходит на каждый кадр прокрутки, поэтому загрузка откладывается и таймер
+  /// перезапускается: `_fetchVisible` уходит один раз — через `_fetchDebounceMs` после
+  /// остановки, когда инерция закончилась и окно уже не меняется. Меньше — запросы пошли бы
+  /// пачками на каждое движение пальца, заметно больше — серые клетки висели бы на глазах.
+  /// Месяц, в отличие от загрузки, обновляем сразу: подпись в заголовке должна идти за
+  /// пальцем, а `_updateMonth` дёргает `setState` только при смене месяца.
   void _onScroll() {
     if (_debounce?.isActive ?? false) _debounce!.cancel();
-    _debounce = Timer(const Duration(milliseconds: 400), _fetchVisible);
+    _debounce = Timer(const Duration(milliseconds: _fetchDebounceMs), _fetchVisible);
     _updateMonth();
   }
 
+  /// Обновляет подпись месяца в заголовке по верхней видимой строке.
+  ///
+  /// Позиция скролла переводится в индекс кадра (строки × колонки), а индекс — в месяц через
+  /// диапазоны `_monthAt`. `setState` вызывается только когда подпись изменилась: скролл шлёт
+  /// события десятками в секунду, и перерисовка на каждое была бы напрасной.
   void _updateMonth() {
-    final t = _total;
-    if (t == null || t == 0 || !_sc.hasClients) return;
-    final idx = (_sc.offset ~/ _row).clamp(0, 1 << 30) * _cols;
+    final t = _total.value;
+    if (t == 0 || !_sc.hasClients) return;
+    final idx = (_sc.offset ~/ _row).clamp(0, 1 << 30) * _cols.value;
     final key = _monthAt(idx);
     final label = key == null ? 'Медиа' : key == 'Без даты' ? key : monthLabel(key);
     if (label != _month) setState(() => _month = label);
   }
 
+  /// Месяц, которому принадлежит кадр с этим индексом, или `null`, если разбивка пуста.
+  ///
+  /// Бинарный поиск по кумулятивным диапазонам: месяцев в библиотеке бывают сотни, а вызывается
+  /// это на каждом событии скролла, поэтому линейный проход по всем корзинам был бы заметен.
   String? _monthAt(int index) {
     final cum = _monthCum();
     if (cum.isEmpty) return null;
@@ -104,6 +253,11 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     return null;
   }
 
+  /// Кумулятивные диапазоны индексов по месяцам: [start, end) для каждой непустой корзины.
+  ///
+  /// Сервер отдаёт только счётчики, поэтому границы накапливаются здесь: так индекс кадра
+  /// превращается в месяц одним поиском. Пустые корзины пропускаются — иначе в диапазонах
+  /// появились бы дырки, и часть кадров не нашла бы своего месяца.
   List<({String month, int start, int end})> _monthCum() {
     final arr = <({String month, int start, int end})>[];
     var start = 0;
@@ -115,60 +269,215 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     return arr;
   }
 
-  Future<void> _fetchVisible() async {
-    final t = _total;
-    if (t == null || t == 0) return;
-    final api = ref.read(appStateProvider).api;
-    // Первый экран надо забрать ещё до того, как сетка привяжет скролл-контроллер:
-    // иначе до первого движения пальцем лента стоит пустой.
+  /// Диапазон индексов кадров, попавших в видимое окно сетки (с запасом `_viewRowsMargin`
+  /// строк сверху и снизу), или `null`, если считать нечего.
+  ///
+  /// Как считается: позиция скролла делится на высоту строки, к полученному диапазону строк
+  /// добавляется запас — столько проскакивает инерция, пока идёт запрос, и столько же
+  /// остаётся готовым, когда пользователь долистает. Строки переводятся в индексы кадров
+  /// умножением на `_cols` — именно поэтому число колонок считается до этого места.
+  ///
+  /// До первой раскладки ни позиции скролла, ни его окна нет, поэтому берётся типовой экран
+  /// телефона: первый запрос должен уйти, даже если сетка ещё не привязала контроллер.
+  (int, int)? _visibleRange() {
+    final t = _total.value;
+    if (t == 0) return null;
     final top = _sc.hasClients ? _sc.offset : 0.0;
-    final vh = _sc.hasClients ? _sc.position.viewportDimension : 900.0;
-    final firstRow = math.max(0, (top / _row).floor() - 3);
-    final lastRow = ((top + vh) / _row).ceil() + 3;
-    final start = firstRow * _cols;
-    final end = math.min(t - 1, (lastRow + 1) * _cols - 1);
-    if (start > end) return;
-    // догрузить только недостающие куски
-    final spans = <(int, int)>[];
-    var a = -1;
-    for (var i = start; i <= end; i++) {
-      if (!_items.containsKey(i)) {
-        if (a == -1) a = i;
-      } else if (a != -1) {
-        spans.add((a, i - 1));
-        a = -1;
-      }
-    }
-    if (a != -1) spans.add((a, end));
-    for (final (s, e) in spans) {
-      for (var off = s; off <= e; off += 500) {
-        final len = math.min(500, e - off + 1);
-        try {
-          final page = await api.mediaRange(off, len);
-          if (!mounted) return;
-          setState(() {
-            for (var j = 0; j < page.length; j++) {
-              _items[off + j] = page[j];
-            }
-          });
-          _revision.value++;
-          debugPrint('media fetched: off=$off len=${page.length}');
-        } catch (e) {
-          debugPrint('media range error: $e');
-        }
-      }
-    }
+    final vh = _sc.hasClients ? _sc.position.viewportDimension : _fallbackViewport;
+    final cols = _cols.value;
+    final firstRow = math.max(0, (top / _row).floor() - _viewRowsMargin);
+    final lastRow = ((top + vh) / _row).ceil() + _viewRowsMargin;
+    final start = firstRow * cols;
+    final end = math.min(t - 1, (lastRow + 1) * cols - 1);
+    return start > end ? null : (start, end);
   }
 
+  /// Загружает кадры, попавшие в видимое окно сетки.
+  ///
+  /// Окно считает `_visibleRange`; здесь из него берутся только непрерывные участки ещё не
+  /// загруженных индексов (загруженное не перезапрашивается), и каждый участок режется на
+  /// порции по `_rangeChunk` кадров.
+  ///
+  /// Параллельные просьбы не удваиваются: пока запрос в полёте, повторный вызов только
+  /// помечает, что окно сдвинулось, и по завершении окно пересчитывается ещё раз. Без этого
+  /// быстрый скролл слал бы пачками одни и те же индексы (дебаунс, таймер статусов и `ensure`
+  /// просмотрщика зовут этот метод независимо).
+  ///
+  /// Слоты, которые ещё не пришли, остаются плейсхолдерами: `_cellWidget` рисует для них серую
+  /// клетку на месте кадра. Это не заглушка «на время» — по такому слоту уже можно тапнуть
+  /// и открыть просмотрщик: он покажет спиннер и дождётся кадра через `_revision`.
+  /// Побочно: `setState` с новыми кадрами, `_revision.value++` после каждой страницы и запуск
+  /// опроса статусов превью (`_pollStatuses`).
+  Future<void> _fetchVisible() async {
+    if (_fetching) {
+      _refetch = true;
+      return;
+    }
+    final range = _visibleRange();
+    if (range == null) return;
+    final (start, end) = range;
+    final api = ref.read(appStateProvider).api;
+    _fetching = true;
+    try {
+      // догрузить только недостающие куски
+      final spans = <(int, int)>[];
+      var a = -1;
+      for (var i = start; i <= end; i++) {
+        if (!_items.containsKey(i)) {
+          if (a == -1) a = i;
+        } else if (a != -1) {
+          spans.add((a, i - 1));
+          a = -1;
+        }
+      }
+      if (a != -1) spans.add((a, end));
+      for (final (s, e) in spans) {
+        for (var off = s; off <= e; off += _rangeChunk) {
+          final len = math.min(_rangeChunk, e - off + 1);
+          try {
+            final page = await api.mediaRange(off, len);
+            if (!mounted) return;
+            setState(() {
+              // Ключ — абсолютный индекс кадра в ленте, а не порядок прихода: страницы могут
+              // приехать вразнобой, а по индексу они ложатся на свои клетки.
+              for (var j = 0; j < page.length; j++) {
+                _items[off + j] = page[j];
+              }
+            });
+            // Просмотрщик (если он открыт) узнаёт, что серые слайды можно отрисовать.
+            _revision.value++;
+          } catch (e) {
+            // Неудачу глотаем: следующий скролл спросит эти же индексы снова, а падать из-за
+            // одного запроса лента не должна. Печать — только в отладке: в релизе сообщать
+            // об этом некуда.
+            if (kDebugMode) debugPrint('media range error: $e');
+          }
+        }
+      }
+    } finally {
+      _fetching = false;
+    }
+    if (!mounted) return;
+    // Пока грузили, окно могло уехать: догружаем его, а не ждём следующего скролла.
+    if (_refetch) {
+      _refetch = false;
+      unawaited(_fetchVisible());
+      return;
+    }
+    _scheduleStatusPoll();
+  }
+
+  /// Запускает опрос статусов превью, если он ещё не идёт.
+  ///
+  /// Опрос разовый: `_pollStatuses` сам решит, продолжать ли (см. его описание).
+  void _scheduleStatusPoll() {
+    _statusTimer ??= Timer(const Duration(milliseconds: _statusPollMs), _pollStatuses);
+  }
+
+  /// Переспрашивает у сервера состояние превью тех видимых кадров, которые ещё не готовы.
+  ///
+  /// Зачем это нужно, хотя `previewState` уже приходит вместе с кадром: в момент, когда лента
+  /// отдана, превью часто ещё только собирается в очереди, и без перезапроса клетка остаётся
+  /// серой до перезахода на экран. Ответ несёт только состояние — картинка по нему уже есть
+  /// в самом кадре: `sha256` сервер отдаёт и для несобранного превью
+  /// (src/media-feed/media-feed.service.ts, `range`).
+  ///
+  /// Опрос прекращается сам: когда среди видимых неготовых кадров не осталось либо когда
+  /// каждый из них спрашивали `_statusMaxTries` раз (превью может собираться долго, а очередь
+  /// стоять — ждать бесконечно на открытом экране незачем). Запускается он только из
+  /// `_fetchVisible`, то есть после каждой подгрузки окна.
+  ///
+  /// Побочно: `_items` с обновлёнными состояниями, `_statusTries`, перезапуск таймера.
+  Future<void> _pollStatuses() async {
+    _statusTimer = null;
+    if (!mounted) return;
+    final range = _visibleRange();
+    if (range == null) return;
+    final (s, e) = range;
+    final ids = <String>[];
+    /// `entryId` → индекс кадра в ленте: по нему найденный статус ложится в свой слот,
+    /// без повторного прохода по всему окну на каждый id.
+    final at = <String, int>{};
+    for (var i = s; i <= e && ids.length < _statusBatchMax; i++) {
+      final it = _items[i];
+      if (it == null) continue;
+      // 'impossible' — превью не будет вовсе (файл больше лимита, тип не поддержан): ждать
+      // нечего, и опрашивать такие кадры незачем.
+      if (it.previewState == 'done' || it.previewState == 'impossible') continue;
+      if ((_statusTries[it.entryId] ?? 0) >= _statusMaxTries) continue;
+      if (at.containsKey(it.entryId)) continue;
+      at[it.entryId] = i;
+      ids.add(it.entryId);
+    }
+    if (ids.isEmpty) return;
+    var unresolved = false;
+    try {
+      final states = await ref.read(appStateProvider).api.mediaStatus(ids);
+      if (!mounted) return;
+      final by = {for (final st in states) st.entryId: st};
+      setState(() {
+        for (final id in ids) {
+          _statusTries[id] = (_statusTries[id] ?? 0) + 1;
+          final st = by[id];
+          if (st == null) continue;
+          if (st.previewState != 'done' && st.previewState != 'impossible') unresolved = true;
+          final i = at[id]!;
+          final it = _items[i];
+          if (it == null || it.entryId != id || it.previewState == st.previewState) continue;
+          _items[i] = _withPreviewState(it, st);
+        }
+      });
+    } catch (e) {
+      // Как и у страниц ленты: неудачный опрос — не повод падать, следующий скролл запустит
+      // его снова.
+      if (kDebugMode) debugPrint('media status error: $e');
+      return;
+    }
+    if (unresolved) _scheduleStatusPoll();
+  }
+
+  /// Копия кадра с новым состоянием превью.
+  ///
+  /// Копия собирается вручную, потому что `MediaItem` неизменяем, а `copyWith` у модели нет
+  /// (`api/models.dart` — файл не этого экрана, см. отчёт ревью): поля те же, меняется одно.
+  MediaItem _withPreviewState(MediaItem it, MediaStatusItem st) => MediaItem(
+        entryId: it.entryId,
+        name: it.name,
+        capturedAt: it.capturedAt,
+        mime: it.mime,
+        sha256: it.sha256,
+        previewState: st.previewState,
+        jobState: st.jobState,
+        size: it.size,
+        tzOffsetMin: it.tzOffsetMin,
+      );
+
+  /// Открывает просмотрщик на кадре `idx`, передав ему доступ к своему кэшу.
+  ///
+  /// Что важно в этом контракте:
+  /// * `_total` отдаётся просмотрщику как общий `ValueNotifier`, а не как число: список и
+  ///   просмотрщик смотрят на один счётчик, поэтому после удаления кадра просмотрщик сразу
+  ///   видит новое число страниц, а не держит замороженное (см. `total` у `MediaViewer`);
+  /// * удаление кадра обрабатывает лента, а не просмотрщик: `onDelete` сдвигает индексы кэша
+  ///   и уменьшает `_total`, потому что просмотрщик только листает, а данные живут в ленте;
+  /// * `revision` отдаётся наружу, чтобы просмотрщик сам узнавал о подгруженных кадрах.
+  ///
+  /// Побочно: маршрут просмотрщика (`fullscreenDialog` — он открывается поверх, а не как
+  /// обычный экран стека).
   void _open(int idx) {
     Navigator.push(context, MaterialPageRoute(
       fullscreenDialog: true,
       builder: (_) => MediaViewer(
         api: ref.read(appStateProvider).api,
-        total: _total ?? 0,
+        total: _total,
         initialIndex: idx,
         getItem: (i) => _items[i],
         ensure: (s, e) {
+          // Аргументы здесь намеренно игнорируются: окно загрузки у ленты одно и считается
+          // от позиции её собственного скролла, а не от индекса, который показывает просмотрщик.
+          // Запрос просмотрщика только будит ленту — грузится окно ленты. Ленте этого хватает:
+          // просмотрщик открывают из неё же, и он листает рядом с открытым кадром (у карты
+          // `ensure`, наоборот, точечный: там кадров в памяти нет вовсе, см. map_screen.dart).
           if (!_items.containsKey(s) || !_items.containsKey(e)) _fetchVisible();
         },
         onDelete: (i) => _handleDelete(i),
@@ -177,65 +486,101 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     ));
   }
 
+  /// Убирает удалённый кадр из кэша ленты, сдвигает индексы остальных и уменьшает счётчик.
+  ///
+  /// Это и есть та работа, которую просмотрщик за ленту не делает: он лишь сообщает номер
+  /// удалённого кадра (`onDelete`), а кэш живёт здесь и хранится по индексам. Удалённый
+  /// выкидывается, все, кто был правее, сдвигаются на единицу — так индексы снова совпадают
+  /// с порядком ленты на сервере.
+  ///
+  /// Кэш и счётчик меняются одной транзакцией `setState`: между сдвигом индексов и новым
+  /// `_total` сетка не должна успеть отрисоваться (в кадре с новым числом клеток, но старым
+  /// кэшем последняя клетка осталась бы без кадра).
+  ///
+  /// Побочно: `_items`, `_total` (через него — `itemCount` у сетки и у просмотрщика).
   void _handleDelete(int index) {
-    final t = _total;
-    if (t == null) return;
-    // сдвиг индексов: удалённый уходит, следующие смещаются на единицу
-    final next = <int, MediaItem>{};
-    _items.forEach((k, v) {
-      if (k == index) return;
-      next[k > index ? k - 1 : k] = v;
+    if (!mounted) return;
+    final t = _total.value;
+    if (t == 0) return;
+    setState(() {
+      // сдвиг индексов: удалённый уходит, следующие смещаются на единицу
+      final next = <int, MediaItem>{};
+      _items.forEach((k, v) {
+        if (k == index) return;
+        next[k > index ? k - 1 : k] = v;
+      });
+      _items
+        ..clear()
+        ..addAll(next);
+      _total.value = t - 1;
     });
-    _items
-      ..clear()
-      ..addAll(next);
-    setState(() => _total = t - 1);
   }
 
   @override
   Widget build(BuildContext context) {
-    final t = _total;
+    final api = ref.read(appStateProvider).api;
     return Scaffold(
       backgroundColor: C.canvas,
       appBar: AppBar(
-        backgroundColor: C.canvas,
         title: Text(_month, style: const TextStyle(color: C.fg, fontSize: 17)),
       ),
       body: LayoutBuilder(builder: (context, c) {
-        _cols = math.max(1, ((c.maxWidth + _gap) / _row).floor());
-        if (t == null) return const Center(child: CircularProgressIndicator());
+        // Число колонок считается прямо в раскладке: от него зависят индексы кадров, поэтому
+        // оно должно быть известно до первого расчёта видимого окна (см. `_fetchVisible`).
+        // Пишется в `ValueNotifier`, а не в обычное поле: слушателей у него нет, поэтому
+        // запись в раскладке никого не будит, а следующий расчёт (из post-frame колбэка или
+        // таймера дебаунса) читает уже новое число.
+        _cols.value = math.max(1, ((c.maxWidth + _gap) / _row).floor());
+        if (!_loaded) return const Center(child: CircularProgressIndicator());
+        final t = _total.value;
         if (t == 0) {
           return const Center(child: Text('Здесь появятся фото и видео из раздела «Фото»', style: TextStyle(color: C.fg3)));
         }
         return GridView.builder(
           controller: _sc,
-          padding: const EdgeInsets.all(3),
+          padding: const EdgeInsets.all(_gap),
           gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: _cols,
+            crossAxisCount: _cols.value,
             mainAxisSpacing: _gap,
             crossAxisSpacing: _gap,
           ),
           itemCount: t,
-          itemBuilder: (context, i) => _cellWidget(i),
+          itemBuilder: (context, i) => _cellWidget(i, api),
         );
       }),
     );
   }
 
-  Widget _cellWidget(int i) {
+  /// Клетка сетки: картинка, а пока кадра нет или превью не собрано — серая клетка с иконкой
+  /// по типу файла.
+  ///
+  /// Плейсхолдер сделан тапаемым намеренно: просмотрщик умеет ждать кадр (через `revision`),
+  /// поэтому нажатие по ещё не загруженной клетке открывает его, а не пропадает впустую.
+  /// Видео и фото отличаются только иконкой — миниатюру для обоих отдаёт сервер.
+  ///
+  /// `previewState = 'impossible'` (файл больше лимита, тип не поддержан) показывается
+  /// намеренно другой иконкой: «превью не будет никогда» и «превью ещё собирается» — разные
+  /// вещи, и по одинаковому значку пользователь не понимает, ждать ему или нет. `api` приходит
+  /// из `build`: читать провайдер на каждую клетку на каждый кадр незачем.
+  Widget _cellWidget(int i, CloudlyApi api) {
     final item = _items[i];
     if (item == null) {
       return Container(color: C.surface3);
     }
+    final isVideo = item.mime.startsWith('video/');
     final ready = item.previewState == 'done' && (item.sha256?.isNotEmpty ?? false);
-    final api = ref.read(appStateProvider).api;
     if (!ready) {
+      final IconData icon;
+      if (item.previewState == 'impossible') {
+        icon = isVideo ? Icons.videocam_off_outlined : Icons.hide_image_outlined;
+      } else {
+        icon = isVideo ? Icons.movie_outlined : Icons.image_outlined;
+      }
       return GestureDetector(
         onTap: () => _open(i),
         child: Container(
           color: C.surface3,
-          child: Icon(item.mime.startsWith('video/') ? Icons.movie_outlined : Icons.image_outlined,
-              color: C.fg3, size: 22),
+          child: Icon(icon, color: C.fg3, size: 22),
         ),
       );
     }
@@ -245,8 +590,8 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
         imageUrl: api.previewUrl(item.sha256!),
         httpHeaders: api.authHeaders,
         fit: BoxFit.cover,
-        placeholder: (_, __) => Container(color: C.surface3),
-        errorWidget: (_, __, ___) => Container(
+        placeholder: (_, _) => Container(color: C.surface3),
+        errorWidget: (_, _, _) => Container(
           color: C.surface3,
           child: Icon(item.mime.startsWith('video/') ? Icons.movie_outlined : Icons.image_outlined, color: C.fg3),
         ),
@@ -257,16 +602,41 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
 
 // ---------- просмотрщик кадра (общий для «Медиа» и «Карты») ----------
 
+/// Полноэкранный просмотрщик кадра — общий для «Медиа» и «Карты».
+///
+/// Кадров у него нет: он листает по индексам и спрашивает их у вызывающего экрана через
+/// `getItem`, а догрузку просит через `ensure`. Такая развязка нужна потому, что источники
+/// разные: у ленты «Медиа» это кэш, заполняемый окнами по скроллу, у карты — кадры, которые
+/// приезжают по одному уже после открытия просмотрщика.
+///
+/// Контракт по удалению (и главная тонкость класса): `total` — не снимок, а общий с владельцем
+/// кадров `ValueListenable`. Он задаёт `itemCount` и границы листания, и его же владелец
+/// уменьшает в своём `onDelete`; просмотрщик перестраивается на новое число сам, поэтому
+/// лишней страницы-спиннера после удаления не остаётся. Значит удаление переживает не
+/// просмотрщик, а вызвавший его экран: он сдвигает свои индексы (`onDelete`) и уменьшает своё
+/// число кадров, а просмотрщик только переставляет указатель на новый текущий кадр.
 class MediaViewer extends StatefulWidget {
   final CloudlyApi api;
-  final int total;
+  /// Число кадров у владельца: тот же счётчик, что показывает список. См. контракт в описании
+  /// класса — значение живое, а не зафиксированное на момент открытия.
+  final ValueListenable<int> total;
+  /// С какого кадра открылись: он же стартовая страница `PageView`.
   final int initialIndex;
+  /// Кадр по индексу или `null`, если он ещё не загружен (тогда показывается спиннер).
   final MediaItem? Function(int) getItem;
+  /// Просьба подгрузить кадры в диапазоне индексов. Вызывается на каждой отрисовке слайда,
+  /// поэтому реализация обязана быть дешёвой и сама решать, что именно грузить.
   final void Function(int start, int end) ensure;
+  /// Сообщение вызывающему экрану, что кадр удалён: индекс в его нумерации. Сдвиг индексов
+  /// и пересчёт числа кадров — забота вызывающего (см. контракт класса).
   final void Function(int index) onDelete;
 
   /// Родитель дёргает этот Listenable, когда его кэш кадров пополнился: без этого
   /// просмотрщик оставался бы со спиннером (у карты кадры приходят уже после открытия).
+  ///
+  /// Кто инкрементит: владелец кэша (`MediaScreen` после каждой страницы `mediaRange`,
+  /// `MapScreen` после догрузки одного кадра). Кто слушает: этот виджет — подписка ставится
+  /// в `initState` и снимается в `dispose`, поэтому сигнал не переживает просмотрщик.
   final Listenable? revision;
 
   const MediaViewer({
@@ -284,43 +654,87 @@ class MediaViewer extends StatefulWidget {
   State<MediaViewer> createState() => _MediaViewerState();
 }
 
+/// Состояние просмотрщика: текущая страница и метаданные кадра для футера.
 class _MediaViewerState extends State<MediaViewer> {
+  /// Контроллер листания; создаётся на стартовом кадре и живёт до закрытия просмотрщика.
   late final PageController _pc = PageController(initialPage: widget.initialIndex);
+  /// Номер текущего кадра. Держится отдельно от контроллера, потому что нужен там, где
+  /// страница не менялась: удаление, обновление метаданных, футер.
   late int _idx = widget.initialIndex;
+  /// Метаданные текущего кадра для футера; `null` — ещё грузятся (или кадра нет).
   MediaInfo? _info;
+  /// Номер запроса метаданных: ответ применяется, только если он всё ещё последний.
+  ///
+  /// Без этого футер показывал бы EXIF прошлого кадра: при быстром листании запросы уходят
+  /// на каждый кадр, а отвечают не по порядку — медленный ответ на кадр №3 перетирал бы
+  /// метаданные уже открытого №4.
+  int _infoGen = 0;
 
   @override
+  /// Подписка на сигнал родителя и метаданные кадра, с которого открылись.
   void initState() {
     super.initState();
     widget.revision?.addListener(_onRevision);
     _loadInfo(_idx);
   }
 
+  /// Реакция на сигнал «в кэше родителя появились кадры».
+  ///
+  /// Кадр мог подгрузиться уже после открытия просмотрщика (это обычный случай для карты),
+  /// поэтому по сигналу достаточно перерисоваться — `build` сам перечитает кадр через
+  /// `getItem`. Метаданные футера при этом дотягиваются отдельно: за них отвечает другое
+  /// поле, и без повторного запроса футер остался бы пустым.
   void _onRevision() {
     if (!mounted) return;
-    debugPrint('viewer revision: idx=$_idx hasItem=${widget.getItem(_idx) != null}');
     setState(() {});
     // Кадр подгрузился уже после открытия — метаданные футера тоже надо дотянуть.
     if (_info == null) _loadInfo(_idx);
   }
 
   @override
+  /// Отписка от сигнала и уничтожение контроллера листания.
   void dispose() {
     widget.revision?.removeListener(_onRevision);
     _pc.dispose();
     super.dispose();
   }
 
+  /// Читает метаданные кадра для футера (параметры съёмки, размер, координаты).
+  ///
+  /// Кадр берётся у родителя: если он ещё не загружен, запрашивать нечего — выход без запроса,
+  /// метаданные подтянутся по сигналу `_onRevision`. Пока идёт запрос, `_info` сбрасывается,
+  /// чтобы футер не показывал данные прошлого кадра. Ошибку глотаем: без футера просмотр
+  /// кадра не ломается.
+  ///
+  /// Ответ применяется только если за время запроса не ушёл следующий (`_infoGen`): иначе
+  /// футер показывал бы EXIF того кадра, который уже пролистали.
+  /// Побочно: `_info` (сначала пусто, потом метаданные кадра), `_infoGen`.
   Future<void> _loadInfo(int i) async {
+    final gen = ++_infoGen;
     final item = widget.getItem(i);
     if (item == null) return;
-    setState(() => _info = null);
+    if (mounted) setState(() => _info = null);
     try {
       final info = await widget.api.mediaInfo(item.entryId);
-      if (mounted) setState(() => _info = info);
+      if (mounted && gen == _infoGen) setState(() => _info = info);
     } catch (_) {}
   }
 
+  /// Удаляет текущий кадр: файл уходит в корзину на сервере, кэш и счётчик сдвигает родитель.
+  ///
+  /// Арифметика перехода опирается на число кадров **до** удаления, — и это не ошибка:
+  /// удалённый кадр в этом числе ещё есть. Если удалили последний кадр, встаём на
+  /// предпоследний (после сдвига он стал последним), иначе остаёмся на своём номере —
+  /// на него въехал следующий кадр. `clamp` не даёт выйти за границы. Если кадр был
+  /// единственным, просмотрщик закрывается: показывать нечего.
+  ///
+  /// Число кадров после удаления берётся из общего с родителем счётчика (`widget.total`),
+  /// который тот уменьшает внутри `onDelete`. Поэтому `itemCount` у `PageView` схлопывается
+  /// сразу, а контроллер переставляется на новый номер вручную — иначе листание осталось бы
+  /// на странице, которой в новом списке уже нет.
+  ///
+  /// Побочно: `widget.onDelete(_idx)` — родитель сдвигает индексы и уменьшает счётчик;
+  /// `_idx` и метаданные футера пересчитываются под новый кадр.
   Future<void> _delete() async {
     final item = widget.getItem(_idx);
     if (item == null) return;
@@ -328,15 +742,24 @@ class _MediaViewerState extends State<MediaViewer> {
     if (!ok) return;
     try {
       await widget.api.deleteFile(item.entryId);
-      if (mounted) widget.onDelete(_idx);
-      if (mounted) {
-        setState(() {
-          if (_idx >= widget.total - 1 && widget.total > 1) _idx = widget.total - 2;
-          _idx = _idx.clamp(0, math.max(0, widget.total - 2));
-        });
-        if (widget.total <= 1) Navigator.pop(context);
-        else _loadInfo(_idx);
+      if (!mounted) return;
+      // Родитель сдвигает свои индексы и уменьшает общий счётчик — из него и берётся число
+      // кадров после удаления.
+      widget.onDelete(_idx);
+      final after = widget.total.value;
+      if (after <= 0) {
+        Navigator.pop(context);
+        return;
       }
+      // Удалили последний кадр — встаём на предыдущий; иначе номер тот же: на него въехал
+      // следующий кадр.
+      setState(() => _idx = (_idx >= after ? after - 1 : _idx).clamp(0, after - 1));
+      // Список страниц уже укоротился, но `PageView` мог остаться на прежнем номере:
+      // переставляем контроллер на кадр, который показываем.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _pc.hasClients) _pc.jumpToPage(_idx);
+      });
+      _loadInfo(_idx);
     } catch (e) {
       if (mounted) snack(context, e.toString());
     }
@@ -344,20 +767,37 @@ class _MediaViewerState extends State<MediaViewer> {
 
   @override
   Widget build(BuildContext context) {
+    // `itemCount` и границы листания живут в счётчике родителя: удаление кадра меняет их
+    // на месте, и просмотрщик перестраивается без переоткрытия (см. контракт класса).
+    return ValueListenableBuilder<int>(
+      valueListenable: widget.total,
+      builder: (context, total, _) => _body(total),
+    );
+  }
+
+  /// Тело просмотрщика для текущего числа кадров `total`.
+  Widget _body(int total) {
     final item = widget.getItem(_idx);
     final geo = (_info?.latitude != null && _info?.longitude != null) ? _info : null;
+    // В шапке — дата съёмки, а если её нет, имя файла. Пояс снимка сервер отдаёт отдельным
+    // полем (`tzOffsetMin` у кадра): `capturedAt` — уже пересчитанный UTC-момент, поэтому без
+    // поправки цифры ISO-строки врут на пояс съёмки. Если пояса в тегах не было, `tzOffsetMin`
+    // пуст и подпись выходит в UTC — сервер в этом случае не знает, где снимали.
+    final date = fmtMediaDate(item?.capturedAt, tzOffsetMin: item?.tzOffsetMin);
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(children: [
         PageView.builder(
           controller: _pc,
-          itemCount: widget.total,
+          itemCount: total,
           onPageChanged: (i) {
             setState(() => _idx = i);
             _loadInfo(i);
           },
           itemBuilder: (context, i) {
-            widget.ensure(math.max(0, i - 1), math.min(widget.total - 1, i + 1));
+            // Просим кадр и соседей: соседние слайды PageView строит заранее, и без этой
+            // просьбы они оставались бы спиннерами до следующего движения пальцем.
+            widget.ensure(math.max(0, i - 1), math.min(total - 1, i + 1));
             return _slide(widget.getItem(i));
           },
         ),
@@ -368,7 +808,7 @@ class _MediaViewerState extends State<MediaViewer> {
               IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: () => Navigator.pop(context)),
               Expanded(
                 child: Text(
-                  fmtMediaDate(item?.capturedAt).isNotEmpty ? fmtMediaDate(item?.capturedAt) : (item?.name ?? ''),
+                  date.isNotEmpty ? date : (item?.name ?? ''),
                   style: const TextStyle(color: Colors.white, fontSize: 14),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -393,6 +833,10 @@ class _MediaViewerState extends State<MediaViewer> {
     );
   }
 
+  /// Один слайд: фото, видео или спиннер, пока кадр не доехал.
+  ///
+  /// Спиннер вместо пустоты — потому что кадры приходят по индексам, и «нет данных» здесь
+  /// штатная ситуация, а не ошибка: `ensure` уже попросил их у родителя.
   Widget _slide(MediaItem? item) {
     if (item == null) return const Center(child: CircularProgressIndicator());
     final isVideo = item.mime.startsWith('video/');
@@ -400,6 +844,11 @@ class _MediaViewerState extends State<MediaViewer> {
     return _image(item);
   }
 
+  /// Фото: превью 1080 px в `InteractiveViewer`, чтобы можно было приблизить пальцами.
+  ///
+  /// Именно превью, а не оригинал: в ленте кадры листают десятками, и тянуть полноразмерные
+  /// файлы ради просмотра на телефоне смысла нет. Оригинал доступен кнопкой «Скачать».
+  /// Если sha256 у кадра нет, кадр брать неоткуда — про это честно сообщаем.
   Widget _image(MediaItem item) {
     final sha = item.sha256;
     if (sha == null || sha.isEmpty) {
@@ -413,24 +862,35 @@ class _MediaViewerState extends State<MediaViewer> {
           imageUrl: widget.api.previewUrl(sha, w: 1080),
           httpHeaders: widget.api.authHeaders,
           fit: BoxFit.contain,
-          placeholder: (_, __) => const CircularProgressIndicator(color: Colors.white),
-          errorWidget: (_, __, ___) => const Center(child: Text('Превью не открылось — файл мог быть удалён', style: TextStyle(color: Colors.white70))),
+          placeholder: (_, _) => const CircularProgressIndicator(color: Colors.white),
+          errorWidget: (_, _, _) => const Center(child: Text('Превью не открылось — файл мог быть удалён', style: TextStyle(color: Colors.white70))),
         ),
       ),
     );
   }
 
+  /// Видео: серверное превью в отдельном виджете `_Vid` со своим контроллером.
+  ///
+  /// Превью — не единственный источник: часть старых роликов собрана в AV1, который
+  /// декодируют не все устройства (Safari/iOS < 17), поэтому `_Vid` при отказе сам переходит
+  /// на оригинал (`?src=original`) — так же, как это сделано в деталке файла.
   Widget _video(MediaItem item) {
     final sha = item.sha256;
     if (sha == null || sha.isEmpty) return const SizedBox();
-    return Center(child: _Vid(api: widget.api, url: widget.api.videoPreviewUrl(sha)));
+    return Center(child: _Vid(api: widget.api, sha: sha));
   }
 
+  /// Футер с параметрами кадра: размер, кадр, камера, объектив, выдержка, ISO, координаты.
+  ///
+  /// Данные — из метаданных кадра (`_info`), а размер берётся из ленты, когда кадр под рукой:
+  /// он там уже есть и не требует отдельного поля. Строки показываются по наличию значения,
+  /// поэтому у фото и видео набор разный. Футер горизонтально прокручивается: параметров
+  /// много, а место занимает одну строку.
   Widget _footer() {
     final info = _info!;
     final item = widget.getItem(_idx);
     final metas = <(IconData, String, String)>[
-      (Icons.sd_storage_outlined, 'Размер', fmtSize(item?.size ?? info.size)),
+      (Icons.sd_storage_outlined, 'Размер', fmt(item?.size ?? info.size)),
       if (info.width != null && info.height != null) (Icons.aspect_ratio, 'Кадр', '${info.width} × ${info.height}'),
       if ((info.make?.isNotEmpty ?? false) || (info.model?.isNotEmpty ?? false))
         (Icons.camera_alt_outlined, 'Камера', [info.make, info.model].where((s) => s != null && s.isNotEmpty).join(' ')),
@@ -447,8 +907,8 @@ class _MediaViewerState extends State<MediaViewer> {
         (Icons.place_outlined, 'Координаты', '${info.latitude!.toStringAsFixed(6)}, ${info.longitude!.toStringAsFixed(6)}'),
     ];
     return Container(
-      color: Colors.black.withOpacity(0.6),
-      height: 46,
+      color: Colors.black.withValues(alpha: _footerAlpha),
+      height: _footerH,
       child: ListView(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -466,51 +926,107 @@ class _MediaViewerState extends State<MediaViewer> {
     );
   }
 
+  /// Открывает точку съёмки на OpenStreetMap в браузере.
+  ///
+  /// Ссылка ведёт не на просмотрщик карты, а на osm.org: полноценной карты внутри приложения
+  /// для одного кадра не нужно, а браузер даёт зум, слои и поиск. `#map=16` — уровень зума,
+  /// на котором видно квартал.
   void _openOsm(MediaInfo geo) {
     launchUrl(Uri.parse(
         'https://www.openstreetmap.org/?mlat=${geo.latitude}&mlon=${geo.longitude}#map=16/${geo.latitude}/${geo.longitude}'));
   }
 
+  /// Скачивает оригинал кадра и открывает его системным просмотрщиком (`downloadAndOpen`).
   void _download(MediaItem item) {
     downloadAndOpen(widget.api, item.entryId, item.name);
   }
 }
 
+/// Проигрыватель видео для просмотрщика: свой контроллер на слайд.
+///
+/// Отдельный виджет, а не код внутри `MediaViewer`, чтобы контроллер жил ровно столько,
+/// сколько слайд на экране: `PageView` уничтожает ушедшие страницы, и вместе с ними
+/// освобождается декодер. Иначе при листании десятков роликов они копились бы в памяти.
+///
+/// Адреса строятся здесь, а не приходят готовой строкой: их два — превью и оригинал, и
+/// выбираются они по ходу (см. `_stage`).
 class _Vid extends StatefulWidget {
   final CloudlyApi api;
-  final String url;
-  const _Vid({required this.api, required this.url});
+  /// sha256 кадра: из него собираются и превью, и оригинал.
+  final String sha;
+  const _Vid({required this.api, required this.sha});
   @override
   State<_Vid> createState() => _VidState();
 }
 
+/// Состояние плеера: контроллер, стадия и признак «не заиграло совсем».
 class _VidState extends State<_Vid> {
+  /// 0 — серверное превью, 1 — оригинал кадра (`?src=original`), 2 — пробовать больше нечего.
+  int _stage = 0;
   VideoPlayerController? _c;
   bool _err = false;
 
   @override
+  /// Сразу поднимаем плеер для этого слайда.
   void initState() {
     super.initState();
     _init();
   }
 
   @override
+  /// Слайд ушёл с экрана — снимаем подписку и освобождаем декодер.
   void dispose() {
+    _c?.removeListener(_onEvent);
     _c?.dispose();
     super.dispose();
   }
 
+  /// Создаёт контроллер текущей стадии и инициализирует поток.
+  ///
+  /// Автовоспроизведения нет (в отличие от деталки файла): в ленте может открыться страница
+  /// с видео, которое пользователь не просил включать. Ошибка ловится и из `initialize`,
+  /// и из событий контроллера — поток может не открыться уже после успешной инициализации.
+  /// Побочно: `_c`, подписка на события, перерисовка; при неудаче — `_fallback`.
   Future<void> _init() async {
-    final c = VideoPlayerController.networkUrl(Uri.parse(widget.url), httpHeaders: widget.api.authHeaders);
+    final url = _stage == 0
+        ? widget.api.videoPreviewUrl(widget.sha)
+        : widget.api.videoPreviewUrl(widget.sha, original: true);
+    final c = VideoPlayerController.networkUrl(Uri.parse(url), httpHeaders: widget.api.authHeaders);
     _c = c;
-    c.addListener(() {
-      if (c.value.hasError && mounted) setState(() => _err = true);
-    });
+    c.addListener(_onEvent);
     try {
       await c.initialize();
       if (mounted) setState(() {});
     } catch (_) {
-      if (mounted) setState(() => _err = true);
+      _fallback();
+    }
+  }
+
+  /// Ловит ошибку, пришедшую уже после `initialize`.
+  void _onEvent() {
+    if (_c?.value.hasError ?? false) _fallback();
+  }
+
+  /// Откат к следующей стадии, а если их больше нет — к надписи «Видео не проигрывается».
+  ///
+  /// Первая стадия — превью 1080: часть старых роликов сервер собрал в AV1, и на устройствах
+  /// без его декодера (Safari/iOS < 17) такое превью не играет вовсе, хотя сам файл
+  /// проигрывается. Вторая стадия — оригинал (`?src=original`): он отдаётся в исходном
+  /// формате, который эти устройства понимают. Тянуть оригинал всегда нельзя (гигабайты
+  /// ради листания), поэтому он только запасной вариант — как в деталке файла.
+  ///
+  /// Побочно: старый контроллер уничтожается (иначе он держал бы декодер и поток), при
+  /// `_stage < 1` стадия растёт и `_init` пробует оригинал, иначе ставится `_err`.
+  void _fallback() {
+    if (!mounted) return;
+    _c?.removeListener(_onEvent);
+    _c?.dispose();
+    _c = null;
+    if (_stage < 1) {
+      setState(() => _stage++);
+      _init();
+    } else {
+      setState(() => _err = true);
     }
   }
 

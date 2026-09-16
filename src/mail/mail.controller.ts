@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Headers, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Logger, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { MailAccountsService } from './mail-accounts.service';
 import { MailFeedService } from './mail-feed.service';
@@ -13,6 +13,31 @@ import { CurrentUser, Public, RateLimit, RequestUser, SessionOnly } from '../com
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { badRequest } from '../common/errors';
 import { secretEquals } from './mail-crypto';
+import { envelopeRecipient } from './mail-parse';
+
+/**
+ * Потолок размера принимаемого письма.
+ *
+ * Выше почтовых пределов отправителей намеренно: Gmail не даёт отправить больше 25 МБ, но в .eml
+ * те же вложения лежат в base64 и весят примерно на треть больше, плюс заголовки и границы MIME.
+ * Это не «рабочий размер письма», а предохранитель против чтения бесконечного потока в память
+ * (у Postfix свой message_size_limit, а у nginx — client_max_body_size).
+ */
+const MAX_INBOUND_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Типы, которые можно отдавать как картинку логотипа. Только растровые: SVG — это документ,
+ * он умеет исполнять скрипт, и, отданный с нашего origin, получил бы доступ к сессионной куке.
+ */
+const FAVICON_MIME = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/bmp',
+  'image/x-icon',
+  'image/vnd.microsoft.icon',
+]);
 
 /**
  * Ручки раздела «Почта».
@@ -21,10 +46,17 @@ import { secretEquals } from './mail-crypto';
  * списка, запуск проверки и работа с письмами. Управление аккаунтами (пароль приложения
  * принимается только на сервере при первичной настройке) закрыто намеренно.
  *
+ * Весь раздел, кроме приёма письма от Postfix, помечен `@SessionOnly`: почта — это личная
+ * переписка, а device-токен (WebDAV, синхронизация) выпускается со scope `files:rw` и без этой
+ * пометки читал бы её целиком — включая `.eml` и безвозвратное удаление писем. Flutter-клиент
+ * ходит cookie-сессией (`flutter/lib/api/cloudly_api.dart`), для него это ничего не меняет.
+ *
  * Статические пути объявлены до параметрических: иначе `messages` уехало бы в `:id`.
  */
 @Controller('mail')
 export class MailController {
+  private readonly logger = new Logger(MailController.name);
+
   constructor(
     private readonly accounts: MailAccountsService,
     private readonly feed: MailFeedService,
@@ -51,8 +83,16 @@ export class MailController {
   @RateLimit(30, 60_000)
   async syncNow(@CurrentUser() user: RequestUser) {
     // Проходы не пересекаются и уже идущий не дублируется — сервис сам скажет, что пропустил.
+    // Отсюда не видно, принят проход или пропущен: `runPass` возвращает void, а свой флаг
+    // занятости держит приватным. Поэтому ответ — «запрос принят», а не «проход пошёл»;
+    // чтобы отвечать точнее, `MailSyncService.runPass` должен возвращать «принят/пропущен»
+    // (правка в его файле).
     void user;
-    void this.sync.runPass('вручную из интерфейса');
+    // Отказ сервиса (например, БД недоступна на первом же запросе) не должен ронять процесс:
+    // без обработчика необработанный reject в Node ≥20 завершает весь API вместе с загрузками.
+    void this.sync.runPass('вручную из интерфейса').catch((e: Error) => {
+      this.logger.warn(`проход по почте не запустился: ${e.message}`);
+    });
     return { ok: true, started: true };
   }
 
@@ -95,7 +135,11 @@ export class MailController {
     @Res() res: Response,
   ): Promise<void> {
     const expected = env.MAIL_INBOUND_TOKEN;
-    if (!expected || !secretEquals(token ?? '', expected)) {
+    // Дублированный заголовок Express отдаёт массивом, а `Buffer.from(массив)` бросает
+    // TypeError — то есть 500 в лог Postfix-обвязки, где 5xx значит «повторить позже».
+    // Значение всё равно не совпало бы с токеном, поэтому достаточно свести его к строке.
+    const header = typeof token === 'string' ? token : '';
+    if (!expected || !secretEquals(header, expected)) {
       res.status(403).json({ message: 'inbound is not configured or token is wrong' });
       return;
     }
@@ -115,10 +159,20 @@ export class MailController {
       res.status(400).json({ message: 'empty message' });
       return;
     }
-    const result = await this.ingestService.ingestInbound(to, source);
+    // Получателя берём из самого письма (`Delivered-To`/`X-Original-To` от нашего Postfix), а не
+    // из query-строки: в адресе из URL плюс декодируется в пробел, и письмо на `user+tag@domain`
+    // не находило бы свой аккаунт (ответ 503 → ретраи → bounce). Query остаётся запасным
+    // вариантом, если заголовков нет.
+    const recipient = envelopeRecipient(source) ?? to;
+    let result = await this.ingestService.ingestInbound(recipient, source);
+    if (result === 'unknown-account') {
+      // Plus-адресация: `user+tag@domain` доставляется аккаунту `user@domain`.
+      const base = stripPlusTag(recipient);
+      if (base) result = await this.ingestService.ingestInbound(base, source);
+    }
     if (result === 'unknown-account') {
       // Не 404: аккаунт могут завести на сервере позже, и тогда письмо доедет повторной доставкой.
-      res.status(503).json({ message: `no mail account for ${to}` });
+      res.status(503).json({ message: `no mail account for ${recipient}` });
       return;
     }
     res.status(200).json({ ok: true, result });
@@ -148,6 +202,7 @@ export class MailController {
 
   /** Заготовка ответа или пересылки: получатели, тема и цитата исходного письма. */
   @Get('messages/:id/reply-context')
+  @SessionOnly()
   replyContext(@Param('id') id: string, @CurrentUser() user: RequestUser, @Query('mode') mode?: string) {
     const kind = mode === 'replyAll' || mode === 'forward' ? mode : 'reply';
     return this.sender.replyContext(user.id, id, kind);
@@ -157,6 +212,7 @@ export class MailController {
 
   /** Общее число писем в папке — клиент по нему считает полную высоту скролла. */
   @Get('count')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   count(@CurrentUser() user: RequestUser, @Query('box') box?: string, @Query('account') account?: string) {
@@ -165,6 +221,7 @@ export class MailController {
 
   /** Срез ленты по смещению: `offset` — позиция, `limit` — сколько взять. */
   @Get('range')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   range(
@@ -187,6 +244,7 @@ export class MailController {
 
   /** Индекс по месяцам — подпись у ползунка и прыжок к месяцу. */
   @Get('months')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   months(@CurrentUser() user: RequestUser, @Query('box') box?: string, @Query('account') account?: string) {
@@ -196,6 +254,7 @@ export class MailController {
   // ===== Письмо =====
 
   @Get('messages/:id')
+  @SessionOnly()
   get(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     return this.feed.get(user.id, id);
   }
@@ -207,6 +266,7 @@ export class MailController {
    * нечитаема в любом движке, и это единственный способ прочитать письмо.
    */
   @Get('messages/:id/body')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   body(
@@ -220,6 +280,7 @@ export class MailController {
 
   /** Сырое письмо файлом: содержимое письма как оно пришло, ничего не потеряно. */
   @Get('messages/:id/raw')
+  @SessionOnly()
   async raw(@Param('id') id: string, @CurrentUser() user: RequestUser, @Req() req: Request, @Res() res: Response) {
     const { key, name } = await this.feed.rawKey(user.id, id);
     await sendObjectOr404(req, res, this.s3, key, {
@@ -236,23 +297,38 @@ export class MailController {
   @RateLimit(1200, 60_000)
   async favicon(@Query('domain') domain: string, @Res() res: Response) {
     const fav = await this.faviconService.get(domain);
-    if (!fav) {
+    // Тип берём из кэша как есть, но отдаём только растровые: SVG здесь был бы документом
+    // нашего origin (сервис сохраняет чужой Content-Type, а favicon тянется с чужого домена).
+    const mime = String(fav?.mime ?? '').split(';')[0].trim().toLowerCase();
+    if (!fav || !FAVICON_MIME.has(mime)) {
       res.status(404).end();
       return;
     }
-    res.setHeader('Content-Type', fav.mime);
+    res.setHeader('Content-Type', mime);
+    // Логотип — не документ: nosniff запрещает движку угадывать тип, а CSP с sandbox не даёт
+    // отрисовать его как страницу, даже если картинка окажется разметкой.
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.send(fav.bytes);
   }
 
   @Post('messages/:id/seen')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(1200, 60_000)
   setSeen(@Param('id') id: string, @Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
     return this.feed.setSeen(user.id, id, body.seen !== false);
   }
 
+  /**
+   * Флаг «важное». Ручка объявлена для совместимости и на будущее: `flagged` приходит в ленте
+   * и в письме, а Flutter-клиент пока рисует только состояние (переключателя в интерфейсе нет,
+   * см. `flutter/lib/api/models.dart` — поле разбирается, ручка не вызывается). Удалять её из-за
+   * этого не стоит: поверхность API у клиента в проде, а форма ответа уже есть в контракте.
+   */
   @Post('messages/:id/flagged')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   setFlagged(@Param('id') id: string, @Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
@@ -265,6 +341,7 @@ export class MailController {
    * ничего не меняется: синхронизация в этой фазе только читает.
    */
   @Delete('messages/:id')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   remove(@Param('id') id: string, @CurrentUser() user: RequestUser) {
@@ -273,14 +350,20 @@ export class MailController {
 
   /** Вернуть письмо из корзины почты (вложения никуда не девались, письмо снова в ленте). */
   @Post('messages/:id/restore')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(600, 60_000)
   restore(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     return this.feed.restoreMessage(user.id, id);
   }
 
-  /** Удалить письмо навсегда: только из корзины, вместе с вложениями и сырым .eml. */
+  /**
+   * Удалить письмо навсегда: только из корзины, вместе с вложениями и сырым .eml.
+   * `@SessionOnly` — по той же причине, что у `/mail/trash/purge`: безвозвратная очистка
+   * не должна быть доступна токену устройства (иначе политика ручки-соседа обходится).
+   */
   @Post('messages/:id/purge')
+  @SessionOnly()
   @UseGuards(RateLimitGuard)
   @RateLimit(300, 60_000)
   purgeMessage(@Param('id') id: string, @CurrentUser() user: RequestUser) {
@@ -296,8 +379,13 @@ export class MailController {
     return this.feed.purgeTrash(user.id);
   }
 
-  /** Метаданные части письма: по ним клиент строит ссылку на файл (`/files/:entryId/...`). */
+  /**
+   * Метаданные части письма: по ним клиент строит ссылку на файл (`/files/:entryId/...`).
+   * Клиент пока берёт вложения из самого письма (`feed.get`), и ручка дублирует эти данные;
+   * оставлена как часть контракта (у клиента в проде может появиться отдельный экран вложения).
+   */
   @Get('messages/:id/attachments/:attachmentId')
+  @SessionOnly()
   attachment(
     @Param('id') id: string,
     @Param('attachmentId') attachmentId: string,
@@ -307,12 +395,23 @@ export class MailController {
   }
 }
 
-/** Потолок размера принимаемого письма: у Gmail предел 25 МБ, у остальных меньше. */
-const MAX_INBOUND_BYTES = 64 * 1024 * 1024;
-
 /** Папка из строки запроса: у почты их три, любое другое значение — ошибка. */
 function boxOf(raw?: string): string {
   if (raw === undefined || raw === '' || raw === 'inbox') return 'inbox';
   if (raw === 'sent' || raw === 'trash') return raw;
   throw badRequest('unknown mail box', 'mail_box_unknown');
+}
+
+/**
+ * Адрес без plus-метки: `user+tag@domain` → `user@domain`. Так работает plus-адресация, и без
+ * этого письмо на такой адрес не нашло бы аккаунт (ответ 503 → повторные доставки → bounce).
+ * `null`, если plus-метки нет: тогда повторять поиск незачем.
+ */
+function stripPlusTag(addr: string): string | null {
+  const at = addr.lastIndexOf('@');
+  if (at <= 0) return null;
+  const local = addr.slice(0, at);
+  const plus = local.indexOf('+');
+  if (plus <= 0) return null;
+  return `${local.slice(0, plus)}${addr.slice(at)}`.toLowerCase();
 }

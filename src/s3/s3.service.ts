@@ -165,6 +165,10 @@ export class S3Service implements OnModuleDestroy {
    * Ключи по префиксу (без префикса инстанса, как их знают вызывающие).
    * Нужно там, где производных у ассета переменное число и перечислить их заранее
    * нельзя: у PDF превью каждой страницы лежат отдельным ключом.
+   *
+   * Границы памяти: метод копит ВСЕ ключи префикса в массиве (пагинация внутри, наружу
+   * отдаётся готовый список) — на префиксе с сотнями тысяч объектов это сотни тысяч строк
+   * в куче. Для потолка по числу объектов вызывающий должен брать узкий префикс.
    */
   async listKeys(prefix: string): Promise<string[]> {
     const keys: string[] = [];
@@ -209,7 +213,12 @@ export class S3Service implements OnModuleDestroy {
     return failed;
   }
 
-  /** Скачать объект целиком в память (для EXIF-парсинга; maxBytes-страховка). */
+  /**
+   * Скачать объект целиком в память (для EXIF-парсинга; maxBytes-страховка).
+   * Границы памяти: буферизует объект целиком, по умолчанию до 150 МБ — для больших
+   * объектов вызывающий обязан либо понизить maxBytes, либо использовать потоки
+   * (`getObjectStream`, `downloadToFile`, `readRange`).
+   */
   async getObjectBytes(key: string, maxBytes = 150 * 1024 * 1024): Promise<Buffer> {
     const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: this.k(key) });
     const out = await this.s3().send(cmd);
@@ -280,7 +289,11 @@ export class S3Service implements OnModuleDestroy {
     }
   }
 
-  /** Размер объекта (HeadObject); 0 — если объекта нет. */
+  /**
+   * Размер объекта (HeadObject). Объекта нет — метод БРОСАЕТ исключение S3 (NotFound),
+   * а не возвращает 0: 0 приходит только у реально пустого объекта. Вызывающий, для которого
+   * «нет объекта» — обычная ситуация, обязан обработать это сам (`headObject` или `.catch`).
+   */
   async objectSize(key: string): Promise<number> {
     const out = await this.s3().send(new HeadObjectCommand({ Bucket: this.bucket, Key: this.k(key) }));
     return Number(out.ContentLength ?? 0);
@@ -306,13 +319,18 @@ export class S3Service implements OnModuleDestroy {
 
   /**
    * Залить поток в объект multipart-загрузкой (без знания размера заранее и без диска).
-   * Буфер одной части переиспользуется — копирование однократное.
+   * Буфер одной части переиспользуется: он аллоцируется один раз на вызов, а не на каждую
+   * часть (на 53 ГБ это ~1650 аллокаций по 32 МБ мимо GC), и перезаписывается только после
+   * того, как предыдущая часть реально ушла в S3 (`uploadPart` awaited).
+   *
+   * Content-Type объекту НЕ проставляется (параметр оставлен для совместимости сигнатуры):
+   * тип всегда задаёт отдача через API (src/common/http-object.ts), а не метаданные объекта.
    */
   async uploadStream(key: string, stream: NodeJS.ReadableStream, _contentType: string): Promise<number> {
     const PART = S3Service.STREAM_PART_SIZE;
     const uploadId = await this.createMultipartUpload(key);
     const parts: S3Part[] = [];
-    let buf = Buffer.allocUnsafe(PART);
+    const buf = Buffer.allocUnsafe(PART);
     let off = 0;
     let total = 0;
     let partNumber = 0;
@@ -333,7 +351,6 @@ export class S3Service implements OnModuleDestroy {
           pos += take;
           if (off === PART) {
             await push(buf);
-            buf = Buffer.allocUnsafe(PART);
             off = 0;
           }
         }
@@ -369,7 +386,20 @@ export class S3Service implements OnModuleDestroy {
     }
   }
 
-  /** Скачать объект в локальный файл (для воркера конвертации). */
+  /**
+   * Скачать объект в локальный файл (для воркера конвертации).
+   *
+   * `filePath` — всегда серверный путь (tmp-каталог воркера), который выбирает вызывающий;
+   * сюда НЕЛЬЗЯ передавать что-либо производное от пользовательского ввода: проверки на
+   * выход за каталог внутри метода нет, ключ с `../` или абсолютный путь запишет файл куда
+   * угодно. Если такой путь когда-нибудь понадобится — проверку добавлять здесь, а не у
+   * вызывающего.
+   *
+   * Таймаута и AbortSignal у скачивания нет: единственная точка, где задача очереди может
+   * зависнуть навсегда (у S3-вызовов дедлайна тоже нет — на уровне клиента `connectionTimeout`
+   * /`requestTimeout` не настроены). Зависший GET держит слот очереди до рестарта процесса,
+   * поэтому watchdog «processing старше X» нужен на стороне очереди (src/queue/queue.service.ts).
+   */
   async downloadToFile(key: string, filePath: string): Promise<void> {
     const cmd = new GetObjectCommand({ Bucket: this.bucket, Key: this.k(key) });
     const out = await this.s3().send(cmd);
@@ -405,17 +435,6 @@ export class S3Service implements OnModuleDestroy {
       ...(contentLength ? { ContentLength: contentLength } : {}),
     });
     await this.s3().send(cmd);
-  }
-
-  /** Временная presigned-ссылка на скачивание (TTL 15 мин). */
-  async presignedGet(key: string, mime: string): Promise<string> {
-    const cmd = new GetObjectCommand({
-      Bucket: this.bucket,
-      Key: this.k(key),
-      ResponseContentType: mime,
-      ResponseContentDisposition: 'attachment',
-    });
-    return getSignedUrl(this.s3(), cmd, { expiresIn: 15 * 60 });
   }
 
   /**
@@ -461,22 +480,44 @@ export class S3Service implements OnModuleDestroy {
 
     const inFlight = new Map<number, Promise<Buffer>>();
     const window = Math.min(S3Service.HASH_CONCURRENCY, ranges);
-    for (let i = 0; i < window; i++) inFlight.set(i, fetchRange(i));
+    /**
+     * Префетч-промисы (их держим в окне) обязаны иметь обработчик отклонения СРАЗУ:
+     * `await` стоит только на текущем индексе, поэтому падение любого запроса из окна
+     * (сетевой сбой, InvalidRange, 5xx) иначе всплывает как unhandled rejection и с
+     * дефолтным `--unhandled-rejections=throw` роняет процесс — вместе со всеми идущими
+     * загрузками. Ошибку мы всё равно увидим: она придёт из `await` своего индекса.
+     */
+    const track = (i: number): void => {
+      const p = fetchRange(i);
+      p.catch(() => undefined);
+      inFlight.set(i, p);
+    };
+    for (let i = 0; i < window; i++) track(i);
 
-    for (let i = 0; i < ranges; i++) {
-      const buf = await inFlight.get(i)!;
-      inFlight.delete(i);
-      hash.update(buf);
-      const next = i + window;
-      if (next < ranges) inFlight.set(next, fetchRange(next));
+    try {
+      for (let i = 0; i < ranges; i++) {
+        const buf = await inFlight.get(i)!;
+        inFlight.delete(i);
+        hash.update(buf);
+        const next = i + window;
+        if (next < ranges) track(next);
+      }
+      return hash.digest('hex');
+    } catch (e) {
+      // выходим по ошибке — все промисы окна дожидаем, чтобы не осталось «висящих» отклонений
+      await Promise.allSettled([...inFlight.values()]);
+      inFlight.clear();
+      throw e;
     }
-    return hash.digest('hex');
   }
 
   /**
    * Открыть объект потоком — для отдачи клиенту через сам сервис (без presigned-ссылок
    * наружу: ссылка на S3 живёт без авторизации и утекает в историю браузера/логи).
    * Range пробрасывается в S3 как есть: без него не работает перемотка в <video>.
+   *
+   * Границы памяти: тело отдаётся потоком без ограничения размера — лимит задаёт вызывающий
+   * (и разрывает поток, если клиент отвалился); в память объект здесь не собирается.
    */
   async getObjectStream(key: string, range?: string): Promise<S3ObjectStream> {
     const cmd = new GetObjectCommand({

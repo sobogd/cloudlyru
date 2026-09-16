@@ -1,9 +1,13 @@
 import {
   BadRequestException,
+  HttpException,
   Injectable,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import { createHash } from 'crypto';
+import { Transform } from 'stream';
+import { pipeline } from 'stream/promises';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
@@ -13,12 +17,41 @@ import { QueueService } from '../queue/queue.service';
 import { ChangesService } from '../sync/changes.service';
 import { assertSafeName, randomToken } from '../common/utils';
 import { HIDDEN_ZONES, ZONE_PHOTOS, isHiddenZone, zoneOf } from '../common/zones';
-import { notFound } from '../common/errors';
+import { setCurrentDeviceId } from '../common/request-context';
+import { MAX_FILE_BYTES } from '../config/env';
+import { notFound, payloadTooLarge } from '../common/errors';
 
 export class DavError extends Error {}
 
+/**
+ * Сколько объектов папки готов отдать PROPFIND. Листинг WebDAV не пагинируется, а XML
+ * собирается строкой в памяти: папка на 100 000 файлов — это десятки мегабайт строки и
+ * минуты ответа. Молча обрезать список нельзя (клиент решит, что файлов нет, и, например,
+ * rclone с `--delete` снесёт их у себя), поэтому превышение лимита — честный 507.
+ */
+const DAV_LIST_LIMIT = 10_000;
+
+/** 507 Insufficient Storage (RFC 4918): в HttpStatus этой версии Nest его нет. */
+const INSUFFICIENT_STORAGE = 507;
+
+/**
+ * Строгая сверка логина из Basic (DAV_VALIDATE_LOGIN=true). По умолчанию выключена:
+ * секрет здесь — токен, а поле «пользователь» в Finder/rclone заполняет человек, и у уже
+ * настроенных клиентов там может стоять что угодно. Включённая по умолчанию проверка
+ * отдала бы им 401 и «не удалось подключиться».
+ */
+const DAV_VALIDATE_LOGIN = process.env.DAV_VALIDATE_LOGIN === 'true' || process.env.DAV_VALIDATE_LOGIN === '1';
+
 @Injectable()
 export class DavService {
+  private readonly logger = new Logger('Dav');
+  /**
+   * Логин владельца токена, по userId. WebDAV-клиенты (Finder, rclone) делают сотни запросов
+   * за проход, и лишний запрос в БД на каждый из них был бы заметен: логин меняется разве что
+   * руками в БД, поэтому кэш в памяти процесса уместен (живёт до рестарта).
+   */
+  private readonly loginCache = new Map<string, string>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
@@ -29,45 +62,46 @@ export class DavService {
     private readonly changes: ChangesService,
   ) {}
 
-  /** Проверка Authorization: Basic login:apptoken → владелец и scope токена. */
+  /**
+   * Проверка Authorization: Basic login:apptoken → владелец и scope токена.
+   * Схема разбирается регистронезависимо (`basic` тоже принимается), а логин по умолчанию
+   * не сверяется — см. DAV_VALIDATE_LOGIN.
+   */
   async authenticate(req: { headers: Record<string, unknown> }): Promise<{ userId: string; scope: string }> {
     const h = req.headers['authorization'];
-    if (typeof h !== 'string' || !h.startsWith('Basic ')) throw new UnauthorizedException('Basic auth required');
-    const decoded = Buffer.from(h.slice(6), 'base64').toString('utf8');
+    if (typeof h !== 'string' || !/^basic\s+/i.test(h)) throw new UnauthorizedException('Basic auth required');
+    const decoded = Buffer.from(h.replace(/^basic\s+/i, ''), 'base64').toString('utf8');
     const idx = decoded.indexOf(':');
+    const login = idx >= 0 ? decoded.slice(0, idx) : '';
     const token = idx >= 0 ? decoded.slice(idx + 1) : decoded;
     const auth = await this.auth.resolveApiToken(token);
     if (!auth) throw new UnauthorizedException('invalid token');
+    // deviceId в журнале изменений: тот же смысл, что у Bearer-гарда (AuthGuard). Без этого
+    // правки из Finder уходили клиентам синхронизации без источника (deviceId = null).
+    setCurrentDeviceId(auth.tokenId);
+    await this.checkLogin(login, auth.userId);
     return auth;
   }
 
-  // ---- path → сущность ----
-  // '/' — корень; '/a/b.txt' — вложенные папки/файл. Только первый уровень у root: папки root → дети.
-
-  async resolvePath(userId: string, davPath: string) {
-    const parts = davPath.split('/').filter(Boolean);
-    const rootId = await this.auth.rootFolderId(userId);
-
-    // конечный сегмент может быть файлом
-    const isFile = parts.length > 0 && (await this.isFile(userId, parts));
-    return { parts, rootId, isFile };
-  }
-
-  private async isFile(userId: string, parts: string[]): Promise<boolean> {
-    const rootId = await this.auth.rootFolderId(userId);
-    let folderId: string = rootId;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const f: { id: string } | null = await this.prisma.folder.findFirst({
-        where: { parentId: folderId, name: parts[i], deletedAt: null },
-        select: { id: true },
-      });
-      if (!f) throw notFound('path not found');
-      folderId = f.id;
+  /** Сверка логина из Basic с логином владельца токена (поведение задаёт DAV_VALIDATE_LOGIN). */
+  private async checkLogin(login: string, userId: string): Promise<void> {
+    if (!login) return;
+    let ownerLogin = this.loginCache.get(userId);
+    if (ownerLogin === undefined) {
+      const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { login: true } });
+      ownerLogin = user?.login ?? '';
+      this.loginCache.set(userId, ownerLogin);
     }
-    const name = parts[parts.length - 1];
-    const entry = await this.prisma.fileEntry.findFirst({ where: { folderId, name, deletedAt: null } });
-    return Boolean(entry);
+    if (!ownerLogin || ownerLogin.toLowerCase() === login.toLowerCase()) return;
+    if (DAV_VALIDATE_LOGIN) throw new UnauthorizedException('invalid login');
+    this.logger.warn(
+      `WebDAV: логин «${login}» не совпадает с логином владельца токена — вход разрешён, потому что DAV_VALIDATE_LOGIN не включён`,
+    );
   }
+
+  // ---- path → сущность ----
+  // '/' — корень; '/a/b.txt' — вложенные папки/файл. Путь приходит уже декодированным
+  // (см. davPathOf в контроллере) — повторно decodeURIComponent здесь вызывать нельзя.
 
   private async folderByPath(userId: string, parts: string[]) {
     const rootId = await this.auth.rootFolderId(userId);
@@ -76,7 +110,10 @@ export class DavService {
     for (const name of parts) {
       const f = await this.prisma.folder.findFirst({ where: { parentId: folderId, name, deletedAt: null } });
       if (!f) return null;
-      // системная медиатека «Фото» скрыта в WebDAV (как и в разделе «Файлы»)
+      // системная медиатека «Фото» скрыта в WebDAV (как и в разделе «Файлы»). Отсекается
+      // именно корень (`f.id === photoId`): дочерние папки под ним недостижимы лишь потому,
+      // что обход спотыкается на самом корне. Если из этой функции когда-нибудь уберут
+      // пошаговый обход, «Фото» станет доступно снаружи — проверку надо будет повторить.
       if (photoId && f.id === photoId) return null;
       // скрытые зоны (папка «Почта» с вложениями писем) недостижимы и по прямому пути:
       // в листинге их нет, но клиент мог бы угадать имя
@@ -92,7 +129,12 @@ export class DavService {
     const parentId = await this.folderByPath(userId, parentParts);
     if (!parentId) return null;
     const name = parts[parts.length - 1];
-    return this.prisma.fileEntry.findFirst({ where: { folderId: parentId, name, deletedAt: null } });
+    return this.prisma.fileEntry.findFirst({
+      where: { folderId: parentId, name, deletedAt: null },
+      // размер и тип нужны PROPFIND: у файла их больше взять негде, а без них клиент
+      // (Finder, rclone) видит файл пустым и переливает его при каждом проходе
+      include: { asset: { select: { size: true, mime: true } } },
+    });
   }
 
   private async folderMeta(folderId: string) {
@@ -100,16 +142,41 @@ export class DavService {
     return f;
   }
 
+  /**
+   * Листинг папки или свойства файла.
+   *
+   * `Depth` больше единицы намеренно трактуется как один уровень: клиенты (Finder, rclone)
+   * просят `Depth: infinity`, а рекурсивный обход всего дерева в одном ответе — это XML на
+   * десятки мегабайт и минуты работы. RFC 4918 разрешает отвечать только на запрошенный
+   * ресурс и его детей, поэтому `infinity` = `1`.
+   */
   async propfind(userId: string, davPath: string, depth: string) {
     const parts = davPath.split('/').filter(Boolean);
     const entry = await this.entryByPath(userId, parts);
     const rootId = await this.auth.rootFolderId(userId);
     const photoId = await this.auth.photoRootIdOrNull(userId);
 
-    let responses: Array<{ href: string; isCollection: boolean; name: string; size?: number; mtime?: Date }> = [];
+    let responses: Array<{
+      href: string;
+      isCollection: boolean;
+      name: string;
+      size?: number;
+      mime?: string;
+      mtime?: Date;
+    }> = [];
 
     if (entry) {
-      responses.push({ href: davPath, isCollection: false, name: entry.name, size: 0 });
+      // настоящие размер и mtime: раньше здесь стояли `size: 0` и отсутствие getlastmodified,
+      // то есть для клиента файл выглядел пустым и «изменившимся» — rclone переливал его
+      // при каждом проходе, Finder показывал 0 байт
+      responses.push({
+        href: davPath,
+        isCollection: false,
+        name: entry.name,
+        size: Number(entry.asset.size),
+        mime: entry.asset.mime,
+        mtime: entry.updatedAt,
+      });
     } else {
       const folderId = parts.length ? await this.folderByPath(userId, parts) : rootId;
       if (!folderId) throw notFound('path not found');
@@ -122,13 +189,27 @@ export class DavService {
           this.prisma.folder.findMany({
             where: { parentId: folderId, deletedAt: null, zone: { notIn: [...HIDDEN_ZONES] } },
             orderBy: { name: 'asc' },
+            take: DAV_LIST_LIMIT + 1,
           }),
           this.prisma.fileEntry.findMany({
             where: { folderId, deletedAt: null, zone: { notIn: [...HIDDEN_ZONES] } },
             orderBy: { name: 'asc' },
             include: { asset: { select: { size: true, mime: true } } },
+            take: DAV_LIST_LIMIT + 1,
           }),
         ]);
+        // обрезанный листинг опаснее ошибки: клиент считает отсутствующие в ответе файлы
+        // удалёнными и (rclone с --delete, Finder при синхронизации) может снести их у себя
+        if (folders.length + entries.length > DAV_LIST_LIMIT) {
+          throw new HttpException(
+            {
+              statusCode: INSUFFICIENT_STORAGE,
+              message: `в папке больше ${DAV_LIST_LIMIT} объектов — WebDAV-листинг столько не отдаёт`,
+              code: 'listing_too_large',
+            },
+            INSUFFICIENT_STORAGE,
+          );
+        }
         for (const c of folders) {
           if (photoId && c.id === photoId) continue; // системная «Фото» не показывается в Finder
           responses.push({ href: `${href === '/' ? '' : href}/${encodeURIComponent(c.name)}`, isCollection: true, name: c.name, mtime: c.updatedAt });
@@ -139,7 +220,10 @@ export class DavService {
             isCollection: false,
             name: c.name,
             size: Number(c.asset.size),
-            mtime: c.createdAt,
+            mime: c.asset.mime,
+            // updatedAt, а не createdAt: перезапись через PUT (Finder/rclone) меняет
+            // содержимое, и с датой создания «mtime» навсегда остался бы в прошлом
+            mtime: c.updatedAt,
           });
         }
       }
@@ -152,7 +236,7 @@ export class DavService {
     if (parts.length === 0) throw new BadRequestException('invalid path');
     const parentId = await this.folderByPath(userId, parts.slice(0, -1));
     if (!parentId) throw notFound('parent not found');
-    const name = decodeURIComponent(parts[parts.length - 1]);
+    const name = parts[parts.length - 1]; // путь уже декодирован контроллером
     try {
       assertSafeName(name);
     } catch {
@@ -186,6 +270,14 @@ export class DavService {
     return 201;
   }
 
+  /**
+   * Запись файла целиком (Finder и rclone перезаписывают содержимое, а не патчат его).
+   *
+   * Размер ограничен MAX_FILE_BYTES, как и у `/uploads`: `Content-Length` приходит не всегда
+   * (`Transfer-Encoding: chunked` у rclone), поэтому байты считаются на лету и запись рвётся
+   * на превышении — иначе одним PUT можно положить в бакет десятки гигабайт (это ещё и
+   * оплачиваемый трафик), тогда как через `/uploads` тот же файл получил бы 413.
+   */
   async put(userId: string, davPath: string, body: NodeJS.ReadableStream, contentLength: number | null, contentType: string) {
     const parts = davPath.split('/').filter(Boolean);
     if (parts.length === 0) throw new BadRequestException('invalid path');
@@ -193,29 +285,34 @@ export class DavService {
     if (!parentId) throw notFound('parent not found');
     const parent = await this.prisma.folder.findUnique({ where: { id: parentId }, select: { zone: true } });
     const zone = zoneOf(parent?.zone);
-    const name = decodeURIComponent(parts[parts.length - 1]);
+    const name = parts[parts.length - 1]; // путь уже декодирован контроллером
     try {
       assertSafeName(name);
     } catch {
       throw new BadRequestException('invalid name');
     }
+    const maxGb = Math.floor(MAX_FILE_BYTES / 1024 ** 3);
     if (contentLength !== null && contentLength <= 0) throw new BadRequestException('empty body');
+    if (contentLength !== null && contentLength > MAX_FILE_BYTES) {
+      throw payloadTooLarge(`файл больше ${maxGb} ГиБ`);
+    }
 
-    // стримим в S3 с инкрементальным sha256 (tee)
+    // Стримим в S3 с инкрементальным sha256: счётчик байтов и хэш идут одним трансформом.
+    // pipeline, а не `tee.write(...)`: он держит backpressure (на медленном S3 тело PUT
+    // иначе копилось в памяти процесса) и корректно разрушает поток при ошибке.
     const hash = createHash('sha256');
-    const { PassThrough } = await import('stream');
-    const tee = new PassThrough();
-    const p = body as NodeJS.ReadableStream;
-    const reader = (async () => {
-      for await (const chunk of p as AsyncIterable<Buffer | string>) {
+    let seen = 0;
+    const meter = new Transform({
+      transform(chunk, _enc, cb) {
         const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        seen += b.length;
+        if (seen > MAX_FILE_BYTES) {
+          cb(payloadTooLarge(`файл больше ${maxGb} ГиБ — запись прервана`));
+          return;
+        }
         hash.update(b);
-        tee.write(b);
-      }
-      tee.end();
-    })().catch((e) => {
-      tee.destroy(e);
-      throw e;
+        cb(null, b);
+      },
     });
 
     // случайный ключ: хэш от имени и времени у двух параллельных PUT одного имени совпадал,
@@ -223,14 +320,27 @@ export class DavService {
     const tmpKey = `files/tmp/${randomToken(16)}`;
     const mime = contentType || 'application/octet-stream';
 
-    await this.s3.putObjectStream(tmpKey, tee, mime, contentLength ?? undefined);
-    await reader;
+    // Оба промиса ждём ВМЕСТЕ. Если ждать их по очереди, отменённая клиентом загрузка
+    // (Finder отменил копирование, rclone получил Ctrl-C, сеть упала) роняет процесс:
+    // `reader` отклонялся раньше, чем до его `await` доходило управление, и отклонение
+    // оставалось необработанным (ERR_UNHANDLED_REJECTION в Node 18+ — фатально).
+    try {
+      await Promise.all([
+        this.s3.putObjectStream(tmpKey, meter, mime, contentLength ?? undefined),
+        pipeline(body, meter),
+      ]);
+    } catch (e) {
+      // недозалитый объект во временном префиксе не нужен: подобрать его некому
+      await this.s3.deleteObject(tmpKey).catch(() => undefined);
+      throw e;
+    }
 
     const sha256 = hash.digest('hex');
     const finalKey = S3Service.assetKey(sha256);
-    // Content-Length есть не всегда (Transfer-Encoding: chunked у rclone и части клиентов):
-    // раньше писался размер 0, и это утекало в журнал синхронизации — клиент вечно перезаливал файл
-    const size = contentLength ?? (await this.s3.objectSize(tmpKey).catch(() => 0));
+    // Размер — сколько байт реально прошло через поток. При chunked `Content-Length` не
+    // приходит вовсе, и раньше размер узнавался отдельным запросом в S3 уже после загрузки;
+    // для «файл перезаливается вечно» в журнале синхронизации это и был источник нулей.
+    const size = seen;
 
     const existing = await this.prisma.asset.findUnique({ where: { sha256 } });
     let assetId: string;
@@ -358,7 +468,7 @@ export class DavService {
     const srcParts = srcPath.split('/').filter(Boolean);
     const dstParts = dstPath.split('/').filter(Boolean);
     if (!srcParts.length || !dstParts.length) throw new BadRequestException('invalid path');
-    const newName = decodeURIComponent(dstParts[dstParts.length - 1]);
+    const newName = dstParts[dstParts.length - 1]; // путь уже декодирован контроллером
     try {
       assertSafeName(newName);
     } catch {
@@ -423,13 +533,17 @@ export class DavService {
   }
 
   private renderMultistatus(
-    items: Array<{ href: string; isCollection: boolean; name: string; size?: number; mtime?: Date }>,
+    items: Array<{ href: string; isCollection: boolean; name: string; size?: number; mime?: string; mtime?: Date }>,
   ): string {
     const rows = items
       .map((it) => {
         const type = it.isCollection ? '<D:collection/>' : '';
         const len = it.isCollection ? '' : `<D:getcontentlength>${it.size ?? 0}</D:getcontentlength>`;
-        const ct = it.isCollection ? '' : '<D:getcontenttype>application/octet-stream</D:getcontenttype>';
+        // тип берём у ассета: захардкоженный application/octet-stream заставлял Finder
+        // показывать файлы без иконок и «неизвестного типа»
+        const ct = it.isCollection
+          ? ''
+          : `<D:getcontenttype>${this.esc(it.mime ?? 'application/octet-stream')}</D:getcontenttype>`;
         const mtime = it.mtime ? `<D:getlastmodified>${it.mtime.toUTCString()}</D:getlastmodified>` : '';
         return `<D:response><D:href>${this.esc(it.href)}</D:href><D:propstat><D:prop><D:displayname>${this.esc(it.name)}</D:displayname><D:resourcetype>${type}</D:resourcetype>${len}${ct}${mtime}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
       })

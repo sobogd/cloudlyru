@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { execFileSync, spawn } from 'child_process';
+import { execFile as execFileCb, spawn } from 'child_process';
+import { promisify } from 'util';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, rmSync, statfsSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -13,13 +14,21 @@ import {
   PDF_PAGES_PER_JOB,
   PDF_PAGE_WIDTH,
   mediaKindOf,
-  parseIso6709,
-  videoInstant,
 } from '../media/media.service';
 import { ZONE_PHOTOS } from '../common/zones';
 import { CONVERT_MAX_BYTES, env } from '../config/env';
 
-const WORKER_MEM_KB = (env.CONVERT_MEM_MB ?? 1024) * 1024; // виртуальная память на ffmpeg (по умолчанию 3 ГБ)
+/** Асинхронный запуск бинаря с захватом stdout: см. pdfPageCount/probeSource. */
+const execFile = promisify(execFileCb);
+
+/**
+ * CONVERT_ENABLED читается как строка (в env у неё z.string(), а не booleanish, в отличие от
+ * KEEP_ORIGINALS и MAIL_SYNC_ENABLED), поэтому раньше значение `1` молча выключало конвертер:
+ * `'1' !== 'true'`. Здесь те же правила, что у остальных флагов окружения.
+ */
+const CONVERT_ENABLED = /^(true|1|yes|on)$/i.test(String(env.CONVERT_ENABLED ?? '').trim());
+/** Лимит памяти на процесс задачи: `?? 1024` убран — у env есть собственный дефолт 3072. */
+const WORKER_MEM_KB = env.CONVERT_MEM_MB * 1024; // виртуальная память на ffmpeg (по умолчанию 3 ГБ)
 /** Кодек полноэкранного превью видео (см. videoEncodeArgs). */
 const VIDEO_CODEC = env.CONVERT_VIDEO_CODEC;
 /**
@@ -102,6 +111,26 @@ const TMP_CLEAN_EVERY_MS = 10 * 60 * 1000;
  * 500, деплой падает на scp, Postgres не может писать. Превью не стоят такого риска.
  */
 const MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024;
+/**
+ * Сколько задача вида может висеть в `processing`, не числясь в `active`, до принудительного
+ * возврата в очередь. Порог — заведомо больше самого долгого честного прогона вида:
+ * фото (heif-convert 120 с и ffmpeg 180 с на кадр), PDF (до PDF_PAGES_PER_JOB страниц по 180 с),
+ * видео (энкод с таймаутом 6 часов). Без этого утечка слота (исключение до try, зависший
+ * S3-запрос) останавливает группу задач до ручного рестарта.
+ */
+const STUCK_MS: Record<JobGroup, number> = {
+  photo: 30 * 60 * 1000,
+  pdf: 6 * 60 * 60 * 1000,
+  video: 13 * 60 * 60 * 1000,
+};
+/** Как часто сверяем `processing` с `active` (см. reapStuckJobs). */
+const REAP_EVERY_MS = 60 * 1000;
+/**
+ * Через сколько видео перестаёт ждать пустой фото-очереди. Иначе непрерывный поток фото
+ * (счётчик `pendingPhotos` глобальный — по всем пользователям) не даёт видео стартовать
+ * никогда: в интерфейсе это «осталось видео: 700» с вечным сроком.
+ */
+const VIDEO_STARVE_MS = 2 * 60 * 60 * 1000;
 
 /** Параметры источника, влияющие на команду ffmpeg (HDR/10 бит/каналы/длительность). */
 interface SourceProbe {
@@ -182,6 +211,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private ticking = false;
   /** Когда последний раз подчищали /tmp (см. TMP_CLEAN_EVERY_MS). */
   private tmpCleanedAt = Date.now();
+  /** Когда последний раз сверяли `processing` с `active` (см. REAP_EVERY_MS). */
+  private reapedAt = Date.now();
   /** Когда последний раз жаловались на кончающееся место: в лог, а не в спам каждые 2 секунды. */
   private lowDiskWarnedAt = 0;
   /**
@@ -191,6 +222,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   private readonly active = new Map<string, { assetId: string; group: JobGroup; child: import('child_process').ChildProcess | null }>();
   /** Короткий кэш числа ожидающих фото: по нему решается, брать ли видео. */
   private photoPendingCache: { at: number; value: number } | null = null;
+  /** Короткий кэш «видео голодает»: по нему видео берётся вне очереди за фото (VIDEO_STARVE_MS). */
+  private videoStarveCache: { at: number; value: boolean } | null = null;
   /** Кэш средней длительности задач по видам (см. estimates): статус спрашивают часто. */
   private estCache: { at: number; value: Record<string, { avgMs: number | null; samples: number }> } | null = null;
 
@@ -201,12 +234,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit() {
-    if ((env.CONVERT_ENABLED ?? 'true') !== 'true') return;
+    if (!CONVERT_ENABLED) return;
     // Дубли сначала: если на файл лежат две строки, перевод processing→pending падает на
     // частичном уникальном индексе (Job_one_pending_per_asset_kind) — одним запросом, то есть
     // молча оставляет ВСЕ прерванные задачи в processing, и очередь после рестарта встаёт.
     await this.dedupeJobs();
-    // после рестарта все processing возвращаем в очередь (рестарт = прерванный воркер)
+    // после рестарта все processing возвращаем в очередь (рестарт = прерванный воркер).
+    // Это верно только для одного процесса (deploy/pm2 держит instances: 1): вторая реплика
+    // на старте воскресила бы задачу, которую прямо сейчас считает первая.
     await this.prisma.job.updateMany({ where: { state: 'processing' }, data: { state: 'pending' } }).catch(() => undefined);
     this.cleanupTmp();
     this.timer = setInterval(() => void this.tick(), 2000);
@@ -332,6 +367,17 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
   onModuleDestroy() {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
+    // Незавершённые задачи прерываем вместе с их процессами: `void this.process(job)` при
+    // остановке модуля не отменяется, и при pm2 reload ffmpeg/pdftoppm оставались сиротами —
+    // жгли ядра и держали файлы в /tmp до следующей уборки. Строка Job остаётся `processing`
+    // и на старте следующего процесса возвращается в очередь (onModuleInit).
+    for (const a of this.active.values()) {
+      try {
+        a.child?.kill('SIGKILL');
+      } catch {
+        /* процесс уже завершился */
+      }
+    }
   }
 
   /**
@@ -489,7 +535,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       }
       // Видео — отдельное правило: энкод занимает ядра целиком, поэтому оно стартует только
       // когда фото-очередь разобрана. Иначе одно длинное видео растягивает превью всех фото.
-      if (this.countActive('video') === 0 && (VIDEO_ALONGSIDE_PHOTOS || (await this.pendingPhotos()) === 0)) {
+      // Исключение — голодание: если самое старое видео ждёт дольше VIDEO_STARVE_MS, слот
+      // отдаём ему, иначе при непрерывном потоке фото видео не начнётся никогда.
+      if (
+        this.countActive('video') === 0 &&
+        (VIDEO_ALONGSIDE_PHOTOS || (await this.pendingPhotos()) === 0 || (await this.videoStarving()))
+      ) {
         const video = await this.next('video');
         if (video) void this.process(video).catch((e) => this.logger.error(`process ${video.id}: ${(e as Error).message}`));
       }
@@ -504,6 +555,50 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         this.tmpCleanedAt = now;
         this.cleanupTmp();
       }
+      // Раз в минуту сверяем `processing` с `active`: так освобождается слот, потерянный из-за
+      // исключения не в том месте или зависшего внешнего вызова.
+      if (now - this.reapedAt > REAP_EVERY_MS) {
+        this.reapedAt = now;
+        await this.reapStuckJobs();
+      }
+    }
+  }
+
+  /**
+   * Задачи, застрявшие в `processing` без воркера: их нет в `active` (значит процесс задачи
+   * не идёт), а с прошлого старта прошло больше STUCK_MS вида. Возвращаем их в очередь.
+   *
+   * `active` — единственный источник правды о занятых слотах и живёт в памяти процесса,
+   * поэтому проверка корректна для одного процесса (`instances: 1`, как в проде). Вторая
+   * реплика увидела бы чужие задачи как «застрявшие», но только по истечении STUCK_MS —
+   * то есть когда честный прогон и так не мог бы длиться.
+   */
+  private async reapStuckJobs(): Promise<void> {
+    try {
+      const rows = await this.prisma.job.findMany({
+        where: { state: 'processing' },
+        select: { id: true, kind: true, startedAt: true },
+      });
+      const now = Date.now();
+      const stuck = rows.filter((r) => {
+        if (this.active.has(r.id)) return false;
+        // startedAt всегда ставит next() при захвате; пустой означает неизвестность — считаем застрявшей
+        const started = r.startedAt?.getTime() ?? 0;
+        return started === 0 || now - started > (STUCK_MS[r.kind as JobGroup] ?? STUCK_MS.photo);
+      });
+      if (!stuck.length) return;
+      for (const r of stuck) this.retryAfter.delete(r.id);
+      // attempts не трогаем: его увеличит захват задачи в next() — иначе один сбой тратил бы
+      // две попытки из MAX_ATTEMPTS
+      await this.prisma.job.updateMany({
+        where: { id: { in: stuck.map((r) => r.id) }, state: 'processing' },
+        data: { state: 'pending', startedAt: null, error: null },
+      });
+      this.logger.warn(
+        `застрявшие задачи возвращены в очередь: ${stuck.length} (${stuck.map((r) => r.kind).join(', ')})`,
+      );
+    } catch (e) {
+      this.logger.warn(`проверка застрявших задач: ${(e as Error).message}`);
     }
   }
 
@@ -519,6 +614,20 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     if (this.photoPendingCache && Date.now() - this.photoPendingCache.at < 5000) return this.photoPendingCache.value;
     const value = await this.prisma.job.count({ where: { state: 'pending', kind: 'photo' } }).catch(() => 0);
     this.photoPendingCache = { at: Date.now(), value };
+    return value;
+  }
+
+  /**
+   * Самое старое ожидающее видео ждёт дольше VIDEO_STARVE_MS — значит фото-очередь не
+   * заканчивается и видео надо пустить вне очереди. Кэш на 5 секунд: тик идёт каждые 2 с.
+   */
+  private async videoStarving(): Promise<boolean> {
+    if (this.videoStarveCache && Date.now() - this.videoStarveCache.at < 5000) return this.videoStarveCache.value;
+    const oldest = await this.prisma.job
+      .findFirst({ where: { state: 'pending', kind: 'video' }, orderBy: { createdAt: 'asc' }, select: { createdAt: true } })
+      .catch(() => null);
+    const value = Boolean(oldest && Date.now() - oldest.createdAt.getTime() > VIDEO_STARVE_MS);
+    this.videoStarveCache = { at: Date.now(), value };
     return value;
   }
 
@@ -548,6 +657,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       if (!row) return null;
       // Захват атомарный: условие по state перепроверяется после блокировки строки, поэтому
       // при параллельных тиках (и даже при нескольких процессах) задачу получит ровно один.
+      // Проигравший гонку получает claim.count = 0 и возвращает null — следующую задачу возьмёт
+      // следующий тик (2 с), поэтому очередь от этого не встаёт.
       const claim = await tx.job.updateMany({
         where: { id: row.id, state: 'pending' },
         data: { state: 'processing', startedAt: new Date(), attempts: { increment: 1 }, error: null },
@@ -559,9 +670,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   private async process(job: JobRow) {
     const group: JobGroup = job.kind === 'photo' ? 'photo' : job.kind === 'pdf' ? 'pdf' : 'video';
-    this.active.set(job.id, { assetId: job.assetId, group, child: null });
     const dir = join(tmpdir(), `clq-${job.id}`);
-    mkdirSync(dir, { recursive: true });
     const rawPath = join(dir, 'raw');
     const tag = `${job.kind} ${job.sha256.slice(0, 8)}`;
     // Длительность задачи: она идёт в лог и в ConvertStat. Строка Job на успехе удаляется
@@ -571,6 +680,13 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const tookMs = () => Date.now() - startedMs;
     const took = () => `${Math.max(1, Math.round(tookMs() / 1000))} с`;
     try {
+      // Заполнение `active` и создание каталога — ВНУТРИ try: `active` это единственный источник
+      // правды о занятых слотах, а его заполнение вне try/finally при исключении (ENOSPC/EACCES
+      // на /tmp, EMFILE) навсегда съедало слот группы и оставляло строку в `processing` до
+      // рестарта. Обе строки выполняются до первого await, поэтому тик по-прежнему видит слот
+      // занятым сразу после запуска задачи.
+      this.active.set(job.id, { assetId: job.assetId, group, child: null });
+      mkdirSync(dir, { recursive: true });
       try {
         await this.s3.downloadToFile(S3Service.assetKey(job.sha256), rawPath);
       } catch (e) {
@@ -585,6 +701,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       }
       // EXIF из локального файла, если MediaMeta ещё нет: так помечаются фото из архивов
       // (при распаковке captureMeta не вызывается) и не тратится повторный трафик S3.
+      // Видео разбирает convertVideo — там же, где читаются параметры источника: два разбора
+      // одного файла (и две записи в MediaMeta) не нужны.
       const hasMeta = await this.prisma.mediaMeta
         .findUnique({ where: { assetId: job.assetId }, select: { id: true } })
         .catch(() => null);
@@ -592,11 +710,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         await this.media
           .captureMetaFromFile(job.assetId, rawPath, statSync(rawPath).size, job.mime)
           .catch(() => undefined);
-      } else if (job.kind === 'video') {
-        // У видео строка MediaMeta уже есть (её создал enqueue с датой загрузки), поэтому разбор
-        // по локальному файлу раньше пропускался: в деталке не было ни длительности, ни кодеков.
-        // Файл под конвертацию уже скачан — теги читаем с него, без второго похода в S3.
-        await this.media.captureVideoFromFile(job.assetId, rawPath).catch(() => undefined);
       }
       let res: ConvertResult = {};
       if (job.kind === 'photo') res = await this.convertPhoto(job, rawPath);
@@ -699,8 +812,8 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
    * Медиана, а не среднее, и окно 6 часов, а не сутки: среднее поднимает одна зависшая задача
    * (таймаут энкода — 6 часов), а широкое окно долго держит старые настройки — сразу после
    * смены кодека оценка показывала бы прежние часы на видео. Это всё равно оценка, и грубая:
-   * видео стартует только когда фото-очередь пуста, поэтому «срок всего» — сумма по видам.
-   * Кэш на 30 с: статус спрашивают каждые пару секунд.
+   * видео стартует только когда фото-очередь пуста (кроме случая голодания — см. VIDEO_STARVE_MS),
+   * поэтому «срок всего» — сумма по видам. Кэш на 30 с: статус спрашивают каждые пару секунд.
    */
   async estimates(remaining: Record<string, number>): Promise<Record<string, { avgSec: number | null; etaSec: number | null; samples: number }>> {
     const out: Record<string, { avgSec: number | null; etaSec: number | null; samples: number }> = {};
@@ -829,11 +942,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     const posterRaw = join(tmpdir(), `clq-${job.id}-poster.png`);
     const previewPath = join(tmpdir(), `clq-${job.id}-1080.mp4`);
 
-    const src = this.probeSource(rawPath);
-    // Метаданные пишем здесь, из ЛОКАЛЬНОГО файла: extractDetail() ходит в ffprobe по
-    // presigned-URL, а резолвер статической сборки ffmpeg не разрешает хост Hetzner S3
-    // ("Failed to resolve hostname") — по ссылке видео-метаданные не достаются вообще.
-    await this.storeVideoMeta(job.assetId, src);
+    const src = await this.probeSource(rawPath);
+    // Метаданные (дата, GPS, камера, длительность, кодеки, `raw` для деталки) пишет MediaService
+    // из ЛОКАЛЬНОГО файла: по presigned-URL ffprobe на этом сервере не работает (резолвер
+    // статической сборки не разрешает хост Hetzner S3 — "Failed to resolve hostname"), поэтому
+    // воркер отдаёт ему уже скачанное сырьё. Разбор ровно один: у очереди был свой второй
+    // ffprobe, который писал те же колонки, но не писал `raw` — и деталка видео оставалась
+    // без параметров кадра.
+    await this.media.captureVideoFromFile(job.assetId, rawPath).catch(() => undefined);
 
     // 1) постер — быстро, чтобы ролик сразу появился в ленте.
     // -ss 1 за концом ролика (видео короче ~1 с) не даёт ни одного кадра: ffmpeg
@@ -945,7 +1061,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       if (page === 1) await this.s3.putObject(MediaService.gridKey(sha), await this.pdfGrid(png), 'image/webp');
       rmSync(png, { force: true });
       rendered++;
-      const doneCount = total - missing.length + batch.indexOf(page) + 1;
     }
 
     // «Есть чем показать» — только если хотя бы одна страница реально лежит в S3: иначе
@@ -972,8 +1087,12 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
 
   /** Число страниц из pdfinfo (та же poppler). Без страниц считать нечего — это ошибка. */
   private async pdfPageCount(rawPath: string): Promise<number> {
-    // execFileSync, а не run(): нужен stdout, а run() отдаёт только код выхода и stderr.
-    const out = execFileSync('pdfinfo', [rawPath], { encoding: 'utf8', timeout: 60000 });
+    // execFile (а не execFileSync): синхронный вызов блокирует единственный поток Nest — на
+    // битом или медленном PDF pdfinfo думает до минуты, и всё это время не обслуживается ни
+    // один HTTP-запрос (ни API, ни загрузки, ни WebDAV). Нужен stdout, поэтому не run().
+    const out = (
+      await execFile('pdfinfo', [rawPath], { encoding: 'utf8', timeout: 60000, maxBuffer: 4 * 1024 * 1024 })
+    ).stdout;
     const m = /^Pages:\s+(\d+)/m.exec(out);
     return m ? Number(m[1]) : 0;
   }
@@ -1074,22 +1193,30 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Параметры источника одним вызовом ffprobe: длительность, 10 бит/HDR, каналы. */
-  private probeSource(file: string): SourceProbe {
+  /**
+   * Параметры источника одним вызовом ffprobe: длительность, 10 бит/HDR, каналы.
+   * Теги контейнера (`tags`) здесь больше не разбираются воркером: и GPS, и дату съёмки, и
+   * камеру пишет MediaService из того же локального файла — один разбор вместо двух.
+   * Асинхронно (execFile): ffprobe на битом контейнере может думать до 30 с, а execFileSync
+   * на это время останавливал весь HTTP-сервис — синхронные вызовы в Nest недопустимы.
+   */
+  private async probeSource(file: string): Promise<SourceProbe> {
     const res: SourceProbe = { duration: 0, hdr: false };
     try {
-      const out = execFileSync(
-        'ffprobe',
-        [
-          '-v', 'error',
-          '-show_entries', 'format=duration',
-          '-show_entries', 'format_tags',
-          '-show_entries', 'stream=codec_type,codec_name,pix_fmt,color_primaries,color_transfer,color_space,color_range,channels,width,height',
-          '-of', 'json',
-          file,
-        ],
-        { encoding: 'utf8', timeout: 30000 },
-      );
+      const out = (
+        await execFile(
+          'ffprobe',
+          [
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-show_entries', 'format_tags',
+            '-show_entries', 'stream=codec_type,codec_name,pix_fmt,color_primaries,color_transfer,color_space,color_range,channels,width,height',
+            '-of', 'json',
+            file,
+          ],
+          { encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 },
+        )
+      ).stdout;
       const j = JSON.parse(out) as {
         format?: { duration?: string; tags?: Record<string, string> };
         streams?: Array<Record<string, unknown>>;
@@ -1121,46 +1248,6 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
       /* ffprobe недоступен или файл битый — работаем с безопасными значениями */
     }
     return res;
-  }
-
-  /**
-   * Метаданные видео из локального файла → MediaMeta (дата съёмки, GPS, камера, размеры).
-   * Иначе видео навсегда остаётся в таймлайне датой загрузки и не попадает на карту/в поездки:
-   * строка MediaMeta создаётся queue.enqueue() сразу, а extractDetail() по presigned-URL
-   * на этом сервере не работает (резолвер ffmpeg не разрешает хост S3).
-   */
-  private async storeVideoMeta(assetId: string, src: SourceProbe): Promise<void> {
-    const tags = src.tags;
-    if (!tags) return;
-    const created = videoInstant(tags);
-    const pos = parseIso6709(tags['com.apple.quicktime.location.ISO6709']);
-    const make = tags['com.apple.quicktime.make'] ?? tags.make ?? null;
-    const model = tags['com.apple.quicktime.model'] ?? tags.model ?? null;
-    if (!created && !pos && !make && !model && !src.width) return;
-    await this.prisma.mediaMeta
-      .upsert({
-        where: { assetId },
-        create: {
-          assetId,
-          capturedAt: created,
-          latitude: pos?.latitude,
-          longitude: pos?.longitude,
-          make,
-          model,
-          width: src.width,
-          height: src.height,
-        },
-        update: {
-          capturedAt: created,
-          latitude: pos?.latitude,
-          longitude: pos?.longitude,
-          make,
-          model,
-          width: src.width,
-          height: src.height,
-        },
-      })
-      .catch(() => undefined);
   }
 
   /** Запуск бинаря под ограничением виртуальной памяти (ulimit -v). */

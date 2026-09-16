@@ -7,13 +7,30 @@ import { QueueService } from '../queue/queue.service';
 import { AuthService } from '../auth/auth.service';
 import { ChangesService } from '../sync/changes.service';
 import { IMAGE_MIMES, MediaService, VIDEO_MIMES } from '../media/media.service';
-import { RemoteZip, ZipEntryInfo, hashStream, mediaKey } from './s3-zip';
-import { assertSafeName } from '../common/utils';
+import { RemoteZip, ZipEntryError, ZipEntryInfo, ZipFormatError, hashTee, mediaKey } from './s3-zip';
+import { assertSafeName, randomToken } from '../common/utils';
 import { ZONE_PHOTOS, zoneOf } from '../common/zones';
 import { badRequest, conflict, notFound } from '../common/errors';
+import {
+  UNZIP_BUFFER_LIMIT,
+  UNZIP_MAX_DEPTH,
+  UNZIP_MAX_ENTRIES,
+  UNZIP_MAX_ENTRY_RATIO,
+  UNZIP_MAX_FOLDERS,
+  UNZIP_MAX_RATIO,
+  UNZIP_MAX_RESTARTS,
+  UNZIP_MAX_TOTAL_BYTES,
+} from './unzip.limits';
 
-/** Файлы до этого размера распаковываются в память (один проход по S3). */
-const BUFFER_LIMIT = 128 * 1024 * 1024;
+/**
+ * Метка «задачу прервал перезапуск процесса» в UnzipJob.error. Колонки с числом попыток у
+ * UnzipJob нет (prisma/schema.prisma — не файл этого модуля), а crash-loop гасить надо: при
+ * падении процесса (OOM) задача остаётся в `processing`, `onModuleInit` возвращает её в
+ * `pending`, тик берёт её же снова — и процесс падает опять, пока кто-нибудь не удалит строку.
+ * Поэтому счётчик прерванных заходов живёт прямо в `error` в виде `[restart#N]`: он переживает
+ * рестарт, а `view()` метку не показывает (наружу уходит текст после неё).
+ */
+const RESTART_MARK = /^\[restart#(\d+)\]\s?/;
 
 const MIME_BY_EXT: Record<string, string> = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
@@ -48,14 +65,46 @@ function safeSegment(raw: string): string {
   return s;
 }
 
+/**
+ * Имя папки-приёмника из имени архива: `фото.zip` → `фото`. Имя архива приходит от
+ * пользователя (и от сторонних клиентов), поэтому проходит ту же проверку, что и любой
+ * создаваемый сегмент: `" .zip"` дало бы папку с именем из пробела, `"...zip"` — папку
+ * `..`-подобного вида, а с ними потом не работают ни клиенты, ни WebDAV.
+ */
+function targetNameOf(archiveName: string): string {
+  const raw = archiveName.replace(/\.zip$/i, '').trim();
+  if (!raw) return 'archive';
+  const clipped = raw.length > 200 ? raw.slice(0, 200).trim() : raw;
+  try {
+    assertSafeName(clipped);
+    return clipped;
+  } catch {
+    return 'archive';
+  }
+}
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Ошибку чтения члена архива отличаем от сбоя окружения (S3, БД): пропускать можно только
+ * первую. Иначе выпавший на минуту S3 превратил бы всю задачу в «готово, пропущено всё».
+ */
+function isEntryError(e: unknown): boolean {
+  if (e instanceof ZipEntryError) return true;
+  // zlib: битый deflate-поток внутри члена архива
+  const code = (e as { code?: string } | null)?.code;
+  return code === 'Z_DATA_ERROR' || code === 'Z_BUF_ERROR';
+}
+
 @Injectable()
 export class UnzipService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('Unzip');
   private timer: NodeJS.Timeout | null = null;
   private running = false;
-  private current: string | null = null;
   private readonly cancelled = new Set<string>();
-  private readonly recent = new Map<string, string>(); // jobId → последнее обновление прогресса
+  private readonly recent = new Map<string, number>(); // jobId → время последней записи прогресса
 
   constructor(
     private readonly prisma: PrismaService,
@@ -68,10 +117,37 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit() {
-    // после рестарта незавершённые задачи возвращаем в очередь (распаковка идемпотентна)
-    await this.prisma.unzipJob
-      .updateMany({ where: { state: 'processing' }, data: { state: 'pending', startedAt: null } })
-      .catch(() => undefined);
+    // Задача в состоянии `processing` на старте означает ровно одно: процесс, который её
+    // распаковывал, умер (распаковка идемпотентна и продолжается с чекпойнта, поэтому такую
+    // задачу возвращаем в очередь). Но если процесс умирает на ней снова и снова, возвращать
+    // её в pending нельзя — это и есть crash-loop, из-за которого API недоступен всем
+    // (см. RESTART_MARK). Считаем прерванные заходы и снимаем задачу после UNZIP_MAX_RESTARTS.
+    const interrupted = await this.prisma.unzipJob
+      .findMany({ where: { state: 'processing' } })
+      .catch((): Array<{ id: string; error: string | null }> => []);
+    for (const job of interrupted) {
+      const restarts = Number(RESTART_MARK.exec(job.error ?? '')?.[1] ?? 0) + 1;
+      if (restarts > UNZIP_MAX_RESTARTS) {
+        this.logger.error(
+          `распаковка ${job.id} прерывалась перезапуском ${restarts} раз подряд — задача снята (запустите распаковку заново)`,
+        );
+        await this.prisma.unzipJob
+          .update({
+            where: { id: job.id },
+            data: {
+              state: 'failed',
+              error: `распаковка ${restarts} раза подряд прерывалась перезапуском сервиса — задача снята, запустите её заново`,
+              finishedAt: new Date(),
+            },
+          })
+          .catch(() => undefined);
+        continue;
+      }
+      this.logger.warn(`распаковка ${job.id} прервана перезапуском сервиса — продолжаем с чекпойнта`);
+      await this.prisma.unzipJob
+        .update({ where: { id: job.id }, data: { state: 'pending', startedAt: null, error: `[restart#${restarts}]` } })
+        .catch(() => undefined);
+    }
     this.timer = setInterval(() => void this.tick(), 3000);
     this.logger.log('сервис разархивирования запущен');
   }
@@ -252,7 +328,8 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       doneBytes: done,
       skippedEntries: job.skippedEntries,
       currentName: job.currentName,
-      error: job.error,
+      // метку о прерванном заходе (RESTART_MARK) наружу не отдаём: это внутренний счётчик
+      error: job.error ? job.error.replace(RESTART_MARK, '') || null : null,
       targetFolderId: job.targetFolderId,
       percent,
       createdAt: job.createdAt,
@@ -263,6 +340,14 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
 
   // ================= воркер =================
 
+  /**
+   * Взять самую старую задачу из очереди и распаковать её.
+   * Автоматических повторов у распаковки нет: упавшая задача уходит в `failed` и ждёт, пока
+   * пользователь запустит её заново (`start`), поэтому экспоненциальные паузы здесь не нужны
+   * (в отличие от очереди конвертации, где задача остаётся `pending`). Единственный цикл,
+   * который тут возможен, — падение самого процесса на одной и той же задаче; его гасит
+   * счётчик прерванных заходов в `onModuleInit` (см. RESTART_MARK).
+   */
   private async tick() {
     if (this.running) return;
     this.running = true;
@@ -273,25 +358,28 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
           orderBy: { createdAt: 'asc' },
         });
         if (!row) return null;
+        // `error` не затираем: там может лежать метка о прерванном заходе ([restart#N]),
+        // по которой onModuleInit решает, продолжать задачу или снять её
         await tx.unzipJob.update({
           where: { id: row.id },
-          data: { state: 'processing', startedAt: new Date(), error: null },
+          data: { state: 'processing', startedAt: new Date() },
         });
         return row;
       });
       if (job) {
-        this.current = job.id;
-        await this.process(job.id).catch(async (e: Error) => {
-          this.logger.error(`распаковка ${job.id} упала: ${e.message}`);
+        await this.process(job.id).catch(async (e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e);
+          this.logger.error(`распаковка ${job.id} упала: ${message}`);
           await this.prisma.unzipJob
             .update({
               where: { id: job.id },
-              data: { state: 'failed', error: e.message.slice(0, 500), finishedAt: new Date() },
+              data: { state: 'failed', error: message.slice(0, 500), finishedAt: new Date() },
             })
             .catch(() => undefined);
         });
-        this.current = null;
         this.cancelled.delete(job.id);
+        // прогресс-троттлинг задачи больше не нужен — иначе Map рос бы на каждую задачу
+        this.recent.delete(job.id);
       }
     } catch (e) {
       this.logger.error(`tick: ${(e as Error).message}`);
@@ -304,9 +392,9 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     doneEntries?: number; doneBytes?: bigint; currentName?: string | null; totalEntries?: number; totalBytes?: bigint; skippedEntries?: number;
   }, force = false) {
     const now = Date.now();
-    const last = Number(this.recent.get(jobId) ?? 0);
+    const last = this.recent.get(jobId) ?? 0;
     if (!force && now - last < 2000) return;
-    this.recent.set(jobId, String(now));
+    this.recent.set(jobId, now);
     await this.prisma.unzipJob.update({ where: { id: jobId }, data: patch }).catch(() => undefined);
   }
 
@@ -325,11 +413,11 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     force = false,
   ) {
     const now = Date.now();
-    const last = Number(this.recent.get(jobId) ?? 0);
+    const last = this.recent.get(jobId) ?? 0;
     const wantProgress = force || now - last >= 2000;
     const wantCursor = force || cursorIndex % 500 === 0;
     if (!wantProgress && !wantCursor) return;
-    if (wantProgress) this.recent.set(jobId, String(now));
+    if (wantProgress) this.recent.set(jobId, now);
     await this.prisma.unzipJob
       .update({
         where: { id: jobId },
@@ -376,10 +464,13 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     const entry = await this.prisma.fileEntry.findUniqueOrThrow({ where: { id: job.entryId }, include: { asset: true } });
     const size = Number(entry.asset.size);
 
-    const zip = new RemoteZip({
-      size: () => size,
-      readRange: (start, end) => this.s3.readRange(S3Service.assetKey(entry.asset.sha256), start, end),
-    });
+    const zip = new RemoteZip(
+      {
+        size: () => size,
+        readRange: (start, end) => this.s3.readRange(S3Service.assetKey(entry.asset.sha256), start, end),
+      },
+      { maxEntries: UNZIP_MAX_ENTRIES },
+    );
 
     const all = await zip.entries();
     const files = all.filter((e) => !e.isDirectory);
@@ -399,7 +490,25 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     // последовательное чтение по возрастанию смещения — меньше Range-запросов
     files.sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
 
-    const baseName = entry.name.replace(/\.zip$/i, '') || 'archive';
+    // Потолки до распаковки: и число записей (проверено выше, в RemoteZip), и суммарный
+    // распакованный объём, и коэффициент сжатия видны из центрального каталога, то есть
+    // бомба отсекается без чтения байтов и без единого нового объекта в дереве. Задача
+    // помечается failed с понятной причиной — иначе падение процесса превращается в crash-loop
+    // (см. RESTART_MARK и unzip.limits.ts).
+    const capGb = (bytes: number) => (bytes / 1024 ** 3).toFixed(1);
+    if (totalBytes > UNZIP_MAX_TOTAL_BYTES) {
+      throw new ZipFormatError(
+        `в архиве ${capGb(totalBytes)} ГБ распакованных данных — больше лимита ${capGb(UNZIP_MAX_TOTAL_BYTES)} ГБ (UNZIP_MAX_TOTAL_MB)`,
+      );
+    }
+    const ratio = totalBytes / Math.max(1, size);
+    if (ratio > UNZIP_MAX_RATIO) {
+      throw new ZipFormatError(
+        `распакованный объём в ${Math.round(ratio)} раз больше архива (лимит ${UNZIP_MAX_RATIO}×, UNZIP_MAX_RATIO) — похоже на zip-бомбу`,
+      );
+    }
+
+    const baseName = targetNameOf(entry.name);
     // владелец дерева нужен для журнала изменений (клиенты синхронизации должны увидеть распаковку)
     const ownerId = await this.auth.ownerOfFolder(job.folderId);
     const targetId = await this.ensureTargetFolder(entry.folderId, baseName, ownerId);
@@ -411,6 +520,8 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     folderCache.set('', targetId);
     /** Папки, по которым событие уже записано: за один проход в одну папку заходим многократно. */
     const journaledFolders = new Set<string>();
+    /** Сколько папок создала эта задача: `a/a/a/...` из архива иначе плодит уровни без конца. */
+    let createdFolders = 0;
 
     const folderIdFor = async (segments: string[]): Promise<string> => {
       const key = segments.join('/');
@@ -429,6 +540,12 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       let folder = found;
       let op: 'create' | 'restore' | null = null;
       if (!found) {
+        createdFolders += 1;
+        if (createdFolders > UNZIP_MAX_FOLDERS) {
+          throw new ZipFormatError(
+            `в архиве больше ${UNZIP_MAX_FOLDERS} папок — распаковка остановлена (UNZIP_MAX_FOLDERS)`,
+          );
+        }
         folder = await this.prisma.$transaction(async (tx) => {
           const row = await tx.folder.create({ data: { parentId, name, zone } });
           if (ownerId) {
@@ -506,6 +623,31 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
       await this.checkpoint(jobId, startIndex, doneEntries, doneBytes, skipped, null, true);
     }
 
+    /**
+     * Член архива не удалось прочитать (неизвестный метод сжатия, битый deflate, не сошёлся
+     * CRC32/размер). Такой член пропускаем, а задачу доводим до конца: иначе один
+     * зашифрованный файл делает архив нераспаковываемым навсегда, а пользователь видит
+     * общую ошибку вместо списка проблемных файлов. Имена пишем в лог (первые SKIP_LOG_MAX),
+     * чтобы лог не разрастался на архиве из тысяч битых записей.
+     */
+    const SKIP_LOG_MAX = 20;
+    let skipLogged = 0;
+    /** Сколько членов не удалось прочитать вовсе (в skippedEntries они идут вместе с готовыми). */
+    let unreadable = 0;
+    const skipEntry = async (e: ZipEntryInfo, reason: string): Promise<void> => {
+      skipped += 1;
+      unreadable += 1;
+      doneEntries += 1;
+      doneBytes += e.uncompressedSize;
+      if (skipLogged < SKIP_LOG_MAX) {
+        skipLogged += 1;
+        this.logger.warn(`архив «${entry.name}»: «${e.name}» пропущен — ${reason}`);
+      } else if (skipLogged === SKIP_LOG_MAX) {
+        skipLogged += 1;
+        this.logger.warn(`архив «${entry.name}»: пропущенных членов больше ${SKIP_LOG_MAX} — имена дальше не логируем`);
+      }
+    };
+
     for (let idx = startIndex; idx < files.length; idx++) {
       const e = files[idx];
       if (this.cancelled.has(jobId)) {
@@ -520,6 +662,23 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
 
       const rawSegments = e.name.split('/').filter(Boolean);
       if (!rawSegments.length) continue;
+      // глубина пути — до создания папок: `a/a/a/...` из архива иначе создаёт столько уровней,
+      // сколько в архиве записей (потолок на число папок стоит в folderIdFor)
+      if (rawSegments.length - 1 > UNZIP_MAX_DEPTH) {
+        throw new ZipFormatError(
+          `слишком глубокая вложенность в архиве (${rawSegments.length - 1} > ${UNZIP_MAX_DEPTH}): «${e.name}»`,
+        );
+      }
+      // один член с безумным коэффициентом сжатия: суммарный потолок он может и не пробить,
+      // а трафик и CPU съест. Пропускаем его, остальные распаковываем
+      if (e.compressedSize > 0 && e.uncompressedSize / e.compressedSize > UNZIP_MAX_ENTRY_RATIO) {
+        await skipEntry(
+          e,
+          `коэффициент сжатия ${Math.round(e.uncompressedSize / e.compressedSize)}× больше лимита ${UNZIP_MAX_ENTRY_RATIO}× (UNZIP_MAX_ENTRY_RATIO)`,
+        );
+        await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, e.name);
+        continue;
+      }
       const segments = rawSegments.map(safeSegment);
       const fileName = segments[segments.length - 1];
       const folderId = await folderIdFor(segments.slice(0, -1));
@@ -539,36 +698,84 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
+      /**
+       * Читаем содержимое. Ошибка одного члена архива (метод сжатия не поддержан, битый
+       * deflate) — не повод валить задачу: член пропускаем и идём дальше. Ошибки S3 и БД,
+       * наоборот, уходят наверх: это сбой окружения, а не свойство архива, и «готово»
+       * с нулём файлов здесь было бы враньём.
+       */
       let sha256: string;
       let realSize: number;
+      let assetId: string;
 
-      if (e.uncompressedSize <= BUFFER_LIMIT) {
-        const buf = await zip.readEntryBuffer(e); // внутри проверяются размер и CRC32
+      if (e.uncompressedSize <= UNZIP_BUFFER_LIMIT) {
+        let buf: Buffer;
+        try {
+          buf = await zip.readEntryBuffer(e); // внутри проверяются метод, размер и CRC32
+        } catch (err) {
+          if (!isEntryError(err)) throw err;
+          await skipEntry(e, errorText(err));
+          await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, e.name);
+          continue;
+        }
         sha256 = createHash('sha256').update(buf).digest('hex');
         realSize = buf.length;
         const known = await this.prisma.asset.findUnique({ where: { sha256 } });
-        if (!known) {
+        if (known) {
+          assetId = known.id;
+        } else {
           await this.s3.putObject(S3Service.assetKey(sha256), buf, mime);
-          await this.files.ensureAsset(sha256, realSize, mime, ext);
+          assetId = await this.files.ensureAsset(sha256, realSize, mime, ext);
         }
       } else {
-        // крупный файл: первый проход — хэш, второй — заливка (в память не влезает)
-        const first = await hashStream(zip.readEntryStream(e));
-        sha256 = first.sha256;
-        realSize = first.size;
+        // Крупный файл — один проход по S3: tee считает sha256, размер и CRC32 на лету.
+        // Раньше хэш считался первым полным чтением, а заливка шла вторым (двойной GET на
+        // каждый файл > лимита буфера: zip-бэкапы и Takeout почти целиком из таких и состоят).
+        // Ключ объекта content-addressed, поэтому хэш известен только в конце — заливаем во
+        // временный ключ и копируем в files/<sha256> (копия внутри бакета дешевле чтения).
+        const tee = hashTee();
+        const tmpKey = `files/tmp/${randomToken(16)}`;
+        let streamError: unknown = null;
+        const source = zip.readEntryStream(e);
+        source.on('error', (err) => {
+          streamError = err;
+          tee.transform.destroy(err);
+        });
+        source.pipe(tee.transform);
+        try {
+          await this.s3.uploadStream(tmpKey, tee.transform, mime);
+        } catch (err) {
+          await this.s3.deleteObject(tmpKey).catch(() => undefined);
+          const cause = streamError ?? err;
+          if (!isEntryError(cause)) throw cause;
+          await skipEntry(e, errorText(cause));
+          await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, e.name);
+          continue;
+        }
+        const sum = tee.result();
+        sha256 = sum.sha256;
+        realSize = sum.size;
+        // сверка с центральным каталогом: у потокового пути это единственная проверка целости
+        const broken =
+          (e.uncompressedSize && realSize !== e.uncompressedSize) || (e.crc32 !== 0 && sum.crc32 !== e.crc32);
         const known = await this.prisma.asset.findUnique({ where: { sha256 } });
-        if (!known) {
-          const { PassThrough } = await import('stream');
-          const pass = new PassThrough();
-          const source = zip.readEntryStream(e);
-          source.on('error', (err) => pass.destroy(err));
-          source.pipe(pass);
-          await this.s3.uploadStream(S3Service.assetKey(sha256), pass, mime);
-          await this.files.ensureAsset(sha256, realSize, mime, ext);
+        if (known) {
+          assetId = known.id;
+        } else {
+          await this.s3.copyObject(tmpKey, S3Service.assetKey(sha256));
+          assetId = await this.files.ensureAsset(sha256, realSize, mime, ext);
+        }
+        await this.s3.deleteObject(tmpKey).catch(() => undefined);
+        if (broken) {
+          // данные разошлись с каталогом — запись в дерево не создаём, а только что
+          // залитый ассет убираем (safeGcOrphanAsset: без ссылок он и в бакете лишний)
+          if (!known) await this.files.safeGcOrphanAsset(assetId);
+          await skipEntry(e, `CRC32/размер не совпали (прочитано ${realSize} байт)`);
+          await this.checkpoint(jobId, idx + 1, doneEntries, doneBytes, skipped, e.name);
+          continue;
         }
       }
 
-      const assetId = (await this.prisma.asset.findUniqueOrThrow({ where: { sha256 } })).id;
 
       // имя занято другим содержимым — не затираем, добавляем суффикс
       const createdName = existing ? await this.uniqueName(folderId, fileName) : fileName;
@@ -615,10 +822,11 @@ export class UnzipService implements OnModuleInit, OnModuleDestroy {
     await this.checkpoint(jobId, files.length, doneEntries, doneBytes, skipped, null, true);
     await this.prisma.unzipJob.update({
       where: { id: jobId },
-      data: { state: 'done', finishedAt: new Date() },
+      // error: null — заодно снимаем метку прерванного захода ([restart#N]): задача дошла до конца
+      data: { state: 'done', error: null, finishedAt: new Date() },
     });
     this.logger.log(
-      `распаковка «${entry.name}» завершена: ${doneEntries} файлов (пропущено как готовые: ${skipped})`,
+      `распаковка «${entry.name}» завершена: ${doneEntries} файлов (пропущено: ${skipped}, из них не удалось прочитать: ${unreadable})`,
     );
   }
 

@@ -31,16 +31,22 @@ export class AuthGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
+    // Живая cookie проверяется первой и побеждает Bearer: браузер шлёт её сам, и это
+    // единственный признак веб-сессии (у неё нет ни scope, ни deviceId). Но МЁРТВАЯ cookie
+    // (протухла, удалена на сервере, осталась от другого аккаунта) больше не запирает ручку:
+    // раньше при ней отвечали 401, не глядя на Bearer, и клиент с валидным device-токеном
+    // не мог ничего сделать, пока в браузере живёт просроченная cookie (logout её не чистит).
+    // Теперь мёртвая cookie просто не аутентифицирует, и разбор идёт дальше — до Bearer.
     const token: unknown = req.cookies?.[COOKIE];
     if (typeof token === 'string' && token.length > 0) {
       const session = await this.prisma.session.findUnique({
         where: { tokenHash: sha256Hex(token) },
         include: { user: { select: { id: true, login: true } } },
       });
-      if (!session || session.expiresAt.getTime() <= Date.now()) throw unauthorized();
-
-      req.user = { id: session.user.id, login: session.user.login };
-      return true;
+      if (session && session.expiresAt.getTime() > Date.now()) {
+        req.user = { id: session.user.id, login: session.user.login };
+        return true;
+      }
     }
 
     // ApiToken в Bearer — тот же app-password, что и Basic в WebDAV: мобильному клиенту

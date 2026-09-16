@@ -8,10 +8,14 @@ import { simpleParser, type AddressObject, type Attachment } from 'mailparser';
  * полсистемы. Всё, что нужно вызывающему, возвращается значениями.
  *
  * Тело в БД не кладём: сырой .eml лежит в S3 и разбирается заново при открытии письма,
- * поэтому здесь только превью текста для списка (первые SNAPSHOT_CHARS символов).
+ * поэтому здесь возвращаются и полный текст (`fullText` — для «показать как текст» и
+ * цитаты ответа), и превью для списка (`bodyText`, первые SNAPSHOT_CHARS символов).
  */
 
-/** Сколько символов тела храним в БД для превью в списке писем. */
+/**
+ * Сколько символов тела хранится в БД для превью в списке писем. Это именно превью:
+ * показывать обрезанное письмо как полное нельзя, поэтому у `ParsedMessage` есть `fullText`.
+ */
 export const SNAPSHOT_CHARS = 2000;
 
 /** Вложение письма, готовое к сохранению (в дерево файлов и в S3). */
@@ -40,7 +44,13 @@ export interface ParsedMessage {
   refs: string[];
   /** Date из заголовков: может врать и может отсутствовать — истина в INTERNALDATE. */
   sentAt: Date | null;
+  /** Превью текста для списка писем: первые SNAPSHOT_CHARS символов (это же значение в БД). */
   bodyText: string;
+  /**
+   * Текст письма целиком. Нужен там, где текст показывают или цитируют («показать как текст»,
+   * цитата ответа): обрезанное до превью тело в этих местах выглядело бы как потерянные данные.
+   */
+  fullText: string;
   /**
    * HTML тела письма — как его отдал разборщик. В БД не хранится (письмо целиком лежит
    * в S3 и разбирается при открытии), нужно только отрисовке. Картинки по cid разборщик
@@ -107,6 +117,11 @@ function snapshot(text: string): string {
   return clean.length > SNAPSHOT_CHARS ? clean.slice(0, SNAPSHOT_CHARS) : clean;
 }
 
+/** Полный текст письма без хвостовых пробелов (та же нормализация переносов, что и у превью). */
+function fullTextOf(text: string): string {
+  return text.replace(/\r\n/g, '\n').trim();
+}
+
 /** Вложение в терминах приложения: инлайн-картинки тела — тоже файлы, и тоже сохраняются. */
 function toAttachment(att: Attachment, index: number): ParsedAttachment {
   const contentId = (att.cid ?? att.contentId ?? null)?.replace(/^<|>$/g, '').trim() || null;
@@ -156,6 +171,7 @@ export async function parseMessage(source: Buffer): Promise<ParsedMessage> {
     refs: refsOf(parsed.references),
     sentAt: parsed.date && !Number.isNaN(parsed.date.getTime()) ? parsed.date : null,
     bodyText: snapshot(text),
+    fullText: fullTextOf(text),
     html: typeof parsed.html === 'string' && parsed.html.trim() ? parsed.html : null,
     attachments,
   };
@@ -182,6 +198,31 @@ export function headerMessageId(source: Buffer): string | null {
   if (!match) return null;
   const value = match[1].trim().replace(/^<|>$/g, '');
   return value || null;
+}
+
+/**
+ * Адрес получателя из самого письма: `Delivered-To` (ставит LDA) или `X-Original-To`
+ * (ставит Postfix на приёме).
+ *
+ * Нужен ручке `inbound`: адрес из query-строки проходит через декодирование URL, где `+`
+ * превращается в пробел, поэтому письмо на `user+tag@domain` не находило бы свой аккаунт.
+ * Заголовок от нашего же сервера надёжнее ещё и тем, что не зависит от того, как адрес передан
+ * в запросе. Берём первое вхождение: Postfix добавляет свой заголовок сверху, выше всего,
+ * что написал отправитель.
+ */
+export function envelopeRecipient(source: Buffer): string | null {
+  const head = source.subarray(0, Math.min(source.length, HEADER_SCAN_BYTES)).toString('latin1');
+  const end = head.search(/\r?\n\r?\n/);
+  const block = end >= 0 ? head.slice(0, end) : head;
+  const unfolded = block.replace(/\r?\n[ \t]+/g, ' ');
+  for (const name of ['delivered-to', 'x-original-to']) {
+    const match = new RegExp(`^${name}:[ \t]*(.+)$`, 'im').exec(unfolded);
+    if (!match) continue;
+    const angle = /<([^>]+)>/.exec(match[1]);
+    const addr = (angle ? angle[1] : match[1]).trim().replace(/^[<"']+|[>"']+$/g, '').trim().toLowerCase();
+    if (addr.includes('@')) return addr;
+  }
+  return null;
 }
 
 /**

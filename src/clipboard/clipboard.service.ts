@@ -1,14 +1,29 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from '../auth/auth.service';
 import { FilesService } from '../files/files.service';
 import { FoldersService } from '../folders/folders.service';
 import { ChangesService } from '../sync/changes.service';
-import { isHiddenZone, zoneOf } from '../common/zones';
-import { badRequest, notFound } from '../common/errors';
+import { MediaService } from '../media/media.service';
+import { QueueService } from '../queue/queue.service';
+import { ZONE_PHOTOS, isHiddenZone, zoneOf } from '../common/zones';
+import { badRequest, conflict, notFound } from '../common/errors';
 
 export type ClipboardKind = 'file' | 'folder';
 export type ClipboardMode = 'copy' | 'cut';
+
+/**
+ * Значения полей буфера — String в БД (в схеме нет enum), поэтому при чтении их надо
+ * проверять, а не приводить типом: колонку могло испортить что угодно, а `as ClipboardKind`
+ * просто врёт компилятору и отдаёт клиенту несуществующий kind.
+ */
+function isClipboardKind(v: unknown): v is ClipboardKind {
+  return v === 'file' || v === 'folder';
+}
+function isClipboardMode(v: unknown): v is ClipboardMode {
+  return v === 'copy' || v === 'cut';
+}
 
 /** Что лежит в буфере: цель, режим и то, что нужно показать в шапке («вырезать: photo.jpg»). */
 export interface ClipboardView {
@@ -45,6 +60,8 @@ export class ClipboardService {
     private readonly files: FilesService,
     private readonly folders: FoldersService,
     private readonly changes: ChangesService,
+    private readonly media: MediaService,
+    private readonly queue: QueueService,
   ) {}
 
   /** Буфер пользователя; null — пусто. Цель могла исчезнуть: тогда available=false. */
@@ -53,10 +70,17 @@ export class ClipboardService {
       where: { id: userId },
       select: { clipboardKind: true, clipboardId: true, clipboardMode: true, clipboardAt: true },
     });
-    const kind = user?.clipboardKind as ClipboardKind | null;
-    const mode = user?.clipboardMode as ClipboardMode | null;
     const id = user?.clipboardId;
-    if (!kind || !mode || !id) return null;
+    // Неизвестное значение = буфер пуст: без проверки типовая система поверила бы `as`-приведению
+    // и клиент получил бы kind, которого не существует (запись в колонке портит не только API).
+    if (!isClipboardKind(user?.clipboardKind) || !isClipboardMode(user?.clipboardMode) || !id) {
+      if (user?.clipboardKind || user?.clipboardMode) {
+        this.logger.warn(`в буфере неизвестные значения (kind=${user?.clipboardKind}, mode=${user?.clipboardMode}) — считаю пустым`);
+      }
+      return null;
+    }
+    const kind = user.clipboardKind;
+    const mode = user.clipboardMode;
 
     const target = kind === 'file'
       ? await this.prisma.fileEntry.findUnique({ where: { id }, select: { name: true, deletedAt: true } })
@@ -137,11 +161,26 @@ export class ClipboardService {
     return { ok: true, action: 'copied', name };
   }
 
-  /** Копия файла: та же запись ассета, новое имя (первое свободное) и папка. */
+  /**
+   * Копия файла: та же запись ассета, новое имя (первое свободное) и папка.
+   *
+   * Полностью повторить `FilesService.createEntry` здесь нельзя (он про перезапись имени,
+   * оптимистичную блокировку и восстановление из корзины — вставке это не нужно), но его
+   * поведение повторяем: занятое имя из корзины — это `in_trash`, а не повод придумать
+   * «(копия N)», и гонка на уникальном индексе отдаётся как 409, а не как 500 от Prisma.
+   * Медиа-шаг нужен только при копировании в «Фото» из обычной зоны: если источник уже
+   * в медиазоне, у ассета всё собрано, а вот файл с диска, скопированный в «Фото», без
+   * разбора метаданных и задачи превью в ленту не попадёт никогда (см. files.patch).
+   *
+   * Имя подбирается вне транзакции, потому что это отдельный SELECT на каждого кандидата,
+   * а транзакция нужна только чтобы запись и событие журнала появились вместе; окончательную
+   * уникальность даёт индекс (folderId, name), а не проверка — она лишь выбирает имя.
+   */
   private async copyFile(userId: string, entryId: string, folderId: string): Promise<string> {
     const entry = await this.prisma.fileEntry.findUnique({ where: { id: entryId }, include: { asset: true } });
     if (!entry || entry.deletedAt) throw notFound('file not found');
-    const zone = (await this.prisma.folder.findUnique({ where: { id: folderId }, select: { zone: true } }))?.zone;
+    const target = await this.prisma.folder.findUnique({ where: { id: folderId }, select: { zone: true } });
+    const zone = zoneOf(target?.zone);
 
     // Имя: сначала как у источника, дальше «(копия)», «(копия 2)»… Длина проверяется
     // тем же assertSafeName, что и везде: 255 байт, из-за чего длинные имена укорачиваем.
@@ -150,37 +189,60 @@ export class ClipboardService {
       const candidate = i === 0 ? name : withSuffix(entry.name, i);
       const clash = await this.prisma.fileEntry.findFirst({ where: { folderId, name: candidate } });
       if (!clash) { name = candidate; break; }
+      // уникальный индекс распространяется и на корзину: имя, занятое удалённой записью,
+      // не «свободно» — клиенту честнее сказать «восстанови или удали насовсем»
+      if (clash.deletedAt) {
+        throw conflict('file with this name is in trash — restore or purge it first', 'in_trash', {
+          entryId: clash.id,
+          name: candidate,
+        });
+      }
       if (i === COPY_NAME_ATTEMPTS - 1) throw badRequest('слишком много копий с таким именем', 'copy_name_exhausted');
     }
 
-    const created = await this.prisma.$transaction(async (tx) => {
-      const row = await tx.fileEntry.create({
-        data: {
-          folderId,
-          assetId: entry.assetId,
-          name,
-          zone: zoneOf(zone),
-        },
-        select: { id: true, name: true, folderId: true, zone: true },
+    const created = await this.prisma
+      .$transaction(async (tx) => {
+        const row = await tx.fileEntry.create({
+          data: {
+            folderId,
+            assetId: entry.assetId,
+            name,
+            zone,
+          },
+          select: { id: true, name: true, folderId: true, zone: true },
+        });
+        // Журнал изменений: без записи копия не доедет до других клиентов (Android, WebDAV)
+        await this.changes.record(
+          {
+            userId,
+            target: 'entry',
+            op: 'create',
+            targetId: row.id,
+            folderId: row.folderId,
+            name: row.name,
+            zone: row.zone,
+            sha256: entry.asset.sha256,
+            size: Number(entry.asset.size),
+            mime: entry.asset.mime,
+          },
+          tx,
+        );
+        return row;
+      })
+      .catch((e: unknown) => {
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+          throw conflict('file with this name already exists (created concurrently)');
+        }
+        throw e;
       });
-      // Журнал изменений: без записи копия не доедет до других клиентов (Android, WebDAV)
-      await this.changes.record(
-        {
-          userId,
-          target: 'entry',
-          op: 'create',
-          targetId: row.id,
-          folderId: row.folderId,
-          name: row.name,
-          zone: row.zone,
-          sha256: entry.asset.sha256,
-          size: Number(entry.asset.size),
-          mime: entry.asset.mime,
-        },
-        tx,
-      );
-      return row;
-    });
+
+    // Копия попала в медиа-зону из обычной: без метаданных и задачи превью её нет в ленте
+    if (created.zone === ZONE_PHOTOS && entry.zone !== ZONE_PHOTOS) {
+      await this.media
+        .captureAny(entry.assetId, entry.asset.sha256, Number(entry.asset.size), entry.asset.mime)
+        .catch(() => undefined);
+      await this.queue.enqueue(entry.assetId, entry.asset.sha256, entry.asset.mime).catch(() => undefined);
+    }
     this.logger.log(`копия файла: ${entry.name} → ${created.name}`);
     return created.name;
   }

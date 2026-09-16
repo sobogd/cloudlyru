@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/commo
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { TrashService } from './trash.service';
+import { FilesService } from '../files/files.service';
 import { MailFeedService } from '../mail/mail-feed.service';
 import { TRASH_RETENTION_MS } from '../config/env';
 
@@ -18,6 +19,9 @@ export const CHANGELOG_RETENTION_MS = 90 * DAY_MS;
 /** Как часто прогоняем уборку. Корзина живёт 30 дней, журнал — 90: чаще незачем. */
 const SWEEP_MS = 6 * 60 * 60 * 1000;
 
+/** Задержка первого прохода: старт сервиса не должен ждать уборку по всем пользователям. */
+const STARTUP_SWEEP_DELAY_MS = 60 * 1000;
+
 /**
  * Порция удаления журнала и потолок порций за один проход: одна DELETE на миллионы строк
  * держала бы таблицу заблокированной, а первый прогон после деплоя не должен занимать
@@ -32,26 +36,44 @@ const MAX_PRUNE_BATCHES = 200;
  * навсегда — файл с тем же именем нельзя было залить уже никогда.
  *
  * Устроено как свип брошенных upload-сессий в UploadsService: интервал + прогон при старте.
+ *
+ * От параллельного запуска на нескольких инстансах защищает только флаг `running` в процессе:
+ * advisory-lock здесь не годится — Prisma берёт соединение из пула на каждый запрос, поэтому
+ * `pg_advisory_lock` мог бы остаться на чужом соединении и уже никогда не отпуститься (уборка
+ * перестала бы работать совсем), а транзакционный вариант потребовал бы прокинуть один
+ * `tx` через весь проход. Сейчас инстанс один (deploy/pm2/ecosystem.config.cjs: `instances: 1`);
+ * при масштабировании на несколько процессов блокировку нужно делать на уровне БД (отдельная
+ * таблица-лок или один выделенный клиент), иначе два прохода пойдут одновременно и дубли
+ * tombstones будут писаться в журнал.
  */
 @Injectable()
 export class RetentionService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RetentionService.name);
   private timer: NodeJS.Timeout | null = null;
+  private startupTimer: NodeJS.Timeout | null = null;
   private running = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly trash: TrashService,
+    private readonly files: FilesService,
     private readonly mail: MailFeedService,
     private readonly audit: AuditService,
   ) {}
 
   async onModuleInit() {
-    await this.sweep();
-    this.timer = setInterval(() => void this.sweep(), SWEEP_MS);
+    // Первый проход запускаем таймером, а не на пути старта: уборка идёт по всем пользователям
+    // и по всей таблице Asset, и деплой/рестарт ждал бы её окончания, прежде чем сервис начнёт
+    // отвечать. Задержка небольшая — уборка не срочная, корзина живёт 30 дней.
+    this.startupTimer = setTimeout(() => {
+      void this.sweep();
+      this.timer = setInterval(() => void this.sweep(), SWEEP_MS);
+    }, STARTUP_SWEEP_DELAY_MS);
+    this.startupTimer.unref();
   }
 
   onModuleDestroy() {
+    if (this.startupTimer) clearTimeout(this.startupTimer);
     if (this.timer) clearInterval(this.timer);
   }
 
@@ -61,6 +83,10 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
     this.running = true;
     try {
       await this.purgeExpiredTrash();
+      // Осиротевшие ассеты и отложенные удаления объектов — ГЛОБАЛЬНЫМ шагом, вне цикла
+      // по пользователям: purge каждого дерева больше не сканирует всю таблицу Asset
+      // (это был O(N × M) и заодно способ одному пользователю удалить чужой свежий объект).
+      await this.swapOrphanObjects();
       await this.pruneChangeLog();
     } catch (e) {
       this.logger.warn(`retention: ${e instanceof Error ? e.message : String(e)}`);
@@ -69,15 +95,31 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Уборка осиротевших ассетов и объектов, чья выдержка истекла (см. FilesService). */
+  private async swapOrphanObjects(): Promise<void> {
+    try {
+      await this.trash.sweepOrphanAssets();
+    } catch (e) {
+      this.logger.warn(`уборка осиротевших ассетов: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    try {
+      const objects = await this.files.flushOrphanObjects();
+      if (objects) this.logger.log(`удалено объектов S3 без ссылок: ${objects}`);
+    } catch (e) {
+      this.logger.warn(`отложенное удаление объектов: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   /**
    * Физическое удаление корзины старше срока хранения — существующим purge() (он сам пишет
-   * tombstones, удаляет строки и осиротевшие объекты в S3), а не второй реализацией.
+   * tombstones, удаляет строки и откладывает удаление осиротевших объектов в S3), а не
+   * второй реализацией.
    */
   private async purgeExpiredTrash(): Promise<void> {
     const cutoff = new Date(Date.now() - TRASH_RETENTION_MS);
-    // Дешёвый предохранитель перед уборкой: purge() дополнительно сканирует все ассеты
-    // на осиротевшие, и гонять это каждые 6 часов на пустой корзине незачем. Письма — тоже
-    // часть корзины: без них в проверке корзина из одних писем не чистилась бы никогда.
+    // Дешёвый предохранитель перед уборкой: purge() идёт по всем удалённым записям дерева,
+    // и гонять это каждые 6 часов на пустой корзине незачем. Письма — тоже часть корзины:
+    // без них в проверке корзина из одних писем не чистилась бы никогда.
     const [entries, folders, messages] = await Promise.all([
       this.prisma.fileEntry.count({ where: { deletedAt: { lt: cutoff } } }),
       this.prisma.folder.count({ where: { deletedAt: { lt: cutoff } } }),
@@ -89,11 +131,12 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
     const users = await this.prisma.user.findMany({ select: { id: true } });
     for (const user of users) {
       try {
-        const res = await this.trash.purge(user.id, days);
+        // source: 'retention' — в аудите видно, что это плановая уборка, а не запрос пользователя
+        const res = await this.trash.purge(user.id, days, { source: 'retention' });
         if (res.purgedEntries || res.purgedFolders) {
           this.logger.log(
             `корзина файлов старше ${days} дней: удалено файлов ${res.purgedEntries}, папок ${res.purgedFolders}, ` +
-              `объектов ${res.purgedAssets}`,
+              `строк ассетов ${res.purgedAssets}`,
           );
         }
       } catch (e) {

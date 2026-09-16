@@ -1,9 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import type { Request, Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
-import { hasUsefulRaw, MediaService } from '../media/media.service';
+import { hasUsefulRaw, mediaKindOf, MediaService } from '../media/media.service';
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { ChangesService } from '../sync/changes.service';
 import { QueueService } from '../queue/queue.service';
@@ -23,9 +23,11 @@ export interface AssetSnapshot {
 /** Параметры создания/перезаписи записи в дереве. */
 export interface CreateEntryOptions {
   /**
-   * Владелец дерева для журнала изменений. Не задан — запись в журнал не пишется,
-   * и это видно в логе: молча расходиться с клиентом синхронизации нельзя.
-   * Все нынешние вызовы его передают.
+   * Владелец дерева. Нужен для записи в журнал изменений и для проверки, что папка-приёмник
+   * действительно его (см. createEntry). Не задан — проверить владельца нечем и событие в
+   * журнал не пишется; такой случай виден в логе предупреждением, молча расходиться с клиентом
+   * синхронизации нельзя. Так вызывают внутренние импортёры: разархивирование передаёт
+   * `ownerId ?? undefined`, а владелец у старой задачи импорта может быть не задан.
    */
   userId?: string;
   /** Перезаписать существующий файл с тем же именем (а не отдавать 409). */
@@ -52,9 +54,32 @@ export interface CreateEntryOptions {
   expect?: { sha256?: string | null; updatedAt?: Date | null };
 }
 
+/** Запись дерева вместе с ассетом: то, что нужно для отдачи содержимого. */
+type EntryWithAsset = Prisma.FileEntryGetPayload<{ include: { asset: true } }>;
+
+/** Разбиение длинных `IN`-списков: у Postgres лимит параметров запроса — 65 535. */
+function chunksOf<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 @Injectable()
-export class FilesService {
+export class FilesService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(FilesService.name);
+
+  /**
+   * Выдержка перед удалением объектов S3 и период проверки отложенных удалений
+   * (зачем — в комментарии scheduleObjectDeletion).
+   */
+  private static readonly OBJECT_GC_GRACE_MS = 60_000;
+  private static readonly OBJECT_GC_FLUSH_MS = 30_000;
+  /** Пауза между двумя проверками «строк с таким sha нет» перед удалением объектов. */
+  private static readonly OBJECT_GC_RECHECK_MS = 2_000;
+
+  /** Ассеты, чьи объекты ждут выдержки: sha256 → ключи и время, раньше которого не удаляем. */
+  private readonly pendingObjectDeletion = new Map<string, { keys: string[]; notBefore: number }>();
+  private gcTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -64,6 +89,21 @@ export class FilesService {
     private readonly changes: ChangesService,
     private readonly queue: QueueService,
   ) {}
+
+  onModuleInit() {
+    // Отложенные удаления объектов подчищаем сами, не дожидаясь шестичасовой уборки:
+    // в памяти живёт только список ключей, состояние БД — источник истины.
+    this.gcTimer = setInterval(() => void this.flushOrphanObjects().catch(() => undefined), FilesService.OBJECT_GC_FLUSH_MS);
+    this.gcTimer.unref();
+  }
+
+  onModuleDestroy() {
+    // Отложенные удаления НЕ сбрасываем на остановке: при `pm2 reload` в этот момент может
+    // идти загрузка того же содержимого, и удаление объектов «на выходе» — ровно та гонка,
+    // от которой выдержка и защищает. Лучше оставить объект в бакете без строки: его подберёт
+    // deploy/scripts/sweep-orphans.mjs (для бакета он и есть осиротевший).
+    if (this.gcTimer) clearInterval(this.gcTimer);
+  }
 
   /** Папка-приёмник: существует и не в корзине. */
   private async ensureFolder(folderId: string) {
@@ -123,8 +163,10 @@ export class FilesService {
   }): Promise<void> {
     if (isHiddenZone(input.zone)) return;
     if (!input.userId) {
+      // Имя файла в лог не пишем: в логах остаётся id записи и папка, этого достаточно для
+      // разбора, а имена пользовательских файлов — персональные данные.
       this.logger.warn(
-        `журнал изменений: неизвестен владелец дерева для файла «${input.name}» (${input.folderId}) — событие не записано`,
+        `журнал изменений: неизвестен владелец дерева для записи ${input.targetId} (папка ${input.folderId}) — событие не записано`,
       );
       return;
     }
@@ -245,22 +287,37 @@ export class FilesService {
     }
   }
 
-  /** Снимок содержимого ассета (для журнала изменений). */
+  /**
+   * Снимок содержимого ассета (для журнала изменений). Строки Asset нет — это расхождение
+   * данных, а не «пустая версия»: раньше здесь возвращалась пустышка `{sha256: '', size: 0}`,
+   * она уходила клиенту событием с фиктивным sha256, а оптимистичная блокировка с
+   * `expect.sha256: ''` могла «совпасть» с ней и пропустить настоящее расхождение версий.
+   */
   private async assetSnapshot(assetId: string, known?: AssetSnapshot): Promise<AssetSnapshot> {
     if (known) return known;
     const asset = await this.prisma.asset.findUnique({
       where: { id: assetId },
       select: { sha256: true, size: true, mime: true },
     });
-    return asset
-      ? { sha256: asset.sha256, size: Number(asset.size), mime: asset.mime }
-      : { sha256: '', size: 0, mime: 'application/octet-stream' };
+    if (!asset) throw new Error(`asset ${assetId} not found — данные записи и ассетов разошлись`);
+    return { sha256: asset.sha256, size: Number(asset.size), mime: asset.mime };
   }
 
   /**
    * Создание FileEntry (после того, как объект в S3 готов или найден по хэшу).
    * `replace` перезаписывает существующее имя, сохраняя id записи: иначе для всех устройств
    * правка файла выглядела бы как «удали + создай» (новая запись, новый путь в истории).
+   *
+   * ПРЕДУСЛОВИЕ, которое метод проверяет сам: папка-приёмник существует, не в корзине и
+   * принадлежит владельцу из `opts.userId` (иначе 404). Проверка живёт здесь, а не у
+   * вызывающих: `FilesService` экспортируется из модуля наружу, и первый же новый вызов с
+   * `folderId` из тела запроса иначе стал бы записью в чужое дерево (IDOR на запись).
+   * `userId` не передан — проверить владельца нечем, это случай внутренних импортёров
+   * (разархивирование без владельца задачи).
+   *
+   * Скрытую зону (MAIL) метод намеренно НЕ запрещает: вложение письма — такая же запись дерева,
+   * и её создаёт почтовый модуль со своим `userId`. Наружу такие записи не видны: листинги,
+   * поиск, WebDAV и журнал изменений фильтруют зону MAIL.
    */
   async createEntry(
     folderId: string,
@@ -269,6 +326,9 @@ export class FilesService {
     opts: CreateEntryOptions,
   ): Promise<{ id: string; deduped: boolean; zone: string; replaced: boolean }> {
     const folder = await this.ensureFolder(folderId);
+    if (opts.userId && !(await this.auth.folderOwnedBy(opts.userId, folderId))) {
+      throw notFound('folder not found');
+    }
     assertSafeName(name);
     const zone = zoneOf(folder.zone);
     const existing = await this.prisma.fileEntry.findFirst({ where: { folderId, name } });
@@ -383,14 +443,19 @@ export class FilesService {
         throw e;
       });
 
-    // прежнее содержимое могло остаться без ссылок — тогда его надо убрать из S3
-    if (opts.userId && previousAssetId && previousAssetId !== assetId) {
+    // прежнее содержимое могло остаться без ссылок — тогда его надо убрать из S3.
+    // Владелец для этого не нужен: в журнал пишет recordEntryChange, а мусор в бакете
+    // копится независимо от того, известен ли владелец дерева (импорт без владельца).
+    if (previousAssetId && previousAssetId !== assetId) {
       await this.safeGcOrphanAsset(previousAssetId);
     }
     return result;
   }
 
-  /** GC без риска уронить процесс: отклонённый промис здесь недопустим (unhandled rejection). */
+  /**
+   * GC без риска уронить процесс: сбой уборки не должен превращать успешную запись файла
+   * в ошибку для клиента (и не должен всплывать необработанным отклонением промиса).
+   */
   async safeGcOrphanAsset(assetId: string): Promise<void> {
     await this.gcOrphanAsset(assetId).catch((e: unknown) =>
       this.logger.warn(`gc ассета ${assetId}: ${e instanceof Error ? e.message : String(e)}`),
@@ -401,9 +466,14 @@ export class FilesService {
    * Убрать ассет, на который больше никто не ссылается: и сырьё files/<sha>, и все производные
    * view/*. Нужно после перезаписи файла — иначе старые объекты остаются в бакете навсегда
    * (плановый GC есть только в очистке корзины, а перезапись при синхронизации — частый путь).
+   *
+   * Строку Asset удаляем сразу, а объекты в S3 — отложенно: см. scheduleObjectDeletion.
    */
   async gcOrphanAsset(assetId: string): Promise<boolean> {
-    const asset = await this.prisma.asset.findUnique({ where: { id: assetId }, select: { sha256: true, pageCount: true } });
+    const asset = await this.prisma.asset.findUnique({
+      where: { id: assetId },
+      select: { sha256: true, pageCount: true, mime: true },
+    });
     if (!asset) return false;
     // строка удаляется только при отсутствии ссылок (двойная защита: условие в where + FK Restrict).
     // mailRaw: none — на ассет может ссылаться письмо (сырое .eml): у него нет записей дерева,
@@ -412,22 +482,131 @@ export class FilesService {
       where: { id: assetId, entries: { none: {} }, mailRaw: { none: {} } },
     });
     if (res.count === 0) return false;
-    // Объекты трогаем только если строки с таким sha не появилось снова: параллельный
-    // дедуп-upload того же содержимого создаёт новый Asset с тем же ключом files/<sha>,
-    // и удаление ключей убило бы байты живого файла.
-    const alive = await this.prisma.asset.count({ where: { sha256: asset.sha256 } });
-    if (alive > 0) return false;
-    const keys = [S3Service.assetKey(asset.sha256), ...MediaService.derivativeKeys(asset.sha256, asset.pageCount)];
-    const failed = await this.s3.deleteObjects(keys).catch((e: Error) => {
-      this.logger.warn(`S3 не подтвердил удаление объектов ${asset.sha256}: ${e.message}`);
-      return keys;
-    });
-    if (failed.length) {
-      // строки уже нет, объекты остались — их подберёт deploy/scripts/sweep-orphans.mjs
-      this.logger.warn(`${failed.length} объектов S3 осиротели (${asset.sha256}) — подберёт sweep-orphans`);
-      return false;
-    }
+    await this.scheduleObjectDeletion(asset.sha256, asset.pageCount, asset.mime);
     return true;
+  }
+
+  /** Пакетная версия gcOrphanAsset: для очистки корзины, где кандидатов тысячи. */
+  async gcOrphanAssets(assetIds: string[]): Promise<number> {
+    let removed = 0;
+    for (const chunk of chunksOf(assetIds, 5000)) {
+      const rows = await this.prisma.asset.findMany({
+        where: { id: { in: chunk }, entries: { none: {} }, mailRaw: { none: {} } },
+        select: { id: true, sha256: true, pageCount: true, mime: true },
+      });
+      if (!rows.length) continue;
+      const res = await this.prisma.asset.deleteMany({
+        where: { id: { in: rows.map((r) => r.id) }, entries: { none: {} }, mailRaw: { none: {} } },
+      });
+      if (res.count === 0) continue;
+      removed += res.count;
+      // Между deleteMany и удалением объектов строку мог создать параллельный дедуп-upload:
+      // сам вызов deleteObjects отложен, а на выдержке мы ещё раз проверим, что строк нет.
+      for (const row of rows) await this.scheduleObjectDeletion(row.sha256, row.pageCount, row.mime);
+    }
+    return removed;
+  }
+
+  /**
+   * Ключи объекта и его производных, включая страницы PDF, которых нет в pageCount.
+   * Лишний LIST в S3 делаем только для PDF без pageCount: у остальных типов страничных
+   * превью не бывает, а уборка идёт пачками и по одному запросу на ассет — это дорого.
+   */
+  private async keysOfAsset(sha256: string, pageCount: number | null, mime?: string): Promise<string[]> {
+    const keys = [S3Service.assetKey(sha256), ...MediaService.derivativeKeys(sha256, pageCount)];
+    if (!pageCount && mime !== undefined && mediaKindOf(mime) === 'pdf') {
+      // Страничные превью PDF перечисляются по числу страниц из БД, а оно пишется только при
+      // удачном рендере (finishPdf). Задача могла отрисовать часть страниц и упасть — тогда
+      // pageCount = null, и уже созданные view/<sha>-p* никто бы не удалил. Берём их префиксом
+      // (как convertPdf) и отбираем по шаблону: префикс `-p` перехватывает ещё и `-poster.webp`.
+      const listed = await this.s3.listKeys(`view/${sha256}-p`).catch(() => [] as string[]);
+      for (const key of listed) if (new RegExp(`^view/${sha256}-p\\d+-.+\\.webp$`).test(key)) keys.push(key);
+    }
+    return keys;
+  }
+
+  /**
+   * Отложить удаление объектов ассета на GC_OBJECT_GRACE_MS.
+   *
+   * Немедленное удаление — это check-then-act: между проверкой «строк с таким sha больше нет»
+   * и deleteObjects параллельная загрузка того же содержимого успевает создать НОВУЮ строку
+   * Asset с тем же ключом files/<sha> (uploads: findUnique не нашёл → headObject видит живой
+   * объект → server-side copy пропускается, строка создаётся). Удаление ключей в этом окне
+   * убивает байты живого файла: загрузка ответила успехом, а скачивание и превью дают 404
+   * навсегда, причём ни внутренний GC, ни sweep-orphans такое уже не найдут (строка есть).
+   * Закрыть окно насовсем можно только блокировкой по sha с обеих сторон (advisory-lock в
+   * загрузке — src/uploads/**, чужой модуль), поэтому здесь выдержка и повторная проверка:
+   * окно загрузки «findUnique → ensureAsset» — миллисекунды, выдержка в минуты его перекрывает.
+   * Не дождались (рестарт процесса) — объект остаётся без строки, его подберёт
+   * deploy/scripts/sweep-orphans.mjs: для бакета он и есть осиротевший.
+   */
+  private async scheduleObjectDeletion(
+    sha256: string,
+    pageCount: number | null,
+    mime: string,
+  ): Promise<void> {
+    const keys = await this.keysOfAsset(sha256, pageCount, mime);
+    this.pendingObjectDeletion.set(sha256, {
+      keys,
+      notBefore: Date.now() + FilesService.OBJECT_GC_GRACE_MS,
+    });
+  }
+
+  /**
+   * Удалить объекты, выдержка которых истекла. Глобальный проход (один на сервис, вне цикла
+   * по пользователям): вызывается таймером и уборкой RetentionService.
+   *
+   * Перед удалением дважды проверяем, что строк с таким sha нет, с паузой между проверками:
+   * за паузу параллельная загрузка того же содержимого успевает создать свою строку Asset
+   * (окно «findUnique → ensureAsset»), и тогда объект живой — ключи не трогаем. Проверки
+   * пакетные (по одному запросу на все просроченные sha), поэтому пауза стоит один раз
+   * на проход, а не на каждый ассет.
+   */
+  async flushOrphanObjects(): Promise<number> {
+    const now = Date.now();
+    const due = [...this.pendingObjectDeletion].filter(([, item]) => item.notBefore <= now);
+    if (!due.length) return 0;
+
+    const goneAfter = await this.absentShas(due.map(([sha256]) => sha256));
+    await new Promise((resolve) => setTimeout(resolve, FilesService.OBJECT_GC_RECHECK_MS));
+    const stillAbsent = await this.absentShas([...goneAfter]);
+
+    let deleted = 0;
+    let returned = 0;
+    for (const [sha256, item] of due) {
+      this.pendingObjectDeletion.delete(sha256);
+      if (!stillAbsent.has(sha256)) {
+        returned += 1;
+        continue;
+      }
+      const failed = await this.s3.deleteObjects(item.keys).catch((e: Error) => {
+        this.logger.warn(`S3 не подтвердил удаление объектов ${sha256}: ${e.message}`);
+        return item.keys;
+      });
+      if (failed.length) {
+        // строки уже нет, объекты остались — их подберёт deploy/scripts/sweep-orphans.mjs
+        this.logger.warn(`${failed.length} объектов S3 осиротели (${sha256}) — подберёт sweep-orphans`);
+        continue;
+      }
+      deleted += item.keys.length;
+    }
+    if (returned) {
+      this.logger.warn(`gc: ${returned} ассетов появились снова за время выдержки — объекты не трогали`);
+    }
+    return deleted;
+  }
+
+  /** Из списка sha — те, для которых в БД нет ни одной строки Asset. */
+  private async absentShas(candidates: string[]): Promise<Set<string>> {
+    const absent = new Set(candidates);
+    for (const chunk of chunksOf([...new Set(candidates)], 5000)) {
+      const alive = await this.prisma.asset.findMany({
+        where: { sha256: { in: chunk } },
+        select: { sha256: true },
+      });
+      for (const row of alive) absent.delete(row.sha256);
+    }
+    return absent;
   }
 
   /** Полные метаданные файла для деталки: путь, размер/тип/хэш, EXIF/видео и метаданные Google. */
@@ -526,6 +705,12 @@ export class FilesService {
    * лучшая из производных. У части легаси-ассетов оригинал удалялся прежним кодом сразу
    * после конвертации. Возвращаем также признак «это оригинал»: для него S3 отдаёт
    * content-disposition: attachment (скачивание), для производных — inline (превью).
+   *
+   * Цена: один HEAD в S3 по ключу оригинала и, только если оригинала нет (легаси), до пяти
+   * HEAD по производным — то есть на обычном файле это один round-trip, а на легаси-ассете
+   * пять. Таблица «ключ → mime» ниже задана строковыми литералами суффиксов: её место —
+   * рядом с теми, кто эти ключи создаёт (MediaService), иначе новая схема производных
+   * потребует правки здесь.
    */
   async resolveContentKey(asset: {
     sha256: string;
@@ -566,13 +751,12 @@ export class FilesService {
    * Содержимое записи для отдачи клиенту: ключ в S3, тип и имя файла.
    * Presigned-ссылки наружу не выдаём (см. download/inlineImage) — по такой ссылке
    * объект качается вообще без авторизации, поэтому байты идут через сервис.
+   *
+   * Владельца проверяет сам (requireOwnEntry): по одному entryId ключ и тип иначе отдались бы
+   * кому угодно, то есть метод был бы готовым IDOR «из коробки».
    */
-  async contentForEntry(entryId: string): Promise<{ key: string; mime: string; name: string }> {
-    const entry = await this.prisma.fileEntry.findUnique({
-      where: { id: entryId },
-      include: { asset: true },
-    });
-    if (!entry || entry.deletedAt) throw notFound('file not found');
+  async contentForEntry(entryId: string, userId: string): Promise<{ key: string; mime: string; name: string }> {
+    const entry = await this.requireOwnEntry(entryId, userId);
     const { key, mime } = await this.resolveContentKey(entry.asset);
     return { key, mime, name: entry.name };
   }
@@ -590,18 +774,32 @@ export class FilesService {
   }
 
   /**
+   * Отдача содержимого уже загруженной записи. Принимает запись, а не id: иначе «небезопасный»
+   * тип в inlineImage уходил бы в download(), и запись с ключом читались бы из БД и S3 дважды.
+   */
+  private async sendEntry(
+    entry: EntryWithAsset,
+    req: Request,
+    res: Response,
+    opts: { mime: string; disposition: 'inline' | 'attachment'; cache?: string },
+  ): Promise<void> {
+    const { key } = await this.resolveContentKey(entry.asset);
+    await sendObjectOr404(req, res, this.s3, key, {
+      mime: opts.mime,
+      disposition: opts.disposition,
+      filename: entry.name,
+      ...(opts.cache ? { cache: opts.cache } : {}),
+    });
+  }
+
+  /**
    * Скачивание файла: байты идут через сервис (не отдаём наружу presigned-ссылку на S3,
    * она живёт без авторизации), тип — octet-stream, имя — из дерева, disposition: attachment.
    * Так браузер сохраняет файл, а не открывает новую вкладку и не рендерит содержимое.
    */
   async download(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
     const entry = await this.requireOwnEntry(entryId, userId);
-    const { key } = await this.resolveContentKey(entry.asset);
-    await sendObjectOr404(req, res, this.s3, key, {
-      mime: 'application/octet-stream',
-      disposition: 'attachment',
-      filename: entry.name,
-    });
+    await this.sendEntry(entry, req, res, { mime: 'application/octet-stream', disposition: 'attachment' });
   }
 
   /**
@@ -611,12 +809,14 @@ export class FilesService {
   async inlineImage(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
     const entry = await this.requireOwnEntry(entryId, userId);
     const mime = safeInlineImageMime(entry.asset.mime);
-    if (!mime) return this.download(entryId, userId, req, res);
-    const { key } = await this.resolveContentKey(entry.asset);
-    await sendObjectOr404(req, res, this.s3, key, {
+    // «небезопасный» тип отдаём тем же уже загруженным entry: раньше здесь вызывался download()
+    // с id, и запись с ключом читались из БД и S3 второй раз на каждый показ
+    if (!mime) {
+      return this.sendEntry(entry, req, res, { mime: 'application/octet-stream', disposition: 'attachment' });
+    }
+    await this.sendEntry(entry, req, res, {
       mime,
       disposition: 'inline',
-      filename: entry.name,
       // содержимое неизменяемо (ключ = sha256), но приватно: кэширует только браузер
       cache: 'private, max-age=600',
     });
@@ -720,6 +920,11 @@ export class FilesService {
       const target = await this.prisma.folder.findUnique({ where: { id: body.folderId } });
       if (!target || target.deletedAt) throw notFound('folder not found');
       if (!(await this.auth.folderOwnedBy(userId, target.id))) throw notFound('folder not found');
+      // В скрытую зону («Почта») файл переносить нельзя: folderOwnedBy для своей же папки
+      // «Почта» возвращает true, а запись там исчезает из всех листингов, поиска, WebDAV и
+      // журнала изменений — то есть файл пропадает безвозвратно и восстановить его нечем.
+      // Остальные пути записи (uploads, dav, clipboard) закрыты так же — 404, как у чужой папки.
+      if (isHiddenZone(target.zone)) throw notFound('folder not found');
       const clash = await this.prisma.fileEntry.findFirst({
         where: { folderId: target.id, name: data.name ?? entry.name },
       });
@@ -736,30 +941,40 @@ export class FilesService {
 
     if (!Object.keys(data).length) return { ok: true, changed: false };
 
-    const updated = await this.prisma.$transaction(async (tx) => {
-      const row = await tx.fileEntry.update({
-        where: { id: entryId },
-        data,
-        select: { id: true, name: true, folderId: true, zone: true, clientMtime: true },
+    const updated = await this.prisma
+      .$transaction(async (tx) => {
+        const row = await tx.fileEntry.update({
+          where: { id: entryId },
+          data,
+          select: { id: true, name: true, folderId: true, zone: true, clientMtime: true },
+        });
+        await this.changes.record(
+          {
+            userId,
+            target: 'entry',
+            op,
+            targetId: row.id,
+            folderId: row.folderId,
+            name: row.name,
+            zone: row.zone,
+            sha256: entry.asset.sha256,
+            size: Number(entry.asset.size),
+            mime: entry.asset.mime,
+            clientMtime: row.clientMtime,
+          },
+          tx,
+        );
+        return row;
+      })
+      .catch((e: unknown) => {
+        // Проверка конфликта имени выше не атомарна с update: два параллельных rename/move
+        // в одно имя оба проходят findFirst, и один из update падает на @@unique([folderId, name]).
+        // Наружу должен уйти 409 (как в createEntry), а не 500 от Prisma.
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+          throw conflict('file name already exists (renamed or moved concurrently)');
+        }
+        throw e;
       });
-      await this.changes.record(
-        {
-          userId,
-          target: 'entry',
-          op,
-          targetId: row.id,
-          folderId: row.folderId,
-          name: row.name,
-          zone: row.zone,
-          sha256: entry.asset.sha256,
-          size: Number(entry.asset.size),
-          mime: entry.asset.mime,
-          clientMtime: row.clientMtime,
-        },
-        tx,
-      );
-      return row;
-    });
 
     // Файл переехал в медиа-зону: без EXIF и превью он не попадёт в таймлайн
     if (updated.zone === ZONE_PHOTOS && entry.zone !== ZONE_PHOTOS) {

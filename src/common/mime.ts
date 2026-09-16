@@ -54,6 +54,10 @@ export function normalizeMime(raw: unknown): string {
   }
   // Картинки пропускаем любые: конвертируем мы только то, что умеем (mediaKindOf), а RAW
   // камер должен хотя бы попадать в ленту и открываться по кнопке «скачать оригинал».
+  // Осторожно: этот пропуск ШИРЕ списков IMAGE_MIMES/VIDEO_MIMES из src/media/media.service.ts
+  // (там нет, например, image/bmp и video/3gpp). Для типа вне списков строка MediaMeta не
+  // создаётся и файл в разделе «Медиа» не появится — расширять нужно списки в media.service,
+  // а не сужать пропуск здесь: сужение сломало бы RAW.
   if (/^(image|video|audio)\//.test(mime)) return mime;
   return KNOWN_MIMES.has(mime) ? mime : 'application/octet-stream';
 }

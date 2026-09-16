@@ -1,8 +1,9 @@
 name: Android APK (build + publish)
 
-# Ручной прогон: собирает релиз Flutter-клиента (flutter/), прогоняет тесты и публикует
-# подписанный APK в релизный артефакт S3, откуда сборку всегда отдаёт
-# https://files.iq-factura.com/apk.
+# Ручной прогон: собирает релиз Flutter-клиента (flutter/) и публикует подписанный APK
+# в релизный артефакт S3, откуда сборку всегда отдаёт https://files.iq-factura.com/apk.
+# Тестов в проекте нет намеренно: прогоняется только сборка, а работу приложения проверяет
+# владелец на телефоне.
 #
 # Собирается единственный мобильный клиент — Flutter-приложение (flutter/). Его
 # applicationId ru.cloudly.sync и подпись те же, что у уже установленного на телефоне
@@ -80,11 +81,10 @@ jobs:
           EOF
           chmod 600 flutter/android/keystore.properties
 
-      - name: Тесты и сборка релиза
+      - name: Сборка релиза
         working-directory: flutter
         run: |
           flutter pub get
-          flutter test
           flutter build apk --release
 
       - uses: pnpm/action-setup@v4
