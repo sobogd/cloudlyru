@@ -21,7 +21,7 @@ import 'mirror_rules.dart';
 /// Создаётся движком на каждый проход (`MirrorEngine._pushLocal`); снимок живёт в памяти
 /// прохода и целиком держится там же, поэтому и есть предел [hardMax].
 class MirrorScanner {
-  /// @param native мост к Android: нужен за номерами файлов, подменяется в тестах.
+  /// @param native доступ к номерам файлов: подменяется, чтобы обойтись без настоящих.
   MirrorScanner({NativeFs? native}) : _native = native ?? NativeFs();
 
   final NativeFs _native;
@@ -146,8 +146,8 @@ class MirrorScanner {
       }
     }
 
-    // Второй проход — за номерами файлов: обход диска отдельно, мост отдельно, чтобы
-    // пачка путей уходила одним вызовом, а не по одному на файл.
+    // Второй проход — за номерами файлов: номера берутся отдельно от обхода, пачкой путей,
+    // чтобы на каждый файл не заводить C-строку и не ходить в диск дважды подряд.
     // Отменённый обход второго прохода не делает: снимок всё равно неполный, а номера файлов
     // никому не понадобятся — удалять по нему нельзя, а план выгрузки движок не строит
     final files = <LocalFile>[];
@@ -161,7 +161,7 @@ class MirrorScanner {
           start,
           math.min(start + inodeBatch, gathered.length),
         );
-        final inodes = await _native.inodes([for (final g in chunk) g.path]);
+        final inodes = _native.inodes([for (final g in chunk) g.path]);
         for (var i = 0; i < chunk.length; i++) {
           final g = chunk[i];
           files.add(
@@ -172,7 +172,8 @@ class MirrorScanner {
               size: g.size,
               mtime: g.mtime,
               // 0 — «номер неизвестен»: тогда переименование не распознаётся и файл уедет
-              // заново. Ответ моста может быть короче запроса, и это не роняет снимок
+              // заново. Список номеров короче запроса быть не может, но проверка дешёвая:
+              // перепутанный номер хуже отсутствующего
               inode: i < inodes.length ? inodes[i] : 0,
             ),
           );

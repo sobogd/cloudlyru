@@ -568,7 +568,7 @@ class MirrorPull {
     final stat = exists ? await file.stat() : null;
     final localSize = stat?.size ?? 0;
     final localMtime = stat?.modified.millisecondsSinceEpoch ?? 0;
-    final localInode = exists ? await _native.inode(path) : 0;
+    final localInode = exists ? _native.inode(path) : 0;
     final cloudSha = sha256?.toLowerCase();
     final rowSha = row?.sha256?.toLowerCase();
 
@@ -834,7 +834,7 @@ class MirrorPull {
           path: dest.path,
           cloudFolderId: folderId ?? '',
           entryId: entryId,
-          inode: await _native.inode(dest.path),
+          inode: _native.inode(dest.path),
           size: stat.size,
           mtime: stat.modified.millisecondsSinceEpoch,
           // хэш — из журнала: содержимое скачанного файла повторно не хэшируется
