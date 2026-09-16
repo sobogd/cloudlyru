@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Песочница выключена намеренно: приложению нужны произвольные папки пользователя —
+	     та же задача, что на Android решает MANAGE_EXTERNAL_STORAGE. В песочнице доступ
+	     к ним даётся только через security-scoped bookmarks, то есть через нативный код. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>
