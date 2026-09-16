@@ -4,15 +4,19 @@ import 'package:flutter/material.dart';
 import '../../api/models.dart';
 import '../../theme.dart';
 
-/// Вертикальная шкала месяцев у правого края ленты: перетаскивание прыгает к месяцу.
+/// Шкала месяцев у правого края ленты: ползунок с подписью месяца и риски периодов.
 ///
 /// Почему не обычный ползунок прокрутки: у ленты десятки тысяч кадров и годы съёмки, и «тянуть
 /// ползунок, пока не найдёшь нужное» по ней бесполезно — нужен переход к периоду. Шкала это и
-/// делает: положение пальца переводится в индекс кадра, а месяц под пальцем показывается
-/// подписью, так что видно, куда едешь, ещё до того, как отпустил.
+/// делает: положение ползунка переводится в индекс кадра, месяц под ним показывается подписью,
+/// так что видно, куда едешь, ещё до того, как отпустил.
 ///
-/// Ширина намеренно узкая, а зона касания шире видимой полосы: тянут её пальцем по краю
-/// экрана, и промахнуться мимо тонкой линии было бы обычным делом.
+/// Геометрия здесь ровно одна и та же для пальца, ползунка и рисок — дорожка между
+/// [_trackInset] сверху и снизу. Это принципиально: раньше палец считался по всей высоте
+/// виджета, а ползунок рисовался по доле прокрутки (`offset / maxScrollExtent`), и эти две
+/// величины не совпадали — ползунок уезжал от пальца, а лента вставала не туда. Теперь доля
+/// одна: положение пальца по дорожке → индекс кадра → лента, и ползунок ставится ровно в ту
+/// же точку дорожки.
 class MonthTimeline extends StatefulWidget {
   const MonthTimeline({
     super.key,
@@ -30,7 +34,9 @@ class MonthTimeline extends StatefulWidget {
   /// Сколько всего кадров: по нему положение пальца переводится в индекс кадра.
   final int total;
 
-  /// Положение прокрутки долей от 0 до 1 — по нему рисуется бегунок.
+  /// Доля ленты, на которой стоит ползунок (0 — начало, 1 — конец). Лента считает её как
+  /// «первый видимый кадр / всего кадров» — та же величина, что получается при перетаскивании,
+  /// поэтому ползунок оказывается под пальцем.
   final ValueListenable<double> position;
 
   /// Подпись месяца для кадра с этим индексом (лента знает её по своим диапазонам).
@@ -41,6 +47,9 @@ class MonthTimeline extends StatefulWidget {
 
   /// Перетаскивание закончилось — лента подгружает окно на новом месте.
   final VoidCallback onJumpEnd;
+
+  /// Ширина шкалы: на неё же отступает сетка справа, чтобы плитки не уходили под ползунок.
+  static const double width = 44;
 
   @override
   State<MonthTimeline> createState() => _MonthTimelineState();
@@ -54,21 +63,28 @@ class _MonthTimelineState extends State<MonthTimeline> {
   /// Месяц, к которому ведёт текущее положение пальца.
   String _label = '';
 
-  /// Доля высоты, где сейчас палец, — по ней ставится подпись (не по бегунку: тот двигается
-  /// уже после прыжка ленты, и подпись отставала бы от пальца).
+  /// Доля, на которую указывает палец, — по ней ставится подпись (не по ползунку: тот
+  /// двигается после прыжка ленты и отставал бы от пальца).
   double _dragFrac = 0;
 
-  /// Ширина зоны касания и толщина видимой полосы.
-  static const double _touchWidth = 34;
-  static const double _trackWidth = 3;
+  /// Толщина дорожки, длина риски месяца и диаметр ползунка.
+  ///
+  /// Ползунок крупный намеренно: это орган управления, а не индикатор — за мелкий кружок
+  /// палец не зацепится.
+  static const double _trackWidth = 5;
+  static const double _markWidth = 18;
+  static const double _thumbSize = 26;
+
+  /// Отступ дорожки от краёв виджета: на столько шкала короче экрана.
+  static const double _trackInset = 16;
 
   /// Перевести положение пальца в индекс кадра и попросить ленту прыгнуть.
   ///
-  /// Индекс считается по доле высоты: шкала линейна по числу кадров, а не по месяцам, — тогда
-  /// палец в середине шкалы оказывается в середине библиотеки, что и ожидается при перетаскивании.
-  void _handleDrag(double localY, double height) {
-    if (height <= 0 || widget.total <= 0) return;
-    final fraction = (localY / height).clamp(0.0, 1.0);
+  /// Доля считается по дорожке (между её началом и концом), а не по высоте виджета: палец на
+  /// верхнем конце дорожки — это начало ленты, на нижнем — конец.
+  void _handleDrag(double localY, double trackTop, double trackLength) {
+    if (trackLength <= 0 || widget.total <= 0) return;
+    final fraction = ((localY - trackTop) / trackLength).clamp(0.0, 1.0);
     final index = (fraction * (widget.total - 1)).round().clamp(0, widget.total - 1);
     setState(() {
       _dragging = true;
@@ -86,58 +102,53 @@ class _MonthTimelineState extends State<MonthTimeline> {
   }
 
   @override
-  /// Полоса с рисками месяцев, бегунок текущего положения и подпись под пальцем.
+  /// Дорожка с рисками, ползунок и подпись месяца под пальцем.
   Widget build(BuildContext context) {
     return SizedBox(
-      width: _touchWidth,
+      width: MonthTimeline.width,
       child: LayoutBuilder(builder: (context, c) {
-        final height = c.maxHeight;
+        final trackTop = _trackInset;
+        final trackLength = c.maxHeight - _trackInset * 2;
+        if (trackLength <= 0) return const SizedBox.shrink();
         return GestureDetector(
-          // Прозрачная зона на всю высоту: тянуть можно в любом месте шкалы, а не только
-          // по видимой полосе.
+          // Прозрачная зона на всю высоту, но шириной только в саму шкалу: сетка справа
+          // имеет такой же отступ, поэтому обычный свайп по списку сюда не попадает.
           behavior: HitTestBehavior.opaque,
-          onVerticalDragStart: (d) => _handleDrag(d.localPosition.dy, height),
-          onVerticalDragUpdate: (d) => _handleDrag(d.localPosition.dy, height),
+          onVerticalDragStart: (d) => _handleDrag(d.localPosition.dy, trackTop, trackLength),
+          onVerticalDragUpdate: (d) => _handleDrag(d.localPosition.dy, trackTop, trackLength),
           onVerticalDragEnd: (_) => _endDrag(),
           onVerticalDragCancel: _endDrag,
-          onTapDown: (d) => _handleDrag(d.localPosition.dy, height),
+          onTapDown: (d) => _handleDrag(d.localPosition.dy, trackTop, trackLength),
           onTapUp: (_) => _endDrag(),
           child: Stack(
             // Подпись выходит за границы виджета — влево, поверх сетки.
             clipBehavior: Clip.none,
             children: [
-              // Дорожка и риски месяцев.
               Positioned(
-                right: 4,
-                top: 8,
-                bottom: 8,
+                right: (MonthTimeline.width - _markWidth) / 2,
+                top: trackTop,
                 child: CustomPaint(
-                  size: Size(_trackWidth, height - 16),
-                  painter: _TimelinePainter(
-                    // Доли начала месяцев: по ним рисуются риски, чтобы шкала читалась
-                    // как таймлайн, а не как безымянная полоса.
-                    marks: _monthMarks(),
-                  ),
+                  size: Size(_markWidth, trackLength),
+                  painter: _TimelinePainter(marks: _monthMarks(), trackWidth: _trackWidth),
                 ),
               ),
-              // Бегунок: где лента находится сейчас. Слушает только положение прокрутки,
-              // поэтому прокрутка не перерисовывает ни сетку, ни подпись.
-              Positioned(
-                right: 0,
-                top: 8,
-                bottom: 8,
-                child: ValueListenableBuilder<double>(
-                  valueListenable: widget.position,
-                  builder: (context, frac, _) => Align(
-                    alignment: Alignment(0, frac * 2 - 1),
-                    child: Container(
-                      width: 11,
-                      height: 11,
-                      decoration: BoxDecoration(
-                        color: C.accent,
-                        shape: BoxShape.circle,
-                        border: Border.all(color: C.canvas, width: 2),
-                      ),
+              // Ползунок: центр ровно в той точке дорожки, которой соответствует текущая
+              // позиция ленты.
+              ValueListenableBuilder<double>(
+                valueListenable: widget.position,
+                builder: (context, frac, _) => Positioned(
+                  right: (MonthTimeline.width - _thumbSize) / 2,
+                  top: trackTop + frac.clamp(0.0, 1.0) * trackLength - _thumbSize / 2,
+                  child: Container(
+                    width: _thumbSize,
+                    height: _thumbSize,
+                    decoration: BoxDecoration(
+                      color: C.accent,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: C.canvas, width: 2),
+                      boxShadow: const [
+                        BoxShadow(color: Color(0x66000000), blurRadius: 4, offset: Offset(0, 1)),
+                      ],
                     ),
                   ),
                 ),
@@ -145,8 +156,8 @@ class _MonthTimelineState extends State<MonthTimeline> {
               // Подпись месяца под пальцем.
               if (_dragging)
                 Positioned(
-                  right: _touchWidth - 2,
-                  top: (height * _dragFrac - 16).clamp(0.0, height - 34),
+                  right: MonthTimeline.width - 4,
+                  top: (trackTop + _dragFrac * trackLength - 16).clamp(0.0, c.maxHeight - 34),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                     decoration: BoxDecoration(
@@ -184,30 +195,36 @@ class _MonthTimelineState extends State<MonthTimeline> {
 
 /// Рисует дорожку шкалы и риски месяцев.
 class _TimelinePainter extends CustomPainter {
-  const _TimelinePainter({required this.marks});
+  const _TimelinePainter({required this.marks, required this.trackWidth});
 
   /// Доли начала месяцев от 0 до 1 (сверху вниз).
   final List<double> marks;
 
+  /// Толщина дорожки.
+  final double trackWidth;
+
   @override
-  /// Полоса-дорожка и поперечные риски на границах месяцев.
+  /// Дорожка по центру и поперечные риски на границах месяцев.
   void paint(Canvas canvas, Size size) {
+    final center = size.width / 2;
     final track = Paint()
       ..color = C.brd
-      ..strokeWidth = size.width
+      ..strokeWidth = trackWidth
       ..strokeCap = StrokeCap.round;
-    canvas.drawLine(Offset(size.width / 2, 0), Offset(size.width / 2, size.height), track);
+    canvas.drawLine(Offset(center, 0), Offset(center, size.height), track);
 
     final mark = Paint()
       ..color = C.fg3
-      ..strokeWidth = 1.5;
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round;
     for (final m in marks) {
       final y = m * size.height;
-      canvas.drawLine(Offset(0, y), Offset(size.width * 2.2, y), mark);
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), mark);
     }
   }
 
   @override
   /// Перерисовываем, когда изменились риски: они зависят от разбивки по месяцам.
-  bool shouldRepaint(_TimelinePainter old) => !listEquals(old.marks, marks);
+  bool shouldRepaint(_TimelinePainter old) =>
+      !listEquals(old.marks, marks) || old.trackWidth != trackWidth;
 }

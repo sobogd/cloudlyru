@@ -46,9 +46,10 @@ const int _minColumns = 4;
 /// или 1080» (`src/media/media.controller.ts`). На экране с DPR 3 клетка — это 150 физических
 /// пикселей, то есть картинка растягивается в полтора раза: подобрать размер под DPR клиент
 /// не может — нужного размера сервер не собирает.
-/// 74 dp — это (360 dp экрана − 34 dp шкалы − зазоры) / 4 колонки; на DPR 3 выходит ~222
-/// физических пикселя, то есть превью 256 px покрывает клетку с запасом на DPR выше среднего.
-const _cell = 74.0;
+/// 70 dp — это (360 dp экрана − 44 dp шкалы − зазоры) / 4 колонки; на DPR 3 выходит ~210
+/// физических пикселей, то есть превью 256 px покрывает клетку с запасом, а на экранах с
+/// повышенной плотностью апскейл остаётся незаметным.
+const _cell = 70.0;
 const _gap = 3.0;
 const _row = _cell + _gap;
 
@@ -326,10 +327,15 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     if (_debounce?.isActive ?? false) _debounce!.cancel();
     _debounce = Timer(const Duration(milliseconds: _fetchDebounceMs), _fetchVisible);
     _updateMonth();
-    // Положение для бегунка шкалы: считается без setState — перерисовывается только шкала.
-    if (_sc.hasClients) {
-      final max = _sc.position.maxScrollExtent;
-      _scrollFrac.value = max > 0 ? (_sc.offset / max).clamp(0.0, 1.0) : 0;
+    // Положение ползунка шкалы: доля ПЕРВОГО ВИДИМОГО КАДРА, а не доля прокрутки
+    // (`offset / maxScrollExtent`). Это важно: шкала переводит палец в индекс кадра, и если
+    // ползунок считать по прокрутке, он встаёт не туда, где палец, — из-за того, что
+    // максимальная прокрутка меньше полной высоты списка на высоту экрана. Считается без
+    // `setState`: перерисовывается только шкала, а не сетка.
+    if (_sc.hasClients && _total.value > 0) {
+      final firstRow = (_sc.offset / _rowStep.value).floor();
+      final firstIndex = firstRow * math.max(1, _cols.value);
+      _scrollFrac.value = (firstIndex / _total.value).clamp(0.0, 1.0);
     }
   }
 
@@ -744,7 +750,7 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
           GridView.builder(
             controller: _sc,
             // Справа отступ шире: там живёт шкала месяцев, и плитки не должны уходить под неё.
-            padding: const EdgeInsets.fromLTRB(_gap, _gap, _gap + 34, _gap),
+            padding: const EdgeInsets.fromLTRB(_gap, _gap, _gap + MonthTimeline.width, _gap),
             gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
               crossAxisCount: _cols.value,
               mainAxisSpacing: _gap,
