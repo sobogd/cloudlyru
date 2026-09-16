@@ -10,6 +10,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
+import 'month_timeline.dart';
+
 import '../../api/cloudly_api.dart';
 import '../../api/models.dart';
 import '../../media/media_sync.dart';
@@ -20,20 +22,44 @@ import '../../util/download.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
 
-/// Размер клетки сетки и зазор между ними.
+/// Сколько кадров минимум в строке сетки.
 ///
-/// `_row` (клетка + зазор) — не только вёрстка: по этой высоте считается, какие кадры попадают
-/// в видимое окно (`_fetchVisible`) и какой месяц показан в заголовке (`_updateMonth`).
-/// Поэтому значения должны совпадать с `mainAxisSpacing`/`crossAxisSpacing` в `build`.
+/// Четыре — выбранная плотность: клетка на экране 360 dp получается 88 dp (264 физических
+/// пикселя на DPR 3), ровно под превью [kThumbSize]. На широких экранах колонок становится
+/// больше по желаемой ширине клетки, но меньше этого числа — никогда.
+const int _minColumns = 4;
+
+/// Желаемая ширина клетки сетки и зазор между ними.
+///
+/// [_cell] — не фактический размер клетки, а то, из чего выводится число колонок: `GridView`
+/// растягивает ячейки на всю ширину экрана, поэтому сторона клетки получается делением
+/// (см. `_cellSide`). Число колонок — «сколько клеток по [_cell] влезает в строку».
+///
+/// Фактическая сторона клетки и шаг строки (`_rowStep`) — не только вёрстка: по ним считается,
+/// какие кадры попадают в видимое окно (`_fetchVisible`) и какой месяц показан в заголовке
+/// (`_updateMonth`). Захардкоженный шаг здесь — источник расхождения, которое копится с
+/// глубиной прокрутки: при клетке 50 dp и зазоре 3 шаг брался 53 dp, а фактический на экране
+/// 360 dp — 60.5 dp, и на 50 000 dp прокрутки окно уезжало от видимого на сотни кадров.
 ///
 /// Числа — логические пиксели, а сеточное превью сервер отдаёт фиксированного размера
 /// (`GRID_SIZE = 100 px`, src/media/media.service.ts) и выбирает его по `w` только как «сетка
 /// или 1080» (`src/media/media.controller.ts`). На экране с DPR 3 клетка — это 150 физических
 /// пикселей, то есть картинка растягивается в полтора раза: подобрать размер под DPR клиент
 /// не может — нужного размера сервер не собирает.
-const _cell = 50.0;
+/// 74 dp — это (360 dp экрана − 34 dp шкалы − зазоры) / 4 колонки; на DPR 3 выходит ~222
+/// физических пикселя, то есть превью 256 px покрывает клетку с запасом на DPR выше среднего.
+const _cell = 74.0;
 const _gap = 3.0;
 const _row = _cell + _gap;
+
+/// Фактическая сторона клетки и шаг строки, посчитанные в раскладке.
+///
+/// `ValueNotifier`, а не поля: пишутся из `LayoutBuilder`, а читаются и вне `build` — из
+/// расчёта окна, из таймера дебаунса и из `ensure` просмотрщика. Слушателей у них нет:
+/// перерисовку и так вызывает раскладка, а запись — обычное обновление числа для следующего
+/// расчёта (та же причина, что у `_cols`).
+final ValueNotifier<double> _cellSide = ValueNotifier(_cell);
+final ValueNotifier<double> _rowStep = ValueNotifier(_cell + _gap);
 
 /// Задержка перед загрузкой окна после последнего события скролла, мс (см. `_onScroll`).
 const _fetchDebounceMs = 400;
@@ -58,6 +84,13 @@ const _statusPollMs = 5000;
 
 /// Предел попыток опроса на один кадр: 24 × 5 с — две минуты ожидания в открытом разделе.
 const _statusMaxTries = 24;
+
+/// Сколько кадров ленты держим в памяти.
+///
+/// Раньше кэш не ограничивался: пролистав ленту, приложение оставляло в куче десятки тысяч
+/// объектов — это и есть «держим всё в памяти». Нужны же единицы: то, что на экране и рядом.
+/// Две тысячи кадров — это ~35 экранов запаса, дальше кэш чистится по удалённости от окна.
+const int _itemsLimit = 2000;
 
 /// Сколько кадров страницы прогревать миниатюрами заранее (см. `_fetchVisible`).
 ///
@@ -127,6 +160,18 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   String _month = 'Медиа';
   /// Скролл сетки: из его позиции считаются видимые строки.
   final ScrollController _sc = ScrollController();
+
+  /// Положение прокрутки долей от 0 до 1 — для бегунка на шкале месяцев.
+  ///
+  /// `ValueNotifier`, а не `setState`: положение меняется на каждом кадре прокрутки, а
+  /// перерисовывать из-за него весь экран (с сеткой) не нужно — слушает только шкала.
+  final ValueNotifier<double> _scrollFrac = ValueNotifier(0);
+
+  /// Кэш разбивки по месяцам в виде диапазонов индексов (см. `_monthCum`).
+  ///
+  /// Считается на каждое событие прокрутки (подпись месяца в шапке), а зависит только от
+  /// `_months`: без кэша десятки раз в секунду строился бы список по всем месяцам ленты.
+  List<({String month, int start, int end})>? _monthCumCache;
   /// Задержка перед загрузкой окна (см. `_onScroll`).
   Timer? _debounce;
   /// Запрос окна уже в полёте: без этого быстрый скролл порождал бы параллельные запросы
@@ -175,6 +220,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     _revision.dispose();
     _total.dispose();
     _cols.dispose();
+    _cellSide.dispose();
+    _rowStep.dispose();
+    _scrollFrac.dispose();
     super.dispose();
   }
 
@@ -225,6 +273,8 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     final m = await feed.store.months(tzOffsetMin: DateTime.now().timeZoneOffset.inMinutes);
     if (!mounted) return;
     final changed = n != _total.value;
+    // Разбивка по месяцам изменилась — кэш диапазонов больше не годится.
+    _monthCumCache = null;
     setState(() {
       _total.value = n;
       _months = m;
@@ -276,6 +326,42 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     if (_debounce?.isActive ?? false) _debounce!.cancel();
     _debounce = Timer(const Duration(milliseconds: _fetchDebounceMs), _fetchVisible);
     _updateMonth();
+    // Положение для бегунка шкалы: считается без setState — перерисовывается только шкала.
+    if (_sc.hasClients) {
+      final max = _sc.position.maxScrollExtent;
+      _scrollFrac.value = max > 0 ? (_sc.offset / max).clamp(0.0, 1.0) : 0;
+    }
+  }
+
+  /// Прыжок ленты к кадру с этим индексом (шкала месяцев).
+  ///
+  /// Прыжок мгновенный (`jumpTo`), а не анимированный: шкалу тянут именно для того, чтобы
+  /// оказаться в другом месте сразу, и анимация через десятки тысяч кадров только мешала бы.
+  void _jumpToFrame(int index) {
+    if (!_sc.hasClients || !_loaded) return;
+    final cols = math.max(1, _cols.value);
+    final offset = (index / cols) * _rowStep.value;
+    _sc.jumpTo(offset.clamp(0.0, _sc.position.maxScrollExtent));
+  }
+
+  /// Подпись месяца для кадра с этим индексом (что видно на шкале при перетаскивании).
+  String _monthLabelAt(int index) {
+    final key = _monthAt(index);
+    if (key == null) return 'Медиа';
+    return key == 'Без даты' ? key : monthLabel(key);
+  }
+
+  /// Выкинуть из кэша кадры, ушедшие далеко от видимого окна.
+  ///
+  /// Вызывается после подгрузки страниц: кэш ограничен [_itemsLimit] кадрами, и при
+  /// пролистывании всей ленты старые вытесняются, а не копятся до конца сеанса.
+  void _trimItems(int center) {
+    if (_items.length <= _itemsLimit) return;
+    final keys = _items.keys.toList()
+      ..sort((a, b) => (a - center).abs().compareTo((b - center).abs()));
+    for (final k in keys.skip(_itemsLimit)) {
+      _items.remove(k);
+    }
   }
 
   /// Обновляет подпись месяца в заголовке по верхней видимой строке.
@@ -286,7 +372,7 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   void _updateMonth() {
     final t = _total.value;
     if (t == 0 || !_sc.hasClients) return;
-    final idx = (_sc.offset ~/ _row).clamp(0, 1 << 30) * _cols.value;
+    final idx = (_sc.offset ~/ _rowStep.value).clamp(0, 1 << 30) * _cols.value;
     final key = _monthAt(idx);
     final label = key == null ? 'Медиа' : key == 'Без даты' ? key : monthLabel(key);
     if (label != _month) setState(() => _month = label);
@@ -320,6 +406,8 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   /// превращается в месяц одним поиском. Пустые корзины пропускаются — иначе в диапазонах
   /// появились бы дырки, и часть кадров не нашла бы своего месяца.
   List<({String month, int start, int end})> _monthCum() {
+    final cached = _monthCumCache;
+    if (cached != null) return cached;
     final arr = <({String month, int start, int end})>[];
     var start = 0;
     for (final b in _months) {
@@ -327,6 +415,7 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
       arr.add((month: b.month == null ? 'Без даты' : b.month!, start: start, end: start + b.count));
       start += b.count;
     }
+    _monthCumCache = arr;
     return arr;
   }
 
@@ -346,8 +435,11 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     final top = _sc.hasClients ? _sc.offset : 0.0;
     final vh = _sc.hasClients ? _sc.position.viewportDimension : _fallbackViewport;
     final cols = _cols.value;
-    final firstRow = math.max(0, (top / _row).floor() - _viewRowsMargin);
-    final lastRow = ((top + vh) / _row).ceil() + _viewRowsMargin;
+    // Шаг строки — фактический, из раскладки: захардкоженный (клетка + зазор) не совпадает
+    // с тем, что видно на экране, потому что GridView растягивает ячейки на всю ширину.
+    final step = _rowStep.value;
+    final firstRow = math.max(0, (top / step).floor() - _viewRowsMargin);
+    final lastRow = ((top + vh) / step).ceil() + _viewRowsMargin;
     final start = firstRow * cols;
     final end = math.min(t - 1, (lastRow + 1) * cols - 1);
     return start > end ? null : (start, end);
@@ -422,6 +514,7 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
               for (var j = 0; j < page.length; j++) {
                 _items[off + j] = page[j];
               }
+              _trimItems((start + end) ~/ 2);
             });
             // Просмотрщик (если он открыт) узнаёт, что серые слайды можно отрисовать.
             _revision.value++;
@@ -632,7 +725,13 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
         // Пишется в `ValueNotifier`, а не в обычное поле: слушателей у него нет, поэтому
         // запись в раскладке никого не будит, а следующий расчёт (из post-frame колбэка или
         // таймера дебаунса) читает уже новое число.
-        _cols.value = math.max(1, ((c.maxWidth + _gap) / _row).floor());
+        // Число колонок — из желаемой ширины клетки, а фактическая сторона ячейки получается
+        // делением ширины: GridView растягивает ячейки на всю строку, поэтому сторона не равна
+        // `_cell`. Именно она (и шаг строки) нужна расчёту видимого окна.
+        final cols = math.max(_minColumns, ((c.maxWidth + _gap) / _row).floor());
+        _cols.value = cols;
+        _cellSide.value = (c.maxWidth - (cols - 1) * _gap) / cols;
+        _rowStep.value = _cellSide.value + _gap;
         if (!_loaded) return const Center(child: CircularProgressIndicator());
         final t = _total.value;
         if (t == 0) {
@@ -641,17 +740,37 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
           if (_syncing) return const Center(child: CircularProgressIndicator());
           return const Center(child: Text('Здесь появятся фото и видео из раздела «Фото»', style: TextStyle(color: C.fg3)));
         }
-        return GridView.builder(
-          controller: _sc,
-          padding: const EdgeInsets.all(_gap),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: _cols.value,
-            mainAxisSpacing: _gap,
-            crossAxisSpacing: _gap,
+        return Stack(children: [
+          GridView.builder(
+            controller: _sc,
+            // Справа отступ шире: там живёт шкала месяцев, и плитки не должны уходить под неё.
+            padding: const EdgeInsets.fromLTRB(_gap, _gap, _gap + 34, _gap),
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: _cols.value,
+              mainAxisSpacing: _gap,
+              crossAxisSpacing: _gap,
+            ),
+            itemCount: t,
+            itemBuilder: (context, i) => _cellWidget(i),
           ),
-          itemCount: t,
-          itemBuilder: (context, i) => _cellWidget(i),
-        );
+          // Шкала месяцев у правого края: перетаскивание — быстрый переход к нужному периоду,
+          // без проматывания десятков тысяч кадров.
+          Positioned(
+            right: 0,
+            top: 0,
+            bottom: 0,
+            child: MonthTimeline(
+              months: _months,
+              total: t,
+              position: _scrollFrac,
+              labelAt: _monthLabelAt,
+              onJump: _jumpToFrame,
+              // Окно грузится один раз — когда палец отпустили: во время перетаскивания оно
+              // всё равно меняется на каждом кадре, и запросы уходили бы впустую.
+              onJumpEnd: _fetchVisible,
+            ),
+          ),
+        ]);
       }),
     );
   }
@@ -698,7 +817,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
       onTap: () => _open(i),
       child: ThumbImage(
         sha: item.sha256!,
-        size: _cell,
+        // Сторона — фактическая ячейка, а не желаемая ширина: иначе картинка окажется меньше
+        // клетки и по краям останется полоса фона.
+        size: _cellSide.value,
         // Без скругления: клетка сетки была квадратной и до появления локального хранилища,
         // менять вид списка эта правка не должна.
         radius: 0,
