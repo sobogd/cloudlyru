@@ -317,6 +317,20 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
     final linkedCloudIds = ref.watch(
       syncControllerProvider.select((c) => c.linkedCloudIds),
     );
+    // Синхронизация закончила круг — перечитываем открытую папку.
+    //
+    // Файл, который только что приехал из облака, должен появиться в списке сам: иначе
+    // синхронизация выглядит неработающей, пока человек не догадается потянуть список вниз.
+    // Слушаем именно конец круга (`finishedAt`), а не ход работы: во время прохода состояние
+    // меняется десятки раз, и перечитывать папку на каждое изменение значило бы слать запрос
+    // на каждый файл. Мгновенный режим двигает эту метку и на догоне журнала — то есть после
+    // каждой правки из веба.
+    ref.listen<int>(
+      syncControllerProvider.select((c) => c.mirrorStatus.finishedAt),
+      (was, now) {
+        if (now != 0 && now != was) unawaited(_load());
+      },
+    );
     return Scaffold(
       appBar: AppBar(
         title: Text(

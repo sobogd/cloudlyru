@@ -395,30 +395,16 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Живые корни зеркал устройств пользователя (без побочных эффектов; для гардов).
-   * Только не отозванные токены: отозванный токен клиенту уже не выдан, папку с его именем
-   * пользователь иначе не смог бы ни удалить, ни переименовать — и не увидел бы почему.
-   */
-  async deviceRootIdsOrNull(userId: string): Promise<string[]> {
-    const tokens = await this.prisma.apiToken.findMany({
-      where: { userId, revokedAt: null, mirrorFolderId: { not: null } },
-      select: { mirrorFolderId: true },
-    });
-    const ids = tokens.map((t) => t.mirrorFolderId).filter((id): id is string => Boolean(id));
-    if (!ids.length) return [];
-    const alive = await this.prisma.folder.findMany({
-      where: { id: { in: ids }, deletedAt: null },
-      select: { id: true },
-    });
-    return alive.map((f) => f.id);
-  }
-
-  /**
-   * Папки, которые нельзя удалять, переименовывать и переносить: корень пользователя, «Фото»,
-   * «Почта» и корни зеркал устройств. «Телефона» в списке больше нет: он превратился в
-   * легаси-папку, которую владелец вправе удалить. Собрано одним методом намеренно: пока
-   * гарды в Folders и Dav проверяли папки по отдельности, новую системную папку забывали
-   * защитить в одном из мест — и клиент терял адресацию.
+   * Папки, которые нельзя удалять, переименовывать и переносить: корень пользователя, «Фото»
+   * и «Почта». Собрано одним методом намеренно: пока гарды в Folders и Dav проверяли папки
+   * по отдельности, новую системную папку забывали защитить в одном из мест — и клиент терял
+   * адресацию.
+   *
+   * Папок, которые заводил сервер для синхронизации, в списке больше нет: прежний корень
+   * зеркала устройства (`‹Имя устройства› - Файлы`) и легаси-«Телефон» — обычные папки, и
+   * владелец вправе их удалить. Приложение их больше не заводит: что с чем синхронизировать,
+   * оно спрашивает связками (см. ApiToken.mirrorFolderId — поле читается только для прежних
+   * сборок клиента).
    */
   async protectedFolderIds(userId: string): Promise<Set<string>> {
     const user = await this.prisma.user.findUnique({
@@ -436,7 +422,6 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
       });
       for (const f of alive) ids.add(f.id);
     }
-    for (const id of await this.deviceRootIdsOrNull(userId)) ids.add(id);
     return ids;
   }
 
