@@ -237,7 +237,9 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   /// Строка состояния внизу окна: загрузка страницы или причина сбоя с кнопкой повтора.
   ///
   /// Она нужна именно строкой, а не всплывающей подсказкой: сбой догрузки — это не событие,
-  /// а состояние, и человек должен видеть и причину, и способ её пережить.
+  /// а состояние, и человек должен видеть и причину, и способ её пережить. Причина показывается
+  /// текстом ошибки: без неё «не загрузилось» неотличимо от «сеть отвалилась» и «сервер
+  /// ответил отказом», а это разные поводы что-то делать.
   Widget _noteRow(GalleryController c, GalleryRow row) {
     final failed = c.error != null;
     return SizedBox(
@@ -248,8 +250,11 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
                 onPressed: c.retry,
                 icon: const Icon(Icons.refresh, size: 16, color: C.fg2),
                 label: Text(
-                  'Не загрузилось — повторить',
-                  style: const TextStyle(color: C.fg2, fontSize: 13),
+                  'Не загрузилось (${row.note}) — повторить',
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: C.fg2, fontSize: 12),
                 ),
               )
             : Row(

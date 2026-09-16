@@ -57,8 +57,8 @@ class GalleryGrid {
   /// Высота строки-заголовка месяца вместе с отступом.
   static const double headerHeight = 34.0;
 
-  /// Высота строки состояния внизу окна (загрузка или сбой).
-  static const double noteHeight = 52.0;
+  /// Высота строки состояния внизу окна: в две строки текста — причина сбоя бывает длинной.
+  static const double noteHeight = 60.0;
 
   /// Сторона клетки при ширине сетки [width]: экран минус шкала и зазоры, поделённый на колонки.
   static double cellSide(double width) => (width - (columns + 1) * gap) / columns;
