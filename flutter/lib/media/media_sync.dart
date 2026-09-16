@@ -86,6 +86,13 @@ class MediaFeedSync {
     if (_busy) return;
     _busy = true;
     try {
+      // Не чаще раза в полминуты: экран открывают и закрывают часто, а список за это время
+      // не меняется. Полный проход при этом не «откладывается» — он случается, когда он
+      // действительно нужен (пустой список или расхождение в числе кадров).
+      final last = DateTime.tryParse(await store.meta(MediaFeedStore.keySyncAt) ?? '');
+      final now = DateTime.now().toUtc();
+      if (last != null && now.difference(last) < const Duration(seconds: 30)) return;
+      await store.setMeta(MediaFeedStore.keySyncAt, now.toIso8601String());
       final local = await store.count();
       if (local == 0) {
         await syncFull();
@@ -111,10 +118,11 @@ class MediaFeedSync {
 
   /// Полный проход: перечитать ленту и заменить список.
   ///
-  /// Все страницы собираются в память и записываются ОДНОЙ транзакцией. Раньше первая страница
-  /// заменяла список, а остальные дописывались: оборванный проход (свернули приложение, сеть
-  /// отвалилась) оставлял в базе усечённый список — лента выглядела короче, чем на сервере,
-  /// а внизу показывала пустоту.
+  /// Страницы пишутся сразу, короткими транзакциями, и помечаются новым поколением; строки
+  /// прежних поколений снимаются в самом конце. Так список никогда не бывает усечённым (в базе
+  /// всегда либо полный прежний набор, либо полный новый), а база не блокируется на минуты
+  /// одной гигантской транзакцией — иначе во время прохода лента не могла прочитать даже своё
+  /// окно: плитки оставались серыми и не нажимались.
   ///
   /// Курсор журнала берётся **до** прохода: изменения, случившиеся во время чтения, останутся
   /// в журнале после этой отметки и будут догнаны следующим [syncChanges].
@@ -123,20 +131,23 @@ class MediaFeedSync {
     final head = await _head();
     final total = await api.mediaCount();
     progress.value = MediaSyncProgress(scanned: 0, total: total, running: true);
-    final all = <MediaItem>[];
+    var scanned = 0;
+    await store.beginGeneration();
     try {
       for (var offset = 0; offset < total; offset += _page) {
         final page = await api.mediaRange(offset, _page);
         if (page.isEmpty) break;
-        all.addAll(page);
-        progress.value = MediaSyncProgress(scanned: all.length, total: total, running: true);
+        await store.upsertAll(page);
+        scanned += page.length;
+        progress.value = MediaSyncProgress(scanned: scanned, total: total, running: true);
         if (page.length < _page) break;
       }
-      await store.replaceAll(all);
+      // Снимаем строки прежних поколений: то, что на сервере уже не в медиатеке.
+      await store.dropOtherGenerations();
       if (head != null) await store.setMeta(MediaFeedStore.keyCursor, '$head');
       await store.setMeta(MediaFeedStore.keyFullSyncAt, DateTime.now().toUtc().toIso8601String());
     } finally {
-      progress.value = MediaSyncProgress(scanned: all.length, total: total, running: false);
+      progress.value = MediaSyncProgress(scanned: scanned, total: total, running: false);
     }
   }
 

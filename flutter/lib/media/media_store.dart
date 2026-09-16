@@ -19,6 +19,10 @@ import '../api/models.dart';
 /// ## `media_items` — кадры ленты
 ///
 ///   • ключ: `entry_id` (id записи в дереве облака);
+///   • `gen` — поколение полного прохода (см. [beginGeneration]): страницы прохода пишутся
+///     короткими транзакциями с новым поколением, а строки прежних поколений снимаются в
+///     конце. Так список не бывает усечённым (в базе всегда либо полный прежний набор, либо
+///     полный новый), и база не блокируется на минуты одной гигантской транзакцией;
 ///   • `sort_key` — время съёмки в миллисекундах UTC, `-1` — «без даты». Целое, а не строка:
 ///     сортировка по нему совпадает с серверной (`capturedAt DESC NULLS LAST` — отрицательный
 ///     ключ уводит кадры без даты в конец), а месяцы считаются модификатором SQLite
@@ -44,14 +48,18 @@ class MediaFeedStore {
 
   final Database _db;
 
+  /// Поколение текущего набора строк: читается при открытии и растёт на каждом полном проходе.
+  int _gen = 0;
+
   /// Имя файла базы в папке баз приложения.
   static const String _name = 'cloudly-media.db';
 
-  /// Версия схемы: 1 — `captured_at_ms` с NULL у кадров без даты, 2 — `sort_key` с -1.
+  /// Версия схемы: 1 — `captured_at_ms` с NULL у кадров без даты, 2 — `sort_key` с -1,
+  /// 3 — колонка `gen` (поколение полного прохода).
   /// Поднимая версию, добавляй ветку в `onUpgrade`, которая только создаёт или добавляет:
   /// удалять данные здесь нельзя — иначе после обновления приложения список пришлось бы
   /// заливать заново (а он нужен офлайн).
-  static const int _version = 2;
+  static const int _version = 3;
 
   /// Курсор журнала изменений: с какого `seq` продолжать догон. Отдельный от курсора зеркала —
   /// сервер курсоров не помнит, каждый потребитель ведёт свой.
@@ -59,6 +67,13 @@ class MediaFeedStore {
 
   /// Когда список последний раз собирался целиком (ISO-8601 UTC).
   static const String keyFullSyncAt = 'full_sync_at';
+
+  /// Поколение, в которое пишутся строки: растёт на каждом полном проходе.
+  static const String keyGen = 'data_gen';
+
+  /// Когда список последний раз сверялся с сервером (ISO-8601 UTC): по этой метке открытие
+  /// экрана не запускает синхронизацию чаще, чем нужно.
+  static const String keySyncAt = 'sync_at';
 
   /// Открыть базу ленты, создав её при первом запуске.
   ///
@@ -82,7 +97,8 @@ class MediaFeedStore {
             sort_key INTEGER NOT NULL,
             tz_offset_min INTEGER,
             preview_state TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL
+            size_bytes INTEGER NOT NULL,
+            gen INTEGER NOT NULL DEFAULT 0
           )
         ''');
         await db.execute('CREATE INDEX media_order ON media_items(sort_key DESC, entry_id DESC)');
@@ -93,6 +109,10 @@ class MediaFeedStore {
         await db.execute('CREATE TABLE media_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)');
       },
       onUpgrade: (db, from, to) async {
+        if (from < 3) {
+          // Поколения нужны, чтобы полный проход писал страницами, а не одной транзакцией.
+          await db.execute('ALTER TABLE media_items ADD COLUMN gen INTEGER NOT NULL DEFAULT 0');
+        }
         if (from < 2) {
           // Прежняя колонка времени переезжает в `sort_key`: у кадров без даты было NULL,
           // теперь -1 (то же место в порядке ленты — в конце).
@@ -103,7 +123,25 @@ class MediaFeedStore {
         }
       },
     );
-    return MediaFeedStore._(db);
+    final store = MediaFeedStore._(db);
+    store._gen = int.tryParse(await store.meta(keyGen) ?? '') ?? 0;
+    return store;
+  }
+
+  /// Начать новое поколение: полный проход пишет свои страницы в него.
+  ///
+  /// Строки прежних поколений снимаются [dropOtherGenerations] только после того, как прочитаны
+  /// все страницы, поэтому обрыв прохода не оставляет список усечённым: в базе лежит полный
+  /// прежний набор плюс обновлённые строки.
+  Future<int> beginGeneration() async {
+    _gen++;
+    await setMeta(keyGen, '$_gen');
+    return _gen;
+  }
+
+  /// Снять строки прежних поколений: после этого в списке ровно то, что прочитал проход.
+  Future<void> dropOtherGenerations() async {
+    await _db.delete('media_items', where: 'gen != ?', whereArgs: [_gen]);
   }
 
   /// Сколько кадров в локальном списке.
@@ -262,6 +300,9 @@ class MediaFeedStore {
         'tz_offset_min': it.tzOffsetMin,
         'preview_state': it.previewState,
         'size_bytes': it.size,
+        // Поколение ставится каждой строке: по нему полный проход в конце снимает то, что на
+        // сервере исчезло, не трогая свежие строки.
+        'gen': _gen,
       };
 
   /// Кадр ленты из строки таблицы. Время собирается обратно в ISO-8601 UTC — тот же формат,

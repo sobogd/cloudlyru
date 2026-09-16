@@ -807,7 +807,13 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   Widget _cellWidget(int i) {
     final item = _items[i];
     if (item == null) {
-      return Container(color: C.surface3);
+      // Плейсхолдер тапаемый: просмотрщик умеет ждать кадр (см. `revision`), поэтому нажатие
+      // по ещё не загруженной клетке открывает его, а не пропадает впустую. Раньше эта ветка
+      // возвращала клетку без обработчика, и по пустому окну нельзя было нажать вообще ничего.
+      return GestureDetector(
+        onTap: () => _open(i),
+        child: Container(color: C.surface3),
+      );
     }
     final isVideo = item.mime.startsWith('video/');
     final ready = item.previewState == 'done' && (item.sha256?.isNotEmpty ?? false);
