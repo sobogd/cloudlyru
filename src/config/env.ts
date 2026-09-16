@@ -139,6 +139,32 @@ const envSchema = z.object({
   // (самый щедрый из явных — 3000/мин у превью), а 0 полностью выключает дефолт и
   // оставляет только явные @RateLimit: это аварийный выход, если лимит кому-то помешает.
   RATE_LIMIT_DEFAULT_PER_MIN: z.coerce.number().int().nonnegative().default(1200),
+
+  // ===== Фактуры (раздел перенесён из отдельного сервиса iq-factura) =====
+  // Компания-эмитент. В прежнем сервисе она выбиралась из связки пользователь↔компания
+  // (`users_companies`) и могла переключаться заголовком x-company-id; здесь владелец один
+  // и компания одна, поэтому её id зафиксирован в конфиге. Пусто — фактурные ручки не смогут
+  // определить компанию, остальное облако работает как обычно.
+  FACTURA_COMPANY_ID: z.string().default(''),
+  // Бакет с PDF инвойсов и сканами расходов/деклараций. Креды и endpoint берутся общие
+  // (S3_FILES_*): проверено, что те же ключи Hetzner открывают этот бакет, а объекты в нём
+  // адресованы по companyId — поэтому перенос данных ключи не меняет.
+  S3_INVOICES_BUCKET: z.string().default('iq-factura-invoices'),
+  // Ключ Gemini: разбор сканов расходов и поданных деклараций, разбор вставленного текста
+  // в контрагента. Пусто — разбор отключается (ручки отвечают без заполненных полей),
+  // остальная работа с фактурами от него не зависит.
+  GEMINI_API_KEY: z.string().default(''),
+  // VeriFactu: disabled — ничего не делаем; local — пишем записи с хеш-цепочкой и QR, но в AEAT
+  // не отправляем; submit — ещё и отправляем. В разработке и на копии прод-данных обязан быть
+  // local или disabled: с submit тестовые инвойсы уходят в прод AEAT по реальному NIF компании.
+  VERIFACTU_MODE: z.enum(['disabled', 'local', 'submit']).default('disabled'),
+  VERIFACTU_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
+  // 32-байтный ключ (base64) шифрования сертификатов компаний (AES-256-GCM). Тот же, что был
+  // в iq-factura: иначе уже загруженный сертификат не расшифруется и отправка в AEAT встанет.
+  VERIFACTU_MASTER_KEY: z.string().default(''),
+  // Номер установки в AEAT. Пусто — берётся id компании (историческое поведение сервиса):
+  // менять его нельзя, иначе AEAT увидит новую установку.
+  VERIFACTU_INSTALLATION_ID: z.string().default(''),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -201,6 +227,22 @@ function load(): Env {
         '[env] MAIL_SYNC_ENABLED=true, но MAIL_SECRET_KEY не задан: синхронизация почты не запустится, ' +
           'аккаунты добавить нельзя. Задайте секрет репозитория MAIL_SECRET_KEY и перезапустите сервис.',
       );
+    }
+    // Фактуры проверяем только когда VeriFactu вообще включён. При `disabled` (умолчание)
+    // раздел может существовать в коде, но не быть настроенным — отказ старта тогда уронил бы
+    // всё облако ради ещё не перенесённых данных.
+    if (e.VERIFACTU_MODE !== 'disabled') {
+      const missingFactura: string[] = [];
+      if (!e.FACTURA_COMPANY_ID) missingFactura.push('FACTURA_COMPANY_ID');
+      if (!e.VERIFACTU_MASTER_KEY) missingFactura.push('VERIFACTU_MASTER_KEY');
+      if (missingFactura.length) {
+        // Без компании записи некуда привязать, без мастер-ключа не расшифруется сертификат —
+        // в обоих случаях отправка в AEAT молча не работает, а это налоговое обязательство,
+        // поэтому лучше не подняться, чем работать «вроде бы».
+        throw new Error(
+          `[env] VERIFACTU_MODE=${e.VERIFACTU_MODE} требует: ${missingFactura.join(', ')}`,
+        );
+      }
     }
   }
   return e;
