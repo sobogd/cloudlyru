@@ -20,9 +20,10 @@ import type { MailCursor } from '@prisma/client';
  * Инвариант курсора — главное правило файла: `lastUid` и `backfillFrom` не двигаются за письмо,
  * которого у нас нет. Не сохранилось письмо (отказ S3, БД, разбора) — курсор остаётся перед ним
  * и следующий проход пробует снова; чтобы одно «упрямое» письмо не блокировало новые, после
- * INGEST_MAX_TRIES попыток его пропускают, но не молча: причина уходит в лог, а счётчик
- * несохранённых писем — в статус аккаунта (`unsavedFor`). Счётчик живёт в памяти процесса:
- * переживающая перезапуск таблица неудач требует миграции, которой у этого модуля нет.
+ * INGEST_MAX_TRIES попыток его пропускают, но не молча: причина уходит в лог, а список
+ * несохранённых писем — в статус аккаунта (`unsavedFor`). Список живёт в таблице
+ * `MailIngestFailure`, а не в памяти: пропущенное письмо иначе исчезало бы из отчёта при
+ * первом же перезапуске процесса, и дырка в архиве становилась бы невидимой навсегда.
  *
  * Порядок работы по папке: сначала новое (UID-диапазон от lastUid+1), потом порция истории
  * назад по дате. Историю берём порциями, потому что у Gmail жёсткий лимит на скачивание по
@@ -153,8 +154,8 @@ const SHUTDOWN_WAIT_MS = 10_000;
  */
 const INGEST_MAX_TRIES = 3;
 
-/** Сколько несохранённых писем держим для отчёта в статусе аккаунта. */
-const UNSAVED_KEEP = 50;
+/** Сколько несохранённых писем показываем в статусе аккаунта (см. [unsavedFor]). */
+const _unsavedKeep = 50;
 
 /**
  * Потолок размера письма для IMAP-пути, МБ.
@@ -248,8 +249,6 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
   private readonly watchPending = new Set<string>();
   /** Неудачи подъёма сторожа по аккаунту: пауза растёт, чтобы не долбить сервер логинами. */
   private readonly watchFailures = new Map<string, { count: number; until: number }>();
-  /** Несохранённые письма по аккаунтам: ключ — координаты письма. */
-  private readonly unsaved = new Map<string, UnsavedLetter>();
   private timer: NodeJS.Timeout | null = null;
   private wakeTimer: NodeJS.Timeout | null = null;
   private watchRetryTimer: NodeJS.Timeout | null = null;
@@ -454,15 +453,27 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
   /**
    * Письма, которые не удалось сохранить, — для отчёта в статусе аккаунта.
    *
-   * Публичный вход, чтобы контроллер мог показать «есть несохранённые письма: N» рядом с
-   * остальным статусом (сам контроллер — не мой файл, сейчас он этого не делает).
+   * Читается из таблицы `MailIngestFailure`, а не из памяти: пропущенное письмо (курсор ушёл
+   * дальше после `INGEST_MAX_TRIES` попыток) иначе исчезало бы из отчёта при первом же
+   * перезапуске процесса, и дырка в архиве оставалась бы невидимой. Записи старше
+   * [_unsavedKeep] не показываем: отчёт нужен про свежие неудачи, а не про всю историю,
+   * и таблица не растёт без предела.
    */
-  unsavedFor(accountId: string): UnsavedLetter[] {
-    const out: UnsavedLetter[] = [];
-    for (const [key, item] of this.unsaved) {
-      if (key.startsWith(`${accountId}|`)) out.push(item);
-    }
-    return out;
+  async unsavedFor(accountId: string): Promise<UnsavedLetter[]> {
+    const rows = await this.prisma.mailIngestFailure.findMany({
+      where: { accountId },
+      orderBy: { lastAt: 'desc' },
+      take: _unsavedKeep,
+    });
+    return rows.map((r) => ({
+      folderPath: r.folderPath,
+      uid: Number(r.uid),
+      uidValidity: r.uidValidity,
+      tries: r.tries,
+      error: r.error,
+      at: r.lastAt,
+      givenUp: r.tries >= INGEST_MAX_TRIES,
+    }));
   }
 
   private dropClient(accountId: string): void {
@@ -533,8 +544,10 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     // Несохранённые письма — это дырка в архиве, о которой иначе никто не узнает: показываем
-    // счётчик в статусе аккаунта (подробности с координатами — в логе).
-    const unsaved = this.unsavedFor(account.id).length;
+    // счётчик в статусе аккаунта (подробности с координатами — в логе). Список читается из
+    // таблицы, поэтому переживает перезапуск процесса: письмо, пропущенное после трёх попыток,
+    // не исчезает из отчёта вместе с памятью.
+    const unsaved = (await this.unsavedFor(account.id)).length;
     await this.prisma.mailAccount.update({
       where: { id: account.id },
       data: {
@@ -906,7 +919,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
               stored += 1;
               fresh.push({ folderPath: ctx.folderPath, uidValidity: ctx.uidValidity, uid: Number(msg.uid) });
             }
-            this.clearUnsaved(ctx, Number(msg.uid));
+            await this.clearUnsaved(ctx, Number(msg.uid));
           } catch (e) {
             // Инвариант курсора: за письмо, которого у нас нет, курсор не двигается. Иначе
             // письмо выпадает из архива навсегда — ни догрузка, ни бэкфилл его больше не
@@ -976,44 +989,67 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
    * Запомнить письмо, которое не удалось сохранить. Возвращает `true`, если попытки кончились
    * и курсор можно двигать дальше.
    *
-   * Счётчик попыток живёт в памяти процесса: переживающая перезапуск таблица неудач требует
-   * миграции (её у этого модуля нет). После перезапуска письмо просто получит ещё три попытки —
-   * это безопасно, курсор за ним всё равно не уходил.
+   * Попытки считаются в таблице `MailIngestFailure`, а не в памяти: письмо, пропущенное после
+   * [INGEST_MAX_TRIES], иначе исчезало бы из отчёта при первом же перезапуске процесса и дырка
+   * в архиве становилась бы невидимой. Обновление идёт по координатам письма, поэтому повторная
+   * неудача увеличивает счётчик, а не заводит вторую строку.
+   *
+   * Неудача самой записи прохода не останавливает: письмо всё равно не сохранено, а падение
+   * на учёте скрыло бы от лога настоящую причину — поэтому ошибку только логируем.
    */
   private async noteUnsaved(ctx: FolderContext, uid: number, error: string): Promise<boolean> {
-    const key = unsavedKey(ctx, uid);
-    const known = this.unsaved.get(key);
-    const item: UnsavedLetter = {
+    const key = {
+      accountId: ctx.account.id,
       folderPath: ctx.folderPath,
-      uid,
       uidValidity: ctx.uidValidity,
-      tries: (known?.tries ?? 0) + 1,
-      error,
-      at: known?.at ?? new Date(),
-      givenUp: (known?.tries ?? 0) + 1 >= INGEST_MAX_TRIES,
+      uid: BigInt(uid),
     };
-    this.unsaved.set(key, item);
-    // Ограничиваем размер: отчёт нужен про свежие неудачи, а не про всю историю.
-    while (this.unsaved.size > UNSAVED_KEEP) {
-      const oldest = this.unsaved.keys().next();
-      if (oldest.done) break;
-      this.unsaved.delete(oldest.value);
+    let tries: number;
+    try {
+      const row = await this.prisma.mailIngestFailure.upsert({
+        where: { accountId_folderPath_uidValidity_uid: key },
+        create: { ...key, tries: 1, error },
+        update: { tries: { increment: 1 }, error },
+        select: { tries: true },
+      });
+      tries = row.tries;
+    } catch (e) {
+      this.logger.warn(`${ctx.folderPath}: неудача письма ${uid} не записана — ${errorText(e, 200)}`);
+      tries = 1;
     }
-    if (item.givenUp) {
-      // Курсор пойдёт дальше, а письмо останется только в этом списке и в логе — поэтому
-      // про него пишем уровнем выше: иначе дырка в архиве никому не видна.
+    const givenUp = tries >= INGEST_MAX_TRIES;
+    if (givenUp) {
+      // Курсор пойдёт дальше, письмо больше не попадётся — поэтому пишем уровнем выше:
+      // иначе дырка в архиве никому не видна. Строка в статусе аккаунта переживёт перезапуск.
       this.logger.error(
-        `${ctx.folderPath}: письмо ${uid} не сохранено (попыток ${item.tries}) — ${error}; ` +
+        `${ctx.folderPath}: письмо ${uid} не сохранено (попыток ${tries}) — ${error}; ` +
           'письмо пропущено, его копия на сервере осталась',
       );
     }
-    return item.givenUp;
+    return givenUp;
   }
 
-  /** Письмо сохранилось — убираем его из списка несохранённых. */
-  private clearUnsaved(ctx: FolderContext, uid: number): void {
-    const key = unsavedKey(ctx, uid);
-    if (this.unsaved.has(key)) this.unsaved.delete(key);
+  /**
+   * Письмо сохранилось — снимаем запись о неудаче по тем же координатам.
+   *
+   * Удаление отсутствующей строки не ошибка: сюда попадает и обычный путь, где неудачи не было
+   * вовсе. Ошибку записи глотаем по той же причине, что и в [noteUnsaved]: сохранённое письмо
+   * важнее учёта, а лишняя строка всего лишь оставит в статусе счётчик, который снимется
+   * следующим успешным приёмом того же письма (письмо пропущенным не считается).
+   */
+  private async clearUnsaved(ctx: FolderContext, uid: number): Promise<void> {
+    try {
+      await this.prisma.mailIngestFailure.deleteMany({
+        where: {
+          accountId: ctx.account.id,
+          folderPath: ctx.folderPath,
+          uidValidity: ctx.uidValidity,
+          uid: BigInt(uid),
+        },
+      });
+    } catch (e) {
+      this.logger.warn(`${ctx.folderPath}: запись о неудаче письма ${uid} не снята — ${errorText(e, 200)}`);
+    }
   }
 
   /**
@@ -1149,7 +1185,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
         const result = await this.ingestService.ingest(item.input);
         ok = true;
         if (result === 'stored' || result === 'attachments-repaired') stored += 1;
-        this.clearUnsaved(ctx, Number(fetched.uid));
+        await this.clearUnsaved(ctx, Number(fetched.uid));
       } catch (e) {
         // Одно проблемное письмо не имеет права останавливать выгрузку: история дойдёт
         // до него ещё раз — окно поиска определяется датой, а дата неудачного письма
@@ -1314,11 +1350,6 @@ function sleep(ms: number): Promise<void> {
 /** Пустой поток писем: imapflow на пустой список UID ругается, а цикл должен просто не пойти. */
 async function* emptyStream(): AsyncGenerator<FetchMessageObject> {
   /* писем нет */
-}
-
-/** Ключ несохранённого письма: аккаунт + координаты (uid без папки и uidValidity не уникален). */
-function unsavedKey(ctx: FolderContext, uid: number): string {
-  return `${ctx.account.id}|${ctx.folderPath}|${ctx.uidValidity}|${uid}`;
 }
 
 /**

@@ -389,6 +389,7 @@ model MailAccount {
   user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   cursors     MailCursor[]
   messages    MailMessage[]
+  failures    MailIngestFailure[]
 
   @@unique([userId, email])
   @@index([userId])
@@ -414,6 +415,35 @@ model MailCursor {
 
   @@unique([accountId, imapPath])
   @@index([accountId])
+}
+
+/// Письмо, которое не удалось сохранить в облако.
+///
+/// Зачем таблица, а не память процесса: после INGEST_MAX_TRIES попыток письмо пропускают,
+/// то есть курсор уходит дальше и письмо больше не попадётся. Единственным следом остаётся
+/// строка в логе и счётчик в `MailAccount.statusError` — но счётчик, живущий в памяти,
+/// стирается первым перезапуском, и дырка в архиве становится невидимой навсегда.
+///
+/// Строка живёт до тех пор, пока письмо не сохранится (`MailSyncService.clearUnsaved`):
+/// сохранённое письмо удаляет запись по тем же координатам.
+model MailIngestFailure {
+  id          String   @id @default(uuid())
+  accountId   String
+  folderPath  String // папка источника на сервере
+  uidValidity BigInt // без неё uid не уникален: провайдер перенумеровывает папку
+  uid         BigInt
+  /// Сколько раз пробовали сохранить. По этому числу видно, письмо ещё пробуют или уже нет.
+  tries       Int      @default(1)
+  /// Причина последней неудачи: та же строка, что уходит в лог (обрезана до 200 знаков).
+  error       String
+  /// Когда письмо впервые не сохранилось и когда пытались в последний раз.
+  firstAt     DateTime @default(now())
+  lastAt      DateTime @updatedAt
+  account     MailAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  /// Координаты письма: по ним запись обновляется и снимается.
+  @@unique([accountId, folderPath, uidValidity, uid])
+  @@index([accountId, lastAt(sort: Desc)])
 }
 
 model MailMessage {
