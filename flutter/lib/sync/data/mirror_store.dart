@@ -425,25 +425,49 @@ class MirrorStore {
   ///
   /// Заменяет прежнюю строку того же пути целиком: строка описывает один слепок, а не смесь
   /// из двух выгрузок. Ошибку не глушит — без записи следующий проход зальёт файл снова.
-  Future<void> putFile(MirrorRow row) => _db.insert('files', {
-    'path': row.path,
-    'cloud_folder_id': row.cloudFolderId,
-    'entry_id': row.entryId,
-    'inode': row.inode,
-    'size': row.size,
-    'mtime': row.mtime,
-    'sha256': row.sha256,
-    'at': DateTime.now().millisecondsSinceEpoch,
-  }, conflictAlgorithm: ConflictAlgorithm.replace);
+  ///
+  /// Одной транзакцией с записью снимается чужая строка с тем же `entry_id`: инвариант таблицы
+  /// — запись облака принадлежит ровно одному пути. Из его нарушения и выросла критичная
+  /// находка ревью: строка оставалась на прежнем пути, и проход считал облачный файл
+  /// «пропавшим с телефона», удаляя только что скачанное. Дубль мог остаться и от прошлых
+  /// сборок, поэтому чистим его здесь, а не только в месте, где он заводился.
+  Future<void> putFile(MirrorRow row) => _db.transaction((txn) async {
+    if (row.entryId.isNotEmpty) {
+      await txn.delete(
+        'files',
+        where: 'entry_id = ? AND path <> ?',
+        whereArgs: [row.entryId, row.path],
+      );
+    }
+    await txn.insert('files', {
+      'path': row.path,
+      'cloud_folder_id': row.cloudFolderId,
+      'entry_id': row.entryId,
+      'inode': row.inode,
+      'size': row.size,
+      'mtime': row.mtime,
+      'sha256': row.sha256,
+      'at': DateTime.now().millisecondsSinceEpoch,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  });
 
   /// Переименование: путь меняется, запись в облаке остаётся той же.
   ///
   /// [oldPath] — прежний путь (ключ), [row] — та же запись под новым путём.
   /// Удаление и вставка идут одной транзакцией: между ними строки нет, и обрыв оставил бы
   /// файл «невыгруженным» — а он в облаке есть, и повторная заливка завела бы дубль.
+  /// Как и в [putFile], заодно снимаются чужие строки с той же записью облака: после переноса
+  /// запись обязана принадлежать новому пути ровно один раз.
   Future<void> moveFile(String oldPath, MirrorRow row) =>
       _db.transaction((txn) async {
         await txn.delete('files', where: 'path = ?', whereArgs: [oldPath]);
+        if (row.entryId.isNotEmpty) {
+          await txn.delete(
+            'files',
+            where: 'entry_id = ? AND path <> ?',
+            whereArgs: [row.entryId, row.path],
+          );
+        }
         await txn.insert('files', {
           'path': row.path,
           'cloud_folder_id': row.cloudFolderId,
