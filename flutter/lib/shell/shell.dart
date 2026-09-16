@@ -10,6 +10,7 @@ import '../features/mail/mail_screen.dart';
 import '../features/map/map_screen.dart';
 import '../features/media/media_screen.dart';
 import '../features/settings/settings_screen.dart';
+import '../factura/invoices_screen.dart';
 import '../features/trash/trash_screen.dart';
 import '../providers.dart';
 
@@ -24,7 +25,7 @@ import '../providers.dart';
 /// а в обработчике нажатия — `AppTab.values[i]`), поэтому порядок `destinations` в
 /// [_ShellState.build] обязан совпадать с порядком значений здесь, иначе подсветится и
 /// откроется не тот раздел. Число `destinations` — тоже ровно по числу значений.
-enum AppTab { files, mail, media, map, trash, settings }
+enum AppTab { files, mail, media, map, invoices, trash, settings }
 
 /// Оболочка после входа: держит выбранный раздел и нижнюю панель навигации.
 ///
@@ -110,6 +111,7 @@ class _ShellState extends ConsumerState<Shell> {
         AppTab.mail => const MailScreen(),
         AppTab.media => const MediaScreen(),
         AppTab.map => const MapScreen(),
+        AppTab.invoices => const InvoicesScreen(),
         AppTab.trash => const TrashScreen(),
         AppTab.settings => const SettingsScreen(),
       });
@@ -150,6 +152,10 @@ class _ShellState extends ConsumerState<Shell> {
           NavigationDestination(icon: Icon(Icons.mail_outline), selectedIcon: Icon(Icons.mail), label: 'Почта'),
           NavigationDestination(icon: Icon(Icons.photo_library_outlined), selectedIcon: Icon(Icons.photo_library), label: 'Медиа'),
           NavigationDestination(icon: Icon(Icons.map_outlined), selectedIcon: Icon(Icons.map), label: 'Карта'),
+          // «Фактуры» — раздел, перенесённый из отдельного сервиса iq-factura: выставление
+          // инвойсов, расходы и квартальные декларации. Стоит рядом с «Картой», потому что
+          // это такая же отдельная зона приложения, а не часть файлов.
+          NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: 'Фактуры'),
           NavigationDestination(icon: Icon(Icons.delete_outline), selectedIcon: Icon(Icons.delete), label: 'Корзина'),
           NavigationDestination(icon: Icon(Icons.settings_outlined), selectedIcon: Icon(Icons.settings), label: 'Настройки'),
         ],
