@@ -8,6 +8,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import 'app_state.dart';
+import 'media/media_store.dart';
+import 'media/media_sync.dart';
 import 'media/thumb_cache.dart';
 import 'media/thumb_store.dart';
 import 'storage/settings.dart';
@@ -93,4 +95,21 @@ final syncControllerProvider = ChangeNotifierProvider<SyncController>((ref) {
 final thumbCacheProvider = FutureProvider<ThumbCache>((ref) async {
   final store = await ThumbStore.open();
   return ThumbCache(store: store, apiOf: () => ref.read(appStateProvider).api);
+});
+
+/// Локальный список ленты «Медиа» и его синхронизация с сервером.
+///
+/// Список лежит в своей базе (`cloudly-media.db`) и читается с диска, поэтому открытие раздела
+/// не зависит от сети: с сервером сверяемся журналом изменений, а полный проход делается только
+/// когда список пуст или журнал этого требует.
+///
+/// Журнал приходит по device-токену ([SyncController.api]), а лента — по веб-сессии: два разных
+/// доступа к одному аккаунту, и оба уже есть у приложения.
+final mediaFeedProvider = FutureProvider<MediaFeedSync>((ref) async {
+  final store = await MediaFeedStore.open();
+  return MediaFeedSync(
+    store: store,
+    apiOf: () => ref.read(appStateProvider).api,
+    changesApiOf: () => ref.read(syncControllerProvider).api,
+  );
 });

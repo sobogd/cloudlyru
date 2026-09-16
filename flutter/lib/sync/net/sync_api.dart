@@ -114,6 +114,7 @@ class CloudChange {
     this.mime,
     this.clientMtime,
     this.deviceId,
+    this.zone,
   });
 
   final int seq;
@@ -135,6 +136,13 @@ class CloudChange {
 
   /// какое устройство сделало изменение; null — изменение из веба или от сервера
   final String? deviceId;
+
+  /// Зона, в которой лежит цель (`PHOTOS`, `FILES`, `MAIL`); null — сервер её не прислал.
+  ///
+  /// Зеркалу зона не нужна (оно работает с папками), а ленте «Медиа» — нужна: по ней она
+  /// понимает, касается ли правка её списка, и не гоняет полный проход из-за заливки
+  /// обычного файла в «Файлы».
+  final String? zone;
 }
 
 /// Страница журнала: `hasMore` — догонять сразу, не дожидаясь следующего прохода.
@@ -424,6 +432,7 @@ class SyncApi {
           mime: _sOrNull(m['mime']),
           clientMtime: _isoOrNull(m['clientMtime']),
           deviceId: _sOrNull(m['deviceId']),
+          zone: _sOrNull(m['zone']),
         );
       }).toList(),
     );

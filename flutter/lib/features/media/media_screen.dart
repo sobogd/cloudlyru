@@ -12,6 +12,7 @@ import 'package:video_player/video_player.dart';
 
 import '../../api/cloudly_api.dart';
 import '../../api/models.dart';
+import '../../media/media_sync.dart';
 import '../../media/thumb_image.dart';
 import '../../providers.dart';
 import '../../theme.dart';
@@ -133,6 +134,16 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   Timer? _statusTimer;
   /// Сколько раз статус каждого кадра уже спрашивали: `entryId` → число попыток.
   final Map<String, int> _statusTries = {};
+  /// Локальный список ленты: из него читаются окна, а с сервером он сверяется журналом.
+  ///
+  /// `null` до первой загрузки: пока хранилище открывается (чтение каталога баз), лента
+  /// показывает спиннер — как и раньше, пока не придёт `mediaCount`.
+  MediaFeedSync? _feed;
+
+  /// Синхронизация идёт прямо сейчас: по этому признаку в шапке показывается полоса прогрева
+  /// (список наполняется с сервера — на первом запуске это десятки секунд).
+  bool _syncing = false;
+
   /// Сигнал открытому просмотрщику, что кадры подгрузились.
   ///
   /// Контракт: инкрементит только владелец ленты — здесь после каждой страницы `mediaRange`
@@ -174,33 +185,74 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   /// как «медиа нет».
   /// Побочно: `_loaded`, `_total`, `_months`, затем `_fetchVisible` и `_updateMonth`.
   Future<void> _load() async {
-    final api = ref.read(appStateProvider).api;
+    final feed = await ref.read(mediaFeedProvider.future);
+    if (!mounted) return;
+    _feed = feed;
     try {
-      final n = await api.mediaCount();
-      // Пояс передаём свой: бакет месяца сервер считает как `capturedAt + tz`, иначе кадр,
-      // снятый вечером последнего числа, уезжает в следующий месяц. В подписи просмотрщика
-      // при этом показывается пояс САМОГО снимка (`tzOffsetMin` кадра) — для фото из другой
-      // поездки эти два пояса расходятся, и это осознанно: бакет один на всю ленту, а подпись
-      // у каждого кадра своя.
-      final m = await api.mediaMonths(
-        tzOffsetMin: DateTime.now().timeZoneOffset.inMinutes,
-      );
-      if (mounted) {
-        setState(() {
-          _total.value = n;
-          _months = m;
-          _loaded = true;
-        });
-      }
+      // Список читается с диска: ни сети, ни ожидания — на экране сразу то, что уже есть
+      // на телефоне. Пояс передаём свой: бакет месяца считается как `capturedAt + tz`, иначе
+      // кадр, снятый вечером последнего числа, уезжает в следующий месяц. В подписи
+      // просмотрщика при этом показывается пояс САМОГО снимка (`tzOffsetMin` кадра) — для фото
+      // из другой поездки эти два пояса расходятся, и это осознанно: бакет один на всю ленту,
+      // а подпись у каждого кадра своя.
+      await _reloadFromStore();
       // После кадра: к этому моменту сетка уже посчитала колонки и привязала скролл.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _fetchVisible();
         _updateMonth();
       });
+      unawaited(_syncWithServer(feed));
     } catch (e) {
       if (mounted) snack(context, e.toString());
     }
+  }
+
+  /// Перечитать счётчик, месяцы и уже загруженные кадры из локального списка.
+  ///
+  /// Нужен и после синхронизации: список на диске изменился (появились новые кадры, ушли
+  /// удалённые), а на экране остались прежние числа и прежние кадры в кэше по индексам.
+  Future<void> _reloadFromStore() async {
+    final feed = _feed;
+    if (feed == null) return;
+    final n = await feed.store.count();
+    final m = await feed.store.months(tzOffsetMin: DateTime.now().timeZoneOffset.inMinutes);
+    if (!mounted) return;
+    setState(() {
+      _total.value = n;
+      _months = m;
+      _loaded = true;
+      // Кадры перечитываются заново: после полного прохода индексы кадров могли сдвинуться.
+      _items.clear();
+    });
+  }
+
+  /// Сверить список с сервером и показать это в шапке, если идёт полный проход.
+  ///
+  /// Догон журнала занимает мгновения и в интерфейсе не показывается; полный проход читает
+  /// десятки страниц — на нём полоса прогрева уместна, иначе экран выглядел бы зависшим.
+  Future<void> _syncWithServer(MediaFeedSync feed) async {
+    feed.progress.addListener(_onSyncProgress);
+    // Слушатель снимается до выхода из метода при любом исходе, но сам разбор результата —
+    // уже за `try`: возврат из `finally` заглушил бы исключение синхронизации, а оно должно
+    // быть видно в отладке (список при этом остаётся тем, что уже лежит на диске).
+    try {
+      await feed.sync();
+    } finally {
+      feed.progress.removeListener(_onSyncProgress);
+    }
+    if (!mounted) return;
+    await _reloadFromStore();
+    if (!mounted) return;
+    setState(() => _syncing = false);
+    _fetchVisible();
+    _updateMonth();
+  }
+
+  /// Перерисовать полосу прогрева при изменении хода синхронизации.
+  void _onSyncProgress() {
+    final running = _feed?.progress.value?.running ?? false;
+    if (mounted && running != _syncing) setState(() => _syncing = running);
   }
 
   /// Ставит задержку перед загрузкой окна и сразу обновляет месяц в заголовке.
@@ -315,8 +367,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     }
     final range = _visibleRange();
     if (range == null) return;
+    final feed = _feed;
+    if (feed == null) return;
     final (start, end) = range;
-    final api = ref.read(appStateProvider).api;
     _fetching = true;
     try {
       // догрузить только недостающие куски
@@ -335,7 +388,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
         for (var off = s; off <= e; off += _rangeChunk) {
           final len = math.min(_rangeChunk, e - off + 1);
           try {
-            final page = await api.mediaRange(off, len);
+            // Окно читается из локального списка: это запрос к SQLite, а не к серверу,
+            // поэтому прокрутка не зависит от сети (данные догоняются синхронизацией).
+            final page = await feed.store.range(off, len);
             if (!mounted) return;
             setState(() {
               // Ключ — абсолютный индекс кадра в ленте, а не порядок прихода: страницы могут
@@ -415,6 +470,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
       final states = await ref.read(appStateProvider).api.mediaStatus(ids);
       if (!mounted) return;
       final by = {for (final st in states) st.entryId: st};
+      // Изменения пишутся и в локальный список: иначе после перезапуска приложения плитки
+      // снова показывали бы «превью не готово» там, где оно уже собрано на сервере.
+      final persist = <String, String>{};
       setState(() {
         for (final id in ids) {
           _statusTries[id] = (_statusTries[id] ?? 0) + 1;
@@ -423,10 +481,14 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
           if (st.previewState != 'done' && st.previewState != 'impossible') unresolved = true;
           final i = at[id]!;
           final it = _items[i];
-          if (it == null || it.entryId != id || it.previewState == st.previewState) continue;
-          _items[i] = _withPreviewState(it, st);
+          if (it == null || it.entryId != id) continue;
+          if (it.previewState != st.previewState) {
+            _items[i] = _withPreviewState(it, st);
+            persist[id] = st.previewState;
+          }
         }
       });
+      if (persist.isNotEmpty) await _feed?.store.setPreviewStates(persist);
     } catch (e) {
       // Как и у страниц ленты: неудачный опрос — не повод падать, следующий скролл запустит
       // его снова.
@@ -502,6 +564,10 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     if (!mounted) return;
     final t = _total.value;
     if (t == 0) return;
+    // Из локального списка кадр убираем сразу: иначе он вернулся бы на своё место после
+    // следующей синхронизации (и занял бы чужой индекс, сдвинув остальные).
+    final removed = _items[index];
+    if (removed != null) unawaited(_feed?.store.removeEntries([removed.entryId]) ?? Future.value());
     setState(() {
       // сдвиг индексов: удалённый уходит, следующие смещаются на единицу
       final next = <int, MediaItem>{};
@@ -522,6 +588,19 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
       backgroundColor: C.canvas,
       appBar: AppBar(
         title: Text(_month, style: const TextStyle(color: C.fg, fontSize: 17)),
+        // Полоса прогрева появляется только на полном проходе (первый запуск, сброс журнала,
+        // переносы): догон журнала мгновенный, и мигающая полоса на нём только мешала бы.
+        bottom: _syncing
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(3),
+                child: LinearProgressIndicator(
+                  value: _feed?.progress.value?.fraction,
+                  backgroundColor: C.surface3,
+                  color: C.accent,
+                  minHeight: 3,
+                ),
+              )
+            : null,
       ),
       body: LayoutBuilder(builder: (context, c) {
         // Число колонок считается прямо в раскладке: от него зависят индексы кадров, поэтому
@@ -533,6 +612,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
         if (!_loaded) return const Center(child: CircularProgressIndicator());
         final t = _total.value;
         if (t == 0) {
+          // Пусто при идущей синхронизации — это ещё не «медиа нет»: список наполняется
+          // с сервера, и спиннер честнее надписи про пустой раздел.
+          if (_syncing) return const Center(child: CircularProgressIndicator());
           return const Center(child: Text('Здесь появятся фото и видео из раздела «Фото»', style: TextStyle(color: C.fg3)));
         }
         return GridView.builder(
