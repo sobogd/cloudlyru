@@ -118,7 +118,13 @@ export class MediaController {
           MediaService.legacyPhotoFull2048Key(sha),
           MediaService.legacyPhotoFullWebpKey(sha),
         ]
-      : [MediaService.gridKey(sha)];
+      : [
+          // Сетка: сначала текущий AVIF, затем прежний WebP — пока библиотека не пересобрана
+          // (`scripts/rebuild-grid.mjs`), под легаси-ключом лежит единственное рабочее
+          // превью этого кадра, и отдавать вместо него 404 нельзя.
+          MediaService.gridKey(sha),
+          MediaService.legacyGridKey(sha),
+        ];
     const sent = await sendFirstExisting(
       req,
       res,

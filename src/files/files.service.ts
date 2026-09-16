@@ -7,7 +7,7 @@ import { hasUsefulRaw, mediaKindOf, MediaService } from '../media/media.service'
 import { AuthService, ROOT_FOLDER_NAME } from '../auth/auth.service';
 import { ChangesService } from '../sync/changes.service';
 import { QueueService } from '../queue/queue.service';
-import { safeInlineImageMime, sendObjectOr404 } from '../common/http-object';
+import { safeInlineImageMime, sendFirstExisting, sendObjectOr404 } from '../common/http-object';
 import { normalizeMime } from '../common/mime';
 import { assertSafeName, parseOptionalDate } from '../common/utils';
 import { ZONE_PHOTOS, isHiddenZone, zoneOf } from '../common/zones';
@@ -736,6 +736,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
           MediaService.legacyPhotoFull2048Key(sha),
           MediaService.legacyPhotoFullWebpKey(sha),
           MediaService.gridKey(sha),
+          MediaService.legacyGridKey(sha),
         ];
     for (const key of fallback) {
       if (await this.s3.headObject(key).catch(() => false)) {
@@ -827,31 +828,45 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
    * Одна ручка на все типы, потому что в списке известен только id записи, а не sha256.
    * Нет превью (задача ещё идёт или упала) — 404, клиент показывает иконку.
    */
+  /**
+   * Миниатюра для списка файлов (квадрат GRID_SIZE×GRID_SIZE): производные, собранные
+   * очередью, а не оригинал.
+   *
+   * Одна ручка на все типы, потому что в списке известен только id записи, а не sha256.
+   * Нет превью (задача ещё идёт или упала) — 404, клиент показывает иконку.
+   *
+   * Кандидаты перебираются во время отдачи (`sendFirstExisting`), а не через `headObject`:
+   * список файлов спрашивает миниатюру на каждую строку, и лишний round-trip к S3 на каждую
+   * из них — это ровно та задержка, которую видно при прокрутке. Порядок — «текущий формат,
+   * потом прежний»: под легаси-ключом лежит рабочее превью, пока библиотека не пересобрана,
+   * и отдавать вместо него 404 нельзя.
+   */
   async thumb(entryId: string, userId: string, req: Request, res: Response): Promise<void> {
     const entry = await this.requireOwnEntry(entryId, userId);
-    // Превью нет (задача ещё идёт, упала или собрать нечего) — отвечаем сразу, без похода в S3:
-    // список файлов запрашивает миниатюру на каждую строку.
     if (entry.asset.previewState !== 'done') {
       res.status(404).end();
       return;
     }
     const sha = entry.asset.sha256;
     const isVideo = String(entry.asset.mime).startsWith('video/');
-    // у видео миниатюра — постер, у фото и PDF — превью для сетки
+    // У видео миниатюра — постер, у фото и PDF — превью для сетки. Постер пока WebP: его
+    // собирает ffmpeg, и перевод на AVIF — отдельная правка конвейера видео.
     const candidates = isVideo
-      ? [MediaService.videoPosterKey(sha), MediaService.gridKey(sha)]
-      : [MediaService.gridKey(sha)];
-    for (const key of candidates) {
-      if (await this.s3.headObject(key).catch(() => false)) {
-        return sendObjectOr404(req, res, this.s3, key, {
-          mime: 'image/webp',
-          disposition: 'inline',
-          // ключ = sha256, содержимое неизменяемо: кэширует только браузер пользователя
-          cache: 'private, max-age=600',
-        });
-      }
-    }
-    res.status(404).end();
+      ? [
+          { key: MediaService.videoPosterKey(sha), mime: 'image/webp' },
+          { key: MediaService.gridKey(sha), mime: 'image/avif' },
+          { key: MediaService.legacyGridKey(sha), mime: 'image/webp' },
+        ]
+      : [
+          { key: MediaService.gridKey(sha), mime: 'image/avif' },
+          { key: MediaService.legacyGridKey(sha), mime: 'image/webp' },
+        ];
+    const sent = await sendFirstExisting(req, res, this.s3, candidates, {
+      disposition: 'inline',
+      // ключ = sha256, содержимое неизменяемо: кэширует только браузер пользователя
+      cache: 'private, max-age=600',
+    });
+    if (!sent) res.status(404).end();
   }
 
   async softDelete(entryId: string, userId: string) {

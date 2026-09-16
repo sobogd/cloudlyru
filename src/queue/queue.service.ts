@@ -9,6 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import {
   FULL_SIZE,
+  GRID_QUALITY,
   GRID_SIZE,
   MediaService,
   PDF_PAGES_PER_JOB,
@@ -893,13 +894,14 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     // в браузере, а ICC в AVIF нельзя добавить постфактум (exiftool умеет только
     // заменять уже существующий блок). EXIF в превью не нужен — метаданные живут
     // в оригинале; ориентация уже запечена в пиксели через rotate().
-    // Превью для списка — квадрат GRID_SIZE×GRID_SIZE: в сетке оно показывается
-    // не крупнее 50 px, поэтому кадрируем по центру (fit: cover) вместо «ширины 512».
+    // Превью для списка — квадрат GRID_SIZE×GRID_SIZE в AVIF: единый формат со полным
+    // превью, и при том же качестве легче WebP. В клетке оно показывается не крупнее
+    // 50 dp, поэтому кадрируем по центру (fit: cover) вместо «ширины 512».
     const grid = await base
       .clone()
       .keepIccProfile()
       .resize({ width: GRID_SIZE, height: GRID_SIZE, fit: 'cover', withoutEnlargement: true })
-      .webp({ quality: 78 })
+      .avif({ quality: GRID_QUALITY })
       .toBuffer();
 
     // Анимированный источник (GIF/WebP): полноэкранное превью оставляем анимированным
@@ -922,11 +924,11 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
           .toBuffer();
 
     await Promise.all([
-      this.s3.putObject(MediaService.gridKey(sha), grid, 'image/webp'),
+      this.s3.putObject(MediaService.gridKey(sha), grid, 'image/avif'),
       this.s3.putObject(MediaService.photoFullKey(sha), full, animated ? 'image/webp' : 'image/avif'),
     ]);
 
-    // Превью собраны: и превью списка (50×50), и полноэкранное (1080). Оптимизированного
+    // Превью собраны: и превью списка (квадрат GRID_SIZE), и полноэкранное (1080). Оптимизированного
     // мастера нет — оригинал и есть мастер, он отдаётся как есть.
     await this.setPreviewState(job.assetId, 'done', null);
     return animated ? { keepRaw: true } : {};
@@ -1058,7 +1060,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
         .webp({ quality: 78 })
         .toBuffer();
       await this.s3.putObject(MediaService.pdfPageKey(sha, page), webp, 'image/webp');
-      if (page === 1) await this.s3.putObject(MediaService.gridKey(sha), await this.pdfGrid(png), 'image/webp');
+      if (page === 1) await this.s3.putObject(MediaService.gridKey(sha), await this.pdfGrid(png), 'image/avif');
       rmSync(png, { force: true });
       rendered++;
     }
@@ -1081,7 +1083,7 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     return sharp(pagePng, SHARP_IN)
       .resize({ width: GRID_SIZE, height: GRID_SIZE, fit: 'contain', background: '#ffffff', withoutEnlargement: true })
       .flatten({ background: '#ffffff' })
-      .webp({ quality: 78 })
+      .avif({ quality: GRID_QUALITY })
       .toBuffer();
   }
 
