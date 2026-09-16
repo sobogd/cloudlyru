@@ -355,6 +355,41 @@ class FacturaApi {
     return rows.map(ContactView.fromJson).toList();
   }
 
+  /// Создаёт контрагента.
+  Future<ContactView> createContact(Map<String, dynamic> body) async {
+    final json = await _json('POST', '/contacts', body: body);
+    return ContactView.fromJson(json);
+  }
+
+  /// Правит контрагента.
+  Future<ContactView> updateContact(String id, Map<String, dynamic> body) async {
+    final json = await _json('PATCH', '/contacts/$id', body: body);
+    return ContactView.fromJson(json);
+  }
+
+  /// Архивирует контрагента (сервер помечает `archivedAt`, строка остаётся в базе).
+  Future<void> deleteContact(String id) => _json('DELETE', '/contacts/$id');
+
+  /// Разбирает вставленный текст (реквизиты из письма или счёта) в поля контрагента.
+  ///
+  /// Разбор делает сервер через Gemini; пустой ответ означает, что модель ничего не разобрала,
+  /// и это не ошибка — человек заполнит поля руками.
+  Future<ParsedContactDraft> parseContactText(String text) async {
+    final json = await _json('POST', '/contacts/parse', body: {'text': text});
+    return ParsedContactDraft.fromJson(json);
+  }
+
+  /// Создаёт банковский счёт.
+  Future<void> createBankAccount(Map<String, dynamic> body) =>
+      _json('POST', '/bank-accounts', body: body);
+
+  /// Правит банковский счёт.
+  Future<void> updateBankAccount(String id, Map<String, dynamic> body) =>
+      _json('PATCH', '/bank-accounts/$id', body: body);
+
+  /// Удаляет банковский счёт.
+  Future<void> deleteBankAccount(String id) => _json('DELETE', '/bank-accounts/$id');
+
   /// Банковские счета компании.
   Future<List<BankAccountView>> listBankAccounts() async {
     final rows = await _list('/bank-accounts');

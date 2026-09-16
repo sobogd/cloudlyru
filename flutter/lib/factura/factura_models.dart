@@ -328,8 +328,13 @@ class ContactView {
     required this.currency,
     required this.email,
     required this.addressLine1,
+    required this.addressLine2,
     required this.city,
     required this.postalCode,
+    required this.region,
+    required this.notes,
+    required this.nature,
+    required this.esNoIva,
     required this.isEu,
   });
 
@@ -347,8 +352,17 @@ class ContactView {
 
   final String? email;
   final String? addressLine1;
+  final String? addressLine2;
   final String? city;
   final String? postalCode;
+  final String? region;
+  final String? notes;
+
+  /// `service` | `goods` — влияет на clave в форме 349.
+  final String? nature;
+
+  /// Клиент на Канарах / Сеуте / Мелилье: Испания, но вне зоны НДС.
+  final bool esNoIva;
 
   /// Признак intracomunitario — влияет на оговорку об обратном начислении НДС.
   final bool isEu;
@@ -362,8 +376,13 @@ class ContactView {
         currency: _str(json['currency']),
         email: _str(json['email']),
         addressLine1: _str(json['addressLine1']),
+        addressLine2: _str(json['addressLine2']),
         city: _str(json['city']),
         postalCode: _str(json['postalCode']),
+        region: _str(json['region']),
+        notes: _str(json['notes']),
+        nature: _str(json['nature']),
+        esNoIva: json['esNoIva'] == true,
         isEu: json['isEu'] == true,
       );
 }
@@ -375,6 +394,7 @@ class BankAccountView {
     required this.label,
     required this.bankName,
     required this.iban,
+    required this.swift,
     required this.currency,
     required this.isDefault,
   });
@@ -383,6 +403,10 @@ class BankAccountView {
   final String label;
   final String? bankName;
   final String? iban;
+
+  /// SWIFT/BIC — печатается в PDF для платежей из-за пределов ЕС.
+  final String? swift;
+
   final String? currency;
 
   /// Счёт по умолчанию — его форма подставляет новым фактурам.
@@ -394,6 +418,7 @@ class BankAccountView {
         label: _str(json['label']) ?? '',
         bankName: _str(json['bankName']),
         iban: _str(json['iban']),
+        swift: _str(json['swift']),
         currency: _str(json['currency']),
         isDefault: json['isDefault'] == true,
       );
@@ -1078,5 +1103,44 @@ class ParsedFiledDeclarationDraft {
         submittedAt: _str(json['submittedAt']) ?? '',
         resultPaid: _num(json['resultPaid']) ?? 0,
         compensarNext: _num(json['compensarNext']) ?? 0,
+      );
+}
+
+
+/// Поля контрагента, которые сервер распознал во вставленном тексте.
+///
+/// Вставляют обычно строку реквизитов из письма или счёта: имя, NIF, адрес. Заполняется
+/// как черновик — человек проверяет и правит перед сохранением.
+class ParsedContactDraft {
+  const ParsedContactDraft({
+    required this.name,
+    required this.taxId,
+    required this.countryCode,
+    required this.email,
+    required this.addressLine1,
+    required this.city,
+    required this.postalCode,
+    required this.region,
+  });
+
+  final String name;
+  final String taxId;
+  final String countryCode;
+  final String email;
+  final String addressLine1;
+  final String city;
+  final String postalCode;
+  final String region;
+
+  /// Собирает распознанные поля; неизвестное остаётся пустым.
+  factory ParsedContactDraft.fromJson(Map<String, dynamic> json) => ParsedContactDraft(
+        name: _str(json['name']) ?? '',
+        taxId: _str(json['taxId']) ?? '',
+        countryCode: _str(json['countryCode']) ?? '',
+        email: _str(json['email']) ?? '',
+        addressLine1: _str(json['addressLine1']) ?? '',
+        city: _str(json['city']) ?? '',
+        postalCode: _str(json['postalCode']) ?? '',
+        region: _str(json['region']) ?? '',
       );
 }

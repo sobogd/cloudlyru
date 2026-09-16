@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../util/format.dart';
+import 'bank_accounts_screen.dart';
+import 'contacts_screen.dart';
 import 'declarations_screen.dart';
 import 'expenses_screen.dart';
 import 'factura_settings_screen.dart';
@@ -96,6 +98,18 @@ class _InvoicesScreenState extends ConsumerState<InvoicesScreen> {
               title: Text('Фактуры'),
               subtitle: Text('Текущий экран'),
               enabled: false,
+            ),
+            ListTile(
+              leading: const Icon(Icons.people_outline),
+              title: const Text('Контрагенты'),
+              subtitle: const Text('Справочник клиентов: NIF, страна, валюта'),
+              onTap: () => Navigator.pop(ctx, const ContactsScreen()),
+            ),
+            ListTile(
+              leading: const Icon(Icons.account_balance_outlined),
+              title: const Text('Счета'),
+              subtitle: const Text('Банковские реквизиты для PDF'),
+              onTap: () => Navigator.pop(ctx, const BankAccountsScreen()),
             ),
             ListTile(
               leading: const Icon(Icons.receipt_outlined),
