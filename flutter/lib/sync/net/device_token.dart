@@ -39,9 +39,29 @@ class DeviceTokenStore {
   /// [storage] — где лежит токен; по умолчанию системное шифрованное хранилище. Параметр
   /// нужен, чтобы подставить своё хранилище, не заводя второй такой же класс.
   DeviceTokenStore({FlutterSecureStorage? storage})
-      : _storage = storage ?? const FlutterSecureStorage();
+      : _storage = storage ?? _systemStorage();
 
   final FlutterSecureStorage _storage;
+
+  /// Шифрованное хранилище системы: связка ключей на Apple, хранилище платформы на Android.
+  ///
+  /// На macOS берётся **классическая** связка, а не «data protection»
+  /// (`usesDataProtectionKeychain: false`), и это не мелочь: data protection доступна только
+  /// приложению с настоящей подписью и правом `keychain-access-groups`, а наша сборка подписана
+  /// ad-hoc — сертификата Developer ID у неё нет. Проверено на этом маке:
+  ///
+  ///  * без права `SecItemAdd` с флагом `kSecUseDataProtectionKeychain` отвечает `-34018`
+  ///    («A required entitlement isn't present»), а без флага — `0`, то есть успех;
+  ///  * если право всё-таки вписать в ad-hoc подпись, система убивает процесс при запуске
+  ///    (проверено: `Killed: 9`) — этот путь не «правильнее», а нерабочий вовсе.
+  ///
+  /// Отсюда и бралась ошибка «токен устройства не выпущен»: обращение к хранилищу падало
+  /// раньше, чем дело доходило до сервера. Классическая связка работает без прав, но помнит,
+  /// какая сборка завела запись: после обновления приложения система может один раз спросить
+  /// разрешение на доступ к своей же записи (кнопка «Always Allow» — и больше не спросит).
+  static FlutterSecureStorage _systemStorage() => const FlutterSecureStorage(
+        mOptions: MacOsOptions(usesDataProtectionKeychain: false),
+      );
 
   /// Прочитать токен для пары «адрес сервера + логин».
   ///
