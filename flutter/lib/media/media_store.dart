@@ -19,10 +19,14 @@ import '../api/models.dart';
 /// ## `media_items` — кадры ленты
 ///
 ///   • ключ: `entry_id` (id записи в дереве облака);
-///   • `captured_at_ms` — время съёмки в миллисекундах UTC, `NULL` — «без даты». Целое, а не
-///     строка: сортировка по нему совпадает с серверной (`capturedAt DESC NULLS LAST`), а
-///     месяцы считаются модификатором SQLite `unixepoch` без разбора ISO — строку пришлось бы
-///     нормализовать, а `datetime()` с суффиксом `Z` понимают не все версии SQLite на Android;
+///   • `sort_key` — время съёмки в миллисекундах UTC, `-1` — «без даты». Целое, а не строка:
+///     сортировка по нему совпадает с серверной (`capturedAt DESC NULLS LAST` — отрицательный
+///     ключ уводит кадры без даты в конец), а месяцы считаются модификатором SQLite
+///     `unixepoch` без разбора ISO, который к тому же понимают не все версии SQLite на Android.
+///     Отдельная колонка вместо `captured_at_ms IS NULL` в сортировке нужна из-за плана
+///     запроса: выражение в `ORDER BY` не даёт использовать индекс, и SQLite читал всю таблицу
+///     с временной сортировкой на каждое окно ленты (проверено `EXPLAIN QUERY PLAN`:
+///     `SCAN media_items` + `USE TEMP B-TREE FOR ORDER BY` против `SCAN ... USING INDEX media_order`);
 ///   • `preview_state` — «есть ли у кадра превью на сервере» (`done`/`none`/`impossible`),
 ///     обновляется опросом `/media/status`; по нему плитка решает, показывать картинку или иконку;
 ///   • `size_bytes` — размер содержимого (показывается в деталях кадра).
@@ -43,10 +47,11 @@ class MediaFeedStore {
   /// Имя файла базы в папке баз приложения.
   static const String _name = 'cloudly-media.db';
 
-  /// Версия схемы. Поднимая версию, добавляй ветку в `onUpgrade`, которая только создаёт или
-  /// добавляет: удалять данные здесь нельзя — иначе после обновления приложения список
-  /// пришлось бы заливать заново (а он нужен офлайн).
-  static const int _version = 1;
+  /// Версия схемы: 1 — `captured_at_ms` с NULL у кадров без даты, 2 — `sort_key` с -1.
+  /// Поднимая версию, добавляй ветку в `onUpgrade`, которая только создаёт или добавляет:
+  /// удалять данные здесь нельзя — иначе после обновления приложения список пришлось бы
+  /// заливать заново (а он нужен офлайн).
+  static const int _version = 2;
 
   /// Курсор журнала изменений: с какого `seq` продолжать догон. Отдельный от курсора зеркала —
   /// сервер курсоров не помнит, каждый потребитель ведёт свой.
@@ -74,13 +79,13 @@ class MediaFeedStore {
             sha256 TEXT,
             name TEXT NOT NULL,
             mime TEXT NOT NULL,
-            captured_at_ms INTEGER,
+            sort_key INTEGER NOT NULL,
             tz_offset_min INTEGER,
             preview_state TEXT NOT NULL,
             size_bytes INTEGER NOT NULL
           )
         ''');
-        await db.execute('CREATE INDEX media_order ON media_items(captured_at_ms DESC, entry_id DESC)');
+        await db.execute('CREATE INDEX media_order ON media_items(sort_key DESC, entry_id DESC)');
         // Неготовые превью ищутся точечно: их единицы процентов от библиотеки.
         await db.execute('CREATE INDEX media_preview ON media_items(preview_state)');
         // Миниатюры адресуются хэшем: по нему список отдаёт, какие кадры ещё не скачаны.
@@ -88,7 +93,14 @@ class MediaFeedStore {
         await db.execute('CREATE TABLE media_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)');
       },
       onUpgrade: (db, from, to) async {
-        // Ветки добавляются сюда по мере роста версии и обязаны быть идемпотентными.
+        if (from < 2) {
+          // Прежняя колонка времени переезжает в `sort_key`: у кадров без даты было NULL,
+          // теперь -1 (то же место в порядке ленты — в конце).
+          await db.execute('ALTER TABLE media_items ADD COLUMN sort_key INTEGER NOT NULL DEFAULT -1');
+          await db.execute('UPDATE media_items SET sort_key = COALESCE(captured_at_ms, -1)');
+          await db.execute('DROP INDEX IF EXISTS media_order');
+          await db.execute('CREATE INDEX IF NOT EXISTS media_order ON media_items(sort_key DESC, entry_id DESC)');
+        }
       },
     );
     return MediaFeedStore._(db);
@@ -109,8 +121,8 @@ class MediaFeedStore {
   Future<List<MediaMonthBucket>> months({int tzOffsetMin = 0}) async {
     final shift = '${tzOffsetMin >= 0 ? '+' : '-'}${tzOffsetMin.abs()} minutes';
     final rows = await _db.rawQuery('''
-      SELECT CASE WHEN captured_at_ms IS NULL THEN NULL
-                  ELSE strftime('%Y-%m', captured_at_ms / 1000, 'unixepoch', ?) END AS month,
+      SELECT CASE WHEN sort_key < 0 THEN NULL
+                  ELSE strftime('%Y-%m', sort_key / 1000, 'unixepoch', ?) END AS month,
              count(*) AS c
       FROM media_items
       GROUP BY month
@@ -130,7 +142,7 @@ class MediaFeedStore {
   Future<List<MediaItem>> range(int offset, int limit) async {
     final rows = await _db.rawQuery('''
       SELECT * FROM media_items
-      ORDER BY captured_at_ms IS NULL, captured_at_ms DESC, entry_id DESC
+      ORDER BY sort_key DESC, entry_id DESC
       LIMIT ? OFFSET ?
     ''', [limit, offset]);
     return rows.map(_toItem).toList();
@@ -229,7 +241,9 @@ class MediaFeedStore {
         'sha256': it.sha256,
         'name': it.name,
         'mime': it.mime,
-        'captured_at_ms': it.capturedAt == null ? null : DateTime.tryParse(it.capturedAt!)?.millisecondsSinceEpoch,
+        // «Без даты» — отрицательный ключ: он меньше любой реальной даты съёмки, поэтому
+        // такие кадры оказываются в конце ленты, как и на сервере (NULLS LAST).
+        'sort_key': (it.capturedAt == null ? null : DateTime.tryParse(it.capturedAt!)?.millisecondsSinceEpoch) ?? -1,
         'tz_offset_min': it.tzOffsetMin,
         'preview_state': it.previewState,
         'size_bytes': it.size,
@@ -238,13 +252,14 @@ class MediaFeedStore {
   /// Кадр ленты из строки таблицы. Время собирается обратно в ISO-8601 UTC — тот же формат,
   /// что отдаёт сервер, чтобы просмотрщик и подписи не различали источник.
   MediaItem _toItem(Map<String, Object?> r) {
-    final ms = r['captured_at_ms'] as int?;
+    final ms = r['sort_key'] as int?;
+    final captured = (ms == null || ms < 0) ? null : ms;
     return MediaItem(
       entryId: r['entry_id'] as String,
       name: r['name'] as String,
-      capturedAt: ms == null
+      capturedAt: captured == null
           ? null
-          : DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true).toIso8601String(),
+          : DateTime.fromMillisecondsSinceEpoch(captured, isUtc: true).toIso8601String(),
       mime: r['mime'] as String,
       sha256: r['sha256'] as String?,
       previewState: r['preview_state'] as String,

@@ -59,6 +59,12 @@ const _statusPollMs = 5000;
 /// Предел попыток опроса на один кадр: 24 × 5 с — две минуты ожидания в открытом разделе.
 const _statusMaxTries = 24;
 
+/// Сколько кадров страницы прогревать миниатюрами заранее (см. `_fetchVisible`).
+///
+/// Пара экранов вперёд: больше — и фоновая очередь растёт быстрее, чем качается, а пользы
+/// нет — до дальних кадров человек дойдёт нескоро, и к тому времени они уже неактуальны.
+const _prefetchMax = 120;
+
 /// Потолок числа id в одном `/media/status` — серверный `MEDIA_STATUS_MAX = 500`
 /// (src/media-feed/media-feed.service.ts): более длинный список сервер обрежет и только
 /// предупредит об этом в логе, признака усечения в ответе нет.
@@ -401,7 +407,9 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
             // кадра ничего не стоит.
             final thumbs = ref.read(thumbCacheProvider).value;
             if (thumbs != null) {
-              for (final it in page) {
+              // Только начало страницы: страница — до 500 кадров, а держать в фоне незачем
+              // больше пары экранов вперёд. Остальное попросят плитки, когда дойдут до них.
+              for (final it in page.take(_prefetchMax)) {
                 final sha = it.sha256;
                 if (sha != null && sha.isNotEmpty && it.previewState == 'done') {
                   unawaited(thumbs.request(sha, background: true));
