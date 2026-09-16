@@ -8,6 +8,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import 'app_state.dart';
+import 'media/thumb_cache.dart';
+import 'media/thumb_store.dart';
 import 'storage/settings.dart';
 import 'sync/sync_controller.dart';
 
@@ -78,4 +80,17 @@ final syncControllerProvider = ChangeNotifierProvider<SyncController>((ref) {
   final controller = SyncController();
   ref.onDispose(controller.dispose);
   return controller;
+});
+
+/// Хранилище и очередь миниатюр галереи.
+///
+/// Открывается один раз на приложение: каталог данных читается с диска, и держать по копии
+/// на экран незачем — очередь общая, а её прогресс и счётчики должны быть одни на всех.
+///
+/// Клиент API берётся функцией, а не значением: адрес сервера и сессия меняются в рантайме
+/// (вход, выход, смена сервера в настройках), а очередь и уже скачанные миниатюры при этом
+/// пересоздавать не нужно — каждая загрузка просто берёт текущий клиент.
+final thumbCacheProvider = FutureProvider<ThumbCache>((ref) async {
+  final store = await ThumbStore.open();
+  return ThumbCache(store: store, apiOf: () => ref.read(appStateProvider).api);
 });

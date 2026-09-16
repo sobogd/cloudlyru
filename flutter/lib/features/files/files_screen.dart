@@ -10,6 +10,7 @@ import '../../providers.dart';
 import '../../theme.dart';
 import '../../upload/upload_queue.dart';
 import '../../util/format.dart';
+import '../../media/thumb_image.dart';
 import '../../util/widgets.dart';
 import 'file_detail.dart';
 import 'folder_detail.dart';
@@ -610,13 +611,23 @@ class _Thumb extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final sha = entry.sha256;
+    // Миниатюра по sha256 — из локального хранилища (оно же копит их прогревом галереи),
+    // с загрузкой через очередь приложения: одинаковый кадр в двух папках качается один раз.
+    if (sha != null && sha.isNotEmpty) {
+      return ThumbImage(
+        sha: sha,
+        size: 44,
+        radius: 8,
+        fallback: Icon(fileIcon(entry.mime), color: C.fg3),
+      );
+    }
+    // Хэша в листинге нет (папка, старый ответ сервера) — прежний путь через сервер: адрес
+    // привязан к записи, и локальному хранилищу тут нечего адресовать.
     return AuthThumb(
       api: api,
       url: api.thumbUrl(entry.id),
       size: 44,
-      // Ключ по хешу содержимого: адрес миниатюры привязан к записи, а сама картинка меняется
-      // при замене файла — без ключа на экране осталась бы прежняя миниатюра.
-      cacheKey: (sha != null && sha.isNotEmpty) ? 'thumb-$sha' : 'thumb-${entry.id}',
+      cacheKey: 'thumb-${entry.id}',
       fallback: Icon(fileIcon(entry.mime), color: C.fg3),
     );
   }

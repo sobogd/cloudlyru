@@ -8,6 +8,7 @@ import 'mail_accounts_panel.dart';
 import 'queue_errors_screen.dart';
 import 'queue_panel.dart';
 import 'sync_panel.dart';
+import 'thumbs_panel.dart';
 import 'tokens_panel.dart';
 import 'updater.dart';
 
@@ -77,6 +78,7 @@ class SettingsScreen extends ConsumerWidget {
           ),
           const TokensPanel(),
           const SyncPanel(),
+          const ThumbsPanel(),
           const UpdaterPanel(),
           QueuePanel(onErrors: () => _openQueueErrors(context)),
           const MailAccountsPanel(),

@@ -12,6 +12,7 @@ import 'package:video_player/video_player.dart';
 
 import '../../api/cloudly_api.dart';
 import '../../api/models.dart';
+import '../../media/thumb_image.dart';
 import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/download.dart';
@@ -25,11 +26,10 @@ import '../../util/widgets.dart';
 /// Поэтому значения должны совпадать с `mainAxisSpacing`/`crossAxisSpacing` в `build`.
 ///
 /// Числа — логические пиксели, а сеточное превью сервер отдаёт фиксированного размера
-/// (`GRID_SIZE = 50 px`, src/queue/queue.service.ts) и выбирает его по `w` только как «сетка
+/// (`GRID_SIZE = 100 px`, src/media/media.service.ts) и выбирает его по `w` только как «сетка
 /// или 1080» (`src/media/media.controller.ts`). На экране с DPR 3 клетка — это 150 физических
-/// пикселей, то есть картинка растягивается втрое и выглядит мыльной. Подобрать размер под
-/// DPR клиент не может: нужного размера сервер не собирает — это правка серверной части,
-/// передана её владельцу.
+/// пикселей, то есть картинка растягивается в полтора раза: подобрать размер под DPR клиент
+/// не может — нужного размера сервер не собирает.
 const _cell = 50.0;
 const _gap = 3.0;
 const _row = _cell + _gap;
@@ -518,7 +518,6 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final api = ref.read(appStateProvider).api;
     return Scaffold(
       backgroundColor: C.canvas,
       appBar: AppBar(
@@ -545,7 +544,7 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
             crossAxisSpacing: _gap,
           ),
           itemCount: t,
-          itemBuilder: (context, i) => _cellWidget(i, api),
+          itemBuilder: (context, i) => _cellWidget(i),
         );
       }),
     );
@@ -560,9 +559,14 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
   ///
   /// `previewState = 'impossible'` (файл больше лимита, тип не поддержан) показывается
   /// намеренно другой иконкой: «превью не будет никогда» и «превью ещё собирается» — разные
-  /// вещи, и по одинаковому значку пользователь не понимает, ждать ему или нет. `api` приходит
-  /// из `build`: читать провайдер на каждую клетку на каждый кадр незачем.
-  Widget _cellWidget(int i, CloudlyApi api) {
+  /// вещи, и по одинаковому значку пользователь не понимает, ждать ему или нет.
+  ///
+  /// Готовый кадр рисует [ThumbImage]: миниатюра берётся с диска, если она уже скачана
+  /// (в том числе прогревом всей библиотеки), иначе качается через очередь приложения.
+  /// Сетевой загрузки «по виджету» здесь больше нет — иначе один и тот же кадр тянулся бы
+  /// в обход хранилища, и офлайн-галерея показывала бы заглушки вместо того, что уже лежит
+  /// на телефоне.
+  Widget _cellWidget(int i) {
     final item = _items[i];
     if (item == null) {
       return Container(color: C.surface3);
@@ -586,14 +590,15 @@ class _MediaScreenState extends ConsumerState<MediaScreen> {
     }
     return GestureDetector(
       onTap: () => _open(i),
-      child: CachedNetworkImage(
-        imageUrl: api.previewUrl(item.sha256!),
-        httpHeaders: api.authHeaders,
-        fit: BoxFit.cover,
-        placeholder: (_, _) => Container(color: C.surface3),
-        errorWidget: (_, _, _) => Container(
+      child: ThumbImage(
+        sha: item.sha256!,
+        size: _cell,
+        // Без скругления: клетка сетки была квадратной и до появления локального хранилища,
+        // менять вид списка эта правка не должна.
+        radius: 0,
+        fallback: Container(
           color: C.surface3,
-          child: Icon(item.mime.startsWith('video/') ? Icons.movie_outlined : Icons.image_outlined, color: C.fg3),
+          child: Icon(isVideo ? Icons.movie_outlined : Icons.image_outlined, color: C.fg3),
         ),
       ),
     );

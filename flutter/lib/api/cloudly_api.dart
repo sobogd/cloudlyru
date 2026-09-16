@@ -623,6 +623,29 @@ class CloudlyApi {
         .toList();
   }
 
+  /// Байты превью для списка (квадрат-миниатюра) по хэшу содержимого.
+  ///
+  /// Отдельно от [previewUrl]: адрес нужен виджетам, которые умеют ходить в сеть сами
+  /// (`CachedNetworkImage`), а этот метод — локальному хранилищу миниатюр, которое качает
+  /// файл само и потом показывает его с диска. `w` — переключатель «сетка или полный экран»
+  /// (см. [previewUrl]); здесь всегда сетка, то есть `w = 512`.
+  ///
+  /// Ошибки — как у остальных ручек: 404 значит «превью для этого файла нет» (ещё не собрано,
+  /// собрать нельзя, либо чужой файл), и вызывающий обязан отличать его от сетевого сбоя:
+  /// повторять 404 бессмысленно, а сбой — нужно.
+  Future<Uint8List> previewBytes(String sha, {int w = 512, CancelToken? cancelToken}) async {
+    try {
+      final res = await _http.get<List<int>>(
+        '/previews/${Uri.encodeComponent(sha)}?w=$w',
+        cancelToken: cancelToken,
+        options: Options(responseType: ResponseType.bytes),
+      );
+      return Uint8List.fromList(res.data ?? const []);
+    } on DioException catch (e) {
+      throw _toException(e);
+    }
+  }
+
   /// Состояния сборки превью для перечисленных кадров.
   ///
   /// Нигде не вызывается: чтобы применить статусы к уже загруженным кадрам, у [MediaItem] нужен
