@@ -34,10 +34,13 @@ import type { MailCursor } from '@prisma/client';
  *
  * Свежее письмо приходит само: на каждый аккаунт держится отдельное соединение, открытое на
  * папку, через которую видно всё новое, — сервер в IDLE сам сообщает о новом письме, и мы
- * запускаем внеочередной проход. Сторожевое соединение отдельное от прохода, потому что
- * открытая под IDLE папка занята: по ней нельзя сделать выборку, не разорвав IDLE. Плановый
- * проход по расписанию остаётся страховкой на случай, когда сторож отвалился, а сервер не
- * умеет IDLE (тогда imapflow сам опрашивает папку NOOP'ом).
+ * догружаем ТОЛЬКО эту папку и только новое (`syncFresh`), своим соединением и без истории.
+ * Так письмо не ждёт ни чужой аккаунт, ни текущий проход, ни порцию истории; внеочередной
+ * проход целиком тут был ошибкой — он шёл по всем аккаунтам и всем папкам, а если проход уже
+ * шёл, событие пропадало и письмо ждало до расписания. Сторожевое соединение отдельное от
+ * выборок, потому что открытая под IDLE папка занята: по ней нельзя сделать выборку, не
+ * разорвав IDLE. Плановый проход по расписанию остаётся страховкой на случай, когда сторож
+ * отвалился, а сервер не умеет IDLE (тогда imapflow сам опрашивает папку NOOP'ом).
  *
  * Состояние аккаунта (`MailAccount.status`) принадлежит этому сервису и означает буквально
  * следующее: `syncing` — идёт проход, `idle` — проход закончился успешно, `error` — проход или
@@ -48,9 +51,9 @@ import type { MailCursor } from '@prisma/client';
  * Владение жизненным циклом и соединениями: у чистки сервера свой таймер
  * (`MailPurgeService`, MAIL_PURGE_ENABLED, каждые 5 минут) — она сознательно не ждёт приём
  * и не выключается вместе с этим сервисом, потому что её выключатель отдельный. На один
- * аккаунт одновременно живут: сторож (IDLE), соединение прохода и — пока идёт — одно
- * соединение чистки; провайдеры считают одновременные подключения, поэтому чистка свежих
- * писем берёт семафор на аккаунт, а проходное соединение не уходит в IDLE.
+ * аккаунт одновременно живут: сторож (IDLE), соединение прохода, соединение догрузки нового
+ * и — пока идёт — одно соединение чистки; провайдеры считают одновременные подключения,
+ * поэтому чистка свежих писем берёт семафор на аккаунт, а проходное соединение не уходит в IDLE.
  *
  * Восстановление после падения процесса: незавершённый проход продолжается с курсора (письма
  * перекачиваются только те, что не успели сохраниться); частично записанные вложения добирает
@@ -78,8 +81,15 @@ interface StoredRef {
   uid: number;
 }
 
-/** Задержка перед внеочередным проходом после события «появилось письмо», мс. */
-const WAKE_DEBOUNCE_MS = 3000;
+/**
+ * Задержка перед догрузкой нового после события сторожа, мс.
+ *
+ * Была 3 с — «письма приходят пачками, склеим в один проход». Платит её КАЖДОЕ письмо, а
+ * склейка почти ничего не экономит: пачку всё равно разбирает одна догрузка, потому что
+ * события, пришедшие во время неё, не теряются, а помечают папку «есть ещё» (`syncFresh`).
+ * Остаток нужен только на то, чтобы два EXISTS одной доставки не подняли две догрузки.
+ */
+const WAKE_DEBOUNCE_MS = 250;
 
 /**
  * Через сколько переустанавливать IDLE, мс.
@@ -250,8 +260,25 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
   /** Неудачи подъёма сторожа по аккаунту: пауза растёт, чтобы не долбить сервер логинами. */
   private readonly watchFailures = new Map<string, { count: number; until: number }>();
   private timer: NodeJS.Timeout | null = null;
-  private wakeTimer: NodeJS.Timeout | null = null;
+  /** Отложенные догрузки нового: свой таймер на аккаунт, поэтому медленный ящик не держит чужой. */
+  private readonly wakeTimers = new Map<string, NodeJS.Timeout>();
   private watchRetryTimer: NodeJS.Timeout | null = null;
+  /**
+   * Соединения для короткой догрузки нового — своё у каждого аккаунта, отдельно от прохода.
+   *
+   * Отдельное, а не общее с проходом: у соединения выбранной может быть только одна папка, и
+   * проход в это время сидит в своей (а история идёт по всем по очереди). Общее соединение
+   * означало бы «догрузка ждёт конца прохода» — ровно та задержка, из-за которой этот путь и
+   * появился. Живут между событиями: логин на каждом письме стоил бы секунды, а провайдеры
+   * считают одновременные подключения (у аккаунта их теперь три: сторож, проход и это).
+   */
+  private readonly freshClients = new Map<string, ImapFlow>();
+  /** Папка, которую стережёт сторож аккаунта: по её событию и догружаем новое. */
+  private readonly watchFolders = new Map<string, MailSourceFolder>();
+  /** «аккаунт:папка» — новые письма этой папки прямо сейчас добираются (кем-то одним). */
+  private readonly freshBusy = new Set<string>();
+  /** За время догрузки пришло ещё событие: после неё нужен ещё один заход (иначе оно потеряно). */
+  private readonly freshDirty = new Set<string>();
   /**
    * Проходы не пересекаются — внутри процесса. Два параллельных прохода по одному ящику верный
    * способ получить от сервера отказ по частоте и разреженные курсоры; защита — флаг `busy`,
@@ -306,7 +333,8 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     this.stopped = true;
     this.passToken += 1;
     if (this.timer) clearInterval(this.timer);
-    if (this.wakeTimer) clearTimeout(this.wakeTimer);
+    for (const timer of this.wakeTimers.values()) clearTimeout(timer);
+    this.wakeTimers.clear();
     if (this.watchRetryTimer) clearTimeout(this.watchRetryTimer);
     if (this.passRunning) {
       await Promise.race([this.passRunning.catch(() => undefined), sleep(SHUTDOWN_WAIT_MS)]);
@@ -321,6 +349,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       this.clients.delete(id);
     }
     for (const id of [...this.watchers.keys()]) this.dropWatcher(id);
+    for (const id of [...this.freshClients.keys()]) this.dropFreshClient(id);
   }
 
   /** Сбросить подвисший `syncing` (прошлый процесс умер посреди прохода). */
@@ -358,6 +387,9 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     }
     for (const id of [...this.clients.keys()]) {
       if (!enabled.has(id)) this.dropClient(id);
+    }
+    for (const id of [...this.freshClients.keys()]) {
+      if (!enabled.has(id)) this.dropFreshClient(id);
     }
     for (const account of accounts) {
       if (!this.accounts.presetOf(account.kind).folders.length) continue;
@@ -690,19 +722,24 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       });
       opened = client;
       client.on('error', (e: Error) => this.logger.warn(`IMAP (сторож) ${account.email}: ${e.message}`));
-      client.on('exists', () => this.wake());
+      // Событие говорит только «в папке прибавилось писем», поэтому аккаунт берём из замыкания,
+      // а папку — из `watchFolders` (её записали ниже, когда сервер назвал её своим именем).
+      client.on('exists', () => this.wake(account.id));
       client.on('close', () => this.onWatcherClosed(account.id, client));
 
       await client.connect();
       // Имя системной папки локализовано («[Gmail]/Вся почта»), поэтому ищем её по метке
       // RFC 6154, как и в проходе, а строку из настроек держим запасным вариантом.
       const resolved = await this.resolveFolders(client, [folder]);
-      const path = resolved[0]?.path ?? folder.path;
-      await client.mailboxOpen(path);
+      // Запоминаем папку в том виде, в каком её знает сервер: догрузка нового откроет ровно
+      // её и не будет ради этого делать LIST.
+      const target = resolved[0] ?? folder;
+      await client.mailboxOpen(target.path);
 
       this.watchers.set(account.id, client);
+      this.watchFolders.set(account.id, target);
       this.watchFailures.delete(account.id);
-      this.logger.log(`${account.email}: сторож на папке ${path} — новые письма пойдут сразу`);
+      this.logger.log(`${account.email}: сторож на папке ${target.path} — новые письма пойдут сразу`);
     } catch (e) {
       try {
         opened?.close();
@@ -757,6 +794,9 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
   private dropWatcher(accountId: string): void {
     const client = this.watchers.get(accountId);
     this.watchers.delete(accountId);
+    // Папку забываем вместе со сторожем: догружать новое в никуда нельзя, а после повторного
+    // подъёма сервер может назвать папку иначе (переименование, другая локаль).
+    this.watchFolders.delete(accountId);
     if (!client) return;
     try {
       client.close();
@@ -792,14 +832,124 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Внеочередной проход с задержкой-склейкой: письма обычно приходят пачками. Зовёт сторож. */
-  private wake(): void {
-    if (this.stopped || this.wakeTimer) return;
-    this.wakeTimer = setTimeout(() => {
-      this.wakeTimer = null;
-      void this.runPass('новое письмо');
+  /**
+   * Сторож увидел новое письмо: короткая догрузка по этому аккаунту, а не общий проход.
+   *
+   * Раньше событие поднимало `runPass` — проход по ВСЕМ аккаунтам и всем их папкам, с историей
+   * и общим флагом занятости. Из-за этого письмо ждало чужой аккаунт (аккаунты идут по очереди)
+   * и текущую историю того же ящика, а если проход уже шёл, событие пропадало совсем («проход
+   * пропущен») и письмо ждало до расписания — до `MAIL_SYNC_INTERVAL_SEC` после конца прохода.
+   * Теперь событие несёт аккаунт, догружается только его папка, без истории и своим соединением.
+   *
+   * Задержка [WAKE_DEBOUNCE_MS] склеивает события одной доставки; таймер у каждого аккаунта свой,
+   * поэтому медленный ящик не откладывает событие другого.
+   */
+  private wake(accountId: string): void {
+    if (this.stopped || this.wakeTimers.has(accountId)) return;
+    const timer = setTimeout(() => {
+      this.wakeTimers.delete(accountId);
+      void this.syncFresh(accountId, 'новое письмо');
     }, WAKE_DEBOUNCE_MS);
-    this.wakeTimer.unref();
+    timer.unref();
+    this.wakeTimers.set(accountId, timer);
+  }
+
+  /**
+   * Догрузить новое в папке, за которой следит сторож, — коротким путём.
+   *
+   * Ни истории, ни других папок, ни других аккаунтов: письмо должно оказаться у нас через
+   * секунды после того, как сервер о нём сообщил. Проход по расписанию остаётся страховкой и
+   * продолжает заниматься историей — он идёт своим соединением и этой догрузке не мешает.
+   *
+   * Заходы по одной папке не пересекаются ([freshBusy]): два одновременных разбора одних и тех
+   * же UID качают письмо дважды, и один из них падает на уникальном ключе письма. Событие,
+   * пришедшее во время захода, не теряется — папка помечается «есть ещё» ([freshDirty]) и заход
+   * повторяется сразу после текущего.
+   *
+   * Ошибку не поднимаем в статус аккаунта: расписание повторит попытку через
+   * `MAIL_SYNC_INTERVAL_SEC`, а мигающий «error» из-за обрыва связи только пугал бы.
+   */
+  private async syncFresh(accountId: string, reason: string): Promise<void> {
+    if (this.stopped) return;
+    const folder = this.watchFolders.get(accountId);
+    // Сторож успел сняться (аккаунт выключили, соединение закрылось) — догружать нечего.
+    if (!folder) return;
+
+    const key = freshKey(accountId, folder.path);
+    if (this.freshBusy.has(key)) {
+      this.freshDirty.add(key);
+      return;
+    }
+    this.freshBusy.add(key);
+    try {
+      const account = await this.prisma.mailAccount.findUnique({ where: { id: accountId } });
+      // Аккаунт выключили между событием и заходом — писем у него уже не берём.
+      if (!account?.enabled || !this.accounts.presetOf(account.kind).folders.length) return;
+
+      const client = await this.connectFresh(account);
+      const fresh: StoredRef[] = [];
+      // Бюджет свой и только на новое: тот же потолок, что у догрузки в проходе, — защита от
+      // лавины писем с вложениями (остальное доберёт следующий заход).
+      const budget: PassBudget = { left: INCREMENTAL_BUDGET_BYTES };
+      const stored = await this.withFolder(client, account, folder, (ctx, cursor) =>
+        this.fetchNew(client, ctx, cursor, budget, fresh, () => this.stopped),
+      );
+      if (stored) this.logger.log(`${account.email}: ${reason} — сохранено писем ${stored}`);
+      // Копии у провайдера убираем тем же порядком, что и в проходе: письмо уже у нас целиком.
+      if (fresh.length) void this.purgeFresh(account, fresh);
+    } catch (e) {
+      // Соединение могло умереть (сервер закрыл, сеть) — следующему событию нужно новое.
+      this.dropFreshClient(accountId);
+      this.logger.warn(`догрузка нового по событию сторожа не удалась: ${errorText(e, 300)}`);
+    } finally {
+      this.freshBusy.delete(key);
+      // Пока шёл заход, пришли ещё письма: добираем их сразу, иначе событие пропало бы до
+      // следующего прохода по расписанию.
+      if (this.freshDirty.delete(key) && !this.stopped) void this.syncFresh(accountId, 'ещё письма');
+    }
+  }
+
+  /** Живое соединение для догрузки нового; при обрыве — новое. */
+  private async connectFresh(account: MailAccountRow): Promise<ImapFlow> {
+    const existing = this.freshClients.get(account.id);
+    if (existing?.usable) return existing;
+    this.dropFreshClient(account.id);
+
+    const { login, password } = this.accounts.credentials(account);
+    const client = new ImapFlow({
+      host: account.imapHost,
+      port: account.imapPort,
+      secure: this.accounts.presetOf(account.kind).secure,
+      auth: { user: login, pass: password },
+      // Логгер imapflow пишет команды целиком — вместе с ним в лог уехал бы и пароль.
+      logger: false,
+      clientInfo: { name: 'CloudlyRu', version: '0.1.0' },
+      // Те же значения, что у прохода: короткий таймаут рвал бы выборку письма с вложением на
+      // медленном канале, а простой лечится NOOP'ом, который imapflow шлёт сам.
+      socketTimeout: 300_000,
+      greetingTimeout: 20_000,
+      // IDLE этому соединению не нужен: за папкой следит сторож, тут только выборки.
+      disableAutoIdle: true,
+    });
+    client.on('error', (e: Error) => this.logger.warn(`IMAP (новое) ${account.email}: ${e.message}`));
+    client.on('close', () => {
+      if (this.freshClients.get(account.id) === client) this.freshClients.delete(account.id);
+    });
+    await client.connect();
+    this.freshClients.set(account.id, client);
+    return client;
+  }
+
+  /** Закрыть соединение догрузки аккаунта: аккаунт выключили или соединение отказало. */
+  private dropFreshClient(accountId: string): void {
+    const client = this.freshClients.get(accountId);
+    this.freshClients.delete(accountId);
+    if (!client) return;
+    try {
+      client.close();
+    } catch {
+      /* уже закрыто */
+    }
   }
 
   /** Одна папка источника: сначала новое, потом кусок истории. */
@@ -811,10 +961,47 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     budget: PassBudget,
     token: number,
   ): Promise<number> {
-    // acquireTimeout обязателен: без него ожидание лока бесконечное, и чужой незакрытый лок
-    // подвесил бы проход вместе с флагом busy.
+    return this.withFolder(client, account, folder, async (ctx, cursor) => {
+      const key = freshKey(account.id, folder.path);
+      let stored = 0;
+      // Новое в этой папке прямо сейчас может добирать короткая догрузка сторожа — тогда свою
+      // пропускаем: иначе оба пути качают одни и те же UID и один из них падает на уникальном
+      // ключе письма. История ниже от этого не страдает, у неё свой бюджет.
+      if (this.freshBusy.has(key)) {
+        this.logger.log(`${folder.path}: новое добирает догрузка сторожа — в этом проходе пропускаю`);
+      } else {
+        this.freshBusy.add(key);
+        try {
+          stored = await this.fetchNew(client, ctx, cursor, budget, fresh, () => this.isCancelled(token));
+        } finally {
+          this.freshBusy.delete(key);
+        }
+      }
+
+      // 2. История: порция за проход, от свежих к старым. Ей достаётся весь остаток бюджета
+      // аккаунта — история и есть основная работа, пока она не добрана.
+      if (budget.left > 0 && !cursor.backfillDone) {
+        stored += await this.backfill(client, ctx, cursor, budget, token);
+      }
+      return stored;
+    });
+  }
+
+  /**
+   * Открыть папку и отдать её контекст вместе с курсором.
+   *
+   * Через этот вход идут оба пути — и проход, и короткая догрузка нового: лок папки берётся
+   * ровно один раз и снимается в `finally`, а `acquireTimeout` обязателен, потому что у imapflow
+   * ожидание лока по умолчанию бесконечное и чужой незакрытый лок подвесил бы проход вместе с
+   * флагом `busy`.
+   */
+  private async withFolder<T>(
+    client: ImapFlow,
+    account: MailAccountRow,
+    folder: MailSourceFolder,
+    body: (ctx: FolderContext, cursor: MailCursor) => Promise<T>,
+  ): Promise<T> {
     const lock = await client.getMailboxLock(folder.path, { acquireTimeout: LOCK_ACQUIRE_TIMEOUT_MS });
-    let stored = 0;
     try {
       const mailbox = client.mailbox;
       if (!mailbox) throw new Error(`папка ${folder.path} не открылась`);
@@ -825,143 +1012,160 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
         uidValidity: BigInt(mailbox.uidValidity),
       };
       const cursor = await this.cursorFor(account.id, folder, ctx.uidValidity);
+      return await body(ctx, cursor);
+    } finally {
+      lock.release();
+    }
+  }
 
-      // 1. Новое. UIDNEXT — следующий свободный UID: если он не больше lastUid+1, нового нет,
-      //    и запрос можно не делать вовсе. Проверка нужна не для экономии: «*» в IMAP — это
-      //    максимальный UID папки, поэтому UID FETCH <n>:* при n больше максимума вернул бы
-      //    последнее письмо (диапазон разворачивается), и мы качали бы его каждый проход.
-      const status = await client.status(folder.path, { uidNext: true, messages: true });
-      const uidNext = BigInt(status.uidNext ?? 1);
-      const maxUid = uidNext > 0n ? uidNext - 1n : 0n;
+  /**
+   * Новое в папке: UID-диапазон от курсора и до хвоста, письмо за письмом.
+   *
+   * Зовут оба пути — проход и короткая догрузка сторожа, — поэтому «отменять» приходит функцией,
+   * а не номером поколения прохода: у догрузки своего поколения нет, её останавливает только
+   * остановка процесса. Курсор двигается за каждое сохранённое письмо (инвариант файла), а
+   * координаты сохранённых складываются в `fresh` — по ним потом убирается копия у провайдера.
+   *
+   * Возвращает число сохранённых писем.
+   */
+  private async fetchNew(
+    client: ImapFlow,
+    ctx: FolderContext,
+    cursor: MailCursor,
+    budget: PassBudget,
+    fresh: StoredRef[],
+    cancelled: () => boolean,
+  ): Promise<number> {
+    let stored = 0;
+    // 1. Новое. UIDNEXT — следующий свободный UID: если он не больше lastUid+1, нового нет,
+    //    и запрос можно не делать вовсе. Проверка нужна не для экономии: «*» в IMAP — это
+    //    максимальный UID папки, поэтому UID FETCH <n>:* при n больше максимума вернул бы
+    //    последнее письмо (диапазон разворачивается), и мы качали бы его каждый проход.
+    const status = await client.status(ctx.folderPath, { uidNext: true, messages: true });
+    const uidNext = BigInt(status.uidNext ?? 1);
+    const maxUid = uidNext > 0n ? uidNext - 1n : 0n;
 
-      // Курсор отстал настолько, что догонять историю «вперёд» бессмысленно: свежая почта
-      // ждала бы в конце очереди. Переставляем его к хвосту и забираем только хвост —
-      // остальное доберёт бэкфилл, который идёт от свежих к старым.
-      let lastUid = cursor.lastUid;
-      if (maxUid - lastUid > CATCHUP_GAP) {
-        const tailFrom = maxUid > TAIL_ON_CATCHUP ? maxUid - TAIL_ON_CATCHUP + 1n : 1n;
-        this.logger.log(
-          `${folder.path}: курсор отстал на ${maxUid - lastUid} писем — забираю хвост с ${tailFrom}, историю доберёт бэкфилл`,
-        );
-        lastUid = tailFrom - 1n;
-        await this.prisma.mailCursor.update({
-          where: { id: cursor.id },
-          data: { lastUid, lastSeenAt: new Date() },
-        });
+    // Курсор отстал настолько, что догонять историю «вперёд» бессмысленно: свежая почта
+    // ждала бы в конце очереди. Переставляем его к хвосту и забираем только хвост —
+    // остальное доберёт бэкфилл, который идёт от свежих к старым.
+    let lastUid = cursor.lastUid;
+    if (maxUid - lastUid > CATCHUP_GAP) {
+      const tailFrom = maxUid > TAIL_ON_CATCHUP ? maxUid - TAIL_ON_CATCHUP + 1n : 1n;
+      this.logger.log(
+        `${ctx.folderPath}: курсор отстал на ${maxUid - lastUid} писем — забираю хвост с ${tailFrom}, историю доберёт бэкфилл`,
+      );
+      lastUid = tailFrom - 1n;
+      await this.prisma.mailCursor.update({
+        where: { id: cursor.id },
+        data: { lastUid, lastSeenAt: new Date() },
+      });
+    }
+
+    const from = lastUid + 1n;
+    // Догрузка нового — своя небольшая доля трафика: раньше она съедала бюджет целиком,
+    // и история не двигалась вовсе.
+    const incrementalCap = Math.min(budget.left, INCREMENTAL_BUDGET_BYTES);
+    let spent = 0;
+    if (uidNext > from) {
+      // Сначала только метаданные (uid + размер): тело тянем лишь у тех писем, что проходят
+      // потолок размера. `source: true` забирает письмо в память целиком, поэтому проверять
+      // размер после скачивания — уже поздно: одно письмо на сотни мегабайт уносит процесс.
+      const fits: number[] = [];
+      let oversized = 0;
+      for await (const meta of client.fetch(`${from}:*`, { uid: true, size: true }, { uid: true })) {
+        if (BigInt(meta.uid) <= cursor.lastUid) continue;
+        if (meta.size && meta.size > MAX_MESSAGE_BYTES) {
+          oversized += 1;
+          const reason = `размер ${Math.round((meta.size ?? 0) / 1024 / 1024)} МБ больше потолка ${MAX_MESSAGE_MB} МБ (MAIL_MAX_MESSAGE_MB)`;
+          this.logger.warn(`${ctx.folderPath}: письмо ${meta.uid} — ${reason}`);
+          const givenUp = await this.noteUnsaved(ctx, Number(meta.uid), reason);
+          if (!givenUp) {
+            // Письмо ещё в списке на повтор: курсор оставляем перед ним, дальше не идём.
+            break;
+          }
+          // Попытки кончились — пропускаем окончательно, иначе одно огромное письмо
+          // навсегда закрыло бы дорогу всем следующим.
+          if (BigInt(meta.uid) > lastUid) {
+            lastUid = BigInt(meta.uid);
+            await this.prisma.mailCursor.update({
+              where: { id: cursor.id },
+              data: { lastUid, lastSeenAt: new Date() },
+            });
+          }
+          continue;
+        }
+        fits.push(meta.uid);
+      }
+      if (oversized) {
+        this.logger.warn(`${ctx.folderPath}: пропущено по размеру писем — ${oversized}`);
       }
 
-      const from = lastUid + 1n;
-      // Догрузка нового — своя небольшая доля трафика: раньше она съедала бюджет целиком,
-      // и история не двигалась вовсе.
-      const incrementalCap = Math.min(budget.left, INCREMENTAL_BUDGET_BYTES);
-      let spent = 0;
-      if (uidNext > from) {
-        // Сначала только метаданные (uid + размер): тело тянем лишь у тех писем, что проходят
-        // потолок размера. `source: true` забирает письмо в память целиком, поэтому проверять
-        // размер после скачивания — уже поздно: одно письмо на сотни мегабайт уносит процесс.
-        const fits: number[] = [];
-        let oversized = 0;
-        for await (const meta of client.fetch(`${from}:*`, { uid: true, size: true }, { uid: true })) {
-          if (BigInt(meta.uid) <= cursor.lastUid) continue;
-          if (meta.size && meta.size > MAX_MESSAGE_BYTES) {
-            oversized += 1;
-            const reason = `размер ${Math.round((meta.size ?? 0) / 1024 / 1024)} МБ больше потолка ${MAX_MESSAGE_MB} МБ (MAIL_MAX_MESSAGE_MB)`;
-            this.logger.warn(`${ctx.folderPath}: письмо ${meta.uid} — ${reason}`);
-            const givenUp = await this.noteUnsaved(ctx, Number(meta.uid), reason);
-            if (!givenUp) {
-              // Письмо ещё в списке на повтор: курсор оставляем перед ним, дальше не идём.
-              break;
-            }
-            // Попытки кончились — пропускаем окончательно, иначе одно огромное письмо
-            // навсегда закрыло бы дорогу всем следующим.
-            if (BigInt(meta.uid) > lastUid) {
-              lastUid = BigInt(meta.uid);
-              await this.prisma.mailCursor.update({
-                where: { id: cursor.id },
-                data: { lastUid, lastSeenAt: new Date() },
-              });
-            }
-            continue;
-          }
-          fits.push(meta.uid);
-        }
-        if (oversized) {
-          this.logger.warn(`${ctx.folderPath}: пропущено по размеру писем — ${oversized}`);
-        }
-
-        for await (const msg of this.sourceStream(client, fits)) {
-          if (this.isCancelled(token)) break;
-          if (BigInt(msg.uid) <= cursor.lastUid) continue;
-          const item = this.messageOf(msg, ctx);
-          // Сохранять нечего (черновик или пустой ответ) — это не потеря, и курсор за таким
-          // письмом двигается: иначе черновик в All Mail навсегда закрыл бы дорогу новым.
-          if (!item) {
-            if (BigInt(msg.uid) > lastUid) {
-              lastUid = BigInt(msg.uid);
-              await this.prisma.mailCursor.update({
-                where: { id: cursor.id },
-                data: { lastUid, lastSeenAt: new Date() },
-              });
-            }
-            continue;
-          }
-          // Бюджет проверяем до обработки: иначе за проход уезжает на одно письмо больше
-          // лимита, и на большом ящике это заметно.
-          if (spent > 0 && spent + item.bytes > incrementalCap) break;
-
-          // Двигаем курсор только за письмо, которое либо сохранилось, либо окончательно
-          // пропущено: инвариант файла в одном месте.
-          let advance = false;
-          try {
-            const result = await this.ingestService.ingest(item.input);
-            advance = true;
-            if (result === 'stored' || result === 'attachments-repaired') {
-              stored += 1;
-              fresh.push({ folderPath: ctx.folderPath, uidValidity: ctx.uidValidity, uid: Number(msg.uid) });
-            }
-            await this.clearUnsaved(ctx, Number(msg.uid));
-          } catch (e) {
-            // Инвариант курсора: за письмо, которого у нас нет, курсор не двигается. Иначе
-            // письмо выпадает из архива навсегда — ни догрузка, ни бэкфилл его больше не
-            // увидят, и о дырке никто не узнает.
-            const givenUp = await this.noteUnsaved(ctx, Number(msg.uid), errorText(e, 200));
-            if (!givenUp) {
-              this.logger.warn(
-                `${ctx.folderPath}: новое письмо ${msg.uid} не сохранено — ${errorText(e, 200)}; ` +
-                  'курсор оставляю перед ним, попробую следующим проходом',
-              );
-              break;
-            }
-            // Попытки кончились: письмо пропускаем, иначе одно битое письмо навсегда
-            // остановило бы приход новых. Оно остаётся в списке несохранённых.
-            advance = true;
-          }
-
-          // Курсор двигаем сразу за письмом: падение на следующем не заставит перекачивать
-          // всё заново (у Gmail это ещё и лимит трафика на сутки).
-          if (advance && BigInt(msg.uid) > lastUid) {
+      for await (const msg of this.sourceStream(client, fits)) {
+        if (cancelled()) break;
+        if (BigInt(msg.uid) <= cursor.lastUid) continue;
+        const item = this.messageOf(msg, ctx);
+        // Сохранять нечего (черновик или пустой ответ) — это не потеря, и курсор за таким
+        // письмом двигается: иначе черновик в All Mail навсегда закрыл бы дорогу новым.
+        if (!item) {
+          if (BigInt(msg.uid) > lastUid) {
             lastUid = BigInt(msg.uid);
             await this.prisma.mailCursor.update({
               where: { id: cursor.id },
               data: { lastUid, lastSeenAt: new Date() },
             });
           }
-          spent += item.bytes;
-          await sleep(PER_MESSAGE_DELAY_MS);
+          continue;
         }
-      }
+        // Бюджет проверяем до обработки: иначе за проход уезжает на одно письмо больше
+        // лимита, и на большом ящике это заметно.
+        if (spent > 0 && spent + item.bytes > incrementalCap) break;
 
-      budget.left -= spent;
-      // 2. История: порция за проход, от свежих к старым. Ей достаётся весь остаток бюджета
-      // аккаунта — история и есть основная работа, пока она не добрана.
-      if (budget.left > 0 && !cursor.backfillDone) {
-        stored += await this.backfill(client, ctx, cursor, budget, token);
+        // Двигаем курсор только за письмо, которое либо сохранилось, либо окончательно
+        // пропущено: инвариант файла в одном месте.
+        let advance = false;
+        try {
+          const result = await this.ingestService.ingest(item.input);
+          advance = true;
+          if (result === 'stored' || result === 'attachments-repaired') {
+            stored += 1;
+            fresh.push({ folderPath: ctx.folderPath, uidValidity: ctx.uidValidity, uid: Number(msg.uid) });
+          }
+          await this.clearUnsaved(ctx, Number(msg.uid));
+        } catch (e) {
+          // Инвариант курсора: за письмо, которого у нас нет, курсор не двигается. Иначе
+          // письмо выпадает из архива навсегда — ни догрузка, ни бэкфилл его больше не
+          // увидят, и о дырке никто не узнает.
+          const givenUp = await this.noteUnsaved(ctx, Number(msg.uid), errorText(e, 200));
+          if (!givenUp) {
+            this.logger.warn(
+              `${ctx.folderPath}: новое письмо ${msg.uid} не сохранено — ${errorText(e, 200)}; ` +
+                'курсор оставляю перед ним, попробую следующим проходом',
+            );
+            break;
+          }
+          // Попытки кончились: письмо пропускаем, иначе одно битое письмо навсегда
+          // остановило бы приход новых. Оно остаётся в списке несохранённых.
+          advance = true;
+        }
+
+        // Курсор двигаем сразу за письмом: падение на следующем не заставит перекачивать
+        // всё заново (у Gmail это ещё и лимит трафика на сутки).
+        if (advance && BigInt(msg.uid) > lastUid) {
+          lastUid = BigInt(msg.uid);
+          await this.prisma.mailCursor.update({
+            where: { id: cursor.id },
+            data: { lastUid, lastSeenAt: new Date() },
+          });
+        }
+        spent += item.bytes;
+        await sleep(PER_MESSAGE_DELAY_MS);
       }
-    } finally {
-      lock.release();
     }
+
+    budget.left -= spent;
     return stored;
   }
+
 
   /** Письма порции: пустой список UID imapflow не принимает, а он бывает — если все письма
    *  диапазона не прошли потолок размера или были ниже курсора. */
@@ -1345,6 +1549,17 @@ function isConnectionError(e: unknown): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Ключ «новые письма этой папки прямо сейчас добираются».
+ *
+ * Аккаунт и путь вместе, а не один аккаунт: папок у аккаунта несколько (у Gmail это All Mail,
+ * спам и корзина), событие приходит по конкретной, и заходы по разным папкам мешать друг другу
+ * не должны. А по одной — обязаны идти по очереди, иначе оба пути качают одни и те же UID.
+ */
+function freshKey(accountId: string, folderPath: string): string {
+  return `${accountId}:${folderPath}`;
 }
 
 /** Пустой поток писем: imapflow на пустой список UID ругается, а цикл должен просто не пойти. */
