@@ -132,6 +132,12 @@ const envSchema = z.object({
   // папок и аккаунтов; для Gmail с его суточным лимитом на скачивание это важно помнить.
   // Потолок «на проход/аккаунт» требует счётчика в src/mail — там же, где заводится budget.
   MAIL_PASS_BUDGET_MB: z.coerce.number().positive().default(300),
+  // Поисковый индекс для старых писем: полного тела в БД нет, поэтому архив разбирается
+  // заново из .eml в S3 — порциями и фоном, пока не закончится (src/mail/mail-index.service.ts).
+  // Выключать есть смысл только на время отладки: без индекса поиск не находит старые письма.
+  MAIL_SEARCH_INDEX_ENABLED: booleanish.default('true'),
+  MAIL_SEARCH_INDEX_BATCH: z.coerce.number().int().positive().default(100),
+  MAIL_SEARCH_INDEX_INTERVAL_SEC: z.coerce.number().int().positive().default(60),
 
   // Лимит по умолчанию для ручек, которые не помечены @RateLimit, запросов в минуту на IP.
   // Гард частоты глобальный именно из-за отсутствия такого потолка у целых разделов

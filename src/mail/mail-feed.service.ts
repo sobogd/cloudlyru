@@ -3,10 +3,10 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { notFound } from '../common/errors';
 import { S3Service } from '../s3/s3.service';
-import { parseMessage } from './mail-parse';
+import { parseMessage, previewOf } from './mail-parse';
 import { htmlWithinLimit, sanitizeMailHtml, textToHtml } from './mail-html';
 import { MailImageService } from './mail-image.service';
-import { inBox, inBoxSql } from './mail-scope';
+import { boxConditionSql, inBox } from './mail-scope';
 import type { MailBox } from './mail-accounts.service';
 
 /**
@@ -25,8 +25,6 @@ import type { MailBox } from './mail-accounts.service';
  * а не только чтения.
  */
 
-/** Сколько символов тела отдаём в списке: хватает на две строки превью. */
-const PREVIEW_CHARS = 200;
 /** Потолок одного среза ленты. */
 export const MAIL_RANGE_MAX = 500;
 /** Сколько писем корзины удаляем за раз: порция влезает и в память, и в транзакцию. */
@@ -41,14 +39,9 @@ const ASSET_POOL = 8;
 const MAX_PARSE_BYTES = 32 * 1024 * 1024;
 
 /**
- * Условие «письмо лежит в папке» для сырого SQL.
- * Корзина почты — это не папка из box/alsoBoxes, а состояние `deletedAt`, поэтому у неё
- * своё условие; обычные папки фильтруются и по принадлежности, и по «не в корзине».
+ * Условие «письмо лежит в папке» переехало в `mail-scope.ts`: оно общее с поиском
+ * (`mail-search.service.ts`), а два одинаковых условия в двух файлах разошлись бы.
  */
-function boxConditionSql(box: MailBox): Prisma.Sql {
-  if (box === 'trash') return Prisma.sql`"deletedAt" IS NOT NULL`;
-  return Prisma.sql`"deletedAt" IS NULL AND ${inBoxSql(box)}`;
-}
 
 export interface MailListItem {
   id: string;
@@ -58,6 +51,8 @@ export interface MailListItem {
   subject: string | null;
   fromName: string | null;
   fromAddr: string | null;
+  /// Начало тела письма. Строка списка его больше не рисует (в ней остались отправитель
+  /// и тема), но поле остаётся в контракте: оно есть у клиента в проде.
   preview: string;
   sortAt: string;
   seen: boolean;
@@ -586,14 +581,3 @@ async function pool<T>(items: T[], limit: number, run: (item: T) => Promise<void
   await Promise.all(Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, () => worker()));
 }
 
-/** Превью: тело письма в одну строку, без переносов. */
-function previewOf(bodyText: string | null): string {
-  if (!bodyText) return '';
-  const line = bodyText
-    .replace(/[ \t\u00a0]+/g, ' ')
-    .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .join(' · ');
-  return line.length > PREVIEW_CHARS ? line.slice(0, PREVIEW_CHARS) : line;
-}

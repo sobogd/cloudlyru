@@ -16,3 +16,18 @@ export function inBox(box: MailBox): Prisma.MailMessageWhereInput {
 export function inBoxSql(box: MailBox): Prisma.Sql {
   return Prisma.sql`("box" = ${box} OR ${box} = ANY("alsoBoxes"))`;
 }
+
+/**
+ * Условие «письмо лежит в папке» для сырого SQL — им лента, её счётчики и поиск ограничивают
+ * выборку.
+ *
+ * Корзина почты — это не папка из box/alsoBoxes, а состояние `deletedAt`, поэтому у неё
+ * своё условие; обычные папки фильтруются и по принадлежности, и по «не в корзине».
+ * Условие общее для всех читающих запросов намеренно: своё в каждом месте означало бы,
+ * что письмо видно в списке, но не находится поиском (или наоборот).
+ */
+export function boxConditionSql(box: MailBox): Prisma.Sql {
+  if (box === 'trash') return Prisma.sql`"deletedAt" IS NOT NULL`;
+  return Prisma.sql`"deletedAt" IS NULL AND ${inBoxSql(box)}`;
+}
+

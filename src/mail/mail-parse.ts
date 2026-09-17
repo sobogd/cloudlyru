@@ -18,6 +18,15 @@ import { simpleParser, type AddressObject, type Attachment } from 'mailparser';
  */
 export const SNAPSHOT_CHARS = 2000;
 
+/**
+ * Потолок текста, который уходит в поисковый индекс.
+ *
+ * Это не «предел длины письма»: почта с таким телом — уже редкость (вложения в base64
+ * раздувают .eml, но не текст). Потолок нужен против одного ненормального письма, которое
+ * раздуло бы строку в БД и GIN-индекс на десятки мегабайт, ничего не добавив к поиску.
+ */
+export const SEARCH_TEXT_MAX_CHARS = 256 * 1024;
+
 /** Вложение письма, готовое к сохранению (в дерево файлов и в S3). */
 export interface ParsedAttachment {
   /** Порядковый номер части в письме — стабильный ключ вложения внутри письма. */
@@ -51,6 +60,12 @@ export interface ParsedMessage {
    * цитата ответа): обрезанное до превью тело в этих местах выглядело бы как потерянные данные.
    */
   fullText: string;
+  /**
+   * То же письмо одной строкой для полнотекстового поиска: тема, отправитель, получатели
+   * и полное тело, разделённые `|`, не длиннее SEARCH_TEXT_MAX_CHARS. Заголовки идут первыми:
+   * тело может упереться в потолок и обрезаться, а отправитель и тема должны искаться всегда.
+   */
+  searchText: string;
   /**
    * HTML тела письма — как его отдал разборщик. В БД не хранится (письмо целиком лежит
    * в S3 и разбирается при открытии), нужно только отрисовке. Картинки по cid разборщик
@@ -91,8 +106,10 @@ function refsOf(raw: string[] | string | undefined): string[] {
 }
 
 /**
- * Текст из HTML — для превью в списке и поиска. Полноценный парсер тут не нужен:
- * показываем первые пару тысяч символов, а теги и служебные блоки только мешают.
+ * Текст из HTML: им пользуется разбор письма, когда текстовой части в письме нет (HTML-only
+ * рассылки, а таких много). Полученный текст идёт и в превью, и в поисковый индекс, поэтому
+ * полноценный парсер тут не нужен: теги и служебные блоки только мешают, а вёрстку никто
+ * по этому тексту не восстанавливает.
  */
 export function htmlToText(html: string): string {
   return html
@@ -117,9 +134,52 @@ function snapshot(text: string): string {
   return clean.length > SNAPSHOT_CHARS ? clean.slice(0, SNAPSHOT_CHARS) : clean;
 }
 
+/**
+ * Сколько символов превью уходит в ответ ручек списка (`/mail/range`, `/mail/search`).
+ *
+ * Строка письма в приложении тело больше не показывает — владелец оставил в ней только
+ * отправителя и тему. Поле при этом остаётся частью контракта: оно есть у клиента в проде,
+ * и убирать его из ответа — отдельное решение, а не побочный эффект правки вёрстки.
+ */
+const PREVIEW_CHARS = 200;
+
+/**
+ * Превью для ответа ручек списка: тело в одну строку, без переносов.
+ *
+ * Живёт рядом со `snapshot`, потому что это вторая половина одного и того же: в БД лежат
+ * первые SNAPSHOT_CHARS символов, а в ответе — они же, сжатые до PREVIEW_CHARS и без переводов
+ * строк. Функция общая для ленты и поиска: два одинаковых превью в двух сервисах разошлись бы.
+ */
+export function previewOf(bodyText: string | null): string {
+  if (!bodyText) return '';
+  const line = bodyText
+    .replace(/[ \t\u00a0]+/g, ' ')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join(' · ');
+  return line.length > PREVIEW_CHARS ? line.slice(0, PREVIEW_CHARS) : line;
+}
+
 /** Полный текст письма без хвостовых пробелов (та же нормализация переносов, что и у превью). */
 function fullTextOf(text: string): string {
   return text.replace(/\r\n/g, '\n').trim();
+}
+
+/**
+ * Текст для полнотекстового поиска: заголовки одной строкой, следом полное тело.
+ *
+ * Заголовки стоят впереди намеренно: тело может упереться в SEARCH_TEXT_MAX_CHARS и быть
+ * обрезанным, а отправитель и тема должны остаться в индексе при любой длине письма.
+ * Разделитель `|` — не украшение: без него последнее слово заголовка и первое слово тела
+ * слиплись бы в один токен («поставкиДобрый»), и оба перестали бы находиться.
+ */
+function searchTextOf(msg: Omit<ParsedMessage, 'searchText'>): string {
+  const head = [msg.subject, msg.fromName, msg.fromAddr, msg.toAddrs.join(' '), msg.ccAddrs.join(' ')]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join(' | ');
+  const text = head ? `${head} | ${msg.fullText}` : msg.fullText;
+  return text.length > SEARCH_TEXT_MAX_CHARS ? text.slice(0, SEARCH_TEXT_MAX_CHARS) : text;
 }
 
 /** Вложение в терминах приложения: инлайн-картинки тела — тоже файлы, и тоже сохраняются. */
@@ -157,7 +217,9 @@ export async function parseMessage(source: Buffer): Promise<ParsedMessage> {
     .map((att, i) => toAttachment(att, i))
     .filter((att) => att.content.length > 0);
 
-  return {
+  // Собираем письмо без поискового текста, а его самого выводим из уже готовых полей:
+  // иначе заголовки пришлось бы перечислять в двух местах и они разошлись бы.
+  const message: Omit<ParsedMessage, 'searchText'> = {
     subject: parsed.subject?.trim() || null,
     fromName: from.name,
     fromAddr: from.addr,
@@ -175,6 +237,7 @@ export async function parseMessage(source: Buffer): Promise<ParsedMessage> {
     html: typeof parsed.html === 'string' && parsed.html.trim() ? parsed.html : null,
     attachments,
   };
+  return { ...message, searchText: searchTextOf(message) };
 }
 
 /** Сколько байт заголовков читаем в поисках Message-ID: больше не бывает даже у спама. */

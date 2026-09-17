@@ -9,7 +9,9 @@ import { MailFeedService } from './mail-feed.service';
 import { MailFaviconService } from './mail-favicon.service';
 import { MailImageService } from './mail-image.service';
 import { MailIngestService } from './mail-ingest.service';
+import { MailIndexService } from './mail-index.service';
 import { MailPurgeService } from './mail-purge.service';
+import { MailSearchService } from './mail-search.service';
 import { MailSendService } from './mail-send.service';
 import { MailSyncService } from './mail-sync.service';
 
@@ -31,7 +33,9 @@ import { MailSyncService } from './mail-sync.service';
     MailPurgeService,
     MailFaviconService,
     MailImageService,
+    MailSearchService,
+    MailIndexService,
   ],
-  exports: [MailAccountsService, MailFeedService, MailSyncService, MailSendService, MailPurgeService],
+  exports: [MailAccountsService, MailFeedService, MailSyncService, MailSendService, MailPurgeService, MailSearchService],
 })
 export class MailModule {}

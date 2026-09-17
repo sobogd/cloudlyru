@@ -424,6 +424,11 @@ export class MailIngestService {
         seen: input.seen,
         flagged: input.flagged,
         bodyText: parsed.bodyText,
+        // Текст для поиска кладём сразу: письмо уже разобрано, и второй раз читать .eml
+        // из хранилища ради этого не нужно. `searchIndexedAt` — та же отметка, что ставит
+        // фоновый бэкфилл старым письмам: без неё проход снова и снова брал бы это письмо.
+        searchText: parsed.searchText,
+        searchIndexedAt: new Date(),
         rawAssetId,
       },
       select: { id: true },

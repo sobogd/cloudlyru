@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Headers, Logger, Param, Post, Query, Req
 import type { Request, Response } from 'express';
 import { MailAccountsService } from './mail-accounts.service';
 import { MailFeedService } from './mail-feed.service';
+import { MailSearchService } from './mail-search.service';
 import { MailSyncService } from './mail-sync.service';
 import { env } from '../config/env';
 import { MailFaviconService } from './mail-favicon.service';
@@ -61,6 +62,7 @@ export class MailController {
   constructor(
     private readonly accounts: MailAccountsService,
     private readonly feed: MailFeedService,
+    private readonly search: MailSearchService,
     private readonly sync: MailSyncService,
     private readonly sender: MailSendService,
     private readonly ingestService: MailIngestService,
@@ -251,6 +253,39 @@ export class MailController {
   @RateLimit(600, 60_000)
   months(@CurrentUser() user: RequestUser, @Query('box') box?: string, @Query('account') account?: string) {
     return this.feed.months(user.id, boxOf(box), account || null);
+  }
+
+  /**
+   * Поиск по письмам папки: ищем по всему телу письма, а не только по теме.
+   *
+   * Папка приходит в `box` — поиск идёт ровно там, где смотрит пользователь (это его решение),
+   * а не по всему ящику сразу. Сортировка — по дате, от свежих к старым: ранжирование по
+   * релевантности сознательно не используется, поэтому в ответе нет ни счёта, ни подсветки.
+   *
+   * Ручка читает БД, а не IMAP: письмо обязано быть уже сохранённым (в том числе иметь
+   * разобранное тело в поисковом индексе — см. `pending` в ответе).
+   */
+  @Get('search')
+  @SessionOnly()
+  @UseGuards(RateLimitGuard)
+  @RateLimit(600, 60_000)
+  searchMessages(
+    @CurrentUser() user: RequestUser,
+    @Query('q') q?: string,
+    @Query('box') box?: string,
+    @Query('account') account?: string,
+    @Query('offset') offset?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const off = Number(offset);
+    const lim = Number(limit);
+    return this.search.search(user.id, {
+      q: q ?? '',
+      box: boxOf(box),
+      accountId: account || null,
+      offset: Number.isFinite(off) ? off : 0,
+      limit: Number.isFinite(lim) ? lim : undefined,
+    });
   }
 
   // ===== Письмо =====
