@@ -430,6 +430,17 @@ class CloudlyApi {
     await _req('/auth/logout', method: 'POST');
   }
 
+  /// Гасит все прочие входы в аккаунт, кроме этого (`POST /auth/sessions/revoke-others`).
+  ///
+  /// Возвращает число погашенных сессий: ноль — «других входов не было», и это тоже ответ,
+  /// который надо показать человеку. Ручка доступна только веб-сессии (у неё на сервере
+  /// `@SessionOnly`): device-токен синхронизации ею ничего погасить не может, поэтому вызов
+  /// осмыслен только из интерфейса.
+  Future<int> revokeOtherSessions() async {
+    final d = _m(await _req('/auth/sessions/revoke-others', method: 'POST', body: {}));
+    return toNum(d['sessionsRevoked'])?.toInt() ?? 0;
+  }
+
   /// Последняя опубликованная сборка Android-приложения (`GET /app/android`).
   ///
   /// Ручка без авторизации: проверка обновления должна работать и с отозванным токеном —

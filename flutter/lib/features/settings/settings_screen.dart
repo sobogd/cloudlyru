@@ -7,6 +7,7 @@ import '../../util/widgets.dart';
 import 'mail_accounts_panel.dart';
 import 'queue_errors_screen.dart';
 import 'queue_panel.dart';
+import 'sessions_panel.dart';
 import 'sync_panel.dart';
 import 'thumbs_panel.dart';
 import 'tokens_panel.dart';
@@ -76,6 +77,9 @@ class SettingsScreen extends ConsumerWidget {
               ],
             ),
           ),
+          // Панель сеансов идёт сразу после входа в аккаунт: она про то же — про доступ к
+          // аккаунту, а не про устройство или раздел приложения.
+          const SessionsPanel(),
           const TokensPanel(),
           const SyncPanel(),
           const ThumbsPanel(),

@@ -85,6 +85,21 @@ export class AuthController {
     return this.auth.me(user.id, user.deviceId ?? null);
   }
 
+  /**
+   * Гасит все прочие входы в аккаунт — все веб-сессии, кроме той, из которой пришёл запрос.
+   *
+   * Только веб-сессия, как и смена пароля: device-токен с телефона не должен уметь выкидывать
+   * владельца из его же браузера и приложения. `SessionOnly` отсекает такой запрос сам (403),
+   * а cookie текущей сессии приходит в том же запросе — по ней и определяется, какую сессию
+   * оставить.
+   */
+  @SessionOnly()
+  @HttpCode(200)
+  @Post('sessions/revoke-others')
+  revokeOtherSessions(@CurrentUser() user: RequestUser, @Req() req: Request) {
+    return this.auth.revokeOtherSessions(user.id, String(req.cookies?.[env.COOKIE_NAME] ?? ''), req.ip);
+  }
+
   // ===== App-password / device-токены =====
   // Выпуск и отзыв токенов — только веб-сессия: устройство со своим токеном не должно
   // выпускать себе новые (иначе отзыв украденного токена ничего не даёт).
