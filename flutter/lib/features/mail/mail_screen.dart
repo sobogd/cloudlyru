@@ -25,12 +25,6 @@ import 'mail_body_web.dart';
 /// одно и то же число — фактическое, из `_rowH`, а не эту константу.
 const _rowBase = 76.0;
 
-/// Базовая высота заглушки строки (серый прямоугольник на месте не приехавшего письма).
-///
-/// Ниже настоящей строки: заглушка держит место, чтобы список не прыгал, когда данные доедут,
-/// и ничего из себя не изображает.
-const _skeletonBase = 52.0;
-
 /// Сколько строк письма просит одна порция `mailRange`.
 ///
 /// 200 — меньше серверного потолка (`MAIL_RANGE_MAX = 500`, src/mail/mail-feed.service.ts) и
@@ -70,7 +64,7 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// `_total` и `_items`.
   String _box = 'inbox';
   /// Сколько писем в текущей папке — по нему `ListView` считает высоту скролла.
-  /// `null` — ответа ещё не было, поэтому вместо списка показывается спиннер.
+  /// `null` — ответа ещё не было: список пуст, индикатора загрузки у экрана нет.
   int? _total;
   /// Загруженные строки по абсолютному индексу письма.
   ///
@@ -82,7 +76,7 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// решения, доступна ли кнопка «Написать» (нет включённых аккаунтов — писать не с чего).
   List<MailAccountRow> _accounts = const [];
   String? _error;
-  /// Идёт перечитка списка: блокирует кнопку «Проверить» и крутит на ней спиннер.
+  /// Идёт необратимая операция над папкой (очистка корзины): блокирует повторное нажатие.
   bool _busy = false;
   /// Скролл списка: из его позиции считается видимое окно строк.
   final ScrollController _sc = ScrollController();
@@ -113,8 +107,6 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// в [didChangeDependencies] (единственное место, где `MediaQuery` читается правильно), а
   /// `_fetchVisible` берёт его оттуда же — иначе окно разъехалось бы с тем, что видно на экране.
   double _rowH = _rowBase;
-  /// То же для заглушки строки: она держит место настоящей строки и растёт вместе с ней.
-  double _skeletonH = _skeletonBase;
 
   @override
   /// Открытие списка: подписка на скролл, аккаунты и первая порция счётчиков.
@@ -133,9 +125,7 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// перестраивается, и `didChangeDependencies` вызывается до `build`.
   void didChangeDependencies() {
     super.didChangeDependencies();
-    final scaler = MediaQuery.textScalerOf(context);
-    _rowH = scaler.scale(_rowBase);
-    _skeletonH = scaler.scale(_skeletonBase);
+    _rowH = MediaQuery.textScalerOf(context).scale(_rowBase);
   }
 
   @override
@@ -172,8 +162,8 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// ещё нет ни размеров, ни позиции, и окно посчиталось бы по нулям.
   ///
   /// Ошибка показывается двумя разными способами: если показывать нечего (`_total == null`) —
-  /// красным на весь экран, а если список уже на экране — полоской снизу, чтобы данные не
-  /// пропадали из-за неудачного фонового обновления.
+  /// красным текстом по центру экрана, а если список уже на экране — полоской снизу, чтобы данные
+  /// не пропадали из-за неудачного фонового обновления.
   Future<void> _loadCounters() async {
     final gen = ++_gen;
     final box = _box;
@@ -208,7 +198,7 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// запросов за один флинг. Таймер при этом перезапускается, поэтому `_fetchVisible` уходит
   /// один раз — через [_scrollDebounce] после остановки: инерция успевает закончиться, и запрос
   /// идёт уже за тем окном, где пользователь остался. Меньше 400 мс — запросы пошли бы пачками
-  /// на каждое движение, заметно больше — серые заглушки висели бы на глазах.
+  /// на каждое движение, заметно больше — пустые строки висели бы на глазах.
   void _onScroll() {
     if (_debounce?.isActive ?? false) _debounce!.cancel();
     _debounce = Timer(_scrollDebounce, _fetchVisible);
@@ -222,8 +212,8 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// Куски: из диапазона выбираются только непрерывные участки ещё не загруженных строк
   /// (уже загруженные не перезапрашиваются), и каждый участок режется на порции по [_rangeChunk].
   ///
-  /// Слоты, которые ещё не пришли, остаются заглушками: `_row` рисует для них серый
-  /// прямоугольник той же высоты, поэтому список не прыгает, когда ответ доехал.
+  /// Слоты, которые ещё не пришли, остаются пустыми: `_row` возвращает для них пустой виджет,
+  /// а место под строку уже занято `itemExtent`, поэтому список не прыгает, когда ответ доехал.
   /// Побочно: `setState` с новыми строками.
   ///
   /// Проход один за раз: на время запроса поднимается [_fetching], а пришедшие за это время
@@ -293,22 +283,16 @@ class _MailScreenState extends ConsumerState<MailScreen> {
     }
   }
 
-  /// Кнопка «Проверить»: перечитывает список открытой папки.
+  /// Обновление списка жестом «потянуть вниз» — единственный способ обновить почту с экрана.
   ///
   /// Отдельного прохода по IMAP тут нет — сервер держит IDLE и складывает письма в базу сам,
   /// поэтому достаточно перечитать счётчики. Полная синхронизация с почтовым сервером осталась
   /// кнопкой «Проверить» в настройках (`mailSync`).
-  /// Ошибку показывает `_loadCounters` (полоской, если список уже на экране), а `_busy` крутит
-  /// спиннер на кнопке и блокирует повторные нажатия.
-  Future<void> _refresh() async {
-    if (_busy) return;
-    setState(() => _busy = true);
-    try {
-      await _loadCounters();
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
+  ///
+  /// Кнопки обновления у экрана нет намеренно: она дублировала жест, а её спиннер был ещё одним
+  /// индикатором загрузки на экране. Ошибку показывает `_loadCounters` — полоской снизу, если
+  /// список уже на экране, и текстом, если показывать больше нечего.
+  Future<void> _refresh() => _loadCounters();
 
   /// Очищает корзину почты целиком (безвозвратно — в отличие от удаления письма, которое
   /// только переносит его в корзину). Отмена в диалоге — выход без запроса. Побочно: перечитка
@@ -368,8 +352,8 @@ class _MailScreenState extends ConsumerState<MailScreen> {
       if (!mounted || sent != true) return;
       setState(() {
         _box = 'sent';
-        // Список «Исходящих» ещё не загружен: пока не пришёл счётчик, показывается спиннер,
-        // а не счётчик и строки прежней папки (индексы у папок свои).
+        // Список «Исходящих» ещё не загружен: пока не пришёл счётчик, экран пуст, а не
+        // показывает строки прежней папки (индексы у папок свои).
         _total = null;
         _items.clear();
       });
@@ -386,81 +370,146 @@ class _MailScreenState extends ConsumerState<MailScreen> {
     return Scaffold(
       backgroundColor: C.canvas,
       appBar: AppBar(
-        title: Row(children: [
-          _boxTab('inbox', Icons.inbox_outlined, 'Входящие'),
-          _boxTab('sent', Icons.send_outlined, 'Исходящие'),
-          _boxTab('trash', Icons.delete_outline, 'Корзина'),
-        ]),
+        // В заголовке — открытая папка, а не три иконки подряд: папки переключаются баром из
+        // иконки в шапке (как разделы фактур), и на узком экране одна подпись читается лучше,
+        // чем три пиктограммы, значение которых надо угадывать.
+        title: Text(_boxLabel(_box), style: const TextStyle(color: C.fg, fontSize: 18)),
         actions: [
           if (_box == 'trash' && (t ?? 0) > 0)
             IconButton(tooltip: 'Очистить корзину', icon: const Icon(Icons.delete_sweep_outlined, color: C.fg), onPressed: _busy ? null : _emptyTrash),
-          IconButton(
-            tooltip: 'Проверить почту',
-            icon: _busy ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.refresh, color: C.fg),
-            onPressed: _busy ? null : _refresh,
-          ),
           IconButton(
             tooltip: 'Написать письмо',
             icon: const Icon(Icons.edit_outlined, color: C.fg),
             onPressed: _accounts.any((a) => a.enabled) ? () => _openCompose() : null,
           ),
+          IconButton(
+            tooltip: 'Папки почты',
+            icon: const Icon(Icons.grid_view, color: C.fg),
+            onPressed: _openFoldersMenu,
+          ),
         ],
       ),
-      body: _error != null
-          ? Center(child: Text(_error!, style: const TextStyle(color: C.danger)))
-          : t == null
-              ? const Center(child: CircularProgressIndicator())
-              : t == 0
-                  ? Center(child: Text(
-                      _box == 'inbox' ? 'Входящих пока нет' : _box == 'sent' ? 'Исходящих пока нет' : 'Корзина пуста',
-                      style: const TextStyle(color: C.fg3)))
-                  : ListView.builder(
-                      controller: _sc,
-                      itemCount: t,
-                      itemExtent: _rowH,
-                      itemBuilder: (context, i) => _row(api, i),
-                    ),
+      // Обновление — только жестом «потянуть вниз»: своей кнопки у экрана нет.
+      body: RefreshIndicator(
+        onRefresh: _refresh,
+        child: _list(t, api),
+      ),
     );
   }
 
-  /// Вкладка папки в заголовке (входящие, исходящие, корзина).
+  /// Тело экрана: ошибка, пустая папка или список писем.
   ///
-  /// Переключение обнуляет `_total` и очищает `_items` ещё до запроса: пока новый счётчик
-  /// не пришёл, показывается спиннер, а не список чужой папки (индексы у папок свои).
-  Widget _boxTab(String id, IconData icon, String label) {
-    final active = _box == id;
-    return InkWell(
-      onTap: () {
-        setState(() {
-          _box = id;
-          _total = null;
-          _items.clear();
-        });
-        // Новый запрос поднимет поколение, и ответы прежней папки (счётчик и уже запрошенные
-        // порции строк) будут отброшены по `gen != _gen`.
-        _loadCounters();
-      },
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-        child: Icon(icon, color: active ? C.accent : C.fg3),
+  /// Всё это — прокручиваемые списки, даже когда показывать нечего: `RefreshIndicator` работает
+  /// только на прокручиваемом содержимом, и на непрокручиваемом виджете жест «потянуть вниз»
+  /// не сработал бы — то есть после сбоя обновить список было бы нечем.
+  ///
+  /// Спиннера первой загрузки здесь больше нет: список писем живёт в базе на устройстве
+  /// (см. план перехода на локальный список), и пустой экран до первого ответа — это честнее,
+  /// чем индикатор, который на быстром соединении не успевают заметить.
+  Widget _list(int? t, CloudlyApi api) {
+    if (_error != null && t == null) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const SizedBox(height: 80),
+          Center(child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: C.danger)),
+          )),
+        ],
+      );
+    }
+    if (t == null || t == 0) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const SizedBox(height: 100),
+          if (t == 0)
+            Center(child: Text(
+              _box == 'inbox' ? 'Входящих пока нет' : _box == 'sent' ? 'Исходящих пока нет' : 'Корзина пуста',
+              style: const TextStyle(color: C.fg3),
+            )),
+        ],
+      );
+    }
+    return ListView.builder(
+      controller: _sc,
+      physics: const AlwaysScrollableScrollPhysics(),
+      itemCount: t,
+      itemExtent: _rowH,
+      itemBuilder: (context, i) => _row(api, i),
+    );
+  }
+
+  /// Подпись папки: в заголовке экрана и в баре папок.
+  String _boxLabel(String id) => switch (id) {
+        'sent' => 'Исходящие',
+        'trash' => 'Корзина',
+        _ => 'Входящие',
+      };
+
+  /// Открывает бар папок почты — тот же приём, что у разделов фактур.
+  ///
+  /// Папок три, и переключение между ними — не переход на другой экран, а смена содержимого
+  /// этого же: список, счётчик и прокрутка у каждой папки свои, поэтому бар только выбирает
+  /// папку, а показывает её тот же экран. Открытая папка в баре выключена и подписана «Текущая
+  /// папка» — так видно, где находишься, и не приходится нажимать пункт, который ничего не меняет.
+  Future<void> _openFoldersMenu() async {
+    const folders = <(String, IconData, String)>[
+      ('inbox', Icons.inbox_outlined, 'Письма, которые вам пришли'),
+      ('sent', Icons.send_outlined, 'Отправленные вами'),
+      ('trash', Icons.delete_outline, 'Удалённые письма: можно вернуть'),
+    ];
+    final target = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final (id, icon, hint) in folders)
+              ListTile(
+                leading: Icon(icon, color: _box == id ? C.accent : C.fg3),
+                title: Text(_boxLabel(id)),
+                subtitle: Text(_box == id ? 'Текущая папка' : hint),
+                enabled: _box != id,
+                onTap: () => Navigator.pop(ctx, id),
+              ),
+          ],
+        ),
       ),
     );
+    // `null` — бар закрыли, не выбрав папку; выбор той же папки ничего не перечитывает.
+    if (target == null || !mounted || target == _box) return;
+    _switchBox(target);
+  }
+
+  /// Переключает открытую папку.
+  ///
+  /// `_total` и `_items` сбрасываются ещё до запроса: индексы у папок свои, и до нового счётчика
+  /// показывать строки прежней папки нельзя — «письмо №5 во входящих» и «письмо №5 в корзине»
+  /// это разные записи. Пока счётчика нет, список пуст.
+  void _switchBox(String id) {
+    setState(() {
+      _box = id;
+      _total = null;
+      _items.clear();
+    });
+    // Новый запрос поднимет поколение, и ответы прежней папки (счётчик и уже запрошенные
+    // порции строк) будут отброшены по `gen != _gen`.
+    _loadCounters();
   }
 
   /// Строка письма по абсолютному индексу.
   ///
-  /// Если строка ещё не загружена (`_items[i] == null`) — заглушка той же высоты: список
-  /// виртуальный, и заглушка держит место, чтобы скролл не прыгал, когда данные доедут.
+  /// Строка, которой ещё нет в `_items`, рисуется пустой: место под неё уже занято
+  /// (`itemExtent`), поэтому список не прыгает, когда данные доедут, а серых заглушек и
+  /// спиннеров на месте писем в приложении нет намеренно — незагруженная строка выглядит
+  /// просто пустой, а не «письмом, которое вот-вот нарисуется».
   /// [api] приходит из `build`: строка строится на каждый кадр, и читать провайдер здесь значило
   /// бы читать его на каждую строку.
   Widget _row(CloudlyApi api, int i) {
     final item = _items[i];
-    if (item == null) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        child: Container(color: C.surface3, height: _skeletonH, width: double.infinity),
-      );
-    }
+    if (item == null) return const SizedBox.shrink();
     return InkWell(
       onTap: () => _openMessage(item.id),
       child: Container(
@@ -818,8 +867,10 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
             IconButton(tooltip: 'Удалить', icon: const Icon(Icons.delete_outline, color: C.fg), onPressed: _busy ? null : _delete),
         ],
       ),
+      // Отступ снизу — под системную навигацию Android: у этого экрана нет нижней панели
+      // приложения, а свой `padding` у списка выключает автоматический системный отступ.
       body: ListView(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        padding: EdgeInsets.fromLTRB(14, 8, 14, 8 + navBarInset(context)),
         children: [
           if (_error != null) Text(_error!, style: const TextStyle(color: C.danger)),
           if (m == null && _error == null)
@@ -861,7 +912,15 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
               // Тело письма — в системном WebView: разметка рассылок (таблицы, медиазапросы,
               // inline-стили) рассчитана на браузерный движок, а не на виджеты Flutter.
               // Обе версии — и разметка, и текст в `<pre>` от сервера — идут одной дорогой.
+              //
+              // Ключ обязателен и стоит на самом элементе списка: выше по списку лежат
+              // необязательные блоки (кнопка «показать картинки», строка об обрезанном тексте),
+              // и без ключа они сдвигали бы тело на другое место — Flutter счёл бы WebView новым
+              // виджетом и пересоздал его, то есть письмо перезагрузилось бы прямо на глазах.
+              // С ключом элемент находится на новом месте, а содержимое меняет только
+              // `didUpdateWidget`.
               Padding(
+                key: const ValueKey('mail-body'),
                 padding: const EdgeInsets.symmetric(horizontal: 4),
                 child: MailBodyWeb(_body!['html'] as String? ?? ''),
               ),
@@ -1025,8 +1084,10 @@ class _MailComposerScreenState extends ConsumerState<MailComposerScreen> {
           ),
         ],
       ),
+      // Низ формы — под системной навигацией Android: у формы нет нижней панели приложения,
+      // а свой `padding` у списка выключает автоматический системный отступ.
       body: ListView(
-        padding: const EdgeInsets.all(14),
+        padding: EdgeInsets.fromLTRB(14, 14, 14, 14 + navBarInset(context)),
         children: [
           // Выбор виден только при нескольких включённых аккаунтах: с одним ящиком это лишнее
           // поле, а `_accountId` и так указывает на него.

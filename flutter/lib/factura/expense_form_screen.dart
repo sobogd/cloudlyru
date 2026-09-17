@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../util/download.dart';
+import '../util/widgets.dart';
 import '../providers.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
@@ -355,7 +356,7 @@ class _ExpenseFormScreenState extends ConsumerState<ExpenseFormScreen> {
         ],
       ),
       body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+        padding: EdgeInsets.fromLTRB(16, 12, 16, 32 + navBarInset(context)),
         children: [
           if (_error != null) ...[
             Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),

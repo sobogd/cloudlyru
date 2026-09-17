@@ -42,12 +42,21 @@ class MailBodyWeb extends StatefulWidget {
 }
 
 /// Состояние WebView: контроллер и измеренная высота содержимого.
-class _MailBodyWebState extends State<MailBodyWeb> {
+///
+/// Состояние просит список держать себя живым ([AutomaticKeepAliveClientMixin]): WebView — самый
+/// дорогой виджет на экране письма, а пересоздание — это полная перезагрузка чужого документа
+/// (разметка, картинки, шрифты). Список выбрасывает содержимое за пределами видимой части, и без
+/// этой просьбы письмо перезагружалось бы у человека на глазах.
+class _MailBodyWebState extends State<MailBodyWeb> with AutomaticKeepAliveClientMixin {
   /// Контроллер создаётся один раз на виджет и переиспользуется между письмами: пересоздание
   /// на каждую загрузку — это ещё один WebView и потерянный нативный кэш.
   late final WebViewController _controller = _newController();
   /// Высота документа по последнему замеру; 0 — замера ещё не было, показывается `minHeight`.
   double _height = 0;
+
+  /// Держать себя живым, пока экран письма открыт (см. комментарий класса).
+  @override
+  bool get wantKeepAlive => true;
 
   /// Собирает контроллер: включает JS, задаёт фон, вешает мост высоты и перехват навигации.
   ///
@@ -95,6 +104,9 @@ class _MailBodyWebState extends State<MailBodyWeb> {
   /// ростом: высота приходит из чужого документа, и верить ей безгранично нельзя.
   /// Порог в 1 px гасит дрожание: скрипт мерит высоту многократно, и перерисовка на каждое
   /// изменение на пиксель стоила бы дороже, чем заметный сдвиг.
+  ///
+  /// Свой прошлый замер здесь не сравнивается с новым: «письмо растёт само по себе» гасится
+  /// в самом скрипте — он меряет содержимое, а не окно (см. [_heightScript]).
   void _onHeight(JavaScriptMessage message) {
     final measured = double.tryParse(message.message);
     if (measured == null || measured <= 0) return;
@@ -142,6 +154,9 @@ class _MailBodyWebState extends State<MailBodyWeb> {
 
   @override
   Widget build(BuildContext context) {
+    // Просьба «держать живым» уходит подпиской, которую ставит миксин: без этого вызова
+    // состояние не узнает, что его собираются выбросить, и просьба не сработает.
+    super.build(context);
     // Высота списка — это и есть высота письма: WebView сам по себе не тянется под содержимое,
     // поэтому до первого замера берём minHeight, а дальше измеренное значение.
     return SizedBox(
@@ -266,9 +281,17 @@ String _nonce() {
 /// `!important` нужен, потому что свои размеры отправитель ставит атрибутом или inline-стилем.
 /// `pre` — текстовая версия письма приходит завёрнутой в `<pre>`, и без переноса она уезжает
 /// в горизонтальную прокрутку.
+///
+/// `html, body { height: auto; min-height: 0 }` — тоже про растягивание, но с другой стороны:
+/// у высоких макетов (а их шлют и в письмах) корень подписан `height: 100%` или
+/// `min-height: 100vh`, и тогда высота документа становится высотой окна, а не содержимого.
+/// Внутри списка писем это давало два бедствия сразу: короткое письмо занимало экран пустым
+/// местом, а окно, выставленное по замеру, снова поднимало эту же высоту — письмо «дорастало»
+/// на каждом замере. `!important` здесь обязателен: объявление отправителя чаще всего inline,
+/// и без веса оно выиграло бы у нашего правила.
 const _normalizeCss = '''
 :root { color-scheme: light; }
-html, body { margin: 0; padding: 0; background: #fff; overflow-x: hidden; }
+html, body { margin: 0; padding: 0; background: #fff; overflow-x: hidden; height: auto !important; min-height: 0 !important; }
 body { padding: 10px 12px; -webkit-text-size-adjust: 100%; word-wrap: break-word; }
 img { max-width: 100% !important; height: auto !important; }
 table { max-width: 100% !important; }
@@ -276,28 +299,118 @@ pre { white-space: pre-wrap; word-wrap: break-word; }
 a { word-break: break-word; }
 ''';
 
-/// Скрипт высоты: WebView не сообщает, сколько места заняло содержимое, а письмо должно расти
-/// внутри общего списка. Считаем высоту документа и пересчитываем её, пока письмо не устоится
-/// (картинки и шрифты приходят позже разметки).
+/// Скрипт замера: WebView не сообщает, сколько места заняло содержимое, а письмо должно расти
+/// внутри общего списка.
+///
+/// Почему замер устроен именно так — три правила, и каждое закрывает свою поломку вёрстки:
+///
+///  • **меряем содержимое, а не документ**. `scrollHeight` никогда не бывает меньше высоты
+///    окна, поэтому короткое письмо всегда «занимало» целый экран, а выставленная по замеру
+///    высота на следующем круге снова попадала в замер — письмо росло вниз само по себе.
+///    Поэтому высота берётся у самого `body` (его высота — это его содержимое) плюс, на случай
+///    выпавших из потока элементов, самая нижняя граница среди детей;
+///  • **единицы вьюпорта пересчитываются в пиксели** ([freezeViewportUnits]). `100vh` внутри
+///    письма — это высота окна, то есть ровно та величина, которую мы и выставляем: замер
+///    зависел бы от собственного прошлого результата и рос бесконечно. Опорой служит высота
+///    экрана (`screen.height`), а не окна: она не меняется от наших же правок. `min-height`
+///    в этих единицах гасится в ноль целиком — на телефоне он даёт не «во весь экран», а
+///    пустое место под коротким письмом;
+///  • **широкие блоки сужаются** ([clampOverflow]): рассылки свёрстаны под 600–800 px, и
+///    фиксированная ширина на телефоне обрезала содержимое. Сужаем только то, что и правда
+///    шире окна, — остального не касаемся.
 ///
 /// Пересчёт идёт по четырём поводам, потому что одного из них мало: сразу при разборе (быстрый
 /// случай — короткий текст), по `DOMContentLoaded` и `load` (готовность документа и ресурсов),
 /// через `ResizeObserver` (письмо «доросло» из-за картинки без перезагрузки) и, наконец,
-/// интервалом 250 мс — страховка на случай, когда ничего из перечисленного не сработало;
-/// интервал снимает себя после 20 замеров (5 с), чтобы не тикать вечно.
+/// интервалом 250 мс — страховка на случай, когда ничего из перечисленного не сработало.
+/// Интервал снимает себя, как только замер устоялся (три одинаковых подряд), а если письмо
+/// почему-то продолжает меняться — после 40 замеров (10 с), чтобы не тикать вечно.
 const _heightScript = r'''
 (function () {
-  var last = 0;
+  // Опорная высота для единиц вьюпорта: высота экрана, а не окна — окно мы и меняем замером.
+  var refH = (window.screen && window.screen.height) || window.innerHeight || 0;
+
+  // Пересчёт vh/vmin/vmax в пиксели: без него письмо растёт от собственной высоты (см. выше).
+  function freezeViewportUnits() {
+    if (!refH) return;
+    var units = /(-?\d*\.?\d+)(vh|vmin|vmax)\b/gi;
+    function swap(css) {
+      if (!css || css.indexOf('v') < 0) return css;
+      // min-height в единицах вьюпорта — это «не меньше экрана», то есть пустое место.
+      css = css.replace(/min-height\s*:\s*-?\d*\.?\d+(vh|vmin|vmax)/gi, 'min-height:0');
+      return css.replace(units, function (all, n, unit) {
+        var u = unit.toLowerCase();
+        var base = u === 'vmin' ? Math.min(refH, window.innerWidth || refH)
+                 : u === 'vmax' ? Math.max(refH, window.innerWidth || refH)
+                 : refH;
+        return (parseFloat(n) * base / 100) + 'px';
+      });
+    }
+    var i, s, t;
+    var styled = document.querySelectorAll('[style]');
+    for (i = 0; i < styled.length; i++) {
+      s = styled[i].getAttribute('style');
+      t = swap(s);
+      if (t !== s) styled[i].setAttribute('style', t);
+    }
+    var sheets = document.querySelectorAll('style');
+    for (i = 0; i < sheets.length; i++) {
+      s = sheets[i].textContent || '';
+      t = swap(s);
+      if (t !== s) sheets[i].textContent = t;
+    }
+  }
+
+  // Сужение блоков шире окна: фиксированные ширины десктопных рассылок на телефоне обрезаются.
+  function clampOverflow() {
+    var vw = document.documentElement.clientWidth || window.innerWidth || 0;
+    if (!vw || !document.body) return;
+    var all = document.body.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getBoundingClientRect().width > vw + 1) all[i].style.maxWidth = '100%';
+    }
+  }
+
+  // Высота содержимого: высота body (у неё auto — значит, по содержимому) и, на всякий случай,
+  // самая нижняя граница среди детей — так видно элементы, выпавшие из потока (float, absolute).
+  function measure() {
+    var b = document.body;
+    if (!b) return 0;
+    var r = b.getBoundingClientRect();
+    var h = r.height;
+    for (var i = 0; i < b.children.length; i++) {
+      var cr = b.children[i].getBoundingClientRect();
+      if (cr.bottom - r.top > h) h = cr.bottom - r.top;
+    }
+    return Math.ceil(h);
+  }
+
+  var last = 0, stable = 0;
   function report() {
     if (!window.MailBody) return;
-    var d = document.documentElement, b = document.body;
-    var h = Math.ceil(Math.max(d ? d.scrollHeight : 0, b ? b.scrollHeight : 0));
-    if (h > 0 && h !== last) { last = h; window.MailBody.postMessage(String(h)); }
+    var h = measure();
+    if (h <= 0) return;
+    if (Math.abs(h - last) < 1) {
+      stable++;              // высота не меняется — значит, письмо устоялось
+    } else {
+      last = h;
+      stable = 0;
+      window.MailBody.postMessage(String(h));
+    }
   }
+
+  freezeViewportUnits();
+  clampOverflow();
   report();
-  document.addEventListener('DOMContentLoaded', report);
-  window.addEventListener('load', report);
+  // На готовности документа и ресурсов обе правки повторяются: скрипт стоит в самом конце
+  // документа, но элементы после него и пришедшие позже (картинки) в первый проход не попали.
+  // Повтор безвреден: vh-единиц после первого прохода в разметке уже нет.
+  document.addEventListener('DOMContentLoaded', function () { freezeViewportUnits(); clampOverflow(); report(); });
+  window.addEventListener('load', function () { freezeViewportUnits(); clampOverflow(); report(); });
   try { if (window.ResizeObserver) new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
-  var n = 0, t = setInterval(function () { report(); if (++n > 20) clearInterval(t); }, 250);
+  var n = 0, t = setInterval(function () {
+    report();
+    if (stable >= 3 || ++n > 40) clearInterval(t);
+  }, 250);
 })();
 ''';

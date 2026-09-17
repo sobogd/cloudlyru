@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers.dart';
 import '../util/download.dart';
 import '../util/format.dart';
+import '../util/widgets.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
 import 'invoice_form_screen.dart';
@@ -336,7 +337,7 @@ class _InvoiceDetailScreenState extends ConsumerState<InvoiceDetailScreen> {
                       ),
               )
             : ListView(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+                padding: EdgeInsets.fromLTRB(16, 12, 16, 32 + navBarInset(context)),
                 children: [
                   if (_error != null) ...[
                     _Banner(text: _error!, color: Theme.of(context).colorScheme.error),

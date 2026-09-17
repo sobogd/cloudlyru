@@ -124,7 +124,7 @@ class _QueueErrorsScreenState extends ConsumerState<QueueErrorsScreen> {
         title: const Text('Ошибки очереди', style: TextStyle(color: C.fg, fontSize: 18)),
       ),
       body: ListView(
-        padding: const EdgeInsets.all(12),
+        padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + navBarInset(context)),
         children: [
           Row(
             children: [

@@ -374,7 +374,7 @@ class _FileDetailScreenState extends ConsumerState<FileDetailScreen> {
           ],
         ),
         body: ListView(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          padding: EdgeInsets.fromLTRB(14, 8, 14, 8 + navBarInset(context)),
           children: [
             if (_error != null) Text(_error!, style: const TextStyle(color: C.danger)),
             if (_notice != null) Text(_notice!, style: const TextStyle(color: C.ok)),

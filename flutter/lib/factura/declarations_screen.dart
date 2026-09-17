@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../util/widgets.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
 import 'factura_providers.dart';
@@ -127,7 +128,7 @@ class _DeclarationsScreenState extends ConsumerState<DeclarationsScreen> {
                         onRefresh: _load,
                         child: ListView(
                           physics: const AlwaysScrollableScrollPhysics(),
-                          padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+                          padding: EdgeInsets.fromLTRB(16, 12, 16, 32 + navBarInset(context)),
                           children: [
                             _summaryCard(context, data),
                             const SizedBox(height: 12),

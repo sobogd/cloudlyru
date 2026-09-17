@@ -8,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers.dart';
 import '../util/download.dart';
 import '../util/format.dart';
+import '../util/widgets.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
 import 'factura_providers.dart';
@@ -111,7 +112,7 @@ class _FiledDeclarationsScreenState extends ConsumerState<FiledDeclarationsScree
                     )
                   : ListView.builder(
                       physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 88),
+                      padding: EdgeInsets.fromLTRB(12, 12, 12, 88 + navBarInset(context)),
                       itemCount: rows.length,
                       itemBuilder: (context, i) {
                         final row = rows[i];
@@ -399,7 +400,7 @@ class _FiledDeclarationFormScreenState extends ConsumerState<FiledDeclarationFor
         ],
       ),
       body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+        padding: EdgeInsets.fromLTRB(16, 12, 16, 32 + navBarInset(context)),
         children: [
           if (_error != null) ...[
             Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),

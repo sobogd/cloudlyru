@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../util/format.dart';
+import '../util/widgets.dart';
 import 'expense_form_screen.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
@@ -133,7 +134,7 @@ class _ExpensesScreenState extends ConsumerState<ExpensesScreen> {
 
     return ListView.builder(
       physics: const AlwaysScrollableScrollPhysics(),
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 88),
+      padding: EdgeInsets.fromLTRB(12, 12, 12, 88 + navBarInset(context)),
       itemCount: keys.length,
       itemBuilder: (context, index) {
         final key = keys[index];

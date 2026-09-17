@@ -178,7 +178,7 @@ class _FolderDetailScreenState extends ConsumerState<FolderDetailScreen> {
           ],
         ),
         body: ListView(
-          padding: const EdgeInsets.all(14),
+          padding: EdgeInsets.fromLTRB(14, 14, 14, 14 + navBarInset(context)),
           children: [
             if (_error != null) Text(_error!, style: const TextStyle(color: C.danger)),
             if (_notice != null) Text(_notice!, style: const TextStyle(color: C.ok)),

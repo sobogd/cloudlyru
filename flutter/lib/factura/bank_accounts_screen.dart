@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../util/widgets.dart';
 import 'factura_api.dart';
 import 'factura_models.dart';
 import 'factura_providers.dart';
@@ -103,7 +104,7 @@ class _BankAccountsScreenState extends ConsumerState<BankAccountsScreen> {
                     )
                   : ListView.builder(
                       physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 88),
+                      padding: EdgeInsets.fromLTRB(12, 12, 12, 88 + navBarInset(context)),
                       itemCount: rows.length,
                       itemBuilder: (context, i) {
                         final a = rows[i];
@@ -268,7 +269,7 @@ class _BankAccountFormScreenState extends ConsumerState<BankAccountFormScreen> {
         ],
       ),
       body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+        padding: EdgeInsets.fromLTRB(16, 12, 16, 32 + navBarInset(context)),
         children: [
           if (_error != null) ...[
             Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
