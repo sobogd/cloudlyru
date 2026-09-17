@@ -632,12 +632,17 @@ String? _domainOfEmail(String? addr) {
 
 // ---------- просмотр письма ----------
 
-/// Просмотр письма: шапка, тело и вложения.
+/// Просмотр письма: шапка, карточка с телом и вложения.
 ///
 /// Тело приходит с сервера уже очищенным (см. src/mail/mail-html.ts) и рисуется в WebView —
-/// почему именно так, написано в `MailBodyWeb`. Здесь решается, что показывать: разметку или
-/// текстовую версию, — и что делать с письмом (ответ, пересылка, скачивание `.eml`,
-/// удаление в корзину; в корзине — восстановление и удаление навсегда).
+/// почему именно так, написано в `MailBodyWeb`. Здесь решается, что делать с письмом (ответ,
+/// пересылка, скачивание `.eml`, удаление в корзину; в корзине — восстановление и удаление
+/// навсегда) и как разложить экран.
+///
+/// Раскладка: письмо прокручивается **внутри карточки**, а не вместе со страницей. Отправитель
+/// и тема живут в шапке, «кому» и аккаунт — строкой над карточкой, вложения — строкой чипов там
+/// же. Всё это не прокручивается вовсе, поэтому отправитель виден всегда, а письмо занимает ровно
+/// ту часть экрана, что осталась, и не уезжает под системную навигацию Android.
 ///
 /// `inTrash` приходит от списка: от него зависит набор действий в AppBar, а чтение письма
 /// и тела у корзины и входящих одинаковое.
@@ -650,31 +655,16 @@ class MailViewerScreen extends ConsumerStatefulWidget {
   ConsumerState<MailViewerScreen> createState() => _MailViewerScreenState();
 }
 
-/// Состояние просмотрщика: письмо, его тело в выбранной версии и флаги показа.
+/// Состояние просмотрщика: письмо, его тело и флаги показа.
 class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
   MailMessageView? _msg;
-  /// Тело от сервера. Разметка приходит готовым документом, текст — тем же полем `html`,
-  /// но с текстом внутри `<pre>`, поэтому дорога до отрисовки одна.
+  /// Тело от сервера: разметка приходит готовым документом в поле `html`.
   Map<String, dynamic>? _body;
   String? _error;
-  /// Идёт операция над письмом (удаление, переключение вида): блокирует повторные нажатия.
+  /// Идёт операция над письмом (удаление): блокирует повторные нажатия.
   bool _busy = false;
-  /// Показываем текстовую версию вместо разметки: у рассылок, которые и в браузере едут,
-  /// читаемый выход важнее оформления.
-  bool _asText = false;
-  /// Была ли у письма версия с разметкой: по ней решаем, показывать ли переключатель.
-  bool _hasHtml = false;
-  /// Пользователь разрешил грузить внешние картинки письма.
-  ///
-  /// По умолчанию нет: картинка по ссылке — это трекер, по которому отправитель узнаёт, что
-  /// письмо открыли, когда и с какого адреса (src/mail/mail-html.ts). Сервер по флагу `images`
-  /// либо оставляет внешние `src`, либо убирает их и считает в `blockedRemote` — по этому счёту
-  /// и появляется предложение показать картинки.
-  bool _images = false;
-  /// Сколько внешних картинок сервер не отдал из-за [_images] == false.
-  int _blockedRemote = 0;
-  /// Сервер отдал не весь текст письма (взял превью из базы): об этом надо сказать, иначе
-  /// «показать как текст» выглядит как потерянное письмо.
+  /// Сервер отдал не весь текст письма (взял превью из базы, потому что исходник не разобрался):
+  /// об этом надо сказать, иначе обрезанное письмо читается как полное.
   bool _truncated = false;
 
   @override
@@ -706,39 +696,24 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
     }
   }
 
-  /// Тело письма в нужной версии: разметка или текст.
+  /// Тело письма — всегда полная разметка, вместе с картинками по ссылке.
   ///
-  /// Внешние картинки показываются только после явного согласия ([_images]): пока его нет,
-  /// сервер убирает внешние `src` и возвращает их число в `blockedRemote`, а экран предлагает
-  /// «показать картинки». Вшитые в письмо (`data:`) картинки приходят всегда — они никуда
-  /// не ходят. Подробности — в src/mail/mail-html.ts.
+  /// Раньше картинки по ссылке не грузились до явного согласия: картинка по ссылке — это трекер,
+  /// по которому отправитель узнаёт, что письмо открыли, когда и с какого адреса
+  /// (src/mail/mail-html.ts). Кнопка «показать картинки» и счёт неотданных картинок убраны по
+  /// решению владельца: письмо должно выглядеть как задумано, а не как набор пустых рамок, и
+  /// лишних кнопок на экране быть не должно.
   ///
-  /// `_hasHtml` выставляется только при непустой разметке: если сервер отдал текст, переключать
-  /// нечего и кнопка «показать как текст» не показывается вовсе.
+  /// Версии «как текст» здесь тоже больше нет: сервер умеет отдавать текстовую версию, но
+  /// переключателя в приложении нет — письмо показывается так, как его сверстали.
   Future<void> _loadBody() async {
     final api = ref.read(appStateProvider).api;
-    final b = await api.mailBody(widget.messageId, _images, text: _asText);
+    final b = await api.mailBody(widget.messageId);
     if (!mounted) return;
     setState(() {
       _body = b;
-      if (!_asText && b['kind'] == 'html') _hasHtml = true;
-      _blockedRemote = _images ? 0 : (toNum(b['blockedRemote'])?.toInt() ?? 0);
       _truncated = b['truncated'] == true;
     });
-  }
-
-  /// Переключает тело между разметкой и текстом и перезапрашивает его.
-  ///
-  /// Версия не хранится на клиенте: сервер отдаёт либо разметку, либо текст, поэтому
-  /// переключение — это новый запрос. Флаг меняется до запроса (кнопка сразу меняет вид),
-  /// а если запрос упал — показывается подсказка, а на экране остаётся прежнее тело.
-  Future<void> _toggleText() async {
-    setState(() => _asText = !_asText);
-    try {
-      await _loadBody();
-    } catch (e) {
-      if (mounted) snack(context, e.toString());
-    }
   }
 
   /// Открывает форму письма как ответ, «ответ всем» или пересылку.
@@ -816,20 +791,6 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
     }
   }
 
-  /// Разрешает показ внешних картинок письма и перезапрашивает тело.
-  ///
-  /// Согласие разовое и живёт в состоянии экрана: это не настройка, а «показать картинки
-  /// в этом письме». Тот же смысл у флага `images` у `/mail/messages/:id/body` — до него сервер
-  /// сам убирает внешние `src`, поэтому переключать что-то на клиенте нечем: нужен новый запрос.
-  Future<void> _showImages() async {
-    setState(() => _images = true);
-    try {
-      await _loadBody();
-    } catch (e) {
-      if (mounted) snack(context, e.toString());
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final m = _msg;
@@ -841,109 +802,165 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
       backgroundColor: C.canvas,
       appBar: AppBar(
         leading: IconButton(icon: const Icon(Icons.arrow_back, color: C.fg), onPressed: () => Navigator.pop(context)),
-        title: Text(m == null ? 'Письмо' : fullDate(DateTime.parse(m.sortAt ?? DateTime.now().toIso8601String())),
-            style: const TextStyle(color: C.fg3, fontSize: 14)),
+        // Отправитель — в шапке: письмо прокручивается внутри карточки, и всё, что стояло бы над
+        // ней в прокручиваемой части, уезжало бы вверх. В шапке отправитель виден всегда.
+        title: Text(_sender(m),
+            style: const TextStyle(color: C.fg, fontSize: 16),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis),
         actions: [
-          if (_hasHtml)
-            IconButton(
-              tooltip: _asText ? 'Показать письмо' : 'Показать как текст',
-              icon: Icon(_asText ? Icons.html : Icons.notes, color: C.fg),
-              onPressed: _busy ? null : _toggleText,
-            ),
           if (m != null && !widget.inTrash) ...[
             IconButton(tooltip: 'Ответить', icon: const Icon(Icons.reply, color: C.fg), onPressed: () => _reply('reply')),
-            IconButton(tooltip: 'Ответить всем', icon: const Icon(Icons.reply_all, color: C.fg), onPressed: () => _reply('replyAll')),
-            IconButton(tooltip: 'Переслать', icon: const Icon(Icons.forward, color: C.fg), onPressed: () => _reply('forward')),
+            IconButton(tooltip: 'Удалить', icon: const Icon(Icons.delete_outline, color: C.fg), onPressed: _busy ? null : _delete),
           ],
-          if (m != null)
-            IconButton(
-              tooltip: 'Скачать .eml',
-              icon: const Icon(Icons.download, color: C.fg),
-              onPressed: () => _downloadRaw(api, m.id),
-            ),
           if (m != null && widget.inTrash) ...[
             IconButton(tooltip: 'Восстановить', icon: const Icon(Icons.restore, color: C.fg), onPressed: _restore),
             IconButton(tooltip: 'Удалить навсегда', icon: const Icon(Icons.delete_forever_outlined, color: C.danger), onPressed: _purgeForever),
-          ] else if (m != null)
-            IconButton(tooltip: 'Удалить', icon: const Icon(Icons.delete_outline, color: C.fg), onPressed: _busy ? null : _delete),
-        ],
-      ),
-      // Отступ снизу — под системную навигацию Android: у этого экрана нет нижней панели
-      // приложения, а свой `padding` у списка выключает автоматический системный отступ.
-      body: ListView(
-        padding: EdgeInsets.fromLTRB(14, 8, 14, 8 + navBarInset(context)),
-        children: [
-          if (_error != null) Text(_error!, style: const TextStyle(color: C.danger)),
-          if (m == null && _error == null)
-            const Center(child: CircularProgressIndicator())
-          else if (m != null) ...[
-            Panel(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(m.subject ?? '(без темы)', style: const TextStyle(color: C.fg, fontSize: 17, fontWeight: FontWeight.w600)),
-              const SizedBox(height: 8),
-              Text('${m.fromName ?? m.fromAddr ?? 'без отправителя'}${m.fromName != null && m.fromAddr != null ? ' <${m.fromAddr}>' : ''}',
-                  style: const TextStyle(color: C.fg2, fontSize: 13)),
-              Text('кому: ${[...m.toAddrs, ...m.ccAddrs].join(', ')}', style: const TextStyle(color: C.fg3, fontSize: 12)),
-              Text('аккаунт: ${m.accountEmail}', style: const TextStyle(color: C.fg3, fontSize: 12)),
-            ])),
-            const SizedBox(height: 8),
-            // Внешние картинки не грузились, пока пользователь не согласился: сервер вырезал
-            // их из разметки и сказал, сколько было. Показываем это предложением, а не молчанием:
-            // без него рассылка выглядит поломанной, а причина (трекеры) не видна.
-            if (_blockedRemote > 0)
-              Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton.icon(
-                  onPressed: _busy ? null : _showImages,
-                  icon: const Icon(Icons.image_outlined, color: C.accent, size: 18),
-                  label: Text('Показать картинки из интернета ($_blockedRemote)',
-                      style: const TextStyle(color: C.accent, fontSize: 13)),
-                ),
-              ),
-            // Текст пришёл не целиком: сервер отдал превью из базы, потому что письмо
-            // не разобралось. Молчать об этом нельзя — обрезанное письмо читается как полное.
-            if (_truncated)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: Text('Письмо показано не полностью: остальное не удалось разобрать.',
-                    style: const TextStyle(color: C.fg3, fontSize: 12)),
-              ),
-            if (_body == null)
-              const Padding(padding: EdgeInsets.all(20), child: Center(child: CircularProgressIndicator()))
-            else
-              // Тело письма — в системном WebView: разметка рассылок (таблицы, медиазапросы,
-              // inline-стили) рассчитана на браузерный движок, а не на виджеты Flutter.
-              // Обе версии — и разметка, и текст в `<pre>` от сервера — идут одной дорогой.
-              //
-              // Ключ обязателен и стоит на самом элементе списка: выше по списку лежат
-              // необязательные блоки (кнопка «показать картинки», строка об обрезанном тексте),
-              // и без ключа они сдвигали бы тело на другое место — Flutter счёл бы WebView новым
-              // виджетом и пересоздал его, то есть письмо перезагрузилось бы прямо на глазах.
-              // С ключом элемент находится на новом месте, а содержимое меняет только
-              // `didUpdateWidget`.
-              Padding(
-                key: const ValueKey('mail-body'),
-                padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: MailBodyWeb(_body!['html'] as String? ?? ''),
-              ),
-            if (files.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Panel(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('Вложения (${files.length})', style: const TextStyle(color: C.fg3, fontSize: 13)),
-                ...files.map((a) => ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: const Icon(Icons.attach_file, color: C.fg3),
-                  title: Text(a.name, style: const TextStyle(color: C.fg, fontSize: 14)),
-                  subtitle: Text('${fmtSize(a.size)} · ${a.mime}', style: const TextStyle(color: C.fg3, fontSize: 12)),
-                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                    IconButton(icon: const Icon(Icons.open_in_new, color: C.accent), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FileDetailScreen(entryId: a.entryId)))),
-                    IconButton(icon: const Icon(Icons.download, color: C.fg), onPressed: () => _download(api, a.entryId, a.name)),
-                  ]),
-                )),
-              ])),
-            ],
           ],
+          // Остальные действия — в меню: в шапке стоит отправитель, и четыре-пять иконок рядом
+          // с подписью оставляли бы от неё считанные буквы.
+          if (m != null)
+            PopupMenuButton<String>(
+              tooltip: 'Ещё',
+              onSelected: (v) => switch (v) {
+                'replyAll' => _reply('replyAll'),
+                'forward' => _reply('forward'),
+                _ => _downloadRaw(api, m.id),
+              },
+              itemBuilder: (_) => [
+                if (!widget.inTrash) ...[
+                  const PopupMenuItem(value: 'replyAll', child: Text('Ответить всем')),
+                  const PopupMenuItem(value: 'forward', child: Text('Переслать')),
+                ],
+                const PopupMenuItem(value: 'eml', child: Text('Скачать .eml')),
+              ],
+            ),
         ],
       ),
+      // Экран — колонка из неподвижной части (тема, кому, аккаунт, вложения) и карточки с письмом,
+      // которая занимает всё оставшееся место и прокручивается сама. Отступ снизу — системная
+      // навигация Android: карточка кончается над полосой, и под ней ничего не просвечивает,
+      // даже когда письмо внутри карточки доехало до конца.
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (m != null) _header(m),
+          // Текст пришёл не целиком: сервер отдал превью из базы, потому что исходник
+          // не разобрался. Молчать об этом нельзя — обрезанное письмо читается как полное.
+          if (_truncated)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+              child: Text('Письмо показано не полностью: остальное не удалось разобрать.',
+                  style: const TextStyle(color: C.fg3, fontSize: 12)),
+            ),
+          if (files.isNotEmpty) _attachments(files),
+          Expanded(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(12, 6, 12, 8 + navBarInset(context)),
+              child: _bodyCard(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Отправитель письма для шапки: имя и адрес, если имя есть.
+  ///
+  /// Подпись та же, что в списке и в блоке над карточкой, — письмо должно узнаваться по одной
+  /// и той же строке, а не по трём разным.
+  String _sender(MailMessageView? m) {
+    if (m == null) return 'Письмо';
+    final name = m.fromName?.trim() ?? '';
+    final addr = m.fromAddr?.trim() ?? '';
+    if (name.isEmpty) return addr.isEmpty ? 'без отправителя' : addr;
+    return addr.isEmpty ? name : '$name <$addr>';
+  }
+
+  /// Неподвижная часть над карточкой: тема, кому и в какой аккаунт пришло письмо.
+  ///
+  /// Письмо прокручивается внутри карточки, поэтому всё это видно всё время чтения — в отличие
+  /// от прежней раскладки, где шапка уезжала вверх вместе со списком.
+  Widget _header(MailMessageView m) {
+    final date = m.sortAt == null ? '' : fullDate(DateTime.parse(m.sortAt!));
+    final subject = m.subject?.trim() ?? '';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 2),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(subject.isEmpty ? '(без темы)' : subject,
+            style: const TextStyle(color: C.fg, fontSize: 15, fontWeight: FontWeight.w600),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis),
+        const SizedBox(height: 2),
+        Text('кому: ${[...m.toAddrs, ...m.ccAddrs].join(', ')}',
+            style: const TextStyle(color: C.fg3, fontSize: 12),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis),
+        Text('аккаунт: ${m.accountEmail}${date.isEmpty ? '' : ' · $date'}',
+            style: const TextStyle(color: C.fg3, fontSize: 12),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis),
+      ]),
+    );
+  }
+
+  /// Вложения — строкой чипов над карточкой.
+  ///
+  /// Раньше это была панель со списком (имя, размер и две кнопки на каждое вложение) и стояла она
+  /// под телом письма; теперь тело занимает всё место до низа экрана, и панель отнимала бы у него
+  /// половину высоты. Нажатие открывает запись файла: там и предпросмотр, и скачивание.
+  Widget _attachments(List<MailAttachment> files) {
+    return SizedBox(
+      height: 42,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        itemCount: files.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, i) {
+          final a = files[i];
+          return ActionChip(
+            avatar: const Icon(Icons.attach_file, size: 16, color: C.fg3),
+            label: Text('${a.name} · ${fmtSize(a.size)}',
+                style: const TextStyle(color: C.fg, fontSize: 12)),
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => FileDetailScreen(entryId: a.entryId))),
+          );
+        },
+      ),
+    );
+  }
+
+  /// Карточка с телом письма: та же форма, что у панелей приложения (скругление и рамка),
+  /// только внутри не виджеты, а документ письма.
+  ///
+  /// Белая подложка нужна с двух сторон. Сама карточка белая, чтобы за документом не просвечивал
+  /// тёмный фон приложения, а `MailBodyWeb` белит ещё и `html`/`body` самого документа и делает
+  /// это с `!important`: у части писем подложка подписана своим цветом, и без веса наше правило
+  /// проигрывало — письмо с чёрным текстом оказывалось на чёрном фоне.
+  ///
+  /// `clipBehavior` обязателен: без него прямоугольный документ вылезал бы за скруглённые углы.
+  Widget _bodyCard() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: C.brd),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: switch ((_error, _body)) {
+        (final String e, _) => Center(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(e, textAlign: TextAlign.center, style: const TextStyle(color: C.danger)),
+            ),
+          ),
+        // Пока тела нет, карточка пустая: индикатора загрузки на экране письма нет — лишних
+        // индикаторов в приложении быть не должно, а пустая белая карточка честно показывает,
+        // что письмо ещё едет.
+        (_, null) => const SizedBox.shrink(),
+        (_, final Map<String, dynamic> b) => MailBodyWeb(b['html'] as String? ?? ''),
+      },
     );
   }
 

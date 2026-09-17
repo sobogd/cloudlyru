@@ -866,15 +866,15 @@ class CloudlyApi {
       MailMessageView.fromJson(
           _m(await _req('/mail/messages/${Uri.encodeComponent(id)}', cancelToken: cancelToken)));
 
-  /// Тело письма: `images` — показывать внешние картинки, `text` — отдать текстовую версию
-  /// вместо разметки (на случай письма, которое и в браузере читается плохо).
+  /// Тело письма для показа — всегда полная разметка вместе с картинками по ссылке.
   ///
-  /// Флаги влияют только на то, что отдаёт сервер: само письмо они не меняют.
-  Future<Map<String, dynamic>> mailBody(String id, bool images, {bool text = false}) async {
-    // Флаги складываем в список: иначе пришлось бы склеивать «?» с пустой строкой параметров.
-    final params = <String>[if (images) 'images=1', if (text) 'text=1'];
-    return _m(await _req('/mail/messages/$id/body${params.isEmpty ? '' : '?${params.join('&')}'}'));
-  }
+  /// Ручка умеет и другое: `images=0` заставляет сервер вырезать внешние картинки (они же
+  /// трекеры, по которым отправитель узнаёт, что письмо открыли), а `text=1` — отдать текстовую
+  /// версию вместо разметки. Клиент не пользуется ни тем, ни другим: письмо показывается так,
+  /// как его сверстали, а переключателя «текст или html» на экране нет по решению владельца.
+  /// Флаги у сервера остаются: ими пользуются другие потребители API.
+  Future<Map<String, dynamic>> mailBody(String id) async =>
+      _m(await _req('/mail/messages/$id/body?images=1'));
 
   /// Помечает письмо прочитанным или непрочитанным.
   Future<void> mailSetSeen(String id, bool seen) async =>
