@@ -16,20 +16,23 @@ import '../../util/format.dart';
 import '../../util/widgets.dart';
 import '../files/file_detail.dart';
 import 'mail_body_web.dart';
+import 'mail_row.dart';
+import 'mail_search_screen.dart';
 
 /// Базовая высота строки письма — до поправки на системный размер шрифта.
 ///
-/// Высота фиксирована (`itemExtent`) и служит не только вёрстке: по ней считаются индексы
-/// видимой части — список на десятки тысяч писем строится целиком, а данные приходят только для
-/// строк, попавших в окно (`_fetchVisible`). Поэтому `itemExtent` и расчёт окна обязаны брать
-/// одно и то же число — фактическое, из `_rowH`, а не эту константу.
-const _rowBase = 76.0;
+/// Само число живёт в `mail_row.dart` (`mailRowBase`): строку рисуют и лента, и поиск, и высота
+/// у них обязана совпадать. Здесь важна вторая роль этой высоты — не вёрстка, а расчёт:
+/// по ней считаются индексы видимой части списка, потому что список на десятки тысяч писем
+/// строится целиком, а данные приходят только для строк, попавших в окно (`_fetchVisible`).
+/// Поэтому `itemExtent` и расчёт окна обязаны брать одно и то же число — фактическое, из `_rowH`.
+const _rowBase = mailRowBase;
 
 /// Сколько строк письма просит одна порция `mailRange`.
 ///
 /// 200 — меньше серверного потолка (`MAIL_RANGE_MAX = 500`, src/mail/mail-feed.service.ts) и
-/// выбрано под вес строки: в письме отправитель, тема, превью и тег аккаунта, а видимое окно при
-/// высоте строки 76 — это около десяти строк, так что порции с большим запасом хватает и на окно,
+/// выбрано под вес строки: в письме отправитель, тема и тег аккаунта, а видимое окно при
+/// высоте строки 52 — это больше десяти строк, так что порции с запасом хватает и на окно,
 /// и на несколько следующих остановок скролла.
 const _rangeChunk = 200;
 
@@ -331,6 +334,27 @@ class _MailScreenState extends ConsumerState<MailScreen> {
     });
   }
 
+  /// Открывает поиск по письмам.
+  ///
+  /// Поиск идёт ровно в той папке, которую смотрит пользователь (так решил владелец: «ищу там,
+  /// где нахожусь»), поэтому папка передаётся параметром, а не выбирается внутри поиска.
+  ///
+  /// Отдельный экран, а не режим этого: список здесь виртуальный, по `itemExtent` и абсолютным
+  /// индексам, и подмешивать в него вторую модель выдачи — значит сломать и то, и другое.
+  ///
+  /// После возврата список перечитывается — как и после открытия письма ([_openMessage]):
+  /// из поиска письмо могли открыть и прочитать, а счётчик непрочитанных и вес шрифта в строках
+  /// живут на этом экране и о чужой правке не знают. Возврат без единого открытого письма тоже
+  /// перечитывает счётчики: отличить этот случай от «открыл и прочитал» отсюда нечем, а лишний
+  /// запрос дешевле, чем строка, которая выглядит непрочитанной после того, как её прочли.
+  void _openSearch() {
+    Navigator.push(context, MaterialPageRoute(
+      builder: (_) => MailSearchScreen(box: _box),
+    )).then((_) {
+      if (mounted) _loadCounters();
+    });
+  }
+
   /// Открывает форму письма — новое, ответ, ответ всем или пересылку.
   ///
   /// Что именно писать, решает контекст `ctx`: сервер вернул готовые адресатов, тему,
@@ -377,6 +401,11 @@ class _MailScreenState extends ConsumerState<MailScreen> {
         actions: [
           if (_box == 'trash' && (t ?? 0) > 0)
             IconButton(tooltip: 'Очистить корзину', icon: const Icon(Icons.delete_sweep_outlined, color: C.fg), onPressed: _busy ? null : _emptyTrash),
+          IconButton(
+            tooltip: 'Поиск по письмам',
+            icon: const Icon(Icons.search, color: C.fg),
+            onPressed: _openSearch,
+          ),
           IconButton(
             tooltip: 'Написать письмо',
             icon: const Icon(Icons.edit_outlined, color: C.fg),
@@ -442,12 +471,9 @@ class _MailScreenState extends ConsumerState<MailScreen> {
     );
   }
 
-  /// Подпись папки: в заголовке экрана и в баре папок.
-  String _boxLabel(String id) => switch (id) {
-        'sent' => 'Исходящие',
-        'trash' => 'Корзина',
-        _ => 'Входящие',
-      };
+  /// Подпись папки: в заголовке экрана и в баре папок — одна и та же функция `mailBoxLabel`
+  /// из `mail_row.dart`, поэтому поиск называет папку теми же словами.
+  String _boxLabel(String id) => mailBoxLabel(id);
 
   /// Открывает бар папок почты — тот же приём, что у разделов фактур.
   ///
@@ -508,126 +534,19 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// просто пустой, а не «письмом, которое вот-вот нарисуется».
   /// [api] приходит из `build`: строка строится на каждый кадр, и читать провайдер здесь значило
   /// бы читать его на каждую строку.
+  ///
+  /// Вёрстка строки — в `MailRow` (`mail_row.dart`): та же строка рисуется в выдаче поиска,
+  /// и вторая её копия здесь разошлась бы с первой при первой же правке.
   Widget _row(CloudlyApi api, int i) {
     final item = _items[i];
     if (item == null) return const SizedBox.shrink();
-    return InkWell(
-      onTap: () => _openMessage(item.id),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(border: Border(bottom: BorderSide(color: C.brd))),
-        child: Row(children: [
-          _avatar(api, item),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                // Жирный шрифт — признак непрочитанного: отдельной точки-индикатора в строке нет,
-                // поэтому вес шрифта несёт всю разницу между прочитанным и новым письмом.
-                Expanded(
-                  child: Text(
-                    item.fromName ?? item.fromAddr ?? 'без отправителя',
-                    style: TextStyle(color: C.fg, fontSize: 14, fontWeight: item.seen ? FontWeight.w400 : FontWeight.w700),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                // Число писем в цепочке: сервер уже свернул переписку в одну строку, и без
-                // этой цифры непонятно, что внутри ещё есть письма.
-                if (item.threadCount > 1) Text('${item.threadCount}', style: const TextStyle(color: C.fg3, fontSize: 11)),
-                const SizedBox(width: 6),
-                Text(_accountTag(item), style: const TextStyle(color: C.fg3, fontSize: 11)),
-                const SizedBox(width: 6),
-                Text(item.sortAt == null ? '' : listDate(DateTime.parse(item.sortAt!), DateTime.now()),
-                    style: const TextStyle(color: C.fg3, fontSize: 11)),
-              ]),
-              const SizedBox(height: 2),
-              Text(item.subject ?? '(без темы)',
-                  style: TextStyle(color: C.fg, fontSize: 13, fontWeight: item.seen ? FontWeight.w400 : FontWeight.w600),
-                  maxLines: 1, overflow: TextOverflow.ellipsis),
-              const SizedBox(height: 1),
-              Text(item.preview.isEmpty ? ' ' : item.preview,
-                  style: const TextStyle(color: C.fg3, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
-            ]),
-          ),
-          if (item.hasAttachments) const Icon(Icons.attach_file, size: 14, color: C.fg3),
-        ]),
-      ),
-    );
-  }
-
-  /// Подпись аккаунта в строке: обычно домен, но если на этом домене больше одного аккаунта —
-  /// полный адрес.
-  ///
-  /// Так видно, куда пришло письмо (у пользователя бывает несколько ящиков), и при этом
-  /// «@gmail.com» не повторяется в каждой строке, когда ящик один.
-  ///
-  /// Домен разбирается тем же [_domainOfEmail], что и для фавикона в [_avatar]: разбор адреса
-  /// в одном файле должен быть один, иначе «домен» в подписи и домен для иконки разойдутся —
-  /// например, на адресе с заглавными буквами или с лишней «собакой».
-  String _accountTag(MailListItem item) {
-    final domain = _domainOfEmail(item.accountEmail) ?? item.accountEmail;
-    final same = _accounts.where((a) => (_domainOfEmail(a.email) ?? a.email) == domain).length > 1;
-    return same ? item.accountEmail : domain;
-  }
-
-  /// Аватар отправителя: фавикон его домена (сервер сам ходит за ним и кэширует).
-  ///
-  /// Пока картинки нет или домена у адреса не разобрать — кружок с первой буквой имени:
-  /// строка не должна зависеть от чужого сайта и от того, отдал ли он иконку.
-  Widget _avatar(CloudlyApi api, MailListItem item) {
-    final domain = _domainOfEmail(item.fromAddr);
-    final letter = _firstLetter(item.fromName ?? item.fromAddr);
-    if (domain == null) return _letterAvatar(letter);
-    // Логотип домена тянет и кэширует сервер (`/mail/favicon`), поэтому клиент в чужой сайт
-    // не ходит; ручка закрыта сессией, и заголовки подставляет [AuthThumb]. Нет логотипа —
-    // остаётся буква: строка не должна зависеть от того, отдал ли чужой сайт иконку.
-    return AuthThumb(
+    return MailRow(
       api: api,
-      url: api.faviconUrl(domain),
-      size: 36,
-      radius: 18,
-      fallback: _letterAvatar(letter),
+      item: item,
+      accounts: _accounts,
+      onTap: () => _openMessage(item.id),
     );
   }
-
-  /// Первая буква имени для запасного аватара.
-  ///
-  /// Первым символом берётся графема (`characters`), а не кодовая единица UTF-16: у имени,
-  /// начинающегося с эмодзи или составного символа, `[0]` разрезал бы суррогатную пару
-  /// и в кружке оказался бы битый глиф. Пустое имя и строка из пробелов дают «?».
-  String _firstLetter(String? name) {
-    final trimmed = name?.trim() ?? '';
-    final chars = trimmed.characters;
-    return chars.isEmpty ? '?' : chars.first.toUpperCase();
-  }
-
-  /// Запасной аватар: буква на сером кружке. Размер тот же, что у фавикона, — строки не
-  /// разъезжаются, когда иконка не пришла.
-  Widget _letterAvatar(String letter) {
-    return Container(
-      width: 36,
-      height: 36,
-      alignment: Alignment.center,
-      decoration: BoxDecoration(color: C.surface3, shape: BoxShape.circle),
-      child: Text(letter, style: const TextStyle(color: C.fg2, fontSize: 16)),
-    );
-  }
-}
-
-/// Домен адреса в нижнем регистре или `null`, если адрес пустой или битый (нет «собаки»
-/// либо после неё пусто).
-///
-/// Один разбор на весь файл: домен нужен и для фавикона в аватаре, и для подписи аккаунта
-/// в строке, и две разные реализации здесь уже расходились (одна падала на адресе с двумя
-/// «собаками», другая считала доменом часть строки после первой). Функция свободная, а не метод
-/// состояния: от состояния она не зависит, и её можно проверить тестом без виджета.
-String? _domainOfEmail(String? addr) {
-  if (addr == null) return null;
-  // Последняя «собака»: в local-part она допустима в кавычках, а домен идёт после последней.
-  final i = addr.lastIndexOf('@');
-  if (i <= 0 || i == addr.length - 1) return null;
-  return addr.substring(i + 1).toLowerCase();
 }
 
 // ---------- просмотр письма ----------

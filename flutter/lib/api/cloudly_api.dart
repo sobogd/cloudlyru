@@ -879,6 +879,33 @@ class CloudlyApi {
     )).map(MailMonthBucket.fromJson).toList();
   }
 
+  /// Поиск по письмам папки [box]: ищем по всему телу письма, а не только по теме.
+  ///
+  /// Область поиска — открытая папка (это решение владельца), порядок — по дате от свежих
+  /// к старым. Ответ — [MailSearchPage]: страница строк той же формы, что и у ленты, плюс
+  /// `total` (сколько всего нашлось) и `pending` (сколько писем папки ещё не в поисковом
+  /// индексе — сервер разбирает старый архив фоном).
+  ///
+  /// [cancelToken] нужен не для красоты: поиск идёт по мере набора текста, и без отмены
+  /// ответы на прежние запросы приходили бы после новых и перебивали выдачу.
+  Future<MailSearchPage> mailSearch(
+    String box,
+    String q, {
+    int offset = 0,
+    int limit = 50,
+    String? account,
+    CancelToken? cancelToken,
+  }) async {
+    final a = (account == null || account.isEmpty)
+        ? ''
+        : '&account=${Uri.encodeQueryComponent(account)}';
+    return MailSearchPage.fromJson(_m(await _req(
+      '/mail/search?box=${Uri.encodeQueryComponent(box)}&q=${Uri.encodeQueryComponent(q)}'
+      '&offset=$offset&limit=$limit$a',
+      cancelToken: cancelToken,
+    )));
+  }
+
   /// Письмо целиком: шапка, вложения и текстовая версия тела.
   Future<MailMessageView> mailMessage(String id, {CancelToken? cancelToken}) async =>
       MailMessageView.fromJson(

@@ -1125,7 +1125,8 @@ class MailListItem {
   final String? subject;
   final String? fromName;
   final String? fromAddr;
-  // Начало тела письма — вторая строка строки списка.
+  // Начало тела письма. Строка списка его не показывает — в ней остались только отправитель
+  // и тема (так решил владелец), — но поле разбирается: оно есть в ответе сервера.
   final String preview;
   // Время, по которому лента отсортирована; в корзине сервер сортирует по времени удаления.
   final String? sortAt;
@@ -1175,6 +1176,56 @@ class MailListItem {
         hasAttachments: j.b('hasAttachments'),
         size: j.i('size'),
         threadCount: j.i('threadCount'),
+      );
+
+  /// Копия строки с другим признаком «прочитано».
+  ///
+  /// Нужна там, где письмо открыли из уже собранного списка: сервер отметил его прочитанным,
+  /// а строка на экране осталась прежней и продолжала бы выглядеть непрочитанной. Перечитывать
+  /// из-за этого всю выдачу нельзя — пользователь потерял бы место, до которого долистал.
+  MailListItem copyWith({bool? seen}) => MailListItem(
+        id: id,
+        box: box,
+        accountId: accountId,
+        accountEmail: accountEmail,
+        subject: subject,
+        fromName: fromName,
+        fromAddr: fromAddr,
+        preview: preview,
+        sortAt: sortAt,
+        seen: seen ?? this.seen,
+        flagged: flagged,
+        hasAttachments: hasAttachments,
+        size: size,
+        threadCount: threadCount,
+      );
+}
+
+/// Страница выдачи поиска по почте (`GET /mail/search`).
+///
+/// Строки — те же [MailListItem], что и в ленте: сервер отдаёт их одной формой, поэтому
+/// и в поиске рисуется та же строка письма (`MailRow`).
+class MailSearchPage {
+  /// Сколько всего писем нашлось — по нему видно, есть ли ещё страницы.
+  final int total;
+  /// Сколько писем этой папки поиск пока не видит: сервер разбирает старый архив фоном
+  /// (в поисковый индекс попадают только разобранные письма). Ноль — индекс готов,
+  /// и «ничего не нашлось» означает именно «ничего не нашлось».
+  final int pending;
+  final List<MailListItem> items;
+
+  MailSearchPage({required this.total, required this.pending, required this.items});
+
+  /// Разбор ответа `/mail/search`: страница строк плюс два счётчика.
+  factory MailSearchPage.fromJson(Map<String, dynamic> j) => MailSearchPage(
+        total: j.i('total'),
+        pending: j.i('pending'),
+        items: (j['items'] is List)
+            ? (j['items'] as List)
+                .whereType<Map>()
+                .map((e) => MailListItem.fromJson(e.cast<String, dynamic>()))
+                .toList()
+            : const <MailListItem>[],
       );
 }
 
