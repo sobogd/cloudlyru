@@ -1,20 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../providers.dart';
 import '../../theme.dart';
-import '../../util/widgets.dart';
+import 'account_panel.dart';
 import 'mail_accounts_panel.dart';
 import 'queue_errors_screen.dart';
 import 'queue_panel.dart';
-import 'sessions_panel.dart';
 import 'sync_panel.dart';
 import 'thumbs_panel.dart';
 import 'tokens_panel.dart';
 import 'updater.dart';
 
-/// Экран «Настройки»: пользователь и сервер, синхронизация телефона, обновление приложения,
-/// очередь превью, почтовые аккаунты и приложения с доступом по токену.
+/// Экран «Настройки»: аккаунт, синхронизация телефона, обновление приложения, очередь превью,
+/// почтовые аккаунты и приложения с доступом по токену.
 ///
 /// Сам экран ничего не показывает и не держит: он собирает независимые панели, и каждая
 /// сама ходит на сервер и сама себя перерисовывает по таймеру или по действию человека.
@@ -39,7 +37,6 @@ class SettingsScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final state = ref.watch(appStateProvider);
     return Scaffold(
       // Шапку красит `appBarTheme` из `theme.dart`: своего цвета у неё тут нет.
       appBar: AppBar(
@@ -48,38 +45,9 @@ class SettingsScreen extends ConsumerWidget {
       body: ListView(
         padding: const EdgeInsets.only(bottom: 24),
         children: [
-          Panel(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.person_outline, color: C.fg3),
-                    const SizedBox(width: 8),
-                    Text(state.user?.login ?? '',
-                        style: const TextStyle(
-                            color: C.fg, fontSize: 15, fontWeight: FontWeight.w600)),
-                    const Spacer(),
-                    FilledButton(
-                      style: FilledButton.styleFrom(backgroundColor: C.danger),
-                      // Выход из аккаунта: `AppState` сам гасит синхронизацию и чистит сессию,
-                      // ждать тут нечего — ни подсказки, ни перехода экран не делает.
-                      onPressed: () => ref.read(appStateProvider).logout(),
-                      child: const Text('Выйти'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                // Адрес сервера — только для чтения: в приложении он не меняется, поле ввода
-                // живёт на экране входа (см. `features/auth/login_screen.dart`).
-                Text(state.settings.serverUrl,
-                    style: const TextStyle(color: C.fg3, fontSize: 12)),
-              ],
-            ),
-          ),
-          // Панель сеансов идёт сразу после входа в аккаунт: она про то же — про доступ к
-          // аккаунту, а не про устройство или раздел приложения.
-          const SessionsPanel(),
+          // Аккаунт — первым: он про вход целиком (логин, пароль, сеансы), а дальше идут панели
+          // про само устройство и разделы приложения.
+          const AccountPanel(),
           const TokensPanel(),
           const SyncPanel(),
           const ThumbsPanel(),

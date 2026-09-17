@@ -6,7 +6,7 @@ import { randomToken, sha256Hex, assertSafeName } from '../common/utils';
 import { MAIL_FOLDER_NAME, PHOTO_FOLDER_NAME, ZONE_MAIL, ZONE_PHOTOS } from '../common/zones';
 import { AuditService } from '../audit/audit.service';
 import { ChangesService } from '../sync/changes.service';
-import { badRequest, notFound, unauthorized } from '../common/errors';
+import { badRequest, conflict, notFound, unauthorized } from '../common/errors';
 
 export const ROOT_FOLDER_NAME = '__root__';
 
@@ -25,6 +25,13 @@ export const MAX_SESSIONS_PER_USER = 32;
  * POST /auth/login открывает все файлы и почту) и при смене пароля.
  */
 const MIN_PASSWORD_LEN = 12;
+
+/**
+ * Минимальная длина логина. Одна константа на два места — seed и смену логина: проверка
+ * «от трёх символов» стояла числом только в seed, и вторая её копия неизбежно разошлась бы
+ * с первой.
+ */
+const MIN_LOGIN_LEN = 3;
 
 /**
  * Потолки входа. Пароль приходит телом запроса, а argon2 считает памятью: без потолка
@@ -129,7 +136,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
    * Проверка учётки, которой будет создан владелец. Стоит только на пути seed (пустая БД):
    * ADMIN_PASSWORD читается ровно один раз — при создании владельца, — поэтому на живой базе
    * (а значит, и на существующем .env прода) эта проверка ничего не меняет и старт не ломает.
-   * Сменить пароль потом можно ручкой POST /auth/password, не трогая .env.
+   * Сменить логин и пароль потом можно ручкой POST /auth/credentials, не трогая .env.
    *
    * По смыслу это страховка на месте действия: та же проверка есть в src/config/env.ts на
    * старте процесса, но она смотрит переменные окружения, а здесь — то, чем реально создаётся
@@ -140,8 +147,8 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
   private assertSeedCredentialsUsable(): void {
     const login = env.ADMIN_LOGIN.trim();
     const password = env.ADMIN_PASSWORD.trim();
-    if (login.length < 3 || login.length > MAX_LOGIN_LEN) {
-      throw new Error(`[auth] ADMIN_LOGIN: длина от 3 до ${MAX_LOGIN_LEN} символов`);
+    if (login.length < MIN_LOGIN_LEN || login.length > MAX_LOGIN_LEN) {
+      throw new Error(`[auth] ADMIN_LOGIN: длина от ${MIN_LOGIN_LEN} до ${MAX_LOGIN_LEN} символов`);
     }
     if (password.length > MAX_PASSWORD_LEN) {
       throw new Error(`[auth] ADMIN_PASSWORD: не длиннее ${MAX_PASSWORD_LEN} символов`);
@@ -158,7 +165,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     if (password.length < MIN_PASSWORD_LEN) {
       this.logger.warn(
         `ADMIN_PASSWORD короче ${MIN_PASSWORD_LEN} символов — вход ограничен 5 попытками в минуту на IP, ` +
-          'то есть пароль перебирается по словарю. Смените его (POST /auth/password) на длинный и случайный.',
+          'то есть пароль перебирается по словарю. Смените его (POST /auth/credentials) на длинный и случайный.',
       );
     }
   }
@@ -240,38 +247,81 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Смена пароля владельца (только веб-сессия). ADMIN_PASSWORD читается лишь при seed на
-   * пустой БД, поэтому смена секрета в .env ничего не меняла: пароль в БД оставался прежним,
-   * а инвалидировать чужие сессии было нечем. Здесь меняем хеш и гасим ВСЕ прочие сессии,
-   * оставляя живой только ту, из которой пришёл запрос (иначе владелец выкинул бы и себя,
-   * а действие казалось бы неудавшимся).
+   * Смена логина и пароля владельца (только веб-сессия).
+   *
+   * Одной ручкой, а не двумя: и логин, и пароль меняются одним и тем же доказательством —
+   * текущим паролем, — и человек заполняет их одной формой. Что не передано (или совпадает
+   * с текущим), то не меняется; запрос вообще без изменений отклоняется: гасить сессии и
+   * писать в аудит «ничего не поменялось» незачем.
+   *
+   * Почему .env не помогает: ADMIN_LOGIN/ADMIN_PASSWORD читаются ровно один раз — при создании
+   * владельца на пустой БД. На живой базе смена секретов репозитория не меняет ни логин, ни
+   * пароль: меняет только эта ручка.
+   *
+   * Смена пароля гасит ВСЕ прочие сессии, оставляя живой ту, из которой пришёл запрос (иначе
+   * владелец выкинул бы и себя, а действие казалось бы неудавшимся): смысл смены пароля в том
+   * числе в том, чтобы выкинуть того, кто мог войти со старым. Смена одного логина сессии не
+   * трогает — сессия принадлежит пользователю, а не строке логина, и повод «кто-то знает
+   * прежний логин» никого никуда не пускает без пароля.
+   *
+   * Побочно: обновление строки пользователя, удаление сессий (при смене пароля), запись в аудит.
    */
-  async changePassword(
+  async changeCredentials(
     userId: string,
     currentRaw: unknown,
+    loginRaw: unknown,
     nextRaw: unknown,
     keepSessionToken: string,
     ip?: string,
-  ): Promise<{ ok: true; sessionsRevoked: number }> {
+  ): Promise<{ ok: true; login: string; sessionsRevoked: number }> {
     const current = typeof currentRaw === 'string' ? currentRaw : '';
+    const wanted = typeof loginRaw === 'string' ? loginRaw.trim() : '';
     const next = typeof nextRaw === 'string' ? nextRaw : '';
-    if (!current || !next) throw badRequest('currentPassword and newPassword are required');
-    if (next.length < MIN_PASSWORD_LEN) throw badRequest(`new password must be at least ${MIN_PASSWORD_LEN} characters`);
-    if (next.length > MAX_PASSWORD_LEN) throw badRequest(`new password must be at most ${MAX_PASSWORD_LEN} characters`);
+    if (!current) throw badRequest('currentPassword is required');
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw unauthorized();
     const ok = await argon2.verify(user.passwordHash, current).catch(() => false);
     if (!ok) {
-      await this.audit.log('auth.password.change.failed', { userId }, ip);
+      await this.audit.log('auth.credentials.change.failed', { userId }, ip);
       throw unauthorized('invalid credentials');
     }
-    const passwordHash = await argon2.hash(next);
-    await this.prisma.user.update({ where: { id: userId }, data: { passwordHash } });
-    const res = await this.prisma.session.deleteMany({
-      where: { userId, tokenHash: keepSessionToken ? { not: sha256Hex(keepSessionToken) } : undefined },
-    });
-    await this.audit.log('auth.password.change', { userId, sessionsRevoked: res.count }, ip);
-    return { ok: true, sessionsRevoked: res.count };
+
+    // Собираем то, что реально меняется: пустое поле формы означает «не менять», а совпадение
+    // с текущим значением — «менять нечего». Так одна форма закрывает все случаи: только логин,
+    // только пароль или оба сразу.
+    const data: { login?: string; passwordHash?: string } = {};
+    if (wanted && wanted !== user.login) {
+      if (wanted.length < MIN_LOGIN_LEN || wanted.length > MAX_LOGIN_LEN) {
+        throw badRequest(`login must be ${MIN_LOGIN_LEN}..${MAX_LOGIN_LEN} characters`);
+      }
+      // Логин уникален в схеме: своя проверка нужна ради понятного текста — иначе наружу ушла бы
+      // ошибка ограничения БД.
+      if (await this.prisma.user.findUnique({ where: { login: wanted } })) {
+        throw conflict('login is already taken');
+      }
+      data.login = wanted;
+    }
+    if (next) {
+      if (next.length < MIN_PASSWORD_LEN) throw badRequest(`new password must be at least ${MIN_PASSWORD_LEN} characters`);
+      if (next.length > MAX_PASSWORD_LEN) throw badRequest(`new password must be at most ${MAX_PASSWORD_LEN} characters`);
+      data.passwordHash = await argon2.hash(next);
+    }
+    if (!data.login && !data.passwordHash) throw badRequest('nothing to change: login and password are the same');
+
+    await this.prisma.user.update({ where: { id: userId }, data });
+    let sessionsRevoked = 0;
+    if (data.passwordHash) {
+      const res = await this.prisma.session.deleteMany({
+        where: { userId, tokenHash: keepSessionToken ? { not: sha256Hex(keepSessionToken) } : undefined },
+      });
+      sessionsRevoked = res.count;
+    }
+    await this.audit.log(
+      'auth.credentials.change',
+      { userId, login: data.login ?? null, password: Boolean(data.passwordHash), sessionsRevoked },
+      ip,
+    );
+    return { ok: true, login: data.login ?? user.login, sessionsRevoked };
   }
 
   /**

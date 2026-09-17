@@ -441,6 +441,33 @@ class CloudlyApi {
     return toNum(d['sessionsRevoked'])?.toInt() ?? 0;
   }
 
+  /// Меняет логин и/или пароль владельца (`POST /auth/credentials`).
+  ///
+  /// Текущий пароль обязателен: это доказательство, что данные аккаунта меняет владелец, а не
+  /// тот, кто взял разблокированный телефон. Что не передано, то и не меняется — так одна форма
+  /// закрывает три случая: только логин, только пароль или оба сразу.
+  ///
+  /// Возвращает новый логин (интерфейс показывает его, не дожидаясь `/auth/me`) и число
+  /// погашенных прочих сессий: смена пароля гасит их на сервере, и об этом надо сказать человеку.
+  /// Смена одного логина сессии не трогает.
+  Future<({String login, int sessionsRevoked})> changeCredentials({
+    required String currentPassword,
+    String? login,
+    String? newPassword,
+  }) async {
+    // Пустые поля не отправляем вовсе: на сервере «поля нет» значит «не менять», и отправленная
+    // пустая строка читалась бы как попытка поставить пустой пароль.
+    final d = _m(await _req('/auth/credentials', method: 'POST', body: {
+      'currentPassword': currentPassword,
+      if (login != null && login.isNotEmpty) 'login': login,
+      if (newPassword != null && newPassword.isNotEmpty) 'newPassword': newPassword,
+    }));
+    return (
+      login: d['login'] as String? ?? '',
+      sessionsRevoked: toNum(d['sessionsRevoked'])?.toInt() ?? 0,
+    );
+  }
+
   /// Последняя опубликованная сборка Android-приложения (`GET /app/android`).
   ///
   /// Ручка без авторизации: проверка обновления должна работать и с отозванным токеном —

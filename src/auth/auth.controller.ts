@@ -58,21 +58,23 @@ export class AuthController {
   }
 
   /**
-   * Смена пароля владельца: только веб-сессия (у device-токена нет пароля, а смена пароля
-   * из украденного токена — это захват аккаунта). Гасит все прочие сессии: смысл смены
-   * пароля в том числе в том, чтобы выкинуть того, кто мог войти со старым.
+   * Смена логина и пароля владельца: только веб-сессия (у device-токена нет пароля, а смена
+   * пароля из украденного токена — это захват аккаунта). Принимает `currentPassword` (обязателен),
+   * `login` и `newPassword` — то, что заполнено, то и меняется. Смена пароля гасит все прочие
+   * сессии: смысл смены пароля в том числе в том, чтобы выкинуть того, кто мог войти со старым.
    */
   @SessionOnly()
   @HttpCode(200)
-  @Post('password')
-  changePassword(
+  @Post('credentials')
+  changeCredentials(
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: RequestUser,
     @Req() req: Request,
   ) {
-    return this.auth.changePassword(
+    return this.auth.changeCredentials(
       user.id,
       body.currentPassword,
+      body.login,
       body.newPassword,
       String(req.cookies?.[env.COOKIE_NAME] ?? ''),
       req.ip,
