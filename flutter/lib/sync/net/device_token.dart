@@ -157,6 +157,12 @@ Future<DeviceToken> ensureDeviceToken({
     // доступ к облаку, о котором человек не знает
     await _revokeOld(session, saved);
   }
+  // Токена в хранилище нет — но он мог остаться живым на сервере: доступ к записи в связке
+  // ключей теряется, если приложение обновилось другой сборкой (см. DeviceTokenStore).
+  // Прежде чем выпускать новый, гасим такие «осиротевшие» токены этого же устройства: иначе
+  // на каждый запуск приложения в аккаунте оставался бы ещё один полный доступ к облаку
+  // (у владельца их набралось 15 за вечер, и «завершить сеансы» их не убирает — это не сеансы).
+  await _revokeOrphans(session, label);
   final created = await session.createToken(label);
   final token = DeviceToken(
     token: '${created['token'] ?? ''}',
@@ -166,6 +172,33 @@ Future<DeviceToken> ensureDeviceToken({
   if (token.token.isEmpty) throw StateError('сервер не выдал токен устройства');
   await store.write(serverUrl, login, token);
   return token;
+}
+
+/// Отозвать токены этого устройства, оставшиеся от прежних запусков приложения.
+///
+/// Ищем по метке: она — имя устройства (`Bogdans-MacBook-Pro.local`, `samsung SM-S938B`), и токен
+/// с такой меткой мог выпустить только сам этот клиент. Чужие токены (WebDAV на другом
+/// компьютере, выпущенные руками) не трогаем — у них другие метки.
+///
+/// Исключений не бросает: не прочитали список — выпустим новый токен, как раньше. Единственное,
+/// чего здесь быть не должно, — отзыва живого токена, которым сейчас работает приложение: если
+/// он у нас на руках, до этой функции дело не доходит (см. [ensureDeviceToken]).
+Future<void> _revokeOrphans(CloudlyApi session, String label) async {
+  final wanted = label.trim();
+  if (wanted.isEmpty) return;
+  try {
+    for (final t in await session.listTokens()) {
+      if (t.label != wanted) continue;
+      try {
+        await session.revokeToken(t.id);
+        debugPrint('cloudly-sync: отозван осиротевший токен устройства (${t.id})');
+      } catch (e) {
+        debugPrint('cloudly-sync: осиротевший токен не отозван (${t.id}): $e');
+      }
+    }
+  } catch (e) {
+    debugPrint('cloudly-sync: список токенов не прочитан: $e');
+  }
 }
 
 /// Отозвать прежний токен по сохранённому id, прежде чем выпускать новый.

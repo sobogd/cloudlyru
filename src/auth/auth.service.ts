@@ -16,6 +16,17 @@ export const MAX_API_TOKENS_PER_USER = 32;
 /** Потолок длины метки токена: из неё строится имя папки-зеркала (см. createToken). */
 const MAX_TOKEN_LABEL_BYTES = 64;
 
+/** Потолок строки «кто вошёл»: это данные клиента, и в БД им расти незачем. */
+const MAX_CLIENT_LEN = 80;
+/** Потолок User-Agent: строка из заголовка, тоже чужая. */
+const MAX_USER_AGENT_LEN = 200;
+
+/** Кто вошёл: как назвался клиент и что он прислал заголовком. */
+export interface LoginClient {
+  client?: string;
+  userAgent?: string;
+}
+
 /** Потолок живых веб-сессий на пользователя (см. login). */
 export const MAX_SESSIONS_PER_USER = 32;
 
@@ -183,7 +194,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
    * к такому пространству ни перебор, ни радужные таблицы неприменимы, а медленный хеш
    * только добавил бы работы на каждый запрос.
    */
-  async login(login: string, password: string, ip?: string) {
+  async login(login: string, password: string, ip?: string, client?: LoginClient) {
     if (login.length > MAX_LOGIN_LEN || password.length > MAX_PASSWORD_LEN) {
       throw badRequest(`login max ${MAX_LOGIN_LEN}, password max ${MAX_PASSWORD_LEN} characters`);
     }
@@ -208,6 +219,11 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
         userId: user.id,
         tokenHash: sha256Hex(token),
         expiresAt: new Date(Date.now() + ttlMs),
+        // Кто и откуда: это единственное, по чему человек в приложении отличит свой телефон
+        // от чужого браузера (см. список сеансов ниже).
+        client: client?.client?.trim().slice(0, MAX_CLIENT_LEN) || null,
+        ip: ip ?? null,
+        userAgent: client?.userAgent?.trim().slice(0, MAX_USER_AGENT_LEN) || null,
       },
     });
     await this.pruneOldSessions(user.id);
@@ -322,6 +338,64 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
       ip,
     );
     return { ok: true, login: data.login ?? user.login, sessionsRevoked };
+  }
+
+  /**
+   * Список живых сеансов владельца: что показать человеку в настройках.
+   *
+   * `tokenHash` наружу не отдаём — по нему нельзя дать ни хеша, ни намёка на токен; вместо
+   * этого в ответе идёт признак `current`, посчитанный по cookie самого запроса: по нему
+   * интерфейс помечает «это устройство» и не предлагает его завершить.
+   *
+   * Сортировка — от свежих к старым: тот, из которого человек пришёл только что, оказывается
+   * первым, и искать его среди десятка старых не приходится.
+   */
+  async listSessions(
+    userId: string,
+    currentToken: string,
+  ): Promise<
+    Array<{ id: string; client: string | null; ip: string | null; userAgent: string | null; createdAt: string; expiresAt: string; current: boolean }>
+  > {
+    const currentHash = currentToken ? sha256Hex(currentToken) : '';
+    const rows = await this.prisma.session.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, tokenHash: true, client: true, ip: true, userAgent: true, createdAt: true, expiresAt: true },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      client: r.client,
+      ip: r.ip,
+      userAgent: r.userAgent,
+      createdAt: r.createdAt.toISOString(),
+      expiresAt: r.expiresAt.toISOString(),
+      current: Boolean(currentHash) && r.tokenHash === currentHash,
+    }));
+  }
+
+  /**
+   * Завершить один сеанс — тот, который человек выбрал в списке.
+   *
+   * Свой текущий сеанс завершать этой ручкой нельзя: для него есть «Выйти», который делает
+   * то же самое, но ещё и чистит cookie и локальные данные приложения. Отказ тут — не
+   * придирка: случайно выкинув себя, человек увидел бы «сеанс завершён», а приложение —
+   * экран входа без объяснения.
+   *
+   * Сеанс ищется вместе с `userId`: чужой id не должен завершаться даже при верной сессии.
+   */
+  async revokeSession(userId: string, id: string, currentToken: string, ip?: string): Promise<{ ok: true; revoked: boolean }> {
+    if (currentToken && sha256Hex(currentToken) === (await this.sessionHash(userId, id))) {
+      throw badRequest('this is the current session: use logout instead');
+    }
+    const res = await this.prisma.session.deleteMany({ where: { id, userId } });
+    await this.audit.log('auth.session.revoked', { userId, sessionId: id, revoked: res.count }, ip);
+    return { ok: true, revoked: res.count > 0 };
+  }
+
+  /** Хеш токена сеанса по его id в рамках пользователя; null — сеанса нет. */
+  private async sessionHash(userId: string, id: string): Promise<string | null> {
+    const row = await this.prisma.session.findFirst({ where: { id, userId }, select: { tokenHash: true } });
+    return row?.tokenHash ?? null;
   }
 
   /**

@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import 'api/cloudly_api.dart';
 import 'api/models.dart';
@@ -143,7 +145,7 @@ class AppState extends ChangeNotifier {
   Future<void> login(String login, String password) async {
     // свежий клиент: вход не должен утащить старую сессию
     final fresh = CloudlyApi(serverUrl: settings.serverUrl);
-    final cookie = await fresh.login(login, password);
+    final cookie = await fresh.login(login, password, client: await _clientLabel());
     api.session = cookie;
     final me = await api.me();
     await settings.setSession(cookie);
@@ -163,6 +165,20 @@ class AppState extends ChangeNotifier {
       user = await api.me();
       notifyListeners();
     } catch (_) {}
+  }
+
+  /// Как приложение представляется серверу при входе: «Cloudly 1.0.0+94 · android».
+  ///
+  /// Нужно для списка сеансов в настройках: без этого все входы выглядели бы одинаково
+  /// («сеанс, созданный 17 сентября»), и отличить свой телефон от чужого браузера было бы нечем.
+  /// Сбой `PackageInfo` входу мешать не должен — тогда остаётся название без версии.
+  static Future<String> _clientLabel() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      return '${info.appName} ${info.version}+${info.buildNumber} · ${Platform.operatingSystem}';
+    } catch (_) {
+      return 'Cloudly · ${Platform.operatingSystem}';
+    }
   }
 
   /// Выход из аккаунта: гасит синхронизацию, гасит сессию на сервере, стирает cookie из

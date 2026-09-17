@@ -396,11 +396,13 @@ class CloudlyApi {
   /// Сбой приводится к [ApiException] тем же [_toException], что и остальные запросы: иначе
   /// наружу улетал бы сырой [DioException], чей `toString()` — многострочный английский дамп
   /// с `SocketException`, а экран входа показывает текст исключения как есть.
-  Future<String> login(String login, String password) async {
+  Future<String> login(String login, String password, {String? client}) async {
     final Response<String> res;
     try {
       res = await _session.post<String>('/auth/login',
-          data: {'login': login, 'password': password},
+          // `client` — как приложение себя называет: по этой строке человек узнаёт свой вход
+          // в списке сеансов (в настройках). Обычно это «Cloudly 1.0.0+94 · android».
+          data: {'login': login, 'password': password, 'client': ?client},
           options: Options(responseType: ResponseType.plain));
     } on DioException catch (e) {
       throw _toException(e);
@@ -468,6 +470,21 @@ class CloudlyApi {
     );
   }
 
+  /// Живые сеансы владельца: входы в приложение и браузер (`GET /auth/sessions`).
+  ///
+  /// Ручка только для веб-сессии, и это правильно: список входов — не то, что должен видеть
+  /// украденный app-токен устройства.
+  Future<List<AuthSessionRow>> listSessions() async =>
+      _lm(await _req('/auth/sessions')).map(AuthSessionRow.fromJson).toList();
+
+  /// Завершает один сеанс — кнопка рядом с конкретным входом в списке.
+  ///
+  /// Свой текущий сеанс так не завершить: сервер откажет, и это осознанно — для него есть
+  /// «Выйти», который делает то же самое и ещё чистит cookie с локальными данными.
+  Future<void> revokeSession(String id) async {
+    await _req('/auth/sessions/${Uri.encodeComponent(id)}', method: 'DELETE');
+  }
+
   /// Последняя опубликованная сборка Android-приложения (`GET /app/android`).
   ///
   /// Ручка без авторизации: проверка обновления должна работать и с отозванным токеном —
@@ -502,8 +519,9 @@ class CloudlyApi {
 
   /// Отзывает app-токен по id — дальше он не пройдёт авторизацию ни в REST, ни в WebDAV.
   ///
-  /// Нигде не вызывается: ручка `DELETE /auth/tokens/:id` доступна только веб-сессии, а выход
-  /// на телефоне гасит собственный device-токен другой ручкой (`DELETE /auth/me/token`).
+  /// Зовётся из панели «Приложения (WebDAV/Finder)» в настройках (кнопка рядом с токеном) и из
+  /// `ensureDeviceToken`, когда прежний токен устройства оказался мёртв. Выход на телефоне гасит
+  /// собственный device-токен другой ручкой (`DELETE /auth/me/token`).
   Future<void> revokeToken(String id) async {
     await _req('/auth/tokens/${Uri.encodeComponent(id)}', method: 'DELETE');
   }

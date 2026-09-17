@@ -45,6 +45,12 @@ model Session {
   tokenHash String   @unique // sha256 токена; сам токен живёт только в cookie
   expiresAt DateTime
   createdAt DateTime @default(now())
+  // Кто вошёл и откуда: без этого список сеансов в приложении был бы списком из неразличимых
+  // строк («сеанс, созданный 17 сентября»), и человек не понимал бы, какой из них его телефон,
+  // а какой — чужой браузер. Пусто у сессий, созданных до этой правки.
+  client    String? // как клиент себя назвал (обычно приложение и его версия)
+  ip        String?
+  userAgent String?
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])

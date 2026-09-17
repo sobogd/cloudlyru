@@ -22,7 +22,12 @@ export class AuthController {
   ) {
     const login = typeof body.login === 'string' ? body.login : '';
     const password = typeof body.password === 'string' ? body.password : '';
-    const result = await this.auth.login(login, password, req.ip);
+    // `client` — как приложение себя называет (например «Cloudly 1.0.0 · android»): по этой
+    // строке человек узнаёт свой вход в списке сеансов. Заголовок — на случай, когда метки нет.
+    const result = await this.auth.login(login, password, req.ip, {
+      client: typeof body.client === 'string' ? body.client : undefined,
+      userAgent: req.headers['user-agent'],
+    });
     res.cookie(env.COOKIE_NAME, result.token, {
       httpOnly: true,
       secure: env.NODE_ENV === 'production',
@@ -85,6 +90,31 @@ export class AuthController {
   me(@CurrentUser() user: RequestUser) {
     // для Bearer-токена deviceId задан гардом: клиент получает корень зеркала своего устройства
     return this.auth.me(user.id, user.deviceId ?? null);
+  }
+
+  /**
+   * Живые сеансы владельца: список для настроек приложения.
+   *
+   * Отдаёт и «какой из них текущий» (`current`) — по нему интерфейс помечает этот сеанс
+   * «это устройство» и не предлагает его завершить.
+   */
+  @SessionOnly()
+  @Get('sessions')
+  listSessions(@CurrentUser() user: RequestUser, @Req() req: Request) {
+    return this.auth.listSessions(user.id, String(req.cookies?.[env.COOKIE_NAME] ?? ''));
+  }
+
+  /**
+   * Завершить один сеанс: кнопка рядом с конкретным входом в списке.
+   *
+   * Только веб-сессия (`SessionOnly`) и только свой сеанс; свой текущий завершать нельзя —
+   * для него есть «Выйти», который делает то же самое и ещё чистит cookie приложения.
+   */
+  @SessionOnly()
+  @HttpCode(200)
+  @Delete('sessions/:id')
+  revokeSession(@Param('id') id: string, @CurrentUser() user: RequestUser, @Req() req: Request) {
+    return this.auth.revokeSession(user.id, id, String(req.cookies?.[env.COOKIE_NAME] ?? ''), req.ip);
   }
 
   /**

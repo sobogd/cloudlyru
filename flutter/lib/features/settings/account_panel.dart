@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../api/models.dart';
 import '../../providers.dart';
 import '../../theme.dart';
+import '../../util/format.dart';
 import '../../util/widgets.dart';
 
 /// Панель аккаунта: кто вошёл, смена логина и пароля, выход и уборка чужих сеансов.
@@ -23,10 +27,70 @@ class AccountPanel extends ConsumerStatefulWidget {
   ConsumerState<AccountPanel> createState() => _AccountPanelState();
 }
 
-/// Состояние панели: идёт ли запрос (смена данных или отзыв сессий).
+/// Состояние панели: список входов и признак идущего запроса.
 class _AccountPanelState extends ConsumerState<AccountPanel> {
   /// Запрос уже уходит: кнопки выключены, чтобы не отправить его второй раз.
   bool _busy = false;
+
+  /// Живые входы в аккаунт: их читает и перечитывает сервер (`GET /auth/sessions`).
+  List<AuthSessionRow> _sessions = const [];
+
+  /// Список входов не прочитался: показать это надо — иначе пустая панель читается как
+  /// «других входов нет», хотя на самом деле их просто не спросили.
+  String? _sessionsError;
+
+  @override
+  /// Открытие панели: читаем список входов.
+  void initState() {
+    super.initState();
+    unawaited(_loadSessions());
+  }
+
+  /// Читает список живых сеансов.
+  ///
+  /// Побочно: заполняет [_sessions] или [_sessionsError] и перерисовывает панель. Ошибку не
+  /// глотаем и не бросаем: панель показывает её текстом, остальное на экране работает.
+  Future<void> _loadSessions() async {
+    try {
+      final list = await ref.read(appStateProvider).api.listSessions();
+      if (mounted) {
+        setState(() {
+          _sessions = list;
+          _sessionsError = null;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _sessionsError = e.toString());
+    }
+  }
+
+  /// Завершает один сеанс — кнопка рядом с конкретным входом.
+  ///
+  /// Подтверждение: завершение мгновенное, и на том устройстве придётся входить заново.
+  /// Свой текущий сеанс сервер завершать откажется — рядом с ним кнопки и нет, там подпись
+  /// «это устройство»: для выхода из него служит «Выйти».
+  Future<void> _revokeSession(AuthSessionRow row) async {
+    if (_busy) return;
+    final ok = await confirmDialog(
+      context,
+      'Завершить этот вход?',
+      'Устройство или браузер, из которого сделан этот вход, потеряет доступ и попросит '
+          'войти заново.',
+      danger: true,
+      confirmLabel: 'Завершить',
+    );
+    if (!ok || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await ref.read(appStateProvider).api.revokeSession(row.id);
+      await _loadSessions();
+      if (mounted) snack(context, 'Вход завершён');
+    } catch (e) {
+      if (mounted) snack(context, e.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
 
   /// Открывает форму смены логина и пароля и применяет то, что вернула форма.
   ///
@@ -67,34 +131,6 @@ class _AccountPanelState extends ConsumerState<AccountPanel> {
     }
   }
 
-  /// Спрашивает подтверждение и гасит все прочие сессии.
-  ///
-  /// Подтверждение обязательно, и кнопка в диалоге красная: действие необратимо с другой
-  /// стороны — на закрытых устройствах придётся входить заново. Число погашенных сессий
-  /// показываем подсказкой: ноль — это «других входов не было», и это тоже ответ, иначе нажатие
-  /// выглядело бы как «ничего не произошло».
-  Future<void> _revokeOthers() async {
-    if (_busy) return;
-    final ok = await confirmDialog(
-      context,
-      'Завершить другие сеансы?',
-      'Все входы, кроме этого устройства, перестанут работать — на них придётся войти заново. '
-          'Приложения с токеном (WebDAV, Finder) и синхронизация это не затрагивает.',
-      danger: true,
-      confirmLabel: 'Завершить',
-    );
-    if (!ok || !mounted) return;
-    setState(() => _busy = true);
-    try {
-      final n = await ref.read(appStateProvider).api.revokeOtherSessions();
-      if (mounted) snack(context, n == 0 ? 'Других сеансов не было' : 'Завершено сеансов: $n');
-    } catch (e) {
-      if (mounted) snack(context, e.toString());
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     // Логин и адрес сервера читаются из состояния: их обновляет `AppState` (после входа,
@@ -125,33 +161,76 @@ class _AccountPanelState extends ConsumerState<AccountPanel> {
           // живёт на экране входа (см. `features/auth/login_screen.dart`).
           Text(state.settings.serverUrl, style: const TextStyle(color: C.fg3, fontSize: 12)),
           const SizedBox(height: 12),
+          // Кнопка не залита акцентом: это редкое действие, и рядом с «Выйти» залитая кнопка
+          // читалась бы как обычный шаг работы с экраном.
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: _busy ? null : _editCredentials,
+              icon: const Icon(Icons.badge_outlined, size: 18),
+              label: const Text('Сменить логин или пароль'),
+            ),
+          ),
+          const SizedBox(height: 14),
+          const Text('Входы в аккаунт', style: TextStyle(color: C.fg, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 6),
           const Text(
-            'Логин и пароль можно сменить здесь же. Вход в браузере и на другом телефоне — '
-            'отдельные сеансы: их закрывает вторая кнопка.',
+            'Каждый вход — отдельный сеанс: телефон, браузер на компьютере, второе приложение. '
+            'Завершать их можно по одному, тот, из которого вы смотрите, помечен как «это устройство».',
             style: TextStyle(color: C.fg3, fontSize: 13),
           ),
-          const SizedBox(height: 8),
-          // Кнопки не залиты акцентом: это редкие действия, и рядом с «Выйти» залитая кнопка
-          // читалась бы как обычный шаг работы с экраном.
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              OutlinedButton.icon(
-                onPressed: _busy ? null : _editCredentials,
-                icon: const Icon(Icons.badge_outlined, size: 18),
-                label: const Text('Сменить логин или пароль'),
-              ),
-              OutlinedButton.icon(
-                onPressed: _busy ? null : _revokeOthers,
-                icon: const Icon(Icons.logout, size: 18),
-                label: const Text('Завершить другие сеансы'),
-              ),
-            ],
-          ),
+          const SizedBox(height: 6),
+          if (_sessionsError != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Text(_sessionsError!, style: const TextStyle(color: C.danger, fontSize: 13)),
+            )
+          else
+            ..._sessions.map((s) => _sessionTile(s)),
         ],
       ),
     );
+  }
+
+  /// Строка одного входа: кто, откуда и когда — и кнопка «завершить» рядом с ней.
+  ///
+  /// У текущего входа кнопки нет намеренно: завершить себя этой ручкой сервер не даст, для
+  /// этого есть «Выйти» — он делает то же самое и ещё чистит cookie и локальные данные.
+  Widget _sessionTile(AuthSessionRow s) {
+    final when = s.createdAt == null ? '' : (fmtLocal(s.createdAt) ?? s.createdAt!);
+    final where = s.ip == null || s.ip!.isEmpty ? '' : ' · ${s.ip}';
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(s.current ? Icons.smartphone : Icons.devices_other, color: s.current ? C.accent : C.fg3),
+      title: Text(
+        s.client ?? _clientFromUserAgent(s.userAgent) ?? 'Неизвестный вход',
+        style: const TextStyle(color: C.fg, fontSize: 14),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(
+        when.isEmpty ? 'время входа неизвестно$where' : 'вход: $when$where',
+        style: const TextStyle(color: C.fg3, fontSize: 12),
+        maxLines: 2,
+      ),
+      trailing: s.current
+          ? const Text('это устройство', style: TextStyle(color: C.accent, fontSize: 12))
+          : IconButton(
+              tooltip: 'Завершить этот вход',
+              onPressed: _busy ? null : () => _revokeSession(s),
+              icon: const Icon(Icons.logout, color: C.danger),
+            ),
+    );
+  }
+
+  /// Название клиента из `User-Agent`, когда метки нет: у входов, сделанных до того, как
+  /// приложение начало представляться, это единственная зацепка. Возвращает `null`, если
+  /// и по заголовку ничего не понять — тогда строка называется «Неизвестный вход».
+  static String? _clientFromUserAgent(String? ua) {
+    final s = ua?.trim() ?? '';
+    if (s.isEmpty) return null;
+    if (s.startsWith('Dio/')) return 'Приложение Cloudly';
+    return s.length <= 40 ? s : '${s.substring(0, 40)}…';
   }
 }
 

@@ -114,6 +114,47 @@ class UserInfo {
 
 // ===== folders/files =====
 
+/// Один вход в аккаунт: веб-сессия со своей cookie (`GET /auth/sessions`).
+///
+/// Сеанс — это вход, а не устройство: телефон, браузер на компьютере и второе приложение дают
+/// три разные строки. Устройства с app-токенами (WebDAV, Finder, синхронизация) — другое:
+/// у них своя таблица и свой список (см. [ApiTokenRow]), и завершение сеанса их не касается.
+class AuthSessionRow {
+  final String id;
+  /// Как назвался клиент при входе («Cloudly 1.0.0+94 · android»). `null` — вход был до того,
+  /// как клиент начал представляться: показать про такой сеанс нечего, кроме даты.
+  final String? client;
+  final String? ip;
+  /// Строка `User-Agent` того, кто вошёл: единственная зацепка у сеансов без метки клиента.
+  final String? userAgent;
+  final String? createdAt;
+  final String? expiresAt;
+  /// Это тот самый сеанс, из которого пришёл запрос: его не завершают отсюда, для него есть
+  /// «Выйти» (он же чистит cookie и локальные данные приложения).
+  final bool current;
+
+  AuthSessionRow({
+    required this.id,
+    this.client,
+    this.ip,
+    this.userAgent,
+    this.createdAt,
+    this.expiresAt,
+    required this.current,
+  });
+
+  /// Разбор элемента ответа `/auth/sessions`.
+  factory AuthSessionRow.fromJson(Map<String, dynamic> j) => AuthSessionRow(
+        id: j.s('id'),
+        client: j.sN('client'),
+        ip: j.sN('ip'),
+        userAgent: j.sN('userAgent'),
+        createdAt: j.sN('createdAt'),
+        expiresAt: j.sN('expiresAt'),
+        current: j['current'] == true,
+      );
+}
+
 /// Одна запись в листинге папки — и папка, и файл: сервер отдаёт их одной формой.
 ///
 /// Поэтому у папки пусты [size], [mime], [sha256] и [clientMtime]: размера, типа и хеша
