@@ -20,7 +20,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # .github/workflows/android.yml, и номер сборки обязан расти с каждым выпуском.
 # Номер общий для платформ: из него же собирается CFBundleVersion настольной сборки
 # (workflow .github/workflows/macos.yml), поэтому поднимать его достаточно один раз.
-version: 1.0.0+93
+version: 1.0.0+94
 
 environment:
   sdk: ^3.13.3
@@ -51,6 +51,10 @@ dependencies:
   # Тело письма показываем системным WebView: письма верстают таблицами, медиазапросами и
   # inline-стилями, то есть разметкой для браузерного движка (см. lib/features/mail/mail_body_web.dart).
   webview_flutter: ^4.14.1
+  # Прямая зависимость, а не транзитивная: политика смешанного контента (http-картинки в письмах)
+  # настраивается только в android-реализации — `setMixedContentMode`; без явной зависимости её
+  # тип не импортируется.
+  webview_flutter_android: ^4.14.1
   file_picker: ^13.0.0
   open_filex: ^4.7.0
   crypto: ^3.0.7

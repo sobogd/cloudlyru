@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 import '../../util/widgets.dart';
 
@@ -51,9 +52,9 @@ class _MailBodyWebState extends State<MailBodyWeb> {
   /// пересоздание — это ещё один WebView и потерянный нативный кэш.
   late final WebViewController _controller = _newController();
 
-  /// Собирает контроллер: выключает скрипты, задаёт фон и перехват навигации.
+  /// Собирает контроллер: выключает скрипты, задаёт фон, политику картинок и перехват навигации.
   WebViewController _newController() {
-    return WebViewController()
+    final controller = WebViewController()
       // Скрипты выключены: измерять высоту больше нечего (см. комментарий класса), а чужой
       // разметке внутри приложения исполняться незачем.
       ..setJavaScriptMode(JavaScriptMode.disabled)
@@ -61,6 +62,22 @@ class _MailBodyWebState extends State<MailBodyWeb> {
       // на тёмной теме это выглядело бы как чёрный прямоугольник до первой отрисовки.
       ..setBackgroundColor(const Color(0xFFFFFFFF))
       ..setNavigationDelegate(NavigationDelegate(onNavigationRequest: _onNavigation));
+
+    // Смешанный контент разрешаем: в письмах сплошь и рядом картинки по `http://` (проверено
+    // на живой почте: 20 таких картинок в 5 письмах из 14), а WebView по умолчанию часть
+    // незащищённых подресурсов не пускает — в письме остаются пустые рамки. Опасного здесь
+    // ничего: скрипты выключены, а CSP документа пускает только картинки, стили, шрифты и медиа,
+    // так что перехваченный по пути `http`-ресурс не может стать кодом. Так же поступают
+    // почтовые клиенты: Gmail вообще тянет картинки через свой прокси и отдаёт их письму
+    // по https, из-за чего в нём «всё грузится».
+    //
+    // Настройка есть только у android-реализации: на других платформах письмо рисует WKWebView
+    // со своими правилами, и трогать там нечего.
+    final platform = controller.platform;
+    if (platform is AndroidWebViewController) {
+      unawaited(platform.setMixedContentMode(MixedContentMode.alwaysAllow));
+    }
+    return controller;
   }
 
   @override
