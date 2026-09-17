@@ -5,6 +5,7 @@ import { notFound } from '../common/errors';
 import { S3Service } from '../s3/s3.service';
 import { parseMessage } from './mail-parse';
 import { htmlWithinLimit, sanitizeMailHtml, textToHtml } from './mail-html';
+import { MailImageService } from './mail-image.service';
 import { inBox, inBoxSql } from './mail-scope';
 import type { MailBox } from './mail-accounts.service';
 
@@ -98,6 +99,7 @@ export class MailFeedService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
+    private readonly images: MailImageService,
   ) {}
 
   /** Общее число цепочек в папке — по нему клиент считает высоту скролла. */
@@ -372,7 +374,11 @@ export class MailFeedService {
     }
 
     if (!asText && parsed?.html && htmlWithinLimit(parsed.html)) {
-      const { html, blockedRemote } = sanitizeMailHtml(parsed.html, allowRemote);
+      // Чужие адреса картинок уходят в наш прокси — тогда письмо грузит их с нашего домена
+      // по https, и ему не мешают ни http, ни hotlink-защита, ни отсутствие Referer
+      // (см. `mail-image.service.ts`). Прокси выключен — адреса остаются прямыми.
+      const proxy = allowRemote && this.images.enabled ? (u: string) => this.images.url(u) : undefined;
+      const { html, blockedRemote } = sanitizeMailHtml(parsed.html, allowRemote, proxy);
       return { html, blockedRemote, kind: 'html', truncated: false };
     }
     const full = parsed?.text ?? '';

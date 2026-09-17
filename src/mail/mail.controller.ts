@@ -5,6 +5,7 @@ import { MailFeedService } from './mail-feed.service';
 import { MailSyncService } from './mail-sync.service';
 import { env } from '../config/env';
 import { MailFaviconService } from './mail-favicon.service';
+import { MailImageService } from './mail-image.service';
 import { MailIngestService } from './mail-ingest.service';
 import { MailSendService } from './mail-send.service';
 import { S3Service } from '../s3/s3.service';
@@ -64,6 +65,7 @@ export class MailController {
     private readonly sender: MailSendService,
     private readonly ingestService: MailIngestService,
     private readonly faviconService: MailFaviconService,
+    private readonly imageService: MailImageService,
     private readonly s3: S3Service,
   ) {}
 
@@ -311,6 +313,40 @@ export class MailController {
     res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.send(fav.bytes);
+  }
+
+  /**
+   * Картинка из письма через наш сервер: письмо грузит её с нашего домена вместо чужого.
+   *
+   * Ручка ПУБЛИЧНАЯ, и это не упущение: документ письма грузится в WebView без адреса
+   * (`about:blank`), cookie веб-сессии у него нет, а картинки он запрашивает сам. Вместо сессии
+   * адрес подписан (HMAC от ключа рассылок, см. `mail-image.service.ts`), поэтому открытым
+   * прокси ручка не становится: по неподписанному адресу сервер наружу не пойдёт.
+   *
+   * Отдаём только растровые картинки, определённые по первым байтам: чужой ответ уходит
+   * браузеру с нашего origin, и документ (SVG, HTML) по этому адресу исполнил бы свои скрипты
+   * в контексте нашего домена. `nosniff` и CSP с `sandbox` — вторая линия на тот же случай.
+   *
+   * Кэширование разрешено надолго: адрес подписан под конкретную картинку и её не меняет,
+   * а WebView держит кэш сам — повторное открытие письма не ходит ни к нам, ни к отправителю.
+   */
+  @Public()
+  @Get('image')
+  @UseGuards(RateLimitGuard)
+  @RateLimit(1200, 60_000)
+  async image(@Query('u') target: string, @Query('s') sig: string, @Res() res: Response) {
+    const got = await this.imageService.fetch(String(target ?? ''), String(sig ?? ''));
+    if (!got) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader('Content-Type', got.mime);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+    // Неделя: картинка письма по подписанному адресу не меняется, а трекеры-пиксели так
+    // перестают срабатывать на каждом открытии письма.
+    res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+    res.send(got.bytes);
   }
 
   @Post('messages/:id/seen')

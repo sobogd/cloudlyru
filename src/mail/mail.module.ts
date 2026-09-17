@@ -7,6 +7,7 @@ import { MailController } from './mail.controller';
 import { MailAccountsService } from './mail-accounts.service';
 import { MailFeedService } from './mail-feed.service';
 import { MailFaviconService } from './mail-favicon.service';
+import { MailImageService } from './mail-image.service';
 import { MailIngestService } from './mail-ingest.service';
 import { MailPurgeService } from './mail-purge.service';
 import { MailSendService } from './mail-send.service';
@@ -29,6 +30,7 @@ import { MailSyncService } from './mail-sync.service';
     MailSendService,
     MailPurgeService,
     MailFaviconService,
+    MailImageService,
   ],
   exports: [MailAccountsService, MailFeedService, MailSyncService, MailSendService, MailPurgeService],
 })

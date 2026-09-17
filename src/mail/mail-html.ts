@@ -144,6 +144,12 @@ function unescapeCss(css: string): string {
   });
 }
 
+/**
+ * Куда переписать чужой адрес картинки: его отдаёт сервер прокси (`mail-image.service.ts`).
+ * Без хука адреса остаются как есть — так письмо показывается, когда прокси выключен.
+ */
+type ProxyUrl = (target: string) => string;
+
 /** Что за ссылка: внешняя, data:, опасная схема или безобидная. */
 interface UrlInfo {
   /** Абсолютный адрес с чужим хостом: за ним уходит запрос наружу (трекинг). */
@@ -210,7 +216,12 @@ interface CssResult {
  * Раскодировать в блоке тоже можно, но тогда из CSS придётся вычистить `<`: `\3c /style\3e`
  * в противном случае превратился бы в настоящий закрывающий тег.
  */
-function sanitizeCss(css: string, allowRemote: boolean, inStyleBlock: boolean): CssResult {
+function sanitizeCss(
+  css: string,
+  allowRemote: boolean,
+  inStyleBlock: boolean,
+  proxy?: ProxyUrl,
+): CssResult {
   let blocked = 0;
   let out = inStyleBlock ? unescapeCss(css) : unescapeCss(decodeEntities(css));
   // @import тянет чужой CSS (и работает как трекер) — вырезаем всегда, даже с картинками.
@@ -226,12 +237,16 @@ function sanitizeCss(css: string, allowRemote: boolean, inStyleBlock: boolean): 
       return 'about:blank';
     });
   } else {
-    // Внешние картинки разрешены, а исполняемые data:-ссылки — нет.
+    // Внешние картинки разрешены, а исполняемые data:-ссылки — нет. Разрешённый чужой адрес
+    // уходит в прокси (см. ProxyUrl): его скачает сервер и отдаст письму со своего домена.
     out = out.replace(CSS_URL_RE, (match) => {
       if (/^\s*data:/i.test(match) && !DATA_IMAGE_RE.test(match)) {
         blocked += 1;
         return 'about:blank';
       }
+      // Замена — голый адрес, а не `url(...)`: регулярка ловит сам адрес внутри `url(...)`
+      // (и внутри кавычек в `image-set()`), и обёртка дала бы `url(url(...))`.
+      if (proxy && urlInfo(match).remote) return proxy(match);
       return match;
     });
   }
@@ -248,6 +263,19 @@ function escapeAttr(value: string): string {
  * Ссылка из `srcset`: это список «адрес + дескриптор», поэтому проверяем каждый кандидат —
  * одного внешнего адреса в списке достаточно, чтобы атрибут считался внешним.
  */
+function proxySrcset(value: string, proxy: ProxyUrl): string {
+  return value
+    .split(',')
+    .map((candidate) => {
+      const parts = candidate.trim().split(/\s+/);
+      const url = parts[0] ?? '';
+      if (!url || !urlInfo(url).remote) return candidate.trim();
+      return [proxy(url), ...parts.slice(1)].join(' ');
+    })
+    .filter(Boolean)
+    .join(', ');
+}
+
 function srcsetInfo(value: string): UrlInfo {
   let out: UrlInfo = SAFE;
   for (const candidate of decodeEntities(value).split(',')) {
@@ -269,7 +297,11 @@ function srcsetInfo(value: string): UrlInfo {
  *
  * `allowRemote` — пользователь нажал «показать картинки»: тогда внешние src оставляем как есть.
  */
-export function sanitizeMailHtml(rawHtml: string, allowRemote: boolean): SanitizeResult {
+export function sanitizeMailHtml(
+  rawHtml: string,
+  allowRemote: boolean,
+  proxy?: ProxyUrl,
+): SanitizeResult {
   let html = rawHtml;
   // Комментарии вырезаем первыми: в них прячут и разметку, и «условные» блоки для старых
   // движков, которых в WebView нет.
@@ -281,7 +313,7 @@ export function sanitizeMailHtml(rawHtml: string, allowRemote: boolean): Sanitiz
   // <style>…</style>: CSS под нашим контролем. Незакрытый блок тоже разбираем (`|$`),
   // иначе его содержимое уехало бы в документ как есть.
   html = html.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>|$)/gi, (_m, open: string, css: string, close: string) => {
-    const res = sanitizeCss(css, allowRemote, true);
+    const res = sanitizeCss(css, allowRemote, true, proxy);
     blockedRemote += res.blocked;
     return `${open}${res.css}${close}`;
   });
@@ -316,7 +348,7 @@ export function sanitizeMailHtml(rawHtml: string, allowRemote: boolean): Sanitiz
       if (!ALLOWED_ATTRS.has(lower)) continue;
 
       if (lower === 'style') {
-        const res = sanitizeCss(value, allowRemote, false);
+        const res = sanitizeCss(value, allowRemote, false, proxy);
         blockedRemote += res.blocked;
         out += `${name}="${escapeAttr(res.css)}"`;
         continue;
@@ -337,6 +369,12 @@ export function sanitizeMailHtml(rawHtml: string, allowRemote: boolean): Sanitiz
         if (info.remote && !allowRemote) {
           blockedRemote += 1;
           out += `data-blocked-${lower}="${escapeAttr(value)}"`;
+          continue;
+        }
+        // Разрешённый чужой адрес уходит в прокси; data: и относительные остаются как есть.
+        if (info.remote && proxy) {
+          const rewritten = lower === 'srcset' ? proxySrcset(value, proxy) : proxy(value);
+          out += `${name}="${escapeAttr(rewritten)}"`;
           continue;
         }
         out += `${name}="${escapeAttr(value)}"`;
