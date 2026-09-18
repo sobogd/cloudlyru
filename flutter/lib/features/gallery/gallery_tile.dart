@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../api/models.dart';
@@ -12,15 +13,18 @@ import '../../theme.dart';
 /// плитка просит её сама и перерисовывается, когда файл появился на диске. Запрос уходит не в
 /// `build`, а с паузой [_settle]: при пролистывании плитки создаются десятками и уезжают за
 /// доли секунды, и качать для них миниатюры — значит занять канал тем, чего человек уже
-/// не видит (именно из-за этого видимые клетки оставались серыми). Пауза работает и при
-/// перетаскивании ползунка скроллбара: список едет быстро, плитки живут меньше её и ничего
-/// не просят, а после остановки видимые клетки догружаются.
+/// не видит (именно из-за этого видимые клетки оставались серыми).
+///
+/// Пока список едет, не просится вообще ничего ([scrolling]): серые клетки вместо картинок —
+/// это и есть плата за гладкую прокрутку, а по остановке плитка просит миниатюру заново. Одна
+/// пауза [_settle] этого не давала: медленное перетаскивание ползунка длится дольше её.
 class GalleryTile extends StatefulWidget {
   const GalleryTile({
     super.key,
     required this.item,
     required this.side,
     required this.thumbs,
+    required this.scrolling,
     required this.onTap,
   });
 
@@ -32,6 +36,9 @@ class GalleryTile extends StatefulWidget {
 
   /// Очередь миниатюр; `null` — хранилище ещё открывается, показываем заглушку.
   final ThumbCache? thumbs;
+
+  /// Идёт ли прокрутка: `true` — миниатюры не просятся (см. `GalleryController`).
+  final ValueListenable<bool> scrolling;
 
   /// Открыть кадр в просмотрщике.
   final VoidCallback onTap;
@@ -59,6 +66,7 @@ class _GalleryTileState extends State<GalleryTile> {
   @override
   void initState() {
     super.initState();
+    widget.scrolling.addListener(_onScrollingChanged);
     _arm(_settle);
   }
 
@@ -80,8 +88,17 @@ class _GalleryTileState extends State<GalleryTile> {
 
   @override
   void dispose() {
+    widget.scrolling.removeListener(_onScrollingChanged);
     _timer?.cancel();
     super.dispose();
+  }
+
+  /// Прокрутка кончилась: у плитки снова есть повод попросить миниатюру.
+  ///
+  /// Просьба, пропущенная на ходу, сама не вернётся: `build` её не повторяет, а `didUpdateWidget`
+  /// молчит, пока кадр тот же. Поэтому остановку слушаем здесь.
+  void _onScrollingChanged() {
+    if (!widget.scrolling.value) _arm(_settle);
   }
 
   /// Поставить просьбу через [delay] — отменяемую и перезапускаемую.
@@ -96,6 +113,8 @@ class _GalleryTileState extends State<GalleryTile> {
   /// попытку, если просить пока нельзя.
   void _request() {
     if (!mounted || _requested) return;
+    // Список едет — не просим: просьбу повторит остановка (см. [_onScrollingChanged]).
+    if (widget.scrolling.value) return;
     final sha = widget.item.sha256;
     // Кадр без собранного превью: качать нечего, ждём опроса состояния (`GalleryController`).
     if (sha == null || sha.isEmpty || widget.item.previewState != 'done') return;

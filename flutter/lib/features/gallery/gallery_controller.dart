@@ -194,8 +194,12 @@ class GalleryController extends ChangeNotifier {
 
   /// Подключить очередь миниатюр. Отдельным вызовом, потому что она открывается асинхронно
   /// (чтение каталога данных), а сетка к этому моменту уже может быть на экране.
+  ///
+  /// Пауза ставится сразу по текущему состоянию прокрутки: очередь могла подключиться как раз
+  /// на ходу, и качать в этот момент ей нечего (см. [_onScrollingChanged]).
   void attachThumbs(ThumbCache cache) {
     thumbs = cache;
+    cache.paused = isScrolling.value;
     notifyListeners();
   }
 
@@ -244,6 +248,9 @@ class GalleryController extends ChangeNotifier {
       _restorePlace(anchor);
       _publishCounters();
       _refreshTopFromScroll();
+      // Позиция прокрутки появляется вместе с первой раскладкой: до неё следить за состоянием
+      // прокрутки не за чем (см. [_watchScrolling]).
+      _watchScrolling();
       notifyListeners();
     });
   }
@@ -251,8 +258,10 @@ class GalleryController extends ChangeNotifier {
   /// Обработать событие прокрутки: подпись месяца в шапке и опрос превью.
   ///
   /// Кадры при этом никто не догружает: их просят сами строки, когда строятся, — то есть ровно
-  /// те, что попали на экран (см. `GalleryPages`).
+  /// те, что попали на экран (см. `GalleryPages`). Пока прокрутка идёт, и это не происходит:
+  /// чтение приостановлено до остановки списка (см. [_onScrollingChanged]).
   void onScroll() {
+    _watchScrolling();
     _refreshTopFromScroll();
     _scheduleStatusPoll();
   }
@@ -495,11 +504,10 @@ class GalleryController extends ChangeNotifier {
   /// Кадры приехали из индекса: перерисовать строки, которые их ждали.
   ///
   /// Перерисовка — не чаще одного раза в кадр, а во время прокрутки — не чаще [_scrollRepaintMs].
-  /// Это не тонкость, а условие плавности: ползунок скроллбара тянут через всю библиотеку, и
-  /// построенные строки успевают попросить десятки пачек в секунду. Пересборка списка стоит как
-  /// пересборка всех живых строк — делегат строк объявляет себя изменившимся всегда
-  /// (`SliverChildBuilderDelegate.shouldRebuild`), — а под пальцем клетки всё равно мелькают,
-  /// и шестьдесят таких пересборок в секунду ради одной приехавшей пачки незачем.
+  /// Пачка, прочитанная до начала движения, может вернуться уже на ходу, а пересборка списка
+  /// стоит как пересборка всех живых строк — делегат строк объявляет себя изменившимся всегда
+  /// (`SliverChildBuilderDelegate.shouldRebuild`). Под пальцем клетки всё равно мелькают, и делать
+  /// это шестьдесят раз в секунду незачем.
   ///
   /// Приехавшее при этом не теряется: каждая пачка либо попадает в перерисовку по сроку таймера,
   /// либо, если прокрутка к тому времени уже встала, перерисовывается кадром — путь есть у любой.
@@ -507,7 +515,7 @@ class GalleryController extends ChangeNotifier {
     if (_disposed) return;
     _scheduleStatusPoll();
     _pagesDirty = true;
-    if (_scrolling) {
+    if (isScrolling.value) {
       _repaintTimer ??= Timer(const Duration(milliseconds: _scrollRepaintMs), _onScrollRepaintDue);
       return;
     }
@@ -515,12 +523,58 @@ class GalleryController extends ChangeNotifier {
   }
 
   /// Прокрутка идёт прямо сейчас.
-  bool get _scrolling => scroll.hasClients && scroll.position.isScrollingNotifier.value;
+  ///
+  /// Наружу — плиткам: пока список едет, миниатюры не просятся (см. `GalleryTile`).
+  final ValueNotifier<bool> isScrolling = ValueNotifier(false);
+
+  /// Позиция прокрутки, за состоянием которой мы следим; `null` — ещё не подключились.
+  ///
+  /// Держится ссылкой, а не берётся из контроллера на каждом шаге: к моменту уничтожения экрана
+  /// позиция уже может быть отцеплена, и `scroll.position` бросил бы исключение прямо в `dispose`.
+  ScrollPosition? _watched;
+
+  /// Обработать смену состояния прокрутки: началась — приостановить загрузки, кончилась —
+  /// показать то, что видно.
+  ///
+  /// Это граница двух режимов раздела. Пока список едет, не читается ни одна пачка кадров
+  /// (`GalleryPages.paused`) и не качается ни одна миниатюра (`ThumbCache.paused`): в сетке
+  /// остаются серые клетки того же размера, и прокрутка идёт гладко на любой скорости — в том
+  /// числе когда палец доходит до границы уже подгруженного, где раньше начинался рывок.
+  /// По остановке видимые строки просят кадры заново, а плитки — миниатюры, то есть грузится
+  /// ровно то, что человек видит. Так же ведёт себя и ползунок скроллбара: перетаскивание —
+  /// это та же прокрутка, и грузить во время него нечего.
+  ///
+  /// Побочно: `isScrolling`, пауза чтения пачек и очереди миниатюр, перерисовка по остановке.
+  void _onScrollingChanged() {
+    if (_disposed) return;
+    final moving = _watched?.isScrollingNotifier.value ?? false;
+    if (isScrolling.value != moving) isScrolling.value = moving;
+    pages.paused = moving;
+    thumbs?.paused = moving;
+    // Начало движения — это и есть вся работа: паузы поставлены, качать и читать нечего.
+    if (moving) return;
+    // Список встал: перерисовать построенные строки — они попросят кадры, а плитки миниатюры.
+    // Заодно возобновляется опрос состояний превью: во время движения он не начинался.
+    _repaintNow();
+    _scheduleStatusPoll();
+  }
+
+  /// Подключиться к состоянию прокрутки, как только у контроллера появится позиция.
+  ///
+  /// Позиция возникает при первой раскладке списка, поэтому зовётся и с прокрутки, и после кадра
+  /// (см. `setLayout`): до этого момента `isScrollingNotifier` просто не существует.
+  void _watchScrolling() {
+    if (_watched != null || !scroll.hasClients) return;
+    _watched = scroll.position;
+    _watched!.isScrollingNotifier.addListener(_onScrollingChanged);
+    _onScrollingChanged();
+  }
 
   /// Срок таймера прокрутки: показать приехавшее, не дожидаясь остановки.
   ///
-  /// Именно по сроку, а не по остановке: ползунок скроллбара можно держать и вести медленно,
-  /// и ждать отпускания значило бы показывать заглушки, пока человек ведёт палец.
+  /// Пачка, которую ждали, успевает вернуться на ходу — например, её просили ещё до начала
+  /// движения, — и держать её до остановки незачем: четверть секунды успевает пройти между
+  /// заметными движениями пальца, а перерисовка стоит четыре раза в секунду, а не шестьдесят.
   void _onScrollRepaintDue() {
     _repaintTimer = null;
     if (_disposed || !_pagesDirty) return;
@@ -552,7 +606,11 @@ class GalleryController extends ChangeNotifier {
   }
 
   /// Запустить опрос состояний превью, если он ещё не идёт.
+  ///
+  /// Во время прокрутки опрос не начинается: это запрос к серверу, а список на ходу не платит
+  /// ни за сеть, ни за разбор ответа. Остановка возобновляет его сама (см. [_onScrollingChanged]).
   void _scheduleStatusPoll() {
+    if (isScrolling.value) return;
     _statusTimer ??= Timer(const Duration(milliseconds: _statusPollMs), _pollStatuses);
   }
 
@@ -643,11 +701,13 @@ class GalleryController extends ChangeNotifier {
     _disposed = true;
     _statusTimer?.cancel();
     _repaintTimer?.cancel();
+    _watched?.isScrollingNotifier.removeListener(_onScrollingChanged);
     sync.progress.removeListener(_onSyncProgress);
     scroll.dispose();
     total.dispose();
     revision.dispose();
     barTitle.dispose();
+    isScrolling.dispose();
     super.dispose();
   }
 }

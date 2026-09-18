@@ -245,6 +245,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       item: item,
       side: side,
       thumbs: c.thumbs,
+      scrolling: c.isScrolling,
       onTap: () => _openViewer(c, row.firstItem + i),
     );
   }
