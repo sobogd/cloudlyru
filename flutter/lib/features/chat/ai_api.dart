@@ -172,14 +172,23 @@ class AiApi {
     final body = res.data;
     if (body == null) throw const AiApiException(0, 'Сервер закрыл соединение, не прислав ответ');
 
-    // Тип объявлен явно: `body.stream` — поток `Uint8List`, а `utf8.decoder` объявлен над
-    // `List<int>`; поток ковариантен, поэтому без этой переменной преобразование не собирается.
-    final Stream<List<int>> raw = body.stream;
-
-    // Построчный разбор отдан `utf8.decoder` + `LineSplitter`, а не написан руками: сетевой
-    // чанк не обязан совпадать со строкой и может разрезать JSON посередине. Эти два
-    // преобразователя держат буфер и склеивают обрывки сами.
-    await for (final line in raw.transform(utf8.decoder).transform(const LineSplitter())) {
+    // `cast<List<int>>()` здесь обязателен, а не косметика: `body.stream` — это поток
+    // `Uint8List`, а `utf8.decoder` объявлен над `List<int>`. В Dart дженерики ковариантны,
+    // поэтому `stream.transform(utf8.decoder)` собирается анализатором, но падает на runtime
+    // (`_TypeError: type 'Utf8Decoder' is not a subtype of type 'StreamTransformer<Uint8List,
+    // String>'`) — ровно это и было причиной «Не удалось получить ответ» при живом ответе
+    // сервера. Приведение меняет и тип потока на runtime, а не только на бумаге.
+    //
+    // Декодер обязан быть потоковым (`utf8.decoder`, а не `utf8.decode` на чанк): русский текст
+    // приходит несколькими байтами на символ, и чанк может разрезать символ посередине.
+    //
+    // Построчный разбор отдан `LineSplitter`: сетевой чанк не обязан совпадать со строкой и
+    // может разрезать JSON посередине — этот преобразователь держит буфер и склеивает обрывки.
+    final lines = body.stream
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
+    await for (final line in lines) {
       if (!line.startsWith('data:')) continue;
       final payload = line.substring('data:'.length).trim();
       if (payload.isEmpty) continue;

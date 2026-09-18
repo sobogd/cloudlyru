@@ -246,8 +246,13 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       );
 
   /// Поле ввода и кнопка отправки (во время генерации — «Стоп»).
+  ///
+  /// Снизу прибавляем системный отступ ([navBarInset]): экран открыт отдельным маршрутом, а
+  /// `Scaffold` без своей нижней панели не резервирует место под полосу навигации Android —
+  /// без этого поле ввода уезжало под неё. С открытой клавиатурой отступ нулевой (клавиатура
+  /// уже перекрывает полосу), поэтому двойного сдвига не будет.
   Widget _composer(ChatThreadState state) => Container(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+        padding: EdgeInsets.fromLTRB(12, 8, 12, 12 + navBarInset(context)),
         decoration: const BoxDecoration(
           border: Border(top: BorderSide(color: C.brd)),
         ),
