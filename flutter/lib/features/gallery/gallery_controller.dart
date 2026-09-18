@@ -10,19 +10,18 @@ import '../../media/thumb_cache.dart';
 import '../../util/format.dart';
 import 'data/gallery_store.dart';
 import 'data/gallery_sync.dart';
-import 'gallery_calendar.dart';
 import 'gallery_index.dart';
 import 'gallery_pages.dart';
 import 'gallery_rows.dart';
 
-/// Состояние галереи: полная сетка по локальному индексу, прокрутка, шкала и кадры строк.
+/// Состояние галереи: полная сетка по локальному индексу, прокрутка и кадры строк.
 ///
 /// ## Полный список вместо окна вокруг якоря
 ///
 /// Прежняя галерея не знала, сколько всего кадров: список был окном вокруг якоря и достраивался
 /// страницами в обе стороны. Отсюда следовало всё остальное — прыжок по шкале сбрасывал окно
-/// и ждал страницу, окно чистилось по краям, подпись месяца считалась по видимому кадру, а
-/// страница, добавленная сверху, требовала вёрстки с `center`, чтобы не сдвинуть читаемое.
+/// и ждал страницу, окно чистилось по краям, а страница, добавленная сверху, требовала вёрстки
+/// с `center`, чтобы не сдвинуть читаемое.
 ///
 /// Теперь геометрия известна целиком и до кадров: разбивка по месяцам в локальном индексе
 /// говорит, сколько кадров в каждом месяце, а заголовок и ряд из четырёх клеток дают строки
@@ -30,9 +29,10 @@ import 'gallery_rows.dart';
 ///
 ///  * у списка есть точная длина на всю историю, и она не зависит от того, что успело
 ///    прочитаться, — под пальцем ничего не растёт и не переставляется;
-///  * прыжок по шкале — арифметика: месяц, номер строки, смещение. Ни сброса, ни ожидания;
-///  * подпись месяца и ползунок считаются по верхней видимой СТРОКЕ, поэтому верны и там,
-///    где кадры ещё не прочитаны.
+///  * позиция прокрутки сама по себе осмысленна: ползунок обычного скроллбара (`GalleryScreen`)
+///    стоит по доле кадров, а не по датам, и его можно тянуть через всю библиотеку;
+///  * подпись месяца в шапке считается по верхней видимой СТРОКЕ, поэтому верна и там, где
+///    кадры ещё не прочитаны.
 ///
 /// ## Где берутся кадры
 ///
@@ -76,13 +76,13 @@ class GalleryController extends ChangeNotifier {
   /// Отступ сетки сверху — тот же, что у вёрстки (`GalleryGrid.gap`).
   ///
   /// Позиция прокрутки отсчитывается от начала содержимого, а строки — от начала списка:
-  /// без этого отступа прыжок по шкале вставал бы на зазор выше строки. Величина берётся
+  /// без этого отступа строка встала бы на зазор выше позиции. Величина берётся
   /// из общего с вёрсткой места, а не задаётся здесь числом: разойдясь, они развели бы
   /// прыжок и строку, к которой он ведёт.
   static const double topInset = GalleryGrid.gap;
 
   /// Прокрутка сетки. Владеет ею контроллер, а не виджет: по позиции прокрутки считаются
-  /// подпись месяца, ползунок и опрос превью, а прыжок по шкале контроллер ставит сам.
+  /// подпись месяца в шапке, опрос превью и место чтения при пересборке геометрии.
   final ScrollController scroll = ScrollController();
 
   /// Сколько кадров во всей ленте — для просмотрщика: он листает по номерам и берёт отсюда
@@ -93,20 +93,14 @@ class GalleryController extends ChangeNotifier {
   /// Сигнал просмотрщику, что кадры изменились и слайд можно перерисовать.
   final ValueNotifier<int> revision = ValueNotifier(0);
 
-  /// Положение ползунка шкалы.
-  final ValueNotifier<GalleryRailPosition> rail = ValueNotifier(GalleryRailPosition.start);
-
   /// Подпись месяца в шапке — месяц верхней видимой строки.
+  ///
+  /// Заменяет собой прежнюю шкалу месяцев: она показывала, куда человек едет, а обычный
+  /// скроллбар возит сам список, и «где я во времени» остаётся видно по этой подписи.
   final ValueNotifier<String> barTitle = ValueNotifier('Медиа');
-
-  /// Ползунок шкалы в пальце: пока true, плитки не просят миниатюры.
-  final ValueNotifier<bool> scrubbing = ValueNotifier(false);
 
   /// Геометрия сетки на всю историю; `null` — ещё не собрана (не было раскладки или разбивки).
   GalleryIndex? index;
-
-  /// Шкала таймлайна, посчитанная по разбивке.
-  GalleryCalendar? calendar;
 
   /// Разбивка по месяцам, из которой собирается геометрия.
   List<MediaMonthBucket> _months = const [];
@@ -129,6 +123,9 @@ class GalleryController extends ChangeNotifier {
 
   /// Синхронизация изменила индекс, пока был открыт просмотрщик: пересобрать после закрытия.
   bool _dirty = false;
+
+  /// Перерисовка уже заказана на этот кадр (см. [_onPagesLoaded]).
+  bool _repaintScheduled = false;
 
   /// Проход наполнения уже замечен этим контроллером (см. [_onSyncProgress]).
   bool _filling = false;
@@ -238,43 +235,13 @@ class GalleryController extends ChangeNotifier {
     });
   }
 
-  /// Ползунок взяли в палец.
-  void setScrubbing(bool value) {
-    if (scrubbing.value == value) return;
-    scrubbing.value = value;
-  }
-
-  /// Обработать событие прокрутки: подпись месяца, ползунок и опрос превью.
+  /// Обработать событие прокрутки: подпись месяца в шапке и опрос превью.
   ///
   /// Кадры при этом никто не догружает: их просят сами строки, когда строятся, — то есть ровно
   /// те, что попали на экран (см. `GalleryPages`).
   void onScroll() {
     _refreshTopFromScroll();
     _scheduleStatusPoll();
-  }
-
-  /// Показать месяц [month] (прыжок по шкале).
-  ///
-  /// Ни сброса списка, ни ожидания страницы здесь нет: месяц — это номер строки в геометрии,
-  /// и прыжок сводится к смещению. Пустой месяц (такие на шкале остаются) ведёт к ближайшим
-  /// кадрам — других в нём и нет.
-  Future<void> jumpToMonth(String month) async {
-    final idx = index;
-    if (idx == null || idx.isEmpty) return;
-    // Строка месяца одна на всю шкалу: `headerRowAtOrOlder` ведёт и в пустой месяц (к ближайшим
-    // кадрам), и в месяц старее всей ленты (к самому старому). `null` он отдаёт только когда
-    // датированных кадров нет вовсе — тогда ведём к началу списка, а не оставляем прыжок без
-    // ответа: ползунок, отпущенный впустую, выглядит как сломанная шкала.
-    _jumpToRow(idx.headerRowAtOrOlder(month) ?? 0);
-  }
-
-  /// Показать кадры без даты (зона под шкалой).
-  Future<void> jumpToTail() async {
-    final idx = index;
-    if (idx == null || idx.isEmpty) return;
-    final row = idx.undatedRow;
-    if (row == null) return;
-    _jumpToRow(row);
   }
 
   /// Строка сетки для вёрстки: заголовок месяца, ряд кадров или строка состояния.
@@ -306,14 +273,6 @@ class GalleryController extends ChangeNotifier {
     final idx = index;
     if (idx == null || row < 0 || row >= idx.rowCount) return null;
     return idx.heightOfRow(row);
-  }
-
-  /// Показать [row] первой строкой экрана.
-  void _jumpToRow(int row) {
-    final idx = index;
-    if (idx == null || !scroll.hasClients) return;
-    scroll.jumpTo(_clampOffset(topInset + idx.topOfRow(row)));
-    _refreshTopFromScroll();
   }
 
   /// Кадр по номеру во всей ленте: так его берёт просмотрщик.
@@ -400,7 +359,6 @@ class GalleryController extends ChangeNotifier {
     // Неполные пачки — тоже: месяцы, которые лента дочитала не до конца, подросли.
     pages.refreshUnfinished();
     _months = months;
-    calendar = GalleryCalendar(months: months, tzOffsetMin: _tz);
     _rebuild();
     _restorePlace(anchor);
     _publishCounters();
@@ -460,10 +418,16 @@ class GalleryController extends ChangeNotifier {
   }
 
   /// Выполнить после текущего кадра: во время сборки будить слушателей нельзя.
+  ///
+  /// Кадр при этом просится явно: отложенное обновление приходит из асинхронного чтения, когда
+  /// рисовать вроде бы и нечего, а `addPostFrameCallback` сам по себе кадр не заказывает —
+  /// без `scheduleFrame` уведомление ждало бы следующей причины перерисоваться, и сетка
+  /// осталась бы с заглушками там, где кадры уже приехали.
   void _afterFrame(VoidCallback action) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_disposed) action();
     });
+    WidgetsBinding.instance.scheduleFrame();
   }
 
   /// Синхронизация в фоне, а после неё — новая разбивка и новая геометрия.
@@ -507,10 +471,20 @@ class GalleryController extends ChangeNotifier {
   }
 
   /// Кадры приехали из индекса: перерисовать строки, которые их ждали.
+  ///
+  /// Перерисовка — не чаще одного раза в кадр. Это не тонкость, а условие плавности: ползунок
+  /// скроллбара тянут через всю библиотеку, и построенные строки успевают попросить десятки
+  /// пачек в секунду. Перерисовывать сетку на каждую приехавшую пачку значило бы собирать
+  /// десятки экранов за кадр ради одного видимого.
   void _onPagesLoaded() {
     if (_disposed) return;
-    revision.value++;
-    notifyListeners();
+    if (_repaintScheduled) return;
+    _repaintScheduled = true;
+    _afterFrame(() {
+      _repaintScheduled = false;
+      revision.value++;
+      notifyListeners();
+    });
     _scheduleStatusPoll();
   }
 
@@ -590,34 +564,22 @@ class GalleryController extends ChangeNotifier {
     return out;
   }
 
-  /// Подпись месяца и ползунок по текущей позиции прокрутки.
+  /// Подпись месяца в шапке по текущей позиции прокрутки.
   void _refreshTopFromScroll() => _refreshTop((scroll.hasClients ? scroll.offset : 0.0) - topInset);
 
-  /// Подпись месяца и ползунок для смещения [offset] от начала списка.
+  /// Подпись месяца для смещения [offset] от начала списка.
   ///
-  /// Считаются по верхней видимой строке, а не по кадру: строка знает свой месяц из геометрии,
-  /// поэтому подпись и ползунок верны и там, где кадры ещё не прочитаны.
+  /// Считается по верхней видимой строке, а не по кадру: строка знает свой месяц из геометрии,
+  /// поэтому подпись верна и там, где кадры ещё не прочитаны, — а именно это и остаётся
+  /// единственным ответом на «где я во времени», пока человек тянет ползунок скроллбара.
   void _refreshTop(double offset) {
     final idx = index;
-    final cal = calendar;
-    if (idx == null || idx.isEmpty || cal == null || cal.isEmpty) return;
+    if (idx == null || idx.isEmpty) return;
     final row = idx.rowAtOffset(offset);
     if (row < 0) return;
     final spec = idx.specAt(row);
     if (spec.note) return;
-    if (spec.month.isEmpty) {
-      rail.value = const GalleryRailPosition(1, tail: true);
-      barTitle.value = 'Без даты';
-      return;
-    }
-    // Календарь считает время от старого края, а ползунок ходит сверху вниз (сверху — свежее),
-    // поэтому доля дорожки — это `1 - доля времени`. Границей месяца подпись и ползунок
-    // считаются по геометрии: кадра под рукой может и не быть.
-    final fraction = 1 - cal.fractionOf(cal.monthBoundaryUtc(spec.month));
-    if (rail.value.tail || (rail.value.fraction - fraction).abs() > 1e-4) {
-      rail.value = GalleryRailPosition(fraction);
-    }
-    barTitle.value = monthLabel(spec.month);
+    barTitle.value = spec.month.isEmpty ? 'Без даты' : monthLabel(spec.month);
   }
 
   @override
@@ -628,9 +590,7 @@ class GalleryController extends ChangeNotifier {
     scroll.dispose();
     total.dispose();
     revision.dispose();
-    rail.dispose();
     barTitle.dispose();
-    scrubbing.dispose();
     super.dispose();
   }
 }

@@ -5,8 +5,8 @@ import 'gallery_rows.dart';
 ///
 /// Блоки идут в порядке ленты — от свежих месяцев к старым, хвост кадров без даты последним, —
 /// и каждый помнит, где он начинается: `firstRow` переводит строку в месяц, `firstItem` —
-/// кадр в свой месяц. Обе величины нужны на каждом шаге (вёрстка, прыжок по шкале, чтение
-/// кадров), поэтому и лежат рядом, а не считаются заново.
+/// кадр в свой месяц. Обе величины нужны на каждом шаге (вёрстка, чтение кадров, поиск места
+/// чтения при пересборке), поэтому и лежат рядом, а не считаются заново.
 class GalleryBlock {
   const GalleryBlock({
     required this.month,
@@ -147,8 +147,8 @@ class GalleryRowSpec {
 /// ## Зачем полная, а не окно вокруг якоря
 ///
 /// Прежняя сетка была окном кадров: список не знал ни начала, ни конца и достраивался
-/// страницами в обе стороны от якоря. Из этого следовало всё остальное — прыжок по шкале
-/// сбрасывал окно и ждал страницу, подпись месяца считалась по видимому кадру, а позиция
+/// страницами в обе стороны от якоря. Из этого следовало всё остальное — переход к другому
+/// году сбрасывал окно и ждал страницу, подпись месяца считалась по видимому кадру, а позиция
 /// прокрутки сама по себе ничего не значила.
 ///
 /// Здесь геометрия известна целиком и до кадров: разбивка по месяцам (`GalleryStore.months`)
@@ -207,34 +207,6 @@ class GalleryIndex {
   /// Кадров нет вовсе: показывать нечего (разбивка пуста или индекс ещё не наполнен).
   bool get isEmpty => _l.itemCount == 0;
 
-  /// Блоки в порядке ленты.
-  List<GalleryBlock> get blocks => _l.blocks;
-
-  /// Номер строки заголовка месяца [month]; `null` — такого месяца в индексе нет.
-  ///
-  /// Нужен прыжку по шкале и месту чтения: и тот и другой адресуются месяцем, а не строкой.
-  int? headerRowOfMonth(String month) {
-    final i = _blockIndexOfMonth(month);
-    return i == null ? null : _l.blocks[i].firstRow;
-  }
-
-  /// Номер строки заголовка ближайшего месяца не новее [month].
-  ///
-  /// На пустой месяц шкала всё равно наводит (пустые месяцы из неё не выброшены): прыжок
-  /// к нему ведёт к ближайшим кадрам, потому что других в этом месяце и нет. Месяц старее всей
-  /// ленты ведёт к самому старому месяцу, а не к началу списка: ползунок, отпущенный внизу,
-  /// не должен уезжать наверх. Кадры без даты в поиске не участвуют — они лежат ниже всей
-  /// дорожки, и для них есть отдельный прыжок ([undatedRow]).
-  ///
-  /// `null` — датированных месяцев в индексе нет вовсе.
-  int? headerRowAtOrOlder(String month) {
-    final i = _blockIndexAtOrOlder(month);
-    return i == null ? null : _l.blocks[i].firstRow;
-  }
-
-  /// Номер строки заголовка блока кадров без даты; `null` — таких кадров в индексе нет.
-  int? get undatedRow => _datedCount < _l.blocks.length ? _l.blocks.last.firstRow : null;
-
   /// Что стоит в строке [row].
   ///
   /// Строку за границами списка отдаёт крайней: вёрстка спрашивает только существующие
@@ -269,14 +241,6 @@ class GalleryIndex {
       top: b.top + GalleryGrid.headerHeight + (k - 1) * rowStep,
       height: rowStep,
     );
-  }
-
-  /// Смещение начала строки [row] от начала списка.
-  double topOfRow(int row) {
-    if (_l.rowCount == 0) return 0;
-    final r = row.clamp(0, _l.rowCount - 1);
-    if (hasNote && r == _l.rowCount - 1) return _l.height - GalleryGrid.noteHeight;
-    return specAt(r).top;
   }
 
   /// Высота строки [row] — ею вёрстка считает полную высоту списка и позицию строки.
@@ -318,13 +282,8 @@ class GalleryIndex {
     final i = _blockIndexOfMonth(month) ?? _blockIndexAtOrOlder(month) ?? _l.blocks.length - 1;
     if (i < 0) return 0;
     final b = _l.blocks[i];
-    return b.top + topInBlock(b, rowInBlock);
-  }
-
-  /// Смещение строки [rowInBlock] внутри блока [b] от его начала.
-  double topInBlock(GalleryBlock b, int rowInBlock) {
-    if (rowInBlock <= 0) return 0;
-    return GalleryGrid.headerHeight + (rowInBlock.clamp(0, b.rows - 1) - 1) * rowStep;
+    if (rowInBlock <= 0) return b.top;
+    return b.top + GalleryGrid.headerHeight + (rowInBlock.clamp(0, b.rows - 1) - 1) * rowStep;
   }
 
   /// Где лежит кадр номер [item]: месяц и его номер внутри месяца; `null` — кадра нет.
@@ -447,8 +406,7 @@ class GalleryIndex {
 
   /// Разложить месяцы по строкам сетки.
   ///
-  /// Пустые месяцы пропускаются: в ленте они не занимают места (в отличие от шкалы, где пустой
-  /// месяц остаётся отрезком календаря — см. `GalleryCalendar`). Хвост кадров без даты идёт
+  /// Пустые месяцы пропускаются: в ленте они не занимают места. Хвост кадров без даты идёт
   /// последним блоком: в ленте такие кадры идут после всех датированных.
   static _Layout _layout(List<MediaMonthBucket> months, double rowStep, bool hasNote) {
     final dated = months.where((m) => (m.month ?? '').isNotEmpty && m.count > 0).toList()

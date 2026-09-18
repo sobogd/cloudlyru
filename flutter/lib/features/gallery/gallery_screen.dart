@@ -12,16 +12,15 @@ import 'data/gallery_sync.dart';
 import 'gallery_controller.dart';
 import 'gallery_rows.dart';
 import 'gallery_tile.dart';
-import 'month_scrubber.dart';
 
-/// Экран «Медиа»: сетка кадров зоны «Фото» с таймлайном месяцев справа.
+/// Экран «Медиа»: сетка кадров зоны «Фото» с прокруткой по всей истории.
 ///
 /// Сетка построена на всю историю сразу — по разбивке локального индекса (см. `GalleryIndex`):
-/// у списка точная длина, поэтому прокрутка, подпись месяца и шкала говорят одно и то же,
-/// а прыжок по дате — это смещение, а не сброс списка и ожидание страницы. Кадры при этом
-/// остаются виртуальными: их просят только построенные строки (см. `GalleryPages`).
-/// Подробности модели — в доке контроллера, подробности раскладки шкалы — в доке
-/// `GalleryCalendar`.
+/// у списка точная длина, поэтому позиция прокрутки, подпись месяца в шапке и сам список
+/// говорят одно и то же. Справа — обычный `Scrollbar`: его ползунок тянется пальцем, и список
+/// едет за пальцем (у ползунка широкое поле захвата при тонком виде, см. `_grid`), а доля
+/// дорожки — это доля кадров, а не времени. Кадры при этом остаются виртуальными: их просят
+/// только построенные строки (см. `GalleryPages`). Подробности модели — в доке контроллера.
 class GalleryScreen extends ConsumerStatefulWidget {
   const GalleryScreen({super.key});
 
@@ -41,9 +40,9 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     unawaited(_prepare());
   }
 
-  /// Поднять контроллер: база индекса, синхронизация, очередь миниатюр, первое окно.
+  /// Поднять контроллер: база индекса, синхронизация, очередь миниатюр, первая раскладка.
   ///
-  /// Миниатюры подключаются отдельно и не блокируют окно: каталог данных читается с диска,
+  /// Миниатюры подключаются отдельно и не блокируют сетку: каталог данных читается с диска,
   /// и ждать его, показывая спиннер, незачем — плитки до его открытия рисуют заглушки.
   Future<void> _prepare() async {
     try {
@@ -85,9 +84,9 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
               ),
         bottom: c == null ? null : _syncBar(c),
       ),
-      // Экран обязан слушать контроллер: окно меняется из фоновых загрузок (страницы, прыжок
-      // по шкале, удаление кадра, подключение миниатюр), и без подписки сетка осталась бы той,
-      // какой её собрали в первый раз — с прежним числом строк и прежним якорем.
+      // Экран обязан слушать контроллер: геометрия и кадры меняются из фоновых загрузок
+      // (наполнение индекса, удаление кадра, подключение миниатюр), и без подписки сетка
+      // осталась бы той, какой её собрали в первый раз — с прежним числом строк и кадров.
       body: c == null
           ? const Center(child: CircularProgressIndicator())
           : ListenableBuilder(listenable: c, builder: (_, _) => _body(c)),
@@ -97,8 +96,8 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   /// Полоса наполнения локального индекса.
   ///
   /// Показывается только на полном проходе (первый запуск, пересборка после сброса журнала):
-  /// раздел в это время уже работает, но шкала знает ещё не все годы съёмки, и человеку стоит
-  /// понимать, почему по ней нельзя прыгнуть далеко в прошлое.
+  /// раздел в это время уже работает, но кадры в дальних годах ещё не прочитаны, и человеку
+  /// стоит понимать, почему внизу ленты клетки пока пустые.
   PreferredSizeWidget _syncBar(GalleryController c) {
     return PreferredSize(
       preferredSize: const Size.fromHeight(3),
@@ -116,68 +115,67 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     );
   }
 
-  /// Тело раздела: сетка, приглушение на время работы со шкалой и сама шкала.
+  /// Тело раздела: сетка под обычным скроллбаром.
+  ///
+  /// Приглушения и перехвата касаний здесь больше нет: они были нужны шкале месяцев, которая
+  /// показывала «куда едешь» вместо самого списка, — а ползунок скроллбара возит сам список,
+  /// и приглушать его значило бы прятать то, за чем человек следит.
   Widget _body(GalleryController c) {
     // `fit: expand` — чтобы сетка занимала весь раздел: `LayoutBuilder` внутри `Stack` при
     // свободных ограничениях иначе подстраивался бы под содержимое.
     return Stack(fit: StackFit.expand, children: [
       LayoutBuilder(builder: (context, box) {
-        // Ширина сетки — экран минус шкала: клетки не должны уходить под ползунок, а сторона
-        // клетки считается именно от этой ширины (иначе последний столбец обрезался бы).
-        c.setLayout(math.max(0.0, box.maxWidth - MonthScrubber.width));
+        // Ширина сетки — экран минус зазор под ползунок: клетки не должны уходить под него,
+        // а сторона клетки считается именно от этой ширины (иначе последний столбец обрезался бы).
+        c.setLayout(math.max(0.0, box.maxWidth - GalleryGrid.scrollbarInset));
         if (c.isEmpty) return _stub(c);
         return _grid(c);
       }),
-      // Приглушение: пока ползунок в пальце, сетка показывает прежнее место и не должна
-      // выглядеть как «то, куда едешь». Оно же перехватывает касания (случайный тап по старому
-      // месту не должен открывать кадр) и закрывает миниатюры — их в это время никто не просит.
-      ValueListenableBuilder<bool>(
-        valueListenable: c.scrubbing,
-        builder: (_, scrubbing, _) => scrubbing
-            ? const AbsorbPointer(child: ColoredBox(color: Color(0x990D0F14)))
-            : const SizedBox.shrink(),
-      ),
-      if (c.calendar != null && !(c.calendar!.isEmpty))
-        Positioned(
-          right: 0,
-          top: 0,
-          bottom: 0,
-          child: MonthScrubber(
-            calendar: c.calendar!,
-            position: c.rail,
-            onScrub: c.setScrubbing,
-            onJumpToMonth: (month) => unawaited(c.jumpToMonth(month)),
-            onJumpToTail: () => unawaited(c.jumpToTail()),
-          ),
-        ),
     ]);
   }
 
-  /// Сетка — один список на всю историю.
+  /// Сетка — один список на всю историю под обычным скроллбаром.
+  ///
+  /// Ползунок тянется пальцем: `interactive` включает перетаскивание, и Flutter ведёт его
+  /// настоящим `ScrollDragController` — список едет за пальцем и на отпускании получает
+  /// инерцию, то есть человек видит, что именно прокручивается, а не «куда-то прыгает»
+  /// после отпускания. Ползунок при этом тонкий (на Android 4 dp), но поле захвата вокруг него
+  /// Flutter расширяет до 48 dp — промахнуться по нему пальцем нельзя (см.
+  /// `RawScrollbar.hitTestOnlyThumbInteractive`). `thumbVisibility` держит его на виду: он здесь
+  /// орган управления, а не индикатор, и исчезающий ползунок пришлось бы ловить.
   ///
   /// Строки не строятся заранее: `SliverVariedExtentList` знает их высоты из геометрии
   /// (`GalleryController.rowHeight`), поэтому полная высота списка и позиция любой строки
-  /// считаются без построения — и прыжок по шкале встаёт ровно на строку месяца, а не «примерно
-  /// туда». Строятся только те строки, что попали на экран, а вместе с ними читаются и кадры
-  /// (см. `GalleryPages`).
+  /// считаются без построения — и ползунок стоит там, где кадры, а не «примерно там». Строятся
+  /// только те строки, что попали на экран, а вместе с ними читаются и кадры (см. `GalleryPages`).
   Widget _grid(GalleryController c) {
-    final side = GalleryGrid.gap + MonthScrubber.width;
-    return CustomScrollView(
+    return Scrollbar(
       controller: c.scroll,
-      physics: const AlwaysScrollableScrollPhysics(),
-      slivers: [
-        SliverPadding(
-          // Отступы задают начало содержимого: позиция прокрутки отсчитывается от него,
-          // и контроллер прибавляет верхний отступ, переводя строку в позицию
-          // (`GalleryController.topInset` — то же число).
-          padding: EdgeInsets.fromLTRB(GalleryGrid.gap, GalleryGrid.gap, side, GalleryGrid.gap),
-          sliver: SliverVariedExtentList.builder(
-            itemCount: c.rowCount,
-            itemExtentBuilder: (i, _) => c.rowHeight(i),
-            itemBuilder: (context, i) => _row(c, c.rowAt(i)),
+      thumbVisibility: true,
+      interactive: true,
+      child: CustomScrollView(
+        controller: c.scroll,
+        physics: const AlwaysScrollableScrollPhysics(),
+        slivers: [
+          SliverPadding(
+            // Отступы задают начало содержимого: позиция прокрутки отсчитывается от него,
+            // и контроллер прибавляет верхний отступ, переводя строку в позицию
+            // (`GalleryController.topInset` — то же число). Правый отступ — зазор под ползунок,
+            // он же вычтен из ширины сетки в `_body`.
+            padding: EdgeInsets.fromLTRB(
+              GalleryGrid.gap,
+              GalleryGrid.gap,
+              GalleryGrid.gap + GalleryGrid.scrollbarInset,
+              GalleryGrid.gap,
+            ),
+            sliver: SliverVariedExtentList.builder(
+              itemCount: c.rowCount,
+              itemExtentBuilder: (i, _) => c.rowHeight(i),
+              itemBuilder: (context, i) => _row(c, c.rowAt(i)),
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
@@ -225,7 +223,6 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       item: item,
       side: side,
       thumbs: c.thumbs,
-      scrubbing: c.scrubbing,
       onTap: () => _openViewer(c, row.firstItem + i),
     );
   }
