@@ -63,12 +63,14 @@ jobs:
 
       - name: Сборка релиза
         working-directory: flutter
+        # Тот же ключ xAI, что и в android.yml: раздел «Чат» есть в обеих сборках, и без
+        # --dart-define он в настольной сборке не заработал бы (значение — секрет репозитория
+        # GROK_API_KEY). Через env, по той же причине, что и в android.yml.
+        env:
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
         run: |
           flutter pub get
-          # Тот же ключ xAI, что и в android.yml: раздел «Чат» есть в обеих сборках, и без
-          # --dart-define он в настольной сборке не заработал бы (значение — секрет
-          # репозитория GROK_API_KEY).
-          flutter build macos --release --dart-define=GROK_API_KEY=${{ secrets.GROK_API_KEY }}
+          flutter build macos --release --dart-define=GROK_API_KEY="$GROK_API_KEY"
 
       - name: Архив со сборкой
         working-directory: flutter/build/macos/Build/Products/Release
