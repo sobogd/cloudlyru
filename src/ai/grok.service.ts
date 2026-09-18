@@ -134,6 +134,11 @@ export class GrokService {
           model: params.model,
           messages: params.messages,
           stream: true,
+          // Без этого поля xAI не присылает `usage` в потоке вообще: расход токенов остаётся
+          // неизвестным, и «сколько это стоило» посчитать нечем. В документации xAI пример
+          // потока показывает usage как обычное дело, но по факту он приходит только по
+          // запросу — проверено на живом API.
+          stream_options: { include_usage: true },
         }),
         signal: params.signal,
       });
