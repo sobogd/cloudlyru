@@ -18,6 +18,9 @@ import '../../theme.dart';
 /// Пока список едет, не просится вообще ничего ([scrolling]): серые клетки вместо картинок —
 /// это и есть плата за гладкую прокрутку, а по остановке плитка просит миниатюру заново. Одна
 /// пауза [_settle] этого не давала: медленное перетаскивание ползунка длится дольше её.
+///
+/// Режим без превью ([previews] = `false`) — тот же случай, но выбранный человеком: плитка
+/// не просит ничего вообще и рисует значок по типу файла.
 class GalleryTile extends StatefulWidget {
   const GalleryTile({
     super.key,
@@ -25,6 +28,7 @@ class GalleryTile extends StatefulWidget {
     required this.side,
     required this.thumbs,
     required this.scrolling,
+    required this.previews,
     required this.onTap,
   });
 
@@ -39,6 +43,9 @@ class GalleryTile extends StatefulWidget {
 
   /// Идёт ли прокрутка: `true` — миниатюры не просятся (см. `GalleryController`).
   final ValueListenable<bool> scrolling;
+
+  /// Показывать ли картинку: `false` — клетка рисует значок по типу файла и ничего не качает.
+  final bool previews;
 
   /// Открыть кадр в просмотрщике.
   final VoidCallback onTap;
@@ -73,6 +80,16 @@ class _GalleryTileState extends State<GalleryTile> {
   @override
   void didUpdateWidget(GalleryTile old) {
     super.didUpdateWidget(old);
+    // Сменился режим показа: прежние «уже просил» и «нет превью» к новому режиму не относятся.
+    // Вернули превью — просьбу надо поставить заново, иначе плитка осталась бы заглушкой,
+    // пока её не пересоздаст прокрутка.
+    if (old.previews != widget.previews) {
+      _timer?.cancel();
+      _requested = false;
+      _missing = false;
+      if (widget.previews) _arm(_settle);
+      return;
+    }
     // Плитку переиспользовали под другой кадр или у того же кадра сменилось состояние превью
     // (опрос `/media/status`): прежние «уже просил» и «нет превью» относятся к прошлому
     // содержимому. Второе важно не меньше первого — плитка, дождавшаяся готовности превью
@@ -113,6 +130,8 @@ class _GalleryTileState extends State<GalleryTile> {
   /// попытку, если просить пока нельзя.
   void _request() {
     if (!mounted || _requested) return;
+    // Режим без превью: картинка на экран не попадёт, и качать её не за чем.
+    if (!widget.previews) return;
     // Список едет — не просим: просьбу повторит остановка (см. [_onScrollingChanged]).
     if (widget.scrolling.value) return;
     final sha = widget.item.sha256;
@@ -140,6 +159,8 @@ class _GalleryTileState extends State<GalleryTile> {
   @override
   Widget build(BuildContext context) {
     final item = widget.item;
+    // Режим без превью: ни файла, ни декодирования — сразу значок по типу файла.
+    if (!widget.previews) return _placeholder(item);
     final sha = item.sha256;
     final thumbs = widget.thumbs;
     final file = (sha != null && thumbs != null && !_missing) ? thumbs.file(sha) : null;
@@ -170,13 +191,18 @@ class _GalleryTileState extends State<GalleryTile> {
   /// Заглушка клетки: серый фон и значок по типу файла.
   ///
   /// Значок разный намеренно: «превью ещё собирается» и «превью не будет никогда» — разные
-  /// вещи, и по одинаковой иконке человек не понимает, ждать ему или нет.
+  /// вещи, и по одинаковой иконке человек не понимает, ждать ему или нет. В режиме без превью
+  /// различать нечего — картинки не будет ни у кого, — поэтому значок показывается всегда:
+  /// иначе клетка готового кадра осталась бы пустым серым квадратом и была бы неотличима
+  /// от клетки, про которую ничего не известно.
   Widget _placeholder(MediaItem item) {
     final isVideo = item.mime.startsWith('video/');
     final impossible = item.previewState == 'impossible';
-    final IconData? icon = impossible
-        ? (isVideo ? Icons.videocam_off_outlined : Icons.hide_image_outlined)
-        : (item.previewState == 'done' ? null : (isVideo ? Icons.movie_outlined : Icons.image_outlined));
+    final IconData? icon = !widget.previews
+        ? (isVideo ? Icons.movie_outlined : Icons.image_outlined)
+        : impossible
+            ? (isVideo ? Icons.videocam_off_outlined : Icons.hide_image_outlined)
+            : (item.previewState == 'done' ? null : (isVideo ? Icons.movie_outlined : Icons.image_outlined));
     return GestureDetector(
       onTap: widget.onTap,
       child: Container(

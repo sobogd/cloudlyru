@@ -27,6 +27,9 @@ class UiStateStore {
   // поставил сборку со старым именем. Писать в него больше не нужно.
   static const _legacyKey = 'cloudlyru:ui';
 
+  /// Показывать ли превью в сетке галереи (кнопка в шапке раздела).
+  static const _kGalleryPreviews = 'gallery_previews';
+
   final SharedPreferences _prefs;
 
   /// [SharedPreferences] передаёт владелец настроек — своё хранилище здесь не открывается,
@@ -78,6 +81,19 @@ class UiStateStore {
       return (id: id is String ? id : null, name: name is String ? name : '');
     }).toList();
   }
+
+  /// Показывать ли превью в сетке галереи. По умолчанию `true`: обычный режим раздела — это
+  /// картинки, а «только значки» включают кнопкой в шапке галереи и выключают ею же.
+  ///
+  /// Значение проверяется на тип, как [tab]: в prefs может лежать что угодно, а `as bool`
+  /// на строке уронил бы экран галереи прямо при открытии раздела.
+  bool get galleryPreviews {
+    final v = read()[_kGalleryPreviews];
+    return v is bool ? v : true;
+  }
+
+  /// Запомнить выбор показа превью (см. [galleryPreviews]).
+  Future<void> setGalleryPreviews(bool on) => patch({_kGalleryPreviews: on});
 
   /// Дописывает поля к сохранённому состоянию: читает текущий объект, накладывает [patch]
   /// и записывает обратно.

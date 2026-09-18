@@ -183,6 +183,36 @@ class GalleryStore {
     return rows.map(_toItem).toList();
   }
 
+  /// Все кадры индекса, разложенные по месяцам: ключ — «ГГГГ-ММ», пустая строка — кадры
+  /// без даты.
+  ///
+  /// Читается страницами по [chunk] строк, а не одним запросом: пятьдесят шесть тысяч строк
+  /// sqflite гонит через platform channel целиком, и промежуточный список карт (около килобайта
+  /// на строку) дал бы десятки мегабайт мусора в тот момент, когда галерея уже держит сетку.
+  /// Страницы идут по индексу `items_order` в порядке ленты, поэтому кадры и внутри месяца
+  /// получаются от свежих к старым — ровно так же, как их отдаёт [monthItems].
+  ///
+  /// Побочно: ничего не пишет; вызывающий получает кадры (десятки мегабайт в памяти), поэтому
+  /// зовётся это один раз при открытии раздела.
+  Future<Map<String, List<MediaItem>>> allItemsByMonth({
+    required int tzOffsetMin,
+    int chunk = 2000,
+  }) async {
+    final out = <String, List<MediaItem>>{};
+    for (var offset = 0;; offset += chunk) {
+      final rows = await _db.rawQuery(
+        'SELECT * FROM items ORDER BY sort_key DESC, entry_id DESC LIMIT ? OFFSET ?',
+        [chunk, offset],
+      );
+      for (final r in rows) {
+        final key = _monthKey((r['sort_key'] as int?) ?? -1, tzOffsetMin);
+        (out[key] ??= <MediaItem>[]).add(_toItem(r));
+      }
+      if (rows.length < chunk) break;
+    }
+    return out;
+  }
+
   /// Разбивка по месяцам в порядке ленты (от свежих), «без даты» — последней.
   ///
   /// Порядок строк здесь же и есть порядок блоков сетки: по нему `GalleryIndex` раскладывает

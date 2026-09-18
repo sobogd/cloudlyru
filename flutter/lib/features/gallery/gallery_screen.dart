@@ -19,10 +19,15 @@ import 'gallery_tile.dart';
 ///
 /// Сетка построена на всю историю сразу — по разбивке локального индекса (см. `GalleryIndex`):
 /// у списка точная длина, поэтому позиция прокрутки, подпись месяца в шапке и сам список
-/// говорят одно и то же. Справа — обычный `Scrollbar`: его ползунок тянется пальцем, и список
-/// едет за пальцем (у ползунка широкое поле захвата при тонком виде, см. `_grid`), а доля
-/// дорожки — это доля кадров, а не времени. Кадры при этом остаются виртуальными: их просят
-/// только построенные строки (см. `GalleryPages`). Подробности модели — в доке контроллера.
+/// говорят одно и то же. Кадры читаются в память целиком при открытии раздела (см.
+/// `GalleryPages`), поэтому клетка на экране всегда знает свой кадр, а виртуальной остаётся
+/// только отрисовка: строки строятся по мере показа (`GalleryRowsSliver`), и построить
+/// пятьдесят шесть тысяч плиток разом нельзя ни по памяти, ни по времени кадра.
+///
+/// Справа — обычный `Scrollbar`: его ползунок тянется пальцем, и список едет за пальцем
+/// (у ползунка широкое поле захвата при тонком виде, см. `_grid`), а доля дорожки — это доля
+/// кадров, а не времени. Картинки в клетках отключаются кнопкой в шапке (см. [_togglePreviews]).
+/// Подробности модели — в доке контроллера.
 class GalleryScreen extends ConsumerStatefulWidget {
   const GalleryScreen({super.key});
 
@@ -52,6 +57,9 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       if (!mounted) return;
       final controller = GalleryController(sync: sync, apiOf: () => ref.read(appStateProvider).api);
       controller.scroll.addListener(controller.onScroll);
+      // Режим показа превью — из настроек: он переживает перезапуск приложения, и раздел
+      // открывается таким, каким его оставили.
+      controller.setShowPreviews(ref.read(settingsProvider).ui.galleryPreviews);
       setState(() => _c = controller);
       unawaited(ref.read(thumbCacheProvider.future).then((thumbs) {
         if (mounted) controller.attachThumbs(thumbs);
@@ -85,6 +93,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
                 builder: (_, title, _) => Text(title, style: const TextStyle(color: C.fg, fontSize: 17)),
               ),
         bottom: c == null ? null : _syncBar(c),
+        actions: c == null ? null : [_previewsButton(c)],
       ),
       // Экран обязан слушать контроллер: геометрия и кадры меняются из фоновых загрузок
       // (наполнение индекса, удаление кадра, подключение миниатюр), и без подписки сетка
@@ -115,6 +124,35 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
               ),
       ),
     );
+  }
+
+  /// Кнопка режима показа превью в шапке раздела.
+  ///
+  /// Выключенный режим — это не «спрятать картинки», а другой способ листать библиотеку:
+  /// плитки не качают и не декодируют миниатюры, клетки рисуются значками по типу файла,
+  /// и сетка едет одинаково гладко на любом участке. Состояние кнопки берётся у контроллера,
+  /// а не у настроек: настройка прочитана один раз при открытии, дальше источник правды —
+  /// контроллер, и по нему же перерисовываются плитки.
+  Widget _previewsButton(GalleryController c) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: c.showPreviews,
+      builder: (_, on, _) => IconButton(
+        tooltip: on ? 'Без превью' : 'С превью',
+        icon: Icon(on ? Icons.image_outlined : Icons.hide_image_outlined, color: C.fg2),
+        onPressed: () => _togglePreviews(c),
+      ),
+    );
+  }
+
+  /// Переключить показ превью и запомнить выбор.
+  ///
+  /// Запись настройки не ждём: она нужна только следующему запуску, а сетка перестраивается
+  /// сразу по контроллеру. Неудачная запись ничего не ломает — раздел останется в выбранном
+  /// режиме до выхода из приложения.
+  void _togglePreviews(GalleryController c) {
+    final on = !c.showPreviews.value;
+    c.setShowPreviews(on);
+    unawaited(ref.read(settingsProvider).ui.setGalleryPreviews(on));
   }
 
   /// Тело раздела: сетка под обычным скроллбаром.
@@ -149,7 +187,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   /// Строки не строятся заранее: `GalleryRowsSliver` знает их высоты из геометрии
   /// (`GalleryController.rowHeight`), поэтому полная высота списка и позиция любой строки
   /// считаются без построения — и ползунок стоит там, где кадры, а не «примерно там». Строятся
-  /// только те строки, что попали на экран, а вместе с ними читаются и кадры (см. `GalleryPages`).
+  /// только те строки, что попали на экран (кадры для них уже лежат в памяти, см. `GalleryPages`).
   Widget _grid(GalleryController c) {
     return Scrollbar(
       controller: c.scroll,
@@ -237,7 +275,8 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   /// Клетка ряда: плитка кадра или заглушка того же размера, пока кадр не прочитан.
   ///
   /// Заглушка — не «пустое место»: клетка стоит на своём месте с самого начала, поэтому
-  /// приезд кадров ничего не сдвигает и не перекладывает.
+  /// приезд кадров ничего не сдвигает и не перекладывает. Она же остаётся на месте картинки
+  /// в режиме без превью.
   Widget _cell(GalleryController c, GalleryRow row, int i, double side) {
     final item = row.items[i];
     if (item == null) return const ColoredBox(color: C.surface3);
@@ -246,6 +285,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       side: side,
       thumbs: c.thumbs,
       scrolling: c.isScrolling,
+      previews: c.showPreviews.value,
       onTap: () => _openViewer(c, row.firstItem + i),
     );
   }
