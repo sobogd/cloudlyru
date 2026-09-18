@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
+import '../features/chat/chat_screen.dart';
 import '../features/files/files_screen.dart';
 import '../features/mail/mail_screen.dart';
 import '../features/map/map_screen.dart';
@@ -25,7 +26,7 @@ import '../providers.dart';
 /// а в обработчике нажатия — `AppTab.values[i]`), поэтому порядок `destinations` в
 /// [_ShellState.build] обязан совпадать с порядком значений здесь, иначе подсветится и
 /// откроется не тот раздел. Число `destinations` — тоже ровно по числу значений.
-enum AppTab { files, mail, media, map, invoices, trash, settings }
+enum AppTab { files, mail, media, map, invoices, chat, trash, settings }
 
 /// Оболочка после входа: держит выбранный раздел и нижнюю панель навигации.
 ///
@@ -112,6 +113,7 @@ class _ShellState extends ConsumerState<Shell> {
         AppTab.media => const GalleryScreen(),
         AppTab.map => const MapScreen(),
         AppTab.invoices => const InvoicesScreen(),
+        AppTab.chat => const ChatScreen(),
         AppTab.trash => const TrashScreen(),
         AppTab.settings => const SettingsScreen(),
       });
@@ -156,6 +158,9 @@ class _ShellState extends ConsumerState<Shell> {
           // инвойсов, расходы и квартальные декларации. Стоит рядом с «Картой», потому что
           // это такая же отдельная зона приложения, а не часть файлов.
           NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: 'Фактуры'),
+          // «Чат» — разговор с моделью ИИ по ключу владельца (xAI/Grok). Отдельный раздел, а не
+          // кнопка внутри другого: это такая же самостоятельная зона приложения, как «Файлы».
+          NavigationDestination(icon: Icon(Icons.chat_bubble_outline), selectedIcon: Icon(Icons.chat_bubble), label: 'Чат'),
           NavigationDestination(icon: Icon(Icons.delete_outline), selectedIcon: Icon(Icons.delete), label: 'Корзина'),
           NavigationDestination(icon: Icon(Icons.settings_outlined), selectedIcon: Icon(Icons.settings), label: 'Настройки'),
         ],
