@@ -7,10 +7,10 @@ import '../../../api/models.dart';
 ///
 /// ## Зачем своя база
 ///
-/// Галерея — это окно в десятки тысяч кадров, и ходить за каждым его сдвигом в сеть значит
+/// Галерея — это десятки тысяч кадров, и ходить за каждым движением пальца в сеть значит
 /// ждать сеть на каждом движении пальца. Поэтому кадры лежат на устройстве (база
-/// `cloudly-gallery.db`): окно читается отсюда за единицы миллисекунд и работает без сети,
-/// а с сервером список сверяется журналом изменений (см. `GallerySync`).
+/// `cloudly-gallery.db`): строки сетки читаются отсюда за единицы миллисекунд и работают без
+/// сети, а с сервером список сверяется журналом изменений (см. `GallerySync`).
 ///
 /// ## Чем это не прежний локальный список
 ///
@@ -31,9 +31,10 @@ import '../../../api/models.dart';
 ///
 /// ## `months` — разбивка по месяцам
 ///
-/// Отдельная таблица, а не запрос с `GROUP BY`: по ней строится шкала таймлайна при каждом
-/// открытии раздела, и агрегат по десяткам тысяч строк на каждом открытии — лишняя работа.
-/// Пересобирается из `items` после записи в список ([rebuildMonths]).
+/// Отдельная таблица, а не запрос с `GROUP BY`: по ней строятся и шкала таймлайна, и геометрия
+/// сетки на всю историю (`GalleryIndex`) — то есть при каждом открытии раздела, а агрегат по
+/// десяткам тысяч строк на каждом открытии — лишняя работа. Пересобирается из `items` после
+/// записи в список ([rebuildMonths]).
 class GalleryStore {
   GalleryStore._(this._db);
 
@@ -100,8 +101,9 @@ class GalleryStore {
             gen INTEGER NOT NULL DEFAULT 0
           )
         ''');
-        // Порядок выборки — тот же, что на сервере: окно читается окрест курсора, и без
-        // индекса SQLite сортировал бы всю таблицу на каждый сдвиг окна.
+        // Порядок выборки — тот же, что на сервере: кадры месяца читаются окном по этому
+        // порядку, и без индекса SQLite сортировал бы всю таблицу на каждую построенную строку
+        // сетки (а строку за строкой она строится на каждом движении пальца).
         await db.execute('CREATE INDEX items_order ON items(sort_key DESC, entry_id DESC)');
         // Ключ месяца; пустая строка — бакет «Без даты» (NULL в первичном ключе SQLite не хранит).
         await db.execute('CREATE TABLE months(month TEXT PRIMARY KEY, count INTEGER NOT NULL)');
@@ -144,98 +146,47 @@ class GalleryStore {
     return (rows.first['n'] as int?) ?? 0;
   }
 
-  /// Начало ленты — самые свежие датированные кадры.
+  /// Кадры месяца [month] пачкой: [offset] — номер первого нужного кадра внутри месяца.
   ///
-  /// Кадры без даты сюда не попадают: они идут после всех датированных и дочитываются
-  /// страницей хвоста (`older` с курсором без даты) — так же, как на сервере.
-  Future<MediaFeedPage> head(int limit) async {
-    final rows = await _db.rawQuery('''
-      SELECT * FROM items
-      WHERE sort_key >= 0
-      ORDER BY sort_key DESC, entry_id DESC
-      LIMIT ?
-    ''', [limit + 1]);
-    return _page(rows, limit);
-  }
-
-  /// Кадры старше курсора — листание в прошлое.
+  /// Строки сетки адресуются месяцем и номером кадра в нём (см. `GalleryIndex`), поэтому
+  /// выборка идёт окном ВНУТРИ месяца, а не курсором: сетке нужен именно этот кадр, а не
+  /// «следующий за предыдущим». Окно отдаёт индекс `items_order` — сортировки таблицы нет.
   ///
-  /// Курсор без даты (`at == null`) адресует хвост ленты: пустой `id` — его начало, непустой —
-  /// позицию внутри хвоста. Датированный курсор хвост не захватывает, поэтому хвост дочитывают
-  /// отдельной страницей.
-  Future<MediaFeedPage> older(MediaCursor cursor, int limit) async {
+  /// [tzOffsetMin] — пояс, в котором посчитаны ключи месяцев (тот же, что у `months` и у
+  /// `rebuildMonths`): границы месяца берутся из ключа, и с другим поясом выборка ушла бы
+  /// в соседний месяц на кадрах у его края.
+  ///
+  /// Пустая строка вместо месяца — хвост кадров без даты: они упорядочены по id записи,
+  /// ровно как на сервере (`sort_key < 0` здесь, `capturedAt DESC NULLS LAST` там).
+  Future<List<MediaItem>> monthItems(
+    String month, {
+    required int tzOffsetMin,
+    required int offset,
+    required int limit,
+  }) async {
     final List<Map<String, Object?>> rows;
-    if (cursor.at == null) {
+    if (month.isEmpty) {
       rows = await _db.rawQuery('''
         SELECT * FROM items
-        WHERE sort_key < 0 ${cursor.id.isEmpty ? '' : 'AND entry_id < ?'}
+        WHERE sort_key < 0
         ORDER BY entry_id DESC
-        LIMIT ?
-      ''', [if (cursor.id.isNotEmpty) cursor.id, limit + 1]);
+        LIMIT ? OFFSET ?
+      ''', [limit, offset]);
     } else {
-      final ms = _ms(cursor.at!);
-      // Разрыв ничьих по одинаковому моменту съёмки — только когда id назван: пустой id
-      // означает границу месяца (строго до момента), см. `MediaCursor`.
-      rows = cursor.id.isEmpty
-          ? await _db.rawQuery('''
-              SELECT * FROM items
-              WHERE sort_key >= 0 AND sort_key < ?
-              ORDER BY sort_key DESC, entry_id DESC
-              LIMIT ?
-            ''', [ms, limit + 1])
-          : await _db.rawQuery('''
-              SELECT * FROM items
-              WHERE sort_key >= 0 AND (sort_key < ? OR (sort_key = ? AND entry_id < ?))
-              ORDER BY sort_key DESC, entry_id DESC
-              LIMIT ?
-            ''', [ms, ms, cursor.id, limit + 1]);
-    }
-    return _page(rows, limit);
-  }
-
-  /// Кадры новее курсора — листание к свежему.
-  ///
-  /// Курсор без даты означает «новее хвоста»: с непустым `id` — остаток хвоста, с пустым —
-  /// самые старые датированные кадры (они и примыкают к хвосту снизу).
-  ///
-  /// Читаем по возрастанию и разворачиваем: нужны кадры, примыкающие к окну, а не начало ленты.
-  Future<MediaFeedPage> newer(MediaCursor cursor, int limit) async {
-    final List<Map<String, Object?>> rows;
-    if (cursor.at == null && cursor.id.isNotEmpty) {
       rows = await _db.rawQuery('''
         SELECT * FROM items
-        WHERE sort_key < 0 AND entry_id > ?
-        ORDER BY entry_id ASC
-        LIMIT ?
-      ''', [cursor.id, limit + 1]);
-    } else if (cursor.at == null) {
-      rows = await _db.rawQuery('''
-        SELECT * FROM items
-        WHERE sort_key >= 0
-        ORDER BY sort_key ASC, entry_id ASC
-        LIMIT ?
-      ''', [limit + 1]);
-    } else {
-      final ms = _ms(cursor.at!);
-      rows = cursor.id.isEmpty
-          ? await _db.rawQuery('''
-              SELECT * FROM items
-              WHERE sort_key >= 0 AND sort_key > ?
-              ORDER BY sort_key ASC, entry_id ASC
-              LIMIT ?
-            ''', [ms, limit + 1])
-          : await _db.rawQuery('''
-              SELECT * FROM items
-              WHERE sort_key >= 0 AND (sort_key > ? OR (sort_key = ? AND entry_id > ?))
-              ORDER BY sort_key ASC, entry_id ASC
-              LIMIT ?
-            ''', [ms, ms, cursor.id, limit + 1]);
+        WHERE sort_key >= ? AND sort_key < ?
+        ORDER BY sort_key DESC, entry_id DESC
+        LIMIT ? OFFSET ?
+      ''', [_monthStartMs(month, tzOffsetMin), _monthStartMs(_nextMonth(month), tzOffsetMin), limit, offset]);
     }
-    final page = _page(rows, limit);
-    return MediaFeedPage(items: page.items.reversed.toList(), hasMore: page.hasMore);
+    return rows.map(_toItem).toList();
   }
 
   /// Разбивка по месяцам в порядке ленты (от свежих), «без даты» — последней.
+  ///
+  /// Порядок строк здесь же и есть порядок блоков сетки: по нему `GalleryIndex` раскладывает
+  /// строки, поэтому сортировка задана в запросе, а не повторяется вызывающим.
   Future<List<MediaMonthBucket>> months() async {
     // Сортировка по `month IS NULL` уводит пустой ключ («без даты») в конец — как в ленте.
     final rows = await _db.rawQuery("SELECT month, count FROM months ORDER BY month = '', month DESC");
@@ -329,6 +280,15 @@ class GalleryStore {
     });
   }
 
+  /// Уменьшить счётчик месяца [month] на [by]: кадр удалён из индекса.
+  ///
+  /// Разбивка обязана следовать за кадром сразу: по ней считается геометрия сетки
+  /// (`GalleryIndex`), и разошедшись, они показали бы под удалённым кадром пустую клетку
+  /// до следующей синхронизации. Пустая строка — бакет кадров без даты.
+  Future<void> decrementMonth(String month, {int by = 1}) async {
+    await _db.rawUpdate('UPDATE months SET count = count - ? WHERE month = ?', [by, month]);
+  }
+
   /// Стереть индекс и состояние синхронизации: следующий проход соберёт всё заново.
   Future<void> wipe() async {
     await _db.transaction((txn) async {
@@ -355,16 +315,7 @@ class GalleryStore {
 
   // ---------- внутреннее ----------
 
-  /// Страница из строк запроса: лишняя строка сверх [limit] — это признак продолжения.
-  ///
-  /// Сравнивать длину с `limit` нельзя: ровно полная страница не значит, что за ней что-то
-  /// есть, и список показал бы «прокрутка кончилась» на живой ленте.
-  MediaFeedPage _page(List<Map<String, Object?>> rows, int limit) => MediaFeedPage(
-        items: rows.take(limit).map(_toItem).toList(),
-        hasMore: rows.length > limit,
-      );
-
-  /// Строка таблицы из кадра ленты. Разбор ISO здесь один раз, а не на каждой сортировке.
+  /// Ряд таблицы из кадра ленты. Разбор ISO здесь один раз, а не на каждой сортировке.
   Map<String, Object?> _fromItem(MediaItem it) => {
         'entry_id': it.entryId,
         'sha256': it.sha256,
@@ -405,14 +356,21 @@ class GalleryStore {
     return '${shifted.year}-$m';
   }
 
-  /// Миллисекунды из ISO-строки курсора.
+  /// Момент начала месяца [month] в миллисекундах UTC для пояса [tzOffsetMin].
   ///
-  /// Неразобранная дата — ошибка вызывающего (курсор приходит из наших же данных: кадра ленты
-  /// или границы месяца), и молча подставить сюда 0 значило бы показать человеку не тот участок
-  /// ленты, поэтому падаем громко.
-  int _ms(String iso) {
-    final dt = DateTime.tryParse(iso);
-    if (dt == null) throw ArgumentError('курсор ленты: не разобрана дата «$iso»');
-    return dt.millisecondsSinceEpoch;
+  /// Ключ месяца — «настенное» время пояса (см. [rebuildMonths]), поэтому граница это первое
+  /// число месяца БЕЗ сдвига пояса минус сам сдвиг: так кадр, снятый в 00:30 первого числа
+  /// по местному времени, попадает в свой месяц, а не в предыдущий.
+  int _monthStartMs(String month, int tzOffsetMin) {
+    final y = int.tryParse(month.substring(0, 4)) ?? 1970;
+    final m = int.tryParse(month.substring(5, 7)) ?? 1;
+    return DateTime.utc(y, m).millisecondsSinceEpoch - tzOffsetMin * 60 * 1000;
+  }
+
+  /// Ключ месяца, следующего за [month]: им задаётся верхняя граница выборки месяца.
+  String _nextMonth(String month) {
+    final y = int.tryParse(month.substring(0, 4)) ?? 1970;
+    final m = int.tryParse(month.substring(5, 7)) ?? 1;
+    return m == 12 ? '${y + 1}-01' : '$y-${(m + 1).toString().padLeft(2, '0')}';
   }
 }

@@ -72,9 +72,13 @@ class _GalleryTileState extends State<GalleryTile> {
   @override
   void didUpdateWidget(GalleryTile old) {
     super.didUpdateWidget(old);
-    // Плитку переиспользовали под другой кадр: прежние «уже просил» и «нет превью» относятся
-    // к прошлому содержимому, и без сброса новая плитка осталась бы серой навсегда.
-    if (old.item.sha256 == widget.item.sha256) return;
+    // Плитку переиспользовали под другой кадр или у того же кадра сменилось состояние превью
+    // (опрос `/media/status`): прежние «уже просил» и «нет превью» относятся к прошлому
+    // содержимому. Второе важно не меньше первого — плитка, дождавшаяся готовности превью
+    // уже после своего появления, без перезапуска просьбы осталась бы серой до перезахода.
+    if (old.item.sha256 == widget.item.sha256 && old.item.previewState == widget.item.previewState) {
+      return;
+    }
     _timer?.cancel();
     _requested = false;
     _missing = false;

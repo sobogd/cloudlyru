@@ -14,21 +14,14 @@ import 'gallery_rows.dart';
 import 'gallery_tile.dart';
 import 'month_scrubber.dart';
 
-/// Ключ слота, от которого отсчитывается прокрутка сетки.
-///
-/// `center` в `CustomScrollView` — это и есть весь смысл вёрстки галереи: окно растёт в две
-/// стороны от якоря, и слот ниже якоря служит нулевой точкой. Поэтому страница, добавленная
-/// вверх, ложится в отрицательные смещения и ничего не сдвигает на экране — то, что человек
-/// читает, остаётся на месте. Ключ обязан быть на самом слоте из `slivers` (обёртка с
-/// отступами — тоже слот), иначе `center` его не найдёт и прокрутка встанет на первом слоте.
-const _anchorKey = ValueKey('gallery-anchor');
-
 /// Экран «Медиа»: сетка кадров зоны «Фото» с таймлайном месяцев справа.
 ///
-/// Раздел устроен как галерея, а не как список: у ленты нет ни начала, ни конца, которые можно
-/// было бы посчитать заранее, поэтому окно кадров живёт вокруг якоря (`GalleryController`),
-/// а навигация идёт по времени — шкалой месяцев. Подробности модели — в доке контроллера,
-/// подробности раскладки шкалы — в доке `GalleryCalendar`.
+/// Сетка построена на всю историю сразу — по разбивке локального индекса (см. `GalleryIndex`):
+/// у списка точная длина, поэтому прокрутка, подпись месяца и шкала говорят одно и то же,
+/// а прыжок по дате — это смещение, а не сброс списка и ожидание страницы. Кадры при этом
+/// остаются виртуальными: их просят только построенные строки (см. `GalleryPages`).
+/// Подробности модели — в доке контроллера, подробности раскладки шкалы — в доке
+/// `GalleryCalendar`.
 class GalleryScreen extends ConsumerStatefulWidget {
   const GalleryScreen({super.key});
 
@@ -137,7 +130,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       }),
       // Приглушение: пока ползунок в пальце, сетка показывает прежнее место и не должна
       // выглядеть как «то, куда едешь». Оно же перехватывает касания (случайный тап по старому
-      // окну не должен открывать кадр) и закрывает миниатюры — их в это время никто не просит.
+      // месту не должен открывать кадр) и закрывает миниатюры — их в это время никто не просит.
       ValueListenableBuilder<bool>(
         valueListenable: c.scrubbing,
         builder: (_, scrubbing, _) => scrubbing
@@ -157,49 +150,41 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
             onJumpToTail: () => unawaited(c.jumpToTail()),
           ),
         ),
-      if (c.jumping) const Center(child: CircularProgressIndicator()),
     ]);
   }
 
-  /// Сетка: два плеча окна вокруг якоря.
+  /// Сетка — один список на всю историю.
   ///
-  /// Слоты обоих плеч отсчитываются от якоря наружу (см. `GalleryArm`), поэтому вёрстка просто
-  /// перечисляет строки — ни о пересчёте позиции прокрутки, ни о компенсации добавленных сверху
-  /// страниц ей знать не нужно.
+  /// Строки не строятся заранее: `SliverVariedExtentList` знает их высоты из геометрии
+  /// (`GalleryController.rowHeight`), поэтому полная высота списка и позиция любой строки
+  /// считаются без построения — и прыжок по шкале встаёт ровно на строку месяца, а не «примерно
+  /// туда». Строятся только те строки, что попали на экран, а вместе с ними читаются и кадры
+  /// (см. `GalleryPages`).
   Widget _grid(GalleryController c) {
     final side = GalleryGrid.gap + MonthScrubber.width;
     return CustomScrollView(
       controller: c.scroll,
-      center: _anchorKey,
       physics: const AlwaysScrollableScrollPhysics(),
       slivers: [
         SliverPadding(
-          padding: EdgeInsets.fromLTRB(GalleryGrid.gap, GalleryGrid.gap, side, 0),
-          sliver: _arm(c, c.newerArm),
-        ),
-        SliverPadding(
-          key: _anchorKey,
+          // Отступы задают начало содержимого: позиция прокрутки отсчитывается от него,
+          // и контроллер прибавляет верхний отступ, переводя строку в позицию
+          // (`GalleryController.topInset` — то же число).
           padding: EdgeInsets.fromLTRB(GalleryGrid.gap, GalleryGrid.gap, side, GalleryGrid.gap),
-          sliver: _arm(c, c.olderArm),
+          sliver: SliverVariedExtentList.builder(
+            itemCount: c.rowCount,
+            itemExtentBuilder: (i, _) => c.rowHeight(i),
+            itemBuilder: (context, i) => _row(c, c.rowAt(i)),
+          ),
         ),
       ],
     );
   }
 
-  /// Слоты одного плеча.
-  SliverList _arm(GalleryController c, GalleryArm arm) {
-    return SliverList(
-      delegate: SliverChildBuilderDelegate(
-        (context, i) => _row(c, arm.rows[i]),
-        childCount: arm.rows.length,
-      ),
-    );
-  }
-
-  /// Строка сетки: заголовок месяца или ряд из кадров.
+  /// Строка сетки: заголовок месяца, ряд из кадров или строка состояния в конце.
   ///
   /// Высота строки берётся у неё самой, а не считается здесь: по этим высотам контроллер
-  /// переводит позицию прокрутки в видимый кадр, и разойтись они не должны.
+  /// переводит позицию прокрутки в строку и обратно, и разойтись они не должны.
   Widget _row(GalleryController c, GalleryRow row) {
     if (row.isNote) return _noteRow(c, row);
     if (row.isHeader) {
@@ -222,20 +207,26 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
         children: [
           for (var i = 0; i < row.items.length; i++) ...[
             if (i > 0) const SizedBox(width: GalleryGrid.gap),
-            SizedBox(
-              width: side,
-              height: side,
-              child: GalleryTile(
-                item: row.items[i],
-                side: side,
-                thumbs: c.thumbs,
-                scrubbing: c.scrubbing,
-                onTap: () => _openViewer(c, c.indexOf(row.items[i].entryId)),
-              ),
-            ),
+            SizedBox(width: side, height: side, child: _cell(c, row, i, side)),
           ],
         ],
       ),
+    );
+  }
+
+  /// Клетка ряда: плитка кадра или заглушка того же размера, пока кадр не прочитан.
+  ///
+  /// Заглушка — не «пустое место»: клетка стоит на своём месте с самого начала, поэтому
+  /// приезд кадров ничего не сдвигает и не перекладывает.
+  Widget _cell(GalleryController c, GalleryRow row, int i, double side) {
+    final item = row.items[i];
+    if (item == null) return const ColoredBox(color: C.surface3);
+    return GalleryTile(
+      item: item,
+      side: side,
+      thumbs: c.thumbs,
+      scrubbing: c.scrubbing,
+      onTap: () => _openViewer(c, row.firstItem + i),
     );
   }
 
@@ -265,8 +256,8 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
             : Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  // Спиннер только у загрузки: у «это все кадры» крутить нечего.
-                  if (c.loadingOlder) ...[
+                  // Спиннер только у наполнения: у «это все кадры» крутить нечего.
+                  if (c.loadingHistory) ...[
                     const SizedBox(
                       width: 14,
                       height: 14,
@@ -281,15 +272,16 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     );
   }
 
-  /// Открыть просмотрщик на кадре по его номеру в окне.
+  /// Открыть просмотрщик на кадре по его номеру во всей ленте.
   ///
-  /// Просмотрщик живёт номерами окна: он листает по ним и просит догрузку (`ensureRange`),
-  /// а `total` отдаётся общим счётчиком — иначе после подгрузки страницы или удаления кадра
-  /// он остался бы с прежним числом страниц.
+  /// Номер берётся у ряда (`firstItem` плюс место клетки): просмотрщик листает всю ленту,
+  /// а не окно, и `total` отдаётся общим счётчиком — иначе после удаления кадра он остался бы
+  /// с прежним числом страниц.
   void _openViewer(GalleryController c, int index) {
     if (index < 0) return;
-    // Просмотрщик листает по номерам окна, поэтому на время его работы окно не должно расти
-    // вверх: новые кадры сдвинули бы все номера, и вместо открытого снимка показался бы соседний.
+    // Просмотрщик листает по номерам ленты, поэтому на время его работы геометрия не
+    // пересобирается: кадры, доехавшие сверху, сдвинули бы все номера, и вместо открытого
+    // снимка показался бы соседний (см. `GalleryController.openViewer`).
     c.openViewer();
     Navigator.push(context, MaterialPageRoute(
       fullscreenDialog: true,
@@ -305,14 +297,16 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     )).then((_) => c.closeViewer());
   }
 
-  /// Что показывать, когда в окне нет кадров: спиннер, ошибку или «здесь пусто».
+  /// Что показывать, когда кадров нет вовсе: спиннер, ошибку или «здесь пусто».
   ///
-  /// Пусто при непустом индексе не бывает: окно всегда начинается с начала ленты, а если лента
-  /// пуста, то и заголовков у неё нет. Ошибку показываем текстом, а не подсказкой: сетке без
-  /// кадров показать больше нечего, и подсказка, уехавшая через пару секунд, — единственное,
-  /// что человек успел бы увидеть.
+  /// Пусто при непустой разбивке не бывает: строки строятся по разбивке, а если разбивка пуста,
+  /// то и заголовков у неё нет. Пустой индекс при этом ещё и наполняется (первый запуск, смена
+  /// аккаунта) — тогда честнее спиннер: «здесь появятся фото» на непустой библиотеке было бы
+  /// неправдой. Ошибку показываем текстом, а не подсказкой: сетке без кадров показать больше
+  /// нечего, и подсказка, уехавшая через пару секунд, — единственное, что человек успел бы
+  /// увидеть.
   Widget _stub(GalleryController c) {
-    if (c.loading || c.jumping) return const Center(child: CircularProgressIndicator());
+    if (c.loading || c.loadingHistory) return const Center(child: CircularProgressIndicator());
     if (c.error != null) {
       return Center(
         child: Padding(

@@ -11,61 +11,58 @@ import '../../util/format.dart';
 import 'data/gallery_store.dart';
 import 'data/gallery_sync.dart';
 import 'gallery_calendar.dart';
+import 'gallery_index.dart';
+import 'gallery_pages.dart';
 import 'gallery_rows.dart';
 
-/// Состояние галереи: окно кадров вокруг якоря, страницы, шкала таймлайна и прокрутка.
+/// Состояние галереи: полная сетка по локальному индексу, прокрутка, шкала и кадры строк.
 ///
-/// ## Как устроено окно
+/// ## Полный список вместо окна вокруг якоря
 ///
-/// Галерея не знает, сколько всего кадров: у ленты нет ни конца, ни начала, которые можно
-/// было бы заранее посчитать. Вместо этого она держит **окно** — кадры вокруг **якоря**,
-/// кадра, с которого окно началось (начало ленты при открытии раздела, самый свежий кадр
-/// месяца при прыжке по шкале). Окно растёт в обе стороны: вниз — к старым кадрам, вверх —
-/// к новым, и в обе стороны страницами по [pageSize] кадров.
+/// Прежняя галерея не знала, сколько всего кадров: список был окном вокруг якоря и достраивался
+/// страницами в обе стороны. Отсюда следовало всё остальное — прыжок по шкале сбрасывал окно
+/// и ждал страницу, окно чистилось по краям, подпись месяца считалась по видимому кадру, а
+/// страница, добавленная сверху, требовала вёрстки с `center`, чтобы не сдвинуть читаемое.
 ///
-/// Растёт оно в `CustomScrollView` с `center`: якорь — это нулевая позиция прокрутки, выше него
-/// лежит «верхнее плечо» (новые кадры), ниже — «нижнее» (якорь и старые). Слоты обоих плеч
-/// отсчитываются от якоря наружу, поэтому добавление страницы вверх ничего не сдвигает на
-/// экране: у обычного списка пришлось бы вручную править позицию прокрутки, и она бы дёргалась.
+/// Теперь геометрия известна целиком и до кадров: разбивка по месяцам в локальном индексе
+/// говорит, сколько кадров в каждом месяце, а заголовок и ряд из четырёх клеток дают строки
+/// известной высоты ([GalleryIndex]). Поэтому:
 ///
-/// Идентификатором кадра служит он сам (`MediaCursor` — пара «время съёмки, id»), а не номер:
-/// библиотека живая, приложение выгружает фото с телефона, и номер кадра врёт уже через
-/// секунду после запроса. Пара «время, id» не врёт никогда.
+///  * у списка есть точная длина на всю историю, и она не зависит от того, что успело
+///    прочитаться, — под пальцем ничего не растёт и не переставляется;
+///  * прыжок по шкале — арифметика: месяц, номер строки, смещение. Ни сброса, ни ожидания;
+///  * подпись месяца и ползунок считаются по верхней видимой СТРОКЕ, поэтому верны и там,
+///    где кадры ещё не прочитаны.
 ///
 /// ## Где берутся кадры
 ///
-/// Сначала в локальном индексе ([GalleryStore]) — он читается мгновенно и работает без сети.
-/// Пока индекс неполон (идёт первое наполнение, см. [GallerySync]), страницы берутся с сервера
-/// и попутно кладутся в индекс: следующее листание того же места сети уже не требует.
-///
-/// ## Что грузится, а что нет
-///
-/// Пока человек тянет ползунок шкалы, не грузится ничего: ни кадров, ни миниатюр — известно
-/// только, какой месяц он выбирает. Страница запрашивается один раз, когда ползунок отпущен
-/// ([jumpToMonth]), а плитки просят миниатюры сами, когда окно уже стоит на месте
-/// (см. `GalleryTile`).
+/// В локальном индексе ([GalleryStore]) пачками по месяцу ([GalleryPages]). Ничего не грузится
+/// заранее: пачку просит построенная строка, то есть видимое место. Непрочитанная клетка стоит
+/// заглушкой того же размера, поэтому появление кадров ничего не сдвигает. Наполняется индекс
+/// фоном ([GallerySync]): пока он наполнен не целиком, сетка уже показывает всю историю
+/// месяцами (разбивку присылает сервер), а кадры в ней появляются по мере чтения.
 class GalleryController extends ChangeNotifier {
-  GalleryController({required this.sync, required this.apiOf}) : store = sync.store;
+  GalleryController({required this.sync, required this.apiOf}) : store = sync.store {
+    pages = GalleryPages(
+      store: store,
+      tzOffsetMin: _tz,
+      onLoaded: _onPagesLoaded,
+      onError: _onPagesError,
+    );
+  }
 
   /// Синхронизация: ею наполняется и догоняется локальный индекс.
   final GallerySync sync;
 
-  /// Локальный индекс — источник страниц, пока он полон.
+  /// Локальный индекс — источник кадров.
   final GalleryStore store;
 
   /// Клиент API. Функцией, а не значением: адрес сервера и сессия меняются в рантайме
   /// (вход, выход, смена сервера), а контроллер пересоздавать из-за этого незачем.
   final CloudlyApi Function() apiOf;
 
-  /// Сколько кадров берём одной страницей окна.
-  ///
-  /// Двести — примерно пять экранов сетки: страница накрывает экран с запасом на инерцию,
-  /// поэтому листание обычно обходится одним запросом на «остановку».
-  static const int pageSize = 200;
-
-  /// Сколько кадров держим в окне. Дальше от видимого места кадры выбрасываются: без этого
-  /// пролистывание всей библиотеки оставило бы в памяти десятки тысяч кадров.
-  static const int windowMax = 2500;
+  /// Кадры, прочитанные из индекса пачками.
+  late final GalleryPages pages;
 
   /// Период опроса состояний превью, мс.
   static const int _statusPollMs = 5000;
@@ -76,102 +73,71 @@ class GalleryController extends ChangeNotifier {
   /// Потолок списка id в одном запросе `/media/status` (серверный `MEDIA_STATUS_MAX = 500`).
   static const int _statusBatchMax = 500;
 
+  /// Отступ сетки сверху — тот же, что у вёрстки (`GalleryGrid.gap`).
+  ///
+  /// Позиция прокрутки отсчитывается от начала содержимого, а строки — от начала списка:
+  /// без этого отступа прыжок по шкале вставал бы на зазор выше строки. Величина берётся
+  /// из общего с вёрсткой места, а не задаётся здесь числом: разойдясь, они развели бы
+  /// прыжок и строку, к которой он ведёт.
+  static const double topInset = GalleryGrid.gap;
+
   /// Прокрутка сетки. Владеет ею контроллер, а не виджет: по позиции прокрутки считаются
-  /// видимый кадр, подпись месяца и ползунок, а при прыжке по шкале контроллер сам ставит
-  /// список на якорь.
+  /// подпись месяца, ползунок и опрос превью, а прыжок по шкале контроллер ставит сам.
   final ScrollController scroll = ScrollController();
 
-  /// Сколько кадров в окне — для просмотрщика: он листает по номерам внутри окна и должен
-  /// видеть, как это число меняется, когда подгружается очередная страница.
+  /// Сколько кадров во всей ленте — для просмотрщика: он листает по номерам и берёт отсюда
+  /// границы листания. Значение меняется на месте (удаление кадра), и просмотрщик
+  /// перестраивается без переоткрытия.
   final ValueNotifier<int> total = ValueNotifier(0);
 
-  /// Сигнал просмотрщику, что кадры в окне изменились и слайд можно перерисовать.
+  /// Сигнал просмотрщику, что кадры изменились и слайд можно перерисовать.
   final ValueNotifier<int> revision = ValueNotifier(0);
 
   /// Положение ползунка шкалы.
   final ValueNotifier<GalleryRailPosition> rail = ValueNotifier(GalleryRailPosition.start);
 
-  /// Подпись месяца в шапке — месяц верхнего видимого кадра.
+  /// Подпись месяца в шапке — месяц верхней видимой строки.
   final ValueNotifier<String> barTitle = ValueNotifier('Медиа');
 
   /// Ползунок шкалы в пальце: пока true, плитки не просят миниатюры.
   final ValueNotifier<bool> scrubbing = ValueNotifier(false);
 
-  /// Окно кадров в порядке ленты (свежие → старые).
-  List<MediaItem> _items = const [];
+  /// Геометрия сетки на всю историю; `null` — ещё не собрана (не было раскладки или разбивки).
+  GalleryIndex? index;
 
-  /// Сколько кадров окна лежит ВЫШЕ якоря. Остальные — сам якорь и всё, что ниже него.
-  ///
-  /// Это не «сколько загружено сверху», а точка разреза окна на два плеча: она задаёт, что
-  /// считается якорем при пересборке слотов.
-  int _newerCount = 0;
-
-  /// Есть ли кадры выше и ниже того, что уже в окне. `false` — направление исчерпано.
-  bool _hasNewer = false;
-  bool _hasOlder = false;
-
-  /// Хвост без даты уже запрошен: он дочитывается один раз, когда кончилась датированная лента.
-  bool _tailDone = false;
-
-  /// Курсор следующей страницы ВВЕРХ, когда он не выводится из первого кадра окна.
-  ///
-  /// Так бывает на стыке хвоста без даты с датированной лентой: кадры хвоста упорядочены по id,
-  /// и «новее последнего кадра хвоста» — это уже не хвост, а самые старые датированные кадры
-  /// (курсор `{at: null, id: ''}`).
-  MediaCursor? _newerCursorOverride;
-
-  /// Страница вверх или вниз уже запрашивается: без этого быстрый скролл порождал бы
-  /// параллельные запросы одних и тех же кадров.
-  bool _loadingNewer = false;
-  bool _loadingOlder = false;
-
-  /// Номер поколения окна. Растёт на каждом прыжке: ответы прежнего окна, пришедшие после
-  /// него, отбрасываются — иначе они вставили бы кадры не туда, где человек уже стоит.
-  int _generation = 0;
-
-  /// Локальный индекс наполнен целиком: страницы можно читать из него, не ходя в сеть.
-  bool _indexComplete = false;
-
-  /// Первое окно ещё грузится (показываем спиннер, а не «здесь ничего нет»).
-  bool _loading = true;
-
-  /// Идёт прыжок по шкале: окно сброшено и ждёт страницу.
-  bool _jumping = false;
-
-  /// Разбивка по месяцам от сервера или из индекса. `null` — ещё не приехала.
-  List<MediaMonthBucket> _months = const [];
-
-  /// Шкала таймлайна, посчитанная по [_months].
+  /// Шкала таймлайна, посчитанная по разбивке.
   GalleryCalendar? calendar;
 
-  /// Ошибка последней загрузки — показывается подсказкой; окно при этом остаётся как было.
+  /// Разбивка по месяцам, из которой собирается геометрия.
+  List<MediaMonthBucket> _months = const [];
+
+  /// Локальный индекс наполнен целиком: лента показана вся, догружать нечего.
+  bool _complete = false;
+
+  /// Первое открытие раздела ещё идёт (показываем спиннер, а не «здесь ничего нет»).
+  bool _loading = true;
+
+  /// Причина сбоя чтения из индекса — показывается в строке состояния; `null` — сбоя нет.
   String? error;
-
-  /// Плечи окна: слоты выше и ниже якоря вместе с их геометрией.
-  GalleryArm newerArm = GalleryArm.empty;
-  GalleryArm olderArm = GalleryArm.empty;
-
-  /// Ширина сетки: от неё считается сторона клетки, а по ней — геометрия плеч.
-  double _gridWidth = 0;
-
-  /// Контроллер уничтожен: отложенные обновления (после кадра, из фоновой синхронизации)
-  /// не должны трогать уничтоженные уведомители.
-  bool _disposed = false;
 
   /// Просмотрщик открыт.
   ///
-  /// Пока он открыт, окно не растёт вверх и не чистится по краям. Причина одна: просмотрщик
-  /// листает по номерам внутри окна, а кадры, добавленные выше якоря, сдвинули бы все номера —
-  /// и он показал бы вместо текущего снимка соседний. Вниз окно расти может: там номера
-  /// не меняются.
+  /// Пока он открыт, геометрия не пересобирается: просмотрщик листает по номерам ленты,
+  /// а кадры, доехавшие сверху, сдвинули бы все номера — и он показал бы вместо открытого
+  /// снимка соседний. Что пришло за это время, применяется после закрытия ([closeViewer]).
   bool _viewerOpen = false;
 
-  /// Якорь окна — первый кадр месяца (так бывает после прыжка по шкале).
-  ///
-  /// Нужно для заголовка: у первого кадра окна подпись ставится, только когда известно, что
-  /// месяц с него и начинается. При открытии раздела это значит «выше кадров нет», а после
-  /// прыжка по шкале — «месяц начинается именно здесь» (см. [_startsMonth]).
-  bool _anchorAtMonthStart = false;
+  /// Синхронизация изменила индекс, пока был открыт просмотрщик: пересобрать после закрытия.
+  bool _dirty = false;
+
+  /// Проход наполнения уже замечен этим контроллером (см. [_onSyncProgress]).
+  bool _filling = false;
+
+  /// Ширина сетки: от неё считается сторона клетки, а по ней — высоты строк.
+  double _gridWidth = 0;
+
+  /// Сдвиг пояса устройства в минутах на восток — в нём считаются месяцы и их границы.
+  int get _tz => DateTime.now().timeZoneOffset.inMinutes;
 
   /// Счётчик попыток опроса на кадр: `entryId` → сколько раз спрашивали состояние превью.
   final Map<String, int> _statusTries = {};
@@ -182,121 +148,94 @@ class GalleryController extends ChangeNotifier {
   /// Кэш миниатюр: плитки просят их отсюда.
   ThumbCache? thumbs;
 
-  /// Первое окно ещё грузится.
+  /// Контроллер уничтожен: отложенные обновления (после кадра, из фоновой загрузки)
+  /// не должны трогать уничтоженные уведомители.
+  bool _disposed = false;
+
+  /// Сколько строк в сетке — по этому числу вёрстка их и спрашивает.
+  int get rowCount => index?.rowCount ?? 0;
+
+  /// Сколько кадров во всей ленте.
+  int get itemCount => index?.itemCount ?? 0;
+
+  /// Первое открытие ещё идёт.
   bool get loading => _loading;
 
-  /// Прыжок по шкале идёт: сетка на это время приглушается.
-  bool get jumping => _jumping;
+  /// Кадров нет вовсе: показывать нечего.
+  bool get isEmpty => index?.isEmpty ?? true;
 
-  /// Сколько кадров в окне.
-  int get itemCount => _items.length;
-
-  /// Окно пусто — показывать нечего (при этом [loading] может быть `true`).
-  bool get isEmpty => _items.isEmpty;
-
-  /// Кадр окна по номеру: так его берёт просмотрщик.
-  MediaItem? itemAt(int index) => index < 0 || index >= _items.length ? null : _items[index];
-
-  /// Номер кадра в окне по id записи; `-1` — кадра в окне нет.
-  ///
-  /// Нужен плитке: она знает кадр, а не его номер, а просмотрщику нужен именно номер — по нему
-  /// он листает и просит догрузку.
-  int indexOf(String entryId) {
-    for (var i = 0; i < _items.length; i++) {
-      if (_items[i].entryId == entryId) return i;
-    }
-    return -1;
-  }
+  /// Наполнение индекса ещё идёт: в строке состояния видно, что кадры продолжают доезжать.
+  bool get loadingHistory => !_complete || (sync.progress.value?.running ?? false);
 
   /// Сторона клетки сетки — по текущей раскладке.
   double get cellSide => GalleryGrid.cellSide(_gridWidth);
 
+  /// Текст строки состояния в конце списка.
+  ///
+  /// Строка есть всегда, даже когда сказать нечего: её высота входит в геометрию, и появление
+  /// или исчезновение текста не должно двигать список. При сбое чтения показывается причина —
+  /// без неё «не загрузилось» неотличимо от «кадров больше нет», а это разные поводы что-то
+  /// делать.
+  String get footerNote {
+    if (error != null) return error!;
+    if (loadingHistory) return 'Загружаем историю…';
+    return 'Это все кадры';
+  }
+
   /// Подключить очередь миниатюр. Отдельным вызовом, потому что она открывается асинхронно
-  /// (чтение каталога данных), а окно к этому моменту уже может быть на экране.
+  /// (чтение каталога данных), а сетка к этому моменту уже может быть на экране.
   void attachThumbs(ThumbCache cache) {
     thumbs = cache;
     notifyListeners();
   }
 
-  /// Просмотрщик открыт: до его закрытия номера кадров в окне не меняются (см. [_viewerOpen]).
+  /// Просмотрщик открыт: до его закрытия геометрия не пересобирается (см. [_viewerOpen]).
   void openViewer() => _viewerOpen = true;
 
-  /// Просмотрщик закрыт: окно снова может расти вверх и чиститься.
-  void closeViewer() => _viewerOpen = false;
+  /// Просмотрщик закрыт: применить то, что принесла синхронизация за время его работы.
+  void closeViewer() {
+    _viewerOpen = false;
+    if (!_dirty) return;
+    _dirty = false;
+    unawaited(_reloadMonths(keepPlace: true));
+  }
 
-  /// Первый показ раздела: месяцы, окно, затем синхронизация в фоне.
+  /// Первый показ раздела: разбивка, геометрия, затем синхронизация в фоне.
   ///
-  /// Синхронизация не ждётся: окно показывает то, что уже лежит в индексе, а сервер догоняет
+  /// Синхронизация не ждётся: сетка показывает то, что уже лежит в индексе, а сервер догоняет
   /// список следом. Ждать её значило бы держать спиннер на каждом открытии раздела.
   Future<void> open() async {
-    await _loadCalendar();
-    _indexComplete = await store.meta(GalleryStore.keyBackboneDone) == '1';
+    sync.progress.addListener(_onSyncProgress);
+    await _reloadMonths(keepPlace: false);
+    _complete = await store.meta(GalleryStore.keyBackboneDone) == '1';
     if (kDebugMode) {
       debugPrint('cloudly-gallery: открытие — кадров ${await store.count()}, '
-          'месяцев ${_months.length}, индекс полон: $_indexComplete');
+          'месяцев ${_months.length}, индекс полон: $_complete');
     }
-    await loadFirstWindow();
-    // Шкала — единственный способ попасть в нужный год, и ждать её до конца наполнения индекса
-    // (десятки страниц) нельзя: один запрос отдаёт все месяцы сразу.
-    if (calendar == null || calendar!.isEmpty) await _loadRemoteMonths();
+    _loading = false;
+    _publishCounters();
+    _refreshTopFromScroll();
+    notifyListeners();
+    _scheduleStatusPoll();
     unawaited(_syncInBackground());
   }
 
-  /// Первое окно — начало ленты.
-  Future<void> loadFirstWindow() async {
-    _loading = true;
-    error = null;
-    _publish();
-    try {
-      final page = await _headPage(pageSize);
-      if (kDebugMode) {
-        debugPrint('cloudly-gallery: первая страница ${page.items.length} кадров, дальше: ${page.hasMore}');
-      }
-      _items = page.items;
-      _hasOlder = page.hasMore;
-      // Датированных кадров нет вовсе — вся медиатека ещё без дат (метаданные не разобраны).
-      // Тогда лента начинается с хвоста: иначе раздел выглядел бы пустым при непустой библиотеке.
-      if (_items.isEmpty) {
-        final tail = await _olderPage(const MediaCursor(at: null, id: ''), pageSize);
-        _items = tail.items;
-        _hasOlder = tail.hasMore;
-        _tailDone = true;
-      }
-      _newerCount = 0;
-      _hasNewer = false;
-      _anchorAtMonthStart = true;
-    } catch (e) {
-      error = e.toString();
-    }
-    _loading = false;
-    _rebuildArms();
-    _refreshTopFromScroll();
-    _publish();
-    // Короткая библиотека (или короткий месяц) может целиком уместиться в экран — тогда
-    // прокручивать нечего, события прокрутки не будет, и догрузку надо проверить самому.
-    _checkViewportFilled();
-  }
-
-  /// Показать окно, начинающееся с месяца [month] (прыжок по шкале).
+  /// Раскладка изменилась (поворот экрана, другая ширина): пересчитать геометрию.
   ///
-  /// Якорь — граница начала месяца, и это ключевой момент: страница запрашивается «старше
-  /// начала следующего месяца», то есть первым в ней идёт самый свежий кадр выбранного месяца.
-  /// Ни номер кадра, ни id первого кадра месяца для этого не нужны.
-  Future<void> jumpToMonth(String month) async {
-    final cal = calendar;
-    if (cal == null || cal.isEmpty) return;
-    final boundary = cal.monthBoundaryUtc(cal.nextMonth(month));
-    if (kDebugMode) debugPrint('cloudly-gallery: прыжок к $month, граница ${boundary.toIso8601String()}');
-    // Якорь — начало месяца: страница начнётся с его первого кадра, и у него будет заголовок.
-    _anchorAtMonthStart = true;
-    await _reanchor(MediaCursor(at: boundary.toIso8601String(), id: ''));
-  }
-
-  /// Показать окно, начинающееся с кадров без даты (зона под шкалой).
-  Future<void> jumpToTail() {
-    _anchorAtMonthStart = false;
-    _tailDone = true;
-    return _reanchor(const MediaCursor(at: null, id: ''));
+  /// Зовётся из `LayoutBuilder`, то есть во время сборки, поэтому уведомления и прокрутка —
+  /// после кадра: будить слушателей и двигать позицию во время чужой сборки нельзя. Сама
+  /// геометрия пересчитывается сразу: тот же кадр уже рисует строки по новым высотам.
+  void setLayout(double gridWidth) {
+    if ((gridWidth - _gridWidth).abs() < 0.5) return;
+    final anchor = _topPlace();
+    _gridWidth = gridWidth;
+    _rebuild();
+    _afterFrame(() {
+      _restorePlace(anchor);
+      _publishCounters();
+      _refreshTopFromScroll();
+      notifyListeners();
+    });
   }
 
   /// Ползунок взяли в палец.
@@ -305,579 +244,281 @@ class GalleryController extends ChangeNotifier {
     scrubbing.value = value;
   }
 
-  /// Раскладка изменилась (поворот экрана, другая ширина): пересчитать слоты.
+  /// Обработать событие прокрутки: подпись месяца, ползунок и опрос превью.
   ///
-  /// Зовётся из `LayoutBuilder`, то есть во время сборки, поэтому слушателей здесь не будим:
-  /// новые плечи нужны тому же кадру, который их и пересчитывает.
-  void setLayout(double gridWidth) {
-    if ((gridWidth - _gridWidth).abs() < 0.5) return;
-    _gridWidth = gridWidth;
-    _rebuildArms();
-    // Подпись месяца и ползунок считаются по видимому кадру, а он известен только после
-    // раскладки: до неё у плеч нет геометрии. Обновляем после кадра — будить слушателей
-    // во время чужой сборки нельзя.
+  /// Кадры при этом никто не догружает: их просят сами строки, когда строятся, — то есть ровно
+  /// те, что попали на экран (см. `GalleryPages`).
+  void onScroll() {
+    _refreshTopFromScroll();
+    _scheduleStatusPoll();
+  }
+
+  /// Показать месяц [month] (прыжок по шкале).
+  ///
+  /// Ни сброса списка, ни ожидания страницы здесь нет: месяц — это номер строки в геометрии,
+  /// и прыжок сводится к смещению. Пустой месяц (такие на шкале остаются) ведёт к ближайшим
+  /// кадрам — других в нём и нет.
+  Future<void> jumpToMonth(String month) async {
+    final idx = index;
+    if (idx == null || idx.isEmpty) return;
+    // Строка месяца одна на всю шкалу: `headerRowAtOrOlder` ведёт и в пустой месяц (к ближайшим
+    // кадрам), и в месяц старее всей ленты (к самому старому). `null` он отдаёт только когда
+    // датированных кадров нет вовсе — тогда ведём к началу списка, а не оставляем прыжок без
+    // ответа: ползунок, отпущенный впустую, выглядит как сломанная шкала.
+    _jumpToRow(idx.headerRowAtOrOlder(month) ?? 0);
+  }
+
+  /// Показать кадры без даты (зона под шкалой).
+  Future<void> jumpToTail() async {
+    final idx = index;
+    if (idx == null || idx.isEmpty) return;
+    final row = idx.undatedRow;
+    if (row == null) return;
+    _jumpToRow(row);
+  }
+
+  /// Строка сетки для вёрстки: заголовок месяца, ряд кадров или строка состояния.
+  ///
+  /// Клетки ряда могут быть `null` — кадр этого места ещё не прочитан из индекса. Так и надо:
+  /// строка известной высоты уже на месте, и приезд кадров ничего не сдвигает.
+  GalleryRow rowAt(int row) {
+    final idx = index;
+    if (idx == null || idx.rowCount == 0) {
+      return GalleryRow.note(footerNote, GalleryGrid.noteHeight);
+    }
+    final spec = idx.specAt(row);
+    if (spec.note) return GalleryRow.note(footerNote, GalleryGrid.noteHeight);
+    if (spec.header) {
+      return GalleryRow.header(
+        spec.month.isEmpty ? 'Без даты' : monthLabel(spec.month),
+        spec.height,
+      );
+    }
+    return GalleryRow.items(
+      [for (var i = 0; i < spec.cells; i++) pages.itemAt(spec.month, spec.monthOffset + i)],
+      spec.firstItem,
+      spec.height,
+    );
+  }
+
+  /// Высота строки [row] — ею вёрстка считает полную высоту списка; `null` — такой строки нет.
+  double? rowHeight(int row) {
+    final idx = index;
+    if (idx == null || row < 0 || row >= idx.rowCount) return null;
+    return idx.heightOfRow(row);
+  }
+
+  /// Показать [row] первой строкой экрана.
+  void _jumpToRow(int row) {
+    final idx = index;
+    if (idx == null || !scroll.hasClients) return;
+    scroll.jumpTo(_clampOffset(topInset + idx.topOfRow(row)));
+    _refreshTopFromScroll();
+  }
+
+  /// Кадр по номеру во всей ленте: так его берёт просмотрщик.
+  ///
+  /// `null` — кадр ещё не прочитан из индекса: просмотрщик показывает спиннер, а пачка
+  /// запрашивается тут же ([ensureRange] зовётся им на каждой странице).
+  MediaItem? itemAt(int item) {
+    final idx = index;
+    if (idx == null) return null;
+    final at = idx.locateItem(item);
+    return at == null ? null : pages.itemAt(at.month, at.offset);
+  }
+
+  /// Попросить кадры для диапазона номеров — просьба просмотрщика.
+  ///
+  /// Смотрятся края диапазона: кадр в его середине — тот, который просмотрщик и показывает,
+  /// и его пачку он уже запросил сам. Края же — это соседи, до которых он долистает следом.
+  void ensureRange(int start, int end) {
+    final idx = index;
+    if (idx == null) return;
+    for (final item in [start, end]) {
+      final at = idx.locateItem(item);
+      if (at != null) pages.itemAt(at.month, at.offset);
+    }
+  }
+
+  /// Убрать кадр из ленты: его удалил просмотрщик.
+  ///
+  /// Разбивка месяца уменьшается сразу за кадром, а не при следующей синхронизации: по ней
+  /// посчитана геометрия, и разошедшись, они оставили бы под удалённым кадром пустую клетку.
+  /// Номера кадров после удалённого сдвигаются — просмотрщик об этом знает и переставляет
+  /// указатель сам (см. `MediaViewer`).
+  void deleteAt(int item) {
+    final idx = index;
+    if (idx == null) return;
+    final at = idx.locateItem(item);
+    if (at == null) return;
+    final removed = pages.loadedAt(at.month, at.offset);
+    // Строка в индексе снимается, если кадр в руках: просмотрщик показывает именно его, но
+    // пачку могло вытеснить, и тогда снять строку нечем. Разбивка при этом уменьшается в любом
+    // случае — иначе номер, по которому листает просмотрщик, остался бы за концом ленты.
+    if (removed != null) unawaited(store.removeEntries([removed.entryId]));
+    unawaited(store.decrementMonth(at.month));
+    // Пачки месяца перечитываются: номера кадров внутри месяца сдвинулись на удалённый.
+    pages.dropMonth(at.month);
+    _months = [
+      for (final m in _months)
+        if ((m.month ?? '') == at.month)
+          MediaMonthBucket(month: m.month, count: math.max(0, m.count - 1))
+        else
+          m,
+    ];
+    _rebuild();
+    _publishCounters();
+    _refreshTopFromScroll();
+    notifyListeners();
+  }
+
+  /// Повторить чтение — кнопкой в строке состояния.
+  ///
+  /// Пачки, которые не прочитались, в памяти и не задерживались, поэтому достаточно снять
+  /// причину и перерисовать: построенные строки попросят кадры снова.
+  void retry() {
+    error = null;
+    notifyListeners();
+  }
+
+  /// Перечитать разбивку по месяцам и пересобрать геометрию.
+  ///
+  /// [keepPlace] — сохранить место чтения: синхронизация в фоне меняет разбивку (сверху доехали
+  /// кадры, снизу удалились), и без переноса позиции человек оказался бы в другом месте ленты.
+  Future<void> _reloadMonths({required bool keepPlace}) async {
+    final months = await store.months();
+    if (_disposed) return;
+    final anchor = keepPlace ? _topPlace() : null;
+    // Число кадров в месяце изменилось — значит, внутри месяца что-то появилось или пропало,
+    // и его прочитанные пачки устарели: номера кадров внутри месяца сдвинулись. У месяцев
+    // с прежним числом кадров меняться нечему, и перечитывать их незачем.
+    final was = {for (final m in _months) m.month ?? '': m.count};
+    for (final m in months) {
+      final key = m.month ?? '';
+      if (was.containsKey(key) && was[key] != m.count) pages.dropMonth(key);
+    }
+    // Неполные пачки — тоже: месяцы, которые лента дочитала не до конца, подросли.
+    pages.refreshUnfinished();
+    _months = months;
+    calendar = GalleryCalendar(months: months, tzOffsetMin: _tz);
+    _rebuild();
+    _restorePlace(anchor);
+    _publishCounters();
+    notifyListeners();
+  }
+
+  /// Пересобрать геометрию сетки по текущей разбивке и раскладке.
+  ///
+  /// Никого не уведомляет и прокрутку не двигает: зовётся и во время сборки (`setLayout`),
+  /// где будить слушателей нельзя, и из асинхронных обновлений, которые публикуют счётчики сами.
+  void _rebuild() {
+    if (_gridWidth <= 0) return;
+    index = GalleryIndex(months: _months, width: _gridWidth, hasNote: true);
+  }
+
+  /// Место чтения — месяц верхней видимой строки и её номер внутри месяца.
+  ///
+  /// Именно место, а не номер строки: номера сдвигаются от каждой загрузки сверху (и меняют
+  /// высоты при смене раскладки), а «месяц и место в нём» переживает и то и другое
+  /// (см. `GalleryIndex.topOfPlace`). `null` — сетки нет или видна строка состояния.
+  ({String month, int rowInBlock})? _topPlace() {
+    final idx = index;
+    if (idx == null || idx.isEmpty || !scroll.hasClients) return null;
+    final row = idx.rowAtOffset(scroll.offset - topInset);
+    if (row < 0) return null;
+    final spec = idx.specAt(row);
+    if (spec.note) return null;
+    return (month: spec.month, rowInBlock: spec.rowInBlock);
+  }
+
+  /// Вернуть список на место [anchor] после пересборки геометрии.
+  void _restorePlace(({String month, int rowInBlock})? anchor) {
+    final idx = index;
+    if (anchor == null || idx == null || !scroll.hasClients) return;
+    scroll.jumpTo(_clampOffset(topInset + idx.topOfPlace(anchor.month, anchor.rowInBlock)));
+  }
+
+  /// Предел прокрутки известен точно: высота списка, отступы сетки и высота окна.
+  ///
+  /// Без этого прыжок в самый низ списка (или на строку, оказавшуюся за концом после удаления)
+  /// дал бы позицию за концом содержимого, и вёрстка поехала бы назад анимацией.
+  double _clampOffset(double offset) {
+    final idx = index;
+    if (idx == null || !scroll.hasClients) return offset;
+    final max = math.max(
+      0.0,
+      idx.height + topInset + GalleryGrid.gap - scroll.position.viewportDimension,
+    );
+    return offset.clamp(0.0, max);
+  }
+
+  /// Обновить счётчики, за которыми следят снаружи (просмотрщик и вёрстка).
+  void _publishCounters() {
+    final items = index?.itemCount ?? 0;
+    if (total.value != items) total.value = items;
+    revision.value++;
+  }
+
+  /// Выполнить после текущего кадра: во время сборки будить слушателей нельзя.
+  void _afterFrame(VoidCallback action) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_disposed) _refreshTopFromScroll();
+      if (!_disposed) action();
     });
   }
 
-  /// Обработать событие прокрутки: подпись месяца, ползунок и подгрузка у краёв окна.
+  /// Синхронизация в фоне, а после неё — новая разбивка и новая геометрия.
   ///
-  /// Всё это считается из одной величины — позиции прокрутки. В `CustomScrollView` с `center`
-  /// нулевая позиция — это якорь, поэтому расстояние от якоря равно `offset`: положительное
-  /// уходит в нижнее плечо (к старым), отрицательное — в верхнее (к новым).
-  void onScroll() {
-    if (!scroll.hasClients) return;
-    final pos = scroll.position;
-    _refreshTop(pos.pixels);
-    _maybeLoad(pos);
-  }
-
-  /// Догрузить страницу вниз (к старым кадрам).
-  Future<void> loadOlder() async {
-    if (_loadingOlder || !_hasOlder || _items.isEmpty) return;
-    _loadingOlder = true;
-    final gen = _generation;
-    try {
-      final page = await _olderPage(MediaCursor.of(_items.last), pageSize);
-      if (kDebugMode) {
-        debugPrint('cloudly-gallery: вниз ${page.items.length} кадров, дальше: ${page.hasMore}');
-      }
-      if (gen != _generation) return;
-      error = null;
-      if (page.items.isNotEmpty) _items = [..._items, ...page.items];
-      _hasOlder = page.hasMore;
-      // Датированная лента кончилась — ниже идёт хвост кадров без даты. Он запрашивается
-      // отдельной страницей: датированный курсор хвост не захватывает (см. `/media/feed`).
-      // Последний кадр берётся из окна, а не из страницы: страница могла прийти пустой, когда
-      // в индексе кончились датированные кадры, а хвост ещё нет.
-      if (!_hasOlder && !_tailDone && _items.last.capturedAt != null) {
-        _tailDone = true;
-        final tail = await _olderPage(const MediaCursor(at: null, id: ''), pageSize);
-        if (gen != _generation) return;
-        if (tail.items.isNotEmpty) {
-          _items = [..._items, ...tail.items];
-          _hasOlder = tail.hasMore;
-        }
-      }
-    } catch (e) {
-      // Неудачная страница — не повод ронять окно: то, что загружено, остаётся, а следующий
-      // скролл попробует снова.
-      error = e.toString();
-    } finally {
-      _loadingOlder = false;
-    }
-    if (gen != _generation) return;
-    _trimWindow();
-    _rebuildArms();
-    _publish();
-    _scheduleStatusPoll();
-    _checkViewportFilled();
-  }
-
-  /// Догрузить страницу вверх (к новым кадрам).
-  ///
-  /// Позицию прокрутки править не нужно: окно растёт в `CustomScrollView` с `center`, и кадры,
-  /// добавленные выше якоря, ложатся в отрицательные смещения — то, что человек видит, стоит
-  /// на месте. У обычного списка здесь пришлось бы пересчитывать позицию, и она бы дёрнулась.
-  Future<void> loadNewer() async {
-    // Просмотрщик открыт — номера кадров трогать нельзя (см. [_viewerOpen]).
-    if (_viewerOpen) return;
-    if (_loadingNewer || !_hasNewer || _items.isEmpty) return;
-    _loadingNewer = true;
-    final gen = _generation;
-    try {
-      final cursor = _newerCursorOverride ?? MediaCursor.of(_items.first);
-      final page = await _newerPage(cursor, pageSize);
-      if (kDebugMode) {
-        debugPrint('cloudly-gallery: вверх ${page.items.length} кадров, дальше: ${page.hasMore}');
-      }
-      if (gen != _generation) return;
-      error = null;
-      if (page.items.isEmpty) {
-        // Пустая страница: либо выше действительно ничего нет, либо только что дочитан хвост
-        // кадров без даты. У хвоста свой ключ (id записи), и «новее хвоста» — это уже
-        // датированная лента, которую спрашивают другим курсором. Без этой подмены человек
-        // оставался в «Без даты» навсегда: выше хвоста страницы нет, а лента есть.
-        final tailEnd = cursor.at == null && cursor.id.isNotEmpty;
-        if (tailEnd) {
-          _newerCursorOverride = const MediaCursor(at: null, id: '');
-          _hasNewer = true;
-        } else {
-          _newerCursorOverride = null;
-          _hasNewer = false;
-        }
-      } else {
-        _items = [...page.items, ..._items];
-        _newerCount += page.items.length;
-        _anchorAtMonthStart = false;
-        // Хвост без даты дочитан: выше него начинается датированная лента, и продолжение
-        // берётся уже курсором «к самым старым датированным кадрам».
-        final tailExhausted = !page.hasMore && cursor.at == null && cursor.id.isNotEmpty;
-        _newerCursorOverride = tailExhausted ? const MediaCursor(at: null, id: '') : null;
-        _hasNewer = page.hasMore || tailExhausted;
-      }
-    } catch (e) {
-      error = e.toString();
-    } finally {
-      _loadingNewer = false;
-    }
-    if (gen != _generation) return;
-    _trimWindow();
-    _rebuildArms();
-    _publish();
-    _scheduleStatusPoll();
-    _checkViewportFilled();
-  }
-
-  /// Подгрузить кадры по просьбе просмотрщика: диапазон номеров в окне.
-  ///
-  /// Просмотрщик листает по номерам окна, поэтому у его краёв просьба означает «дай ещё» —
-  /// именно это здесь и делается. Кадры в середине окна всегда на месте.
-  void ensureRange(int start, int end) {
-    if (_items.isEmpty) return;
-    if (end >= _items.length - 2) unawaited(loadOlder());
-    if (!_viewerOpen && start <= 1) unawaited(loadNewer());
-  }
-
-  /// Убрать кадр из окна: его удалил просмотрщик.
-  ///
-  /// Нумерация окна сдвигается, поэтому меняются и номера, по которым просмотрщик листает:
-  /// он перестраивается сам, а сюда приходит один раз — сообщить, какой номер выпал.
-  void deleteAt(int index) {
-    if (index < 0 || index >= _items.length) return;
-    final removed = _items[index];
-    unawaited(store.removeEntries([removed.entryId]));
-    _items = [..._items]..removeAt(index);
-    if (index < _newerCount) _newerCount--;
-    _rebuildArms();
-    _refreshTopFromScroll();
-    _publish();
-  }
-
-  /// Сбросить окно на новом якоре и загрузить первую страницу.
-  ///
-  /// Поколение растёт до запроса: страницы прежнего окна, приехавшие позже, не должны попасть
-  /// в новое — они про другое место ленты.
-  Future<void> _reanchor(MediaCursor cursor) async {
-    _generation++;
-    final gen = _generation;
-    _items = const [];
-    _newerCount = 0;
-    // Якорь почти всегда в середине ленты: выше наверняка что-то есть. Если нет (прыжок
-    // в самый свежий месяц), первая же страница вверх это покажет.
-    _hasNewer = true;
-    _hasOlder = true;
-    _tailDone = false;
-    _newerCursorOverride = null;
-    _jumping = true;
-    _rebuildArms();
-    if (scroll.hasClients) scroll.jumpTo(0);
-    _publish();
-    try {
-      final page = await _olderPage(cursor, pageSize);
-      if (gen != _generation) return;
-      _items = page.items;
-      _hasOlder = page.hasMore;
-      // Пустая страница на якоре — не «медиа нет» (библиотека непуста, раз шкала нарисована),
-      // а «в этом месте ленты ничего не нашлось»: говорим это прямо, иначе человек видит
-      // надпись про пустой раздел и не понимает, почему прыжок ничего не дал.
-      error = page.items.isEmpty ? 'Здесь кадров нет — выберите другое место на шкале' : null;
-    } catch (e) {
-      if (gen == _generation) error = e.toString();
-    } finally {
-      if (gen == _generation) {
-        _jumping = false;
-        _rebuildArms();
-        _refreshTopFromScroll();
-        _publish();
-        _scheduleStatusPoll();
-        // Месяц бывает коротким: окно из одной страницы может оказаться короче экрана, и без
-        // этой проверки догрузка не случилась бы — прокручивать было бы нечего.
-        _checkViewportFilled();
-      }
-    }
-  }
-
-  /// Прочитать разбивку по месяцам из локального индекса и собрать шкалу.
-  Future<void> _loadCalendar() async {
-    _months = await store.months();
-    calendar = GalleryCalendar(months: _months, tzOffsetMin: _tz);
-  }
-
-  /// Забрать разбивку по месяцам с сервера — когда локальный индекс ещё пуст.
-  ///
-  /// Побочно: разбивка кладётся в индекс (следующее открытие раздела обойдётся без запроса),
-  /// шкала пересобирается.
-  Future<void> _loadRemoteMonths() async {
-    try {
-      final months = await apiOf().mediaMonths(tzOffsetMin: _tz);
-      if (_disposed) return;
-      await store.writeMonths(months);
-      _months = months;
-      calendar = GalleryCalendar(months: months, tzOffsetMin: _tz);
-      notifyListeners();
-    } catch (e) {
-      // Без разбивки раздел работает: сетка листается, шкалы просто нет, пока её не принесёт
-      // синхронизация.
-      if (kDebugMode) debugPrint('gallery months error: $e');
-    }
-  }
-
-  /// Синхронизация в фоне, а после неё — месяцы и тихое обновление верхушки окна.
+  /// Разбивка перечитывается, только если индекс изменился: сверху доехали кадры или из журнала
+  /// ушли удалённые. Место чтения при этом сохраняется.
   Future<void> _syncInBackground() async {
     final changed = await sync.sync();
     if (_disposed) return;
-    if (changed) {
-      await _loadCalendar();
-      _indexComplete = await store.meta(GalleryStore.keyBackboneDone) == '1';
-      await _silentHeadRefresh();
-    }
-    if (!_disposed) notifyListeners();
-  }
-
-  /// Показать новые загрузки, не трогая прокрутку.
-  ///
-  /// Только если человек стоит на верхушке окна: подсунуть кадры в середину того, что он
-  /// читает, — хуже, чем показать их при следующем открытии раздела.
-  Future<void> _silentHeadRefresh() async {
-    if (_items.isEmpty) return;
-    if (_hasNewer || (scroll.hasClients && scroll.offset > 1)) return;
-    final page = await store.head(pageSize);
-    if (page.items.isEmpty) return;
-    final known = {for (final it in _items) it.entryId};
-    final fresh = page.items.where((it) => !known.contains(it.entryId)).toList();
-    if (fresh.isEmpty) return;
-    _items = [...fresh, ..._items];
-    _rebuildArms();
-    _publish();
-  }
-
-  /// Первая страница окна — начало ленты.
-  ///
-  /// Полный индекс отвечает сам: это чтение из SQLite, без сети и мгновенно. Неполному верить
-  /// нельзя: он знает только прочитанную часть ленты, поэтому его «дальше ничего» означало бы
-  /// конец ленты через пару экранов. Поэтому пока индекс неполон, страница берётся с сервера
-  /// и кладётся в индекс; локальное берётся, только если сети нет вовсе.
-  Future<MediaFeedPage> _headPage(int limit) async {
-    if (_indexComplete && await _indexBelievable()) {
-      final local = await store.head(limit);
-      if (local.hasMore) return local;
-      // Индекс говорит «это вся лента»: проверяем у сервера, прежде чем поверить.
-      return _verifyEnd(const MediaCursor(at: null, id: ''), limit, local, older: false, head: true);
-    }
-    try {
-      final page = await apiOf().mediaFeed(limit: limit);
-      await store.upsertAll(page.items);
-      return page;
-    } catch (e) {
-      final local = await store.head(limit);
-      if (local.items.isNotEmpty) return local;
-      rethrow;
-    }
-  }
-
-  /// Страница вниз от курсора.
-  ///
-  /// Полный индекс отвечает сам: это чтение из SQLite, то есть без сети и мгновенно. Неполный
-  /// (идёт наполнение) берёт страницу с сервера и кладёт её в индекс — так следующие заходы
-  /// в это же место обходятся без сети. Если сети нет, но локально что-то есть, отдаём
-  /// локальное: офлайн-галерея важнее свежести.
-  Future<MediaFeedPage> _olderPage(MediaCursor cursor, int limit) async {
-    if (_indexComplete && await _indexBelievable()) {
-      final local = await store.older(cursor, limit);
-      if (local.hasMore) return local;
-      return _verifyEnd(cursor, limit, local, older: true);
-    }
-    try {
-      final page = await apiOf().mediaFeed(before: cursor, limit: limit);
-      await store.upsertAll(page.items);
-      return page;
-    } catch (e) {
-      final local = await store.older(cursor, limit);
-      if (local.items.isNotEmpty) return local;
-      rethrow;
-    }
-  }
-
-  /// Страница вверх от курсора — тем же правилом, что и [_olderPage].
-  Future<MediaFeedPage> _newerPage(MediaCursor cursor, int limit) async {
-    if (_indexComplete && await _indexBelievable()) {
-      final local = await store.newer(cursor, limit);
-      if (local.hasMore) return local;
-      return _verifyEnd(cursor, limit, local, older: false);
-    }
-    try {
-      final page = await apiOf().mediaFeed(after: cursor, limit: limit);
-      await store.upsertAll(page.items);
-      return page;
-    } catch (e) {
-      final local = await store.newer(cursor, limit);
-      if (local.items.isNotEmpty) return local;
-      rethrow;
-    }
-  }
-
-  /// Сверить с сервером «дальше ничего» от локального индекса.
-  ///
-  /// Индекс — кэш: он наполняется фоном, пересобирается после сброса журнала и может остаться
-  /// неполным, а его «кадров больше нет» человек видит как «лента кончилась в прошлом месяце» —
-  /// то есть не видит остальных лет съёмки. Поэтому такой ответ проверяется у сервера.
-  ///
-  /// Проверка сравнивает страницы, а не «есть ли у сервера кадры вообще»: последняя страница
-  /// ленты у обоих источников короткая и непустая, и принимать её за доказательство неполноты
-  /// значило бы гонять полное наполнение индекса на каждой остановке у конца ленты (именно так
-  /// и выглядела вечная полоса загрузки в шапке). Неполнота — это когда сервер знает о
-  /// продолжении или отдаёт больше кадров, чем нашлось локально.
-  ///
-  /// [head] — запрос без курсора (начало ленты): у него нет позиции, только «дальше есть/нет».
-  /// Побочно: `_indexComplete`, мета наполнения, локальный индекс и запуск наполнения.
-  Future<MediaFeedPage> _verifyEnd(
-    MediaCursor cursor,
-    int limit,
-    MediaFeedPage local, {
-    required bool older,
-    bool head = false,
-  }) async {
-    try {
-      final remote = head
-          ? await apiOf().mediaFeed(limit: limit)
-          : (older
-              ? await apiOf().mediaFeed(before: cursor, limit: limit)
-              : await apiOf().mediaFeed(after: cursor, limit: limit));
-      if (!remote.hasMore && remote.items.length <= local.items.length) return local;
-      if (kDebugMode) {
-        debugPrint('cloudly-gallery: индекс неполон — сервер отдал ${remote.items.length} кадров '
-            'против ${local.items.length} локальных');
-      }
-      await store.upsertAll(remote.items);
-      await _markIndexIncomplete();
-      return remote;
-    } catch (e) {
-      // Сервер недоступен — верим индексу: показать то, что есть, важнее полноты.
-      if (kDebugMode) debugPrint('cloudly-gallery: сверка конца ленты не удалась: $e');
-      return local;
-    }
-  }
-
-  /// Признать локальный индекс неполным: страницы пойдут с сервера, а наполнение — заново.
-  ///
-  /// Побочно: `_indexComplete` (снимается сразу и возвращается, когда наполнение дочитает ленту).
-  Future<void> _markIndexIncomplete() async {
-    _indexComplete = false;
-    await store.setMeta(GalleryStore.keyBackboneDone, '0');
-    await store.setMeta(GalleryStore.keyBackboneCursor, '');
-    // Именно `refill`, а не `sync`: проход мог уже идти и считать индекс полным — тогда
-    // обычный запуск вернул бы «занято» и наполнение не началось бы вовсе.
-    unawaited(sync.refill().then((_) async {
-      if (_disposed) return;
-      final full = await store.meta(GalleryStore.keyBackboneDone) == '1';
-      if (full && !_indexComplete) {
-        _indexComplete = true;
-        if (kDebugMode) debugPrint('cloudly-gallery: индекс наполнен заново');
-      }
-    }));
-  }
-
-  /// Можно ли верить индексу прямо сейчас.
-  ///
-  /// Два условия: он считался полным при открытии раздела и наполнение по нему уже не идёт
-  /// (иначе прочитанная часть ещё растёт, и её «конец» — временный).
-  Future<bool> _indexBelievable() async {
-    if (!_indexComplete) return false;
-    if (sync.progress.value?.running ?? false) return false;
-    return true;
-  }
-
-  /// Пересобрать плечи окна по текущим кадрам и раскладке.
-  void _rebuildArms() {
-    if (_items.isEmpty || _gridWidth <= 0) {
-      newerArm = GalleryArm.empty;
-      olderArm = GalleryArm.empty;
+    _complete = await store.meta(GalleryStore.keyBackboneDone) == '1';
+    if (!changed) {
+      notifyListeners();
       return;
     }
-    final tz = _tz;
-    final flags = _startsMonth(tz);
-    final newerRows = buildGalleryRows(
-      items: _items.sublist(0, _newerCount),
-      startsMonth: flags.sublist(0, _newerCount),
-      width: _gridWidth,
-      tzOffsetMin: tz,
-    );
-    final olderRows = buildGalleryRows(
-      items: _items.sublist(_newerCount),
-      startsMonth: flags.sublist(_newerCount),
-      width: _gridWidth,
-      tzOffsetMin: tz,
-    );
-    // Строка состояния — последняя в нижнем плече: пока грузится страница, по ней видно, что
-    // лента не кончилась, а при сбое — почему она не грузится и что с этим делать. Без неё сбой
-    // выглядел бы либо как «кадры кончились», либо как вечная загрузка.
-    final note = _footerNote();
-    if (note != null) olderRows.add(GalleryRow.note(note, GalleryGrid.noteHeight));
-    // Плечо выше якоря собирается «наружу» переворотом строк: слот, примыкающий к якорю, —
-    // последний в визуальном порядке (см. `GalleryArm.of`).
-    newerArm = GalleryArm.of(newerRows, up: true);
-    olderArm = GalleryArm.of(olderRows, up: false);
+    // Просмотрщик открыт — геометрия ждёт его закрытия (см. [_viewerOpen]).
+    if (_viewerOpen) {
+      _dirty = true;
+      notifyListeners();
+      return;
+    }
+    await _reloadMonths(keepPlace: true);
   }
 
-  /// Текст строки состояния внизу окна; `null` — показывать нечего.
+  /// Полоса наполнения индекса: пока проход идёт, видно, что кадры продолжают доезжать.
   ///
-  /// Сбой показывается вместо загрузки: причина важнее, а «грузим» на сбое было бы враньём —
-  /// именно так и выглядел прежний вечный спиннер. Конец ленты тоже называется прямо: иначе
-  /// «дальше не грузится» неотличимо от «сломалось».
-  String? _footerNote() {
-    if (error != null) return error;
-    if (_loadingOlder) return 'Загружаем…';
-    if (!_hasOlder && _items.isNotEmpty) return 'Это все кадры';
-    return null;
-  }
-
-  /// Страница вниз едет прямо сейчас (по этому признаку в строке состояния спиннер).
-  bool get loadingOlder => _loadingOlder;
-
-  /// Повторить неудавшуюся загрузку — кнопкой в строке состояния.
-  ///
-  /// Направление берётся по тому, что видно: сбой почти всегда случается там, куда человек
-  /// листает, а если данных не хватает и сверху, окно само догрузится при прокрутке.
-  void retry() {
-    error = null;
-    // Строка состояния собрана вместе со слотами, поэтому её надо пересобрать сразу: иначе
-    // причина сбоя осталась бы на экране до конца следующей загрузки.
-    _rebuildArms();
+  /// Начало прохода — отдельный повод перечитать разбивку: серверную разбивку проход записывает
+  /// первым делом, и по ней сетка сразу становится полной на всю историю, а кадры в ней
+  /// появляются по мере чтения (см. `GalleryPages`).
+  void _onSyncProgress() {
+    if (_disposed) return;
+    final running = sync.progress.value?.running ?? false;
+    if (running && !_filling) {
+      _filling = true;
+      unawaited(_reloadMonths(keepPlace: true));
+    }
+    // Прочитана очередная страница ленты: неполные пачки (месяц, который лента ещё дочитывает)
+    // могли подрасти — их надо перечитать, иначе низ месяца останется заглушками.
+    if (running) pages.refreshUnfinished();
+    if (!running) _filling = false;
     notifyListeners();
-    unawaited(loadOlder());
-    unawaited(loadNewer());
   }
 
-  /// С какого кадра начинается новый месяц — по флагу на каждый кадр окна.
-  ///
-  /// У первого кадра окна заголовок ставится, только если выше кадров нет вовсе: иначе
-  /// неизвестно, тот же это месяц, что у кадра за окном, и подпись могла бы соврать. Сверху
-  /// в этом случае месяц показывает шапка.
-  List<bool> _startsMonth(int tz) {
-    final flags = List<bool>.filled(_items.length, false);
-    String? prev;
-    for (var i = 0; i < _items.length; i++) {
-      final at = _items[i].capturedAt;
-      final dt = at == null ? null : DateTime.tryParse(at);
-      final key = dt == null ? '' : GalleryGrid.monthKey(dt, tz);
-      // Первый кадр окна: подпись ставится, только если месяц с него и начинается — то есть
-      // выше кадров нет вовсе либо окно началось с начала месяца (прыжок по шкале).
-      final anchor = _newerCount == 0 && (_anchorAtMonthStart || !_hasNewer);
-      flags[i] = i == 0 ? anchor : key != prev;
-      prev = key;
-    }
-    return flags;
+  /// Кадры приехали из индекса: перерисовать строки, которые их ждали.
+  void _onPagesLoaded() {
+    if (_disposed) return;
+    revision.value++;
+    notifyListeners();
+    _scheduleStatusPoll();
   }
 
-  /// Выбросить из окна кадры, ушедшие далеко от видимого места.
-  ///
-  /// Удаляются только заведомо невидимые (половина окна в каждую сторону), поэтому прокрутка
-  /// от чистки не дёргается: положение якоря и примыкающих к нему строк не меняется.
-  void _trimWindow() {
-    // При открытом просмотрщике окно не чистится: он может стоять далеко от того места,
-    // которое видно в сетке, и выброшенный кадр оказался бы тем самым, который он показывает.
-    if (_viewerOpen) return;
-    if (_items.length <= windowMax) return;
-    final visible = _visibleItemIndex();
-    final half = windowMax ~/ 2;
-    var from = math.max(0, visible - half);
-    final to = math.min(_items.length, from + windowMax);
-    from = math.max(0, to - windowMax);
-    if (from == 0 && to == _items.length) return;
-    if (from > 0) _hasNewer = true;
-    if (to < _items.length) _hasOlder = true;
-    _items = _items.sublist(from, to);
-    _newerCount = math.max(0, _newerCount - from);
-  }
-
-  /// Номер верхнего видимого кадра в окне.
-  int _visibleItemIndex() {
-    final offset = scroll.hasClients ? scroll.offset : 0.0;
-    final arm = offset >= 0 ? olderArm : newerArm;
-    final row = arm.rowAt(offset.abs());
-    if (row < 0) return _newerCount;
-    // Заголовок месяца кадров не несёт: первый видимый кадр — в следующей строке плеча.
-    for (var i = row; i < arm.rows.length; i++) {
-      final items = arm.rows[i].items;
-      if (items.isNotEmpty) {
-        final item = items.first;
-        final index = indexOf(item.entryId);
-        if (index >= 0) return index;
-        break;
-      }
-    }
-    return _newerCount;
-  }
-
-  /// Обновить подпись месяца и ползунок по позиции прокрутки.
-  void _refreshTopFromScroll() => _refreshTop(scroll.hasClients ? scroll.offset : 0.0);
-
-  /// Подпись месяца и ползунок для позиции прокрутки [offset].
-  ///
-  /// Считается по верхнему видимому кадру, а не по доле прокрутки: у окна нет ни начала, ни
-  /// конца, и «доля прокрутки» в нём ничего не значит. Кадр же честно говорит, какой сейчас
-  /// месяц, — по нему и подпись, и положение ползунка.
-  void _refreshTop(double offset) {
-    final arm = offset >= 0 ? olderArm : newerArm;
-    final row = arm.rowAt(offset.abs());
-    MediaItem? item;
-    if (row >= 0) {
-      for (var i = row; i < arm.rows.length; i++) {
-        if (arm.rows[i].items.isNotEmpty) {
-          item = arm.rows[i].items.first;
-          break;
-        }
-      }
-    }
-    if (item == null) return;
-    final cal = calendar;
-    final at = item.capturedAt;
-    if (at == null) {
-      rail.value = const GalleryRailPosition(1, tail: true);
-      barTitle.value = 'Без даты';
-      return;
-    }
-    final dt = DateTime.tryParse(at);
-    if (dt == null || cal == null || cal.isEmpty) return;
-    // Календарь считает время от старого края, а ползунок ходит сверху вниз (сверху — свежее),
-    // поэтому доля дорожки — это `1 - доля времени`.
-    final fraction = 1 - cal.fractionOf(dt);
-    if (rail.value.tail || (rail.value.fraction - fraction).abs() > 1e-4) {
-      rail.value = GalleryRailPosition(fraction);
-    }
-    barTitle.value = monthLabel(GalleryGrid.monthKey(dt, _tz));
-  }
-
-  /// Проверить догрузку после кадра.
-  ///
-  /// Нужна потому, что окно бывает короче экрана (в месяце мало кадров, а хвост без даты и вовсе
-  /// из одного кадра): прокручивать тогда нечего, события прокрутки не будет вовсе, и страница
-  /// не запросилась бы никогда.
-  ///
-  /// Ожидание списка повторяется: сразу после прыжка окно пусто, и на месте сетки стоит заглушка
-  /// — списка, у которого можно спросить размеры, в этот момент ещё нет, а проверка, сделанная
-  /// один раз, молча ничего бы не сделала.
-  void _checkViewportFilled([int attempt = 0]) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_disposed) return;
-      if (!scroll.hasClients) {
-        if (attempt < 5) _checkViewportFilled(attempt + 1);
-        return;
-      }
-      _maybeLoad(scroll.position);
-    });
-  }
-
-  /// Догрузить страницу, если до края окна осталось меньше двух экранов.
-  ///
-  /// Порог в два экрана — чтобы страница успела приехать до того, как человек доедет до края:
-  /// иначе на быстром пролистывании у края появлялись бы пустые места.
-  void _maybeLoad(ScrollPosition pos) {
-    final threshold = math.max(600.0, pos.viewportDimension * 2);
-    if (_hasOlder && pos.pixels >= pos.maxScrollExtent - threshold) unawaited(loadOlder());
-    if (_hasNewer && pos.pixels <= pos.minScrollExtent + threshold) unawaited(loadNewer());
+  /// Пачка не прочиталась: причина показывается в строке состояния, повтор — кнопкой.
+  void _onPagesError(Object e) {
+    if (_disposed) return;
+    error = e.toString();
+    notifyListeners();
   }
 
   /// Запустить опрос состояний превью, если он ещё не идёт.
@@ -885,7 +526,7 @@ class GalleryController extends ChangeNotifier {
     _statusTimer ??= Timer(const Duration(milliseconds: _statusPollMs), _pollStatuses);
   }
 
-  /// Переспросить у сервера состояние превью у кадров окна, которые ещё не готовы.
+  /// Переспросить у сервера состояние превью у видимых кадров, которые ещё не готовы.
   ///
   /// Нужно потому, что к моменту показа кадра превью часто только в очереди: без перезапроса
   /// клетка осталась бы серой до перезахода в раздел. Опрос прекращается сам — когда неготовых
@@ -893,33 +534,25 @@ class GalleryController extends ChangeNotifier {
   /// долго, а очередь стоять, и ждать этого на открытом экране незачем).
   Future<void> _pollStatuses() async {
     _statusTimer = null;
-    final ids = <String>[];
-    final at = <String, int>{};
-    for (var i = 0; i < _items.length && ids.length < _statusBatchMax; i++) {
-      final it = _items[i];
-      if (it.previewState == 'done' || it.previewState == 'impossible') continue;
-      if ((_statusTries[it.entryId] ?? 0) >= _statusMaxTries) continue;
-      ids.add(it.entryId);
-      at[it.entryId] = i;
-    }
-    if (ids.isEmpty) return;
+    final unready = _visibleUnready();
+    if (unready.isEmpty) return;
     try {
-      final states = await apiOf().mediaStatus(ids);
+      final states = await apiOf().mediaStatus(unready.keys.toList());
       final by = {for (final st in states) st.entryId: st};
       final persist = <String, String>{};
       var unresolved = false;
-      for (final id in ids) {
+      unready.forEach((id, place) {
         _statusTries[id] = (_statusTries[id] ?? 0) + 1;
         final st = by[id];
-        if (st == null) continue;
+        if (st == null) return;
         if (st.previewState != 'done' && st.previewState != 'impossible') unresolved = true;
-        final i = at[id];
-        if (i == null || i >= _items.length) continue;
-        final it = _items[i];
-        if (it.entryId != id || it.previewState == st.previewState) continue;
-        _items[i] = it.copyWith(previewState: st.previewState, jobState: st.jobState);
-        persist[id] = st.previewState;
-      }
+        final item = pages.loadedAt(place.month, place.offset);
+        if (item == null || item.entryId != id || item.previewState == st.previewState) return;
+        final updated = item.copyWith(previewState: st.previewState, jobState: st.jobState);
+        // Замена может не найти своё место: пачка успела вытесниться — тогда новое состояние
+        // приедет вместе с кадром при следующем чтении.
+        if (pages.replace(place.month, place.offset, updated)) persist[id] = st.previewState;
+      });
       if (persist.isNotEmpty) {
         await store.setPreviewStates(persist);
         revision.value++;
@@ -927,25 +560,71 @@ class GalleryController extends ChangeNotifier {
       }
       if (unresolved) _scheduleStatusPoll();
     } catch (e) {
-      // Неудачный опрос — не повод падать: следующий запустится после подгрузки страницы.
+      // Неудачный опрос — не повод падать: следующий запустится после следующей прокрутки.
       if (kDebugMode) debugPrint('gallery status error: $e');
     }
   }
 
-  /// Отдать наружу текущее окно: счётчик для просмотрщика и сигнал перерисовки.
-  void _publish() {
-    total.value = _items.length;
-    revision.value++;
-    notifyListeners();
+  /// Видимые кадры без готового превью: id → место кадра в индексе (месяц и номер в нём).
+  ///
+  /// Только видимые: опрос — это запрос каждые пять секунд, и спрашивать про всю библиотеку
+  /// значило бы занимать канал тем, чего человек не видит.
+  Map<String, ({String month, int offset})> _visibleUnready() {
+    final idx = index;
+    if (idx == null || !scroll.hasClients) return const {};
+    final offset = scroll.offset - topInset;
+    final first = idx.rowAtOffset(offset);
+    final last = idx.rowAtOffset(offset + scroll.position.viewportDimension);
+    final out = <String, ({String month, int offset})>{};
+    for (var row = first < 0 ? 0 : first; row <= last && out.length < _statusBatchMax; row++) {
+      final spec = idx.specAt(row);
+      for (var i = 0; i < spec.cells; i++) {
+        final at = spec.monthOffset + i;
+        final item = pages.loadedAt(spec.month, at);
+        if (item == null) continue;
+        if (item.previewState == 'done' || item.previewState == 'impossible') continue;
+        if ((_statusTries[item.entryId] ?? 0) >= _statusMaxTries) continue;
+        out[item.entryId] = (month: spec.month, offset: at);
+      }
+    }
+    return out;
   }
 
-  /// Сдвиг пояса устройства в минутах на восток — в нём считаются месяцы и их границы.
-  int get _tz => DateTime.now().timeZoneOffset.inMinutes;
+  /// Подпись месяца и ползунок по текущей позиции прокрутки.
+  void _refreshTopFromScroll() => _refreshTop((scroll.hasClients ? scroll.offset : 0.0) - topInset);
+
+  /// Подпись месяца и ползунок для смещения [offset] от начала списка.
+  ///
+  /// Считаются по верхней видимой строке, а не по кадру: строка знает свой месяц из геометрии,
+  /// поэтому подпись и ползунок верны и там, где кадры ещё не прочитаны.
+  void _refreshTop(double offset) {
+    final idx = index;
+    final cal = calendar;
+    if (idx == null || idx.isEmpty || cal == null || cal.isEmpty) return;
+    final row = idx.rowAtOffset(offset);
+    if (row < 0) return;
+    final spec = idx.specAt(row);
+    if (spec.note) return;
+    if (spec.month.isEmpty) {
+      rail.value = const GalleryRailPosition(1, tail: true);
+      barTitle.value = 'Без даты';
+      return;
+    }
+    // Календарь считает время от старого края, а ползунок ходит сверху вниз (сверху — свежее),
+    // поэтому доля дорожки — это `1 - доля времени`. Границей месяца подпись и ползунок
+    // считаются по геометрии: кадра под рукой может и не быть.
+    final fraction = 1 - cal.fractionOf(cal.monthBoundaryUtc(spec.month));
+    if (rail.value.tail || (rail.value.fraction - fraction).abs() > 1e-4) {
+      rail.value = GalleryRailPosition(fraction);
+    }
+    barTitle.value = monthLabel(spec.month);
+  }
 
   @override
   void dispose() {
     _disposed = true;
     _statusTimer?.cancel();
+    sync.progress.removeListener(_onSyncProgress);
     scroll.dispose();
     total.dispose();
     revision.dispose();
