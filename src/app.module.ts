@@ -23,6 +23,7 @@ import { ReleaseModule } from './release/release.module';
 import { ClipboardModule } from './clipboard/clipboard.module';
 import { MailModule } from './mail/mail.module';
 import { FacturaModule } from './factura/factura.module';
+import { AiModule } from './ai/ai.module';
 
 /**
  * Корневой модуль: собирает функциональные модули и вешает на каждый запрос три глобальные
@@ -66,6 +67,7 @@ import { FacturaModule } from './factura/factura.module';
     ClipboardModule,
     MailModule,
     FacturaModule,
+    AiModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },

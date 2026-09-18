@@ -1,73 +1,27 @@
 import 'package:flutter/foundation.dart';
 
-/// Роль сообщения в переписке с моделью.
+/// Модель, доступная ключу сервера.
 ///
-/// Имена значений совпадают с ролями в API провайдеров (`system`, `user`, `assistant`) и
-/// подставляются в тело запроса как есть ([AiMessage.toApiJson]): переименование значения —
-/// это правка протокола, а не косметика, и оно молча сломает запрос.
-enum AiRole { system, user, assistant }
-
-/// Одно сообщение переписки: кто и что сказал.
-///
-/// Объект неизменяемый: список сообщений целиком пересобирается контроллером чата, а поток
-/// ответа порождает новую копию последнего сообщения на каждую полученную дельту
-/// ([AiMessage.copyWith]). Так у экрана всегда цельная картина состояния, а не список,
-/// который кто-то правит на месте.
-@immutable
-class AiMessage {
-  /// Кто автор сообщения.
-  final AiRole role;
-
-  /// Текст сообщения без «размышлений»: именно он уходит в следующий запрос как история.
-  final String text;
-
-  /// «Размышления» модели, пришедшие вместе с ответом (у reasoning-моделей).
-  ///
-  /// В контекст следующего запроса они **не** отправляются: OpenAI-совместимые API такого поля
-  /// во входных сообщениях не принимают, а у xAI для этого есть отдельный механизм
-  /// (`reasoning.encrypted_content`). Здесь они хранятся только чтобы показать их человеку.
-  final String reasoning;
-
-  /// Сообщение целиком: роль, текст и, если есть, «размышления».
-  const AiMessage({required this.role, required this.text, this.reasoning = ''});
-
-  /// Копия сообщения с заменёнными полями — нужна потоку ответа, который дописывает текст
-  /// по дельтам, не трогая уже собранный список.
-  AiMessage copyWith({String? text, String? reasoning}) => AiMessage(
-        role: role,
-        text: text ?? this.text,
-        reasoning: reasoning ?? this.reasoning,
-      );
-
-  /// Представление для тела запроса к провайдеру.
-  ///
-  /// Провайдеры (xAI и OpenAI) принимают `content` строкой — так и отдаём. Роль переводится
-  /// в строку через `name`, поэтому значения [AiRole] обязаны совпадать с именами ролей API.
-  Map<String, dynamic> toApiJson() => {'role': role.name, 'content': text};
-}
-
-/// Модель, доступная ключу владельца, — как её отдаёт сам провайдер.
-///
-/// Список моделей никогда не хардкодится: набор зависит от ключа (у разных ключей разные
-/// уровни доступа), а провайдер выпускает новые модели и снимает старые. Отсюда и поля:
-/// идентификатор нужен для запроса, остальное — чтобы человек понимал, что выбирает.
+/// Список моделей приходит от нашего сервера (`GET /ai/models`), а тот спрашивает его у xAI
+/// ключом из своего окружения. В приложении ключа нет вовсе, и хардкодить модели тоже нельзя:
+/// набор зависит от ключа, а провайдер выпускает новые модели и снимает старые.
 @immutable
 class AiModel {
   /// Идентификатор для поля `model` в запросе (`grok-4.6`, `grok-4.3` и т. п.).
   ///
-  /// Хранить и сравнивать нужно именно его: индекс в списке между запусками меняется.
+  /// Хранится и сравнивается именно он: индекс в списке между запусками меняется.
   final String id;
 
-  /// Размер контекста в токенах, если провайдер его сообщил.
+  /// Размер контекста в токенах — если провайдер его сообщил.
   final int? contextLength;
 
-  /// Цена входа за 1 млн токенов в долларах, если провайдер её сообщил.
+  /// Цена входа за 1 млн токенов в долларах.
   final double? inputPricePerMillion;
 
-  /// Цена выхода за 1 млн токенов в долларах, если провайдер её сообщил.
+  /// Цена выхода за 1 млн токенов в долларах.
   final double? outputPricePerMillion;
 
-  /// Модель с идентификатором и, если провайдер их дал, ценой и размером контекста.
+  /// Модель с идентификатором и тем, что о ней сообщил сервер.
   const AiModel({
     required this.id,
     this.contextLength,
@@ -75,22 +29,23 @@ class AiModel {
     this.outputPricePerMillion,
   });
 
-  /// Копия модели с заменённым размером контекста.
+  /// Разбор модели из ответа сервера.
   ///
-  /// Нужна потому, что цена и контекст приходят разными ручками провайдера: список чат-моделей
-  /// отдаёт цены, а размер контекста лежит в другом списке (`GrokProvider.listModels`), и
-  /// модель собирается из двух ответов.
-  AiModel copyWith({int? contextLength}) => AiModel(
-        id: id,
-        contextLength: contextLength ?? this.contextLength,
-        inputPricePerMillion: inputPricePerMillion,
-        outputPricePerMillion: outputPricePerMillion,
+  /// Незнакомые поля игнорируем, отсутствующие цены и контекст оставляем `null`: список должен
+  /// показаться, даже если сервер поменяет формат, а не упасть разбором.
+  factory AiModel.fromJson(Map<String, dynamic> json) => AiModel(
+        id: json['id']?.toString() ?? '',
+        contextLength: json['contextLength'] is int ? json['contextLength'] as int : null,
+        inputPricePerMillion:
+            json['inputPricePerMillion'] is num ? (json['inputPricePerMillion'] as num).toDouble() : null,
+        outputPricePerMillion:
+            json['outputPricePerMillion'] is num ? (json['outputPricePerMillion'] as num).toDouble() : null,
       );
 
   /// Подпись для списка выбора: идентификатор и через точку то, что о модели известно.
   ///
-  /// Цены — единственный способ увидеть, во что обойдётся разговор: у xAI разница между
-  /// `grok-4.6` и `grok-4.3` втрое на выходе, а из идентификатора этого не видно.
+  /// Цены здесь не для красоты: разница между `grok-4.6` и `grok-4.3` на выходе втрое, и из
+  /// идентификатора этого не видно.
   String get label {
     final parts = <String>[];
     if (contextLength != null) parts.add('${_shortTokens(contextLength!)} контекст');
@@ -101,7 +56,7 @@ class AiModel {
     return parts.isEmpty ? id : '$id · ${parts.join(' · ')}';
   }
 
-  /// Токены в короткой записи (`500k`, `1M`) — полное число в списке не помещается и не читается.
+  /// Токены в короткой записи (`500k`, `1M`): полное число в списке не помещается и не читается.
   static String _shortTokens(int tokens) {
     if (tokens >= 1000000) {
       final m = tokens / 1000000;
@@ -112,45 +67,162 @@ class AiModel {
   }
 }
 
-/// Расход токенов на один ответ — то, за что провайдер выставит счёт.
-///
-/// Приходит в каждом чанке потока, а не один раз в конце, поэтому контроллер чата берёт
-/// последнее полученное значение ([AiChunk.usage]).
+/// Чат в списке: тема, модель и когда в нём последний раз что-то происходило.
+@immutable
+class AiChat {
+  /// Идентификатор чата: по нему открывается переписка и уходят запросы.
+  final String id;
+
+  /// Тема чата — её выводит сервер из первого вопроса.
+  final String title;
+
+  /// Модель, которой отвечает этот чат.
+  final String model;
+
+  /// Время последнего сообщения (сервер отдаёт по нему сортировку списка).
+  final DateTime? updatedAt;
+
+  /// Сколько сообщений в чате — видно в списке, не открывая переписку.
+  final int messages;
+
+  /// Чат с темой, моделью и счётчиком сообщений.
+  const AiChat({
+    required this.id,
+    required this.title,
+    required this.model,
+    this.updatedAt,
+    this.messages = 0,
+  });
+
+  /// Разбор чата из ответа сервера.
+  factory AiChat.fromJson(Map<String, dynamic> json) => AiChat(
+        id: json['id']?.toString() ?? '',
+        title: json['title']?.toString() ?? 'Чат',
+        model: json['model']?.toString() ?? '',
+        updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? '')?.toLocal(),
+        messages: json['messages'] is int ? json['messages'] as int : 0,
+      );
+}
+
+/// Сообщение переписки: вопрос человека или ответ модели.
+@immutable
+class AiMessage {
+  /// Идентификатор сообщения; у ответа, который ещё дописывается, он пустой.
+  final String id;
+
+  /// `user` или `assistant` — те же имена ролей, что и на сервере.
+  final String role;
+
+  /// Текст сообщения без «размышлений».
+  final String content;
+
+  /// «Размышления» reasoning-модели: на экране показываются отдельным блоком.
+  final String reasoning;
+
+  /// Расход токенов на этот ответ (у вопроса — `null`).
+  final int? promptTokens;
+  final int? completionTokens;
+
+  /// Сообщение переписки.
+  const AiMessage({
+    required this.id,
+    required this.role,
+    required this.content,
+    this.reasoning = '',
+    this.promptTokens,
+    this.completionTokens,
+  });
+
+  /// Пустой ответ-заготовка, который дописывается потоком.
+  ///
+  /// Показывается сразу после отправки: человек видит, что запрос ушёл, а не пустое место до
+  /// первого слова модели.
+  const AiMessage.pending()
+      : id = '',
+        role = 'assistant',
+        content = '',
+        reasoning = '',
+        promptTokens = null,
+        completionTokens = null;
+
+  /// Это вопрос человека (а не ответ модели).
+  bool get isUser => role == 'user';
+
+  /// Разбор сообщения из ответа сервера.
+  factory AiMessage.fromJson(Map<String, dynamic> json) => AiMessage(
+        id: json['id']?.toString() ?? '',
+        role: json['role']?.toString() ?? 'assistant',
+        content: json['content']?.toString() ?? '',
+        reasoning: json['reasoning']?.toString() ?? '',
+        promptTokens: json['promptTokens'] is int ? json['promptTokens'] as int : null,
+        completionTokens:
+            json['completionTokens'] is int ? json['completionTokens'] as int : null,
+      );
+
+  /// Копия сообщения с дописанным текстом — так растёт ответ по мере генерации.
+  AiMessage copyWith({String? content, String? reasoning}) => AiMessage(
+        id: id,
+        role: role,
+        content: content ?? this.content,
+        reasoning: reasoning ?? this.reasoning,
+        promptTokens: promptTokens,
+        completionTokens: completionTokens,
+      );
+}
+
+/// Расход токенов на ответ — то, за что провайдер выставит счёт.
 @immutable
 class AiUsage {
-  /// Токенов во входе (вся отправленная история плюс системная часть).
+  /// Токенов во входе: вся отправленная история плюс системная часть.
   final int promptTokens;
 
   /// Токенов в ответе, включая «размышления».
   final int completionTokens;
 
-  /// Всего токенов в запросе.
-  final int totalTokens;
-
   /// Расход по одному ответу.
-  const AiUsage({
-    required this.promptTokens,
-    required this.completionTokens,
-    required this.totalTokens,
-  });
+  const AiUsage({required this.promptTokens, required this.completionTokens});
+
+  /// Разбор расхода из события потока; поля приходят из ответа xAI.
+  factory AiUsage.fromJson(Map<String, dynamic> json) => AiUsage(
+        promptTokens: json['promptTokens'] is int ? json['promptTokens'] as int : 0,
+        completionTokens:
+            json['completionTokens'] is int ? json['completionTokens'] as int : 0,
+      );
 }
 
-/// Порция ответа, пришедшая из потока.
+/// Событие потока ответа.
 ///
-/// Один чанк несёт что-то одно: либо кусок обычного текста, либо кусок «размышлений», либо
-/// только расход токенов. Разделение оставлено как есть, а не склеено в «текст», потому что
-/// «размышления» на экране показываются отдельным сворачиваемым блоком.
+/// Сервер шлёт их строками SSE (`data: {...}`), каждое несёт что-то одно: кусок текста, кусок
+/// «размышлений», новую тему чата, расход токенов в конце или причину отказа. Разделение
+/// оставлено как есть, а не склеено в «текст»: «размышления» показываются отдельным блоком,
+/// а тему и расход надо разложить по своим местам в состоянии экрана.
 @immutable
 class AiChunk {
-  /// Кусок текста ответа или `null`, если в этом чанке текста нет.
+  /// Кусок текста ответа.
   final String? text;
 
-  /// Кусок «размышлений» или `null`, если в этом чанке их нет.
+  /// Кусок «размышлений».
   final String? reasoning;
 
-  /// Расход токенов на текущий момент или `null`, если провайдер его не прислал.
+  /// Новая тема чата (сервер выводит её из первого вопроса).
+  final String? title;
+
+  /// Расход токенов на текущий момент.
   final AiUsage? usage;
 
-  /// Чанк с одним из трёх видов полезной нагрузки (остальные — `null`).
-  const AiChunk({this.text, this.reasoning, this.usage});
+  /// Сервер закончил ответ; дальше событий не будет.
+  final bool done;
+
+  /// Причина отказа, полученная уже внутри потока (после начала ответа).
+  final String? error;
+
+  /// Событие потока с одной из полезных нагрузок.
+  const AiChunk({
+    this.text,
+    this.reasoning,
+    this.title,
+    this.usage,
+    this.done = false,
+    this.error,
+  });
 }

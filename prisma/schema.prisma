@@ -37,6 +37,7 @@ model User {
   clipboardId   String?
   clipboardMode String? // 'copy' | 'cut'
   clipboardAt   DateTime?
+  aiChats       AiChat[]
 }
 
 model Session {
@@ -1215,4 +1216,52 @@ model VerifactuRegistry {
   @@index([companyId, signedAt])
   @@index([aeatStatus, aeatRetryCount])
   @@map("verifactu_registries")
+}
+
+// ===== Чат с моделью ИИ (раздел «Чат») =====
+// Ключ провайдера (xAI) живёт в окружении сервера (GROK_API_KEY) и на клиент не уходит:
+// запросы к модели идут через сервер, поэтому ключ не лежит в сборке приложения, расход виден
+// в логах сервера, а история переписки — в БД и доступна с любого устройства.
+
+/// Диалог с моделью: тема, выбранная модель и сообщения.
+model AiChat {
+  id        String      @id @default(uuid())
+  userId    String
+  // Тема чата. Своей темы у модели не спрашивают: она выводится из первого вопроса, как это
+  // делают приложения ChatGPT и Gemini — иначе список чатов состоял бы из одинаковых «Новый чат».
+  title     String      @default("Новый чат")
+  // Идентификатор модели, который уходит провайдеру в поле `model` (например, grok-4.6).
+  model     String      @default("grok-4.6")
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  AiMessage[]
+
+  // Список чатов всегда берётся по владельцу и сортируется по времени последнего сообщения —
+  // под этот запрос индекс и заведён.
+  @@index([userId, updatedAt])
+  @@map("ai_chats")
+}
+
+/// Сообщение диалога: вопрос человека или ответ модели.
+model AiMessage {
+  id     String @id @default(uuid())
+  chatId String
+  // 'user' | 'assistant' — те же имена ролей, что понимает API провайдера: их не приходится
+  // переводить при сборе контекста запроса.
+  role   String
+  content String @db.Text
+  // «Размышления» reasoning-модели. Отдельным полем, а не вклейкой в content: на экране они
+  // показываются отдельным сворачиваемым блоком, а в контекст следующего запроса не уходят —
+  // провайдеры такого поля во входных сообщениях не принимают.
+  reasoning String @default("") @db.Text
+  // Расход токенов на этот ответ (у вопроса — null). Нужен, чтобы расход был виден не только
+  // в логах провайдера: цена ошибки здесь — деньги, а не время.
+  promptTokens     Int?
+  completionTokens Int?
+  createdAt DateTime @default(now())
+  chat      AiChat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@index([chatId, createdAt])
+  @@map("ai_messages")
 }
