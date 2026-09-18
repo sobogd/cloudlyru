@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../media/media_viewer.dart';
@@ -11,6 +12,7 @@ import '../../util/widgets.dart';
 import 'data/gallery_sync.dart';
 import 'gallery_controller.dart';
 import 'gallery_rows.dart';
+import 'gallery_sliver.dart';
 import 'gallery_tile.dart';
 
 /// Экран «Медиа»: сетка кадров зоны «Фото» с прокруткой по всей истории.
@@ -144,7 +146,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   /// `RawScrollbar.hitTestOnlyThumbInteractive`). `thumbVisibility` держит его на виду: он здесь
   /// орган управления, а не индикатор, и исчезающий ползунок пришлось бы ловить.
   ///
-  /// Строки не строятся заранее: `SliverVariedExtentList` знает их высоты из геометрии
+  /// Строки не строятся заранее: `GalleryRowsSliver` знает их высоты из геометрии
   /// (`GalleryController.rowHeight`), поэтому полная высота списка и позиция любой строки
   /// считаются без построения — и ползунок стоит там, где кадры, а не «примерно там». Строятся
   /// только те строки, что попали на экран, а вместе с ними читаются и кадры (см. `GalleryPages`).
@@ -168,15 +170,35 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
               GalleryGrid.gap + GalleryGrid.scrollbarInset,
               GalleryGrid.gap,
             ),
-            sliver: SliverVariedExtentList.builder(
-              itemCount: c.rowCount,
-              itemExtentBuilder: (i, _) => c.rowHeight(i),
-              itemBuilder: (context, i) => _row(c, c.rowAt(i)),
+            sliver: GalleryRowsSliver(
+              // Индекс непуст: сетку показывают только тогда, когда в ней есть кадры
+              // (см. `_body`), а кадры есть ровно у собранной геометрии.
+              index: c.index!,
+              itemExtentBuilder: _extent,
+              delegate: SliverChildBuilderDelegate(_buildRow, childCount: c.rowCount),
             ),
           ),
         ],
       ),
     );
+  }
+
+  /// Высота строки [row] — её спрашивает вёрстка (`GalleryRowsSliver`).
+  ///
+  /// Методом, а не замыканием: у одного и того же метода личность постоянна, поэтому слайвер
+  /// не считает геометрию изменившейся на каждой пересборке экрана — а сверяет он именно
+  /// `itemExtentBuilder`.
+  double? _extent(int row, SliverLayoutDimensions _) => _c!.rowHeight(row);
+
+  /// Построить строку [row] — делегат списка.
+  ///
+  /// Строки пересобираются на каждой перерисовке сетки, и это не случайность: приехавшие из
+  /// индекса кадры показать иначе нельзя — `SliverChildBuilderDelegate` объявляет себя
+  /// изменившимся всегда (`shouldRebuild`), и все живые строки строятся заново. Поэтому частоту
+  /// перерисовок ограничивает контроллер, а не вёрстка (см. `GalleryController._onPagesLoaded`).
+  Widget _buildRow(BuildContext context, int row) {
+    final c = _c!;
+    return _row(c, c.rowAt(row));
   }
 
   /// Строка сетки: заголовок месяца, ряд из кадров или строка состояния в конце.

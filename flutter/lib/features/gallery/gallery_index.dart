@@ -153,8 +153,8 @@ class GalleryRowSpec {
 ///
 /// Здесь геометрия известна целиком и до кадров: разбивка по месяцам (`GalleryStore.months`)
 /// говорит, сколько кадров в каждом месяце, а заголовок и ряд из четырёх клеток дают строки
-/// известной высоты. Значит, список строится сразу на всю историю, а вёрстка
-/// (`SliverVariedExtentList`) получает точную длину, не построив ни одной строки заранее.
+/// известной высоты. Значит, список строится сразу на всю историю, а вёрстка (`GalleryRowsSliver`)
+/// получает точную длину, не построив ни одной строки заранее.
 ///
 /// ## Почему это не «нарисовать семьдесят тысяч плиток»
 ///
@@ -243,17 +243,31 @@ class GalleryIndex {
     );
   }
 
-  /// Высота строки [row] — ею вёрстка считает полную высоту списка и позицию строки.
+  /// Высота строки [row] — ею вёрстка ставит строку на её место и считает полную длину списка.
   ///
-  /// Памятка последнего вызова — не микрооптимизация ради: `SliverVariedExtentList` зовёт это
-  /// на каждом шаге линейного обхода (позиция прокрутки переводится в строку счётом от начала
-  /// списка), и без памятки обход восемнадцати тысяч строк стоил бы бинарного поиска на каждой
-  /// строке — это миллисекунды в каждом кадре прокрутки. Последовательный вызов, который
-  /// в обходе и бывает, обслуживается одним шагом.
+  /// Зовётся только для строк, которые вёрстка и раскладывает (десятки за кадр), поэтому
+  /// двоичного поиска по блокам здесь достаточно: перебор всех строк списка в этой величине
+  /// не участвует (смещение строки даёт [topOfRow], а не сложение высот от начала).
   double heightOfRow(int row) {
     if (row < 0 || row >= _l.rowCount) return 0;
     if (hasNote && row == _l.rowCount - 1) return GalleryGrid.noteHeight;
-    return _place(row).inBlock == 0 ? GalleryGrid.headerHeight : rowStep;
+    return _blockAtRow(row)!.firstRow == row ? GalleryGrid.headerHeight : rowStep;
+  }
+
+  /// Смещение начала строки [row] от начала списка.
+  ///
+  /// Обратная к [rowAtOffset]: по ней вёрстка ставит строку туда, где она и должна быть. Блоки
+  /// помнят свои смещения (`GalleryBlock.top`), поэтому ответ — арифметика внутри блока, а не
+  /// сумма высот всех предыдущих строк. Строка за концом списка даёт полную высоту: так вёрстка
+  /// спрашивает конец последней строки, когда считает длину содержимого.
+  double topOfRow(int row) {
+    if (_l.rowCount == 0 || row <= 0) return 0;
+    if (row >= _l.rowCount) return _l.height;
+    if (hasNote && row == _l.rowCount - 1) return _l.height - GalleryGrid.noteHeight;
+    final b = _l.blocks[_blockIndexAtRow(row)];
+    final k = row - b.firstRow;
+    if (k == 0) return b.top;
+    return b.top + GalleryGrid.headerHeight + (k - 1) * rowStep;
   }
 
   /// Строка, накрывающая смещение [offset] от начала списка.
@@ -373,36 +387,6 @@ class GalleryIndex {
   /// Сколько блоков занимают датированные месяцы (кадры без даты — последний блок).
   int get _datedCount =>
       _l.blocks.isNotEmpty && _l.blocks.last.month.isEmpty ? _l.blocks.length - 1 : _l.blocks.length;
-
-  /// Место строки [row] в блоках — с памяткой о прошлом вызове (см. [heightOfRow]).
-  ({int block, int inBlock}) _place(int row) {
-    if (row == _memoRow) return (block: _memoBlock, inBlock: _memoInBlock);
-    if (_memoRow >= 0 && row == _memoRow + 1) {
-      // Последовательный обход — обычный случай: шаг от прошлого места, без поиска.
-      var block = _memoBlock;
-      var inBlock = _memoInBlock + 1;
-      while (block < _l.blocks.length && inBlock >= _l.blocks[block].rows) {
-        inBlock -= _l.blocks[block].rows;
-        block++;
-      }
-      return _memo(row: row, block: block, inBlock: inBlock);
-    }
-    final block = _blockIndexAtRow(row);
-    return _memo(row: row, block: block, inBlock: row - _l.blocks[block].firstRow);
-  }
-
-  /// Запомнить место строки в блоках и отдать его.
-  ({int block, int inBlock}) _memo({required int row, required int block, required int inBlock}) {
-    _memoRow = row;
-    _memoBlock = block;
-    _memoInBlock = inBlock;
-    return (block: block, inBlock: inBlock);
-  }
-
-  /// Номер строки последнего обращения к [heightOfRow] и её место в блоках.
-  int _memoRow = -1;
-  int _memoBlock = 0;
-  int _memoInBlock = 0;
 
   /// Разложить месяцы по строкам сетки.
   ///

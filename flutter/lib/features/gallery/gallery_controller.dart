@@ -127,6 +127,19 @@ class GalleryController extends ChangeNotifier {
   /// Перерисовка уже заказана на этот кадр (см. [_onPagesLoaded]).
   bool _repaintScheduled = false;
 
+  /// Приехало то, чего построенные строки ещё не видели (см. [_onPagesLoaded]).
+  bool _pagesDirty = false;
+
+  /// Срок перерисовки во время прокрутки; `null` — срока нет (см. [_scrollRepaintMs]).
+  Timer? _repaintTimer;
+
+  /// Через сколько показывать приехавшие кадры, пока список едет, мс.
+  ///
+  /// Четверть секунды — это уже не «заглушки до остановки» и всё ещё вчетверо реже кадра:
+  /// под пальцем за это время сменяется десяток экранов, и увидеть в них одну приехавшую
+  /// пачку всё равно нельзя, а остановившись человек получает её через кадр.
+  static const int _scrollRepaintMs = 250;
+
   /// Проход наполнения уже замечен этим контроллером (см. [_onSyncProgress]).
   bool _filling = false;
 
@@ -472,20 +485,54 @@ class GalleryController extends ChangeNotifier {
 
   /// Кадры приехали из индекса: перерисовать строки, которые их ждали.
   ///
-  /// Перерисовка — не чаще одного раза в кадр. Это не тонкость, а условие плавности: ползунок
-  /// скроллбара тянут через всю библиотеку, и построенные строки успевают попросить десятки
-  /// пачек в секунду. Перерисовывать сетку на каждую приехавшую пачку значило бы собирать
-  /// десятки экранов за кадр ради одного видимого.
+  /// Перерисовка — не чаще одного раза в кадр, а во время прокрутки — не чаще [_scrollRepaintMs].
+  /// Это не тонкость, а условие плавности: ползунок скроллбара тянут через всю библиотеку, и
+  /// построенные строки успевают попросить десятки пачек в секунду. Пересборка списка стоит как
+  /// пересборка всех живых строк — делегат строк объявляет себя изменившимся всегда
+  /// (`SliverChildBuilderDelegate.shouldRebuild`), — а под пальцем клетки всё равно мелькают,
+  /// и шестьдесят таких пересборок в секунду ради одной приехавшей пачки незачем.
+  ///
+  /// Приехавшее при этом не теряется: каждая пачка либо попадает в перерисовку по сроку таймера,
+  /// либо, если прокрутка к тому времени уже встала, перерисовывается кадром — путь есть у любой.
   void _onPagesLoaded() {
     if (_disposed) return;
+    _scheduleStatusPoll();
+    _pagesDirty = true;
+    if (_scrolling) {
+      _repaintTimer ??= Timer(const Duration(milliseconds: _scrollRepaintMs), _onScrollRepaintDue);
+      return;
+    }
+    _scheduleFrameRepaint();
+  }
+
+  /// Прокрутка идёт прямо сейчас.
+  bool get _scrolling => scroll.hasClients && scroll.position.isScrollingNotifier.value;
+
+  /// Срок таймера прокрутки: показать приехавшее, не дожидаясь остановки.
+  ///
+  /// Именно по сроку, а не по остановке: ползунок скроллбара можно держать и вести медленно,
+  /// и ждать отпускания значило бы показывать заглушки, пока человек ведёт палец.
+  void _onScrollRepaintDue() {
+    _repaintTimer = null;
+    if (_disposed || !_pagesDirty) return;
+    _repaintNow();
+  }
+
+  /// Перерисовать сетку после кадра — когда список стоит.
+  void _scheduleFrameRepaint() {
     if (_repaintScheduled) return;
     _repaintScheduled = true;
     _afterFrame(() {
       _repaintScheduled = false;
-      revision.value++;
-      notifyListeners();
+      if (_pagesDirty) _repaintNow();
     });
-    _scheduleStatusPoll();
+  }
+
+  /// Показать приехавшие кадры: их ждут построенные строки и открытый просмотрщик.
+  void _repaintNow() {
+    _pagesDirty = false;
+    revision.value++;
+    notifyListeners();
   }
 
   /// Пачка не прочиталась: причина показывается в строке состояния, повтор — кнопкой.
@@ -586,6 +633,7 @@ class GalleryController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _statusTimer?.cancel();
+    _repaintTimer?.cancel();
     sync.progress.removeListener(_onSyncProgress);
     scroll.dispose();
     total.dispose();

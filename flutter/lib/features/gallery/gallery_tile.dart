@@ -136,9 +136,13 @@ class _GalleryTileState extends State<GalleryTile> {
         // Кадр не мигает заглушкой при перерисовке окна и декодируется в размер клетки:
         // миниатюра 256×256 после кэша картинок занимала бы память под квадрат 256, хотя на
         // экране она 75 dp.
+        //
+        // Фильтрация — `low`, а не `medium`: миниатюра приходит квадратом 256 и ужимается в клетку
+        // на считаные проценты, мипмапы тут ничего не улучшают, а строятся они на каждую картинку
+        // заново — при пролистывании это десятки построений в секунду.
         gaplessPlayback: true,
         cacheWidth: (widget.side * dpr).round(),
-        filterQuality: FilterQuality.medium,
+        filterQuality: FilterQuality.low,
         errorBuilder: (_, _, _) => _placeholder(item),
       ),
     );
