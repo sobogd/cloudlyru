@@ -22,6 +22,7 @@ import {
   COMPACT_PROMPT,
   needsSearch,
   searchBlock,
+  searchFailedBlock,
   systemPrompt,
 } from './prompts';
 import { ApiError, badRequest } from '../common/errors';
@@ -206,6 +207,11 @@ export class AiController {
       if (outcome.results.length) {
         searched = 1;
         userContent = `${searchBlock(outcome.results)}\n\nВопрос: ${question}`;
+      } else {
+        // Поиск не нашёл ничего (капча, пауза после неё, пустая выдача) — говорим об этом
+        // модели прямо: иначе она отвечает «не могу» и человек не понимает, виноват поиск или
+        // её знания, а вопрос «поищи в интернете» остаётся без объяснения.
+        userContent = `${searchFailedBlock()}\n\nВопрос: ${question}`;
       }
     }
 
