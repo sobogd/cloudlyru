@@ -29,9 +29,18 @@ export interface ChatSummary {
   messages: number;
 }
 
-/** Ограничение окна контекста, отправляемого провайдеру. */
+/** Ограничение окна контекста, отправляемого провайдеру, когда компакции ещё нет. */
 const CONTEXT_MESSAGES = 40;
 const CONTEXT_CHARS = 60_000;
+
+/**
+ * Порог, после которого разговор сжимается компакцией (символы истории).
+ *
+ * Двадцать тысяч символов — это примерно десять тысяч токенов входа на каждый следующий вопрос.
+ * Вызов компакции сам стоит токенов, поэтому порог держим там, где история иначе ушла бы в
+ * запрос ещё несколько раз: сжатие окупается уже на втором-третьем вопросе после него.
+ */
+export const COMPACT_AFTER_CHARS = 20_000;
 
 /**
  * Хранилище чатов и сообщений.
@@ -116,6 +125,68 @@ export class ChatsService {
   async remove(userId: string, chatId: string): Promise<void> {
     await this.owned(userId, chatId);
     await this.prisma.aiChat.delete({ where: { id: chatId } });
+  }
+
+  /**
+   * Сохранённая компакция чата или `null`, если разговор ещё не сжимали.
+   *
+   * Блок непрозрачный: передаём его провайдеру как есть и никогда не разбираем.
+   */
+  async compaction(chatId: string): Promise<{ id: string; blob: string; upToAt: Date } | null> {
+    const row = await this.prisma.aiChat.findUnique({
+      where: { id: chatId },
+      select: { compactionId: true, compactionBlob: true, compactedUpToAt: true },
+    });
+    if (!row?.compactionId || !row.compactionBlob || !row.compactedUpToAt) return null;
+    return { id: row.compactionId, blob: row.compactionBlob, upToAt: row.compactedUpToAt };
+  }
+
+  /** Запоминает результат компакции: блок и границу, до которой сообщения внутри него. */
+  async saveCompaction(chatId: string, id: string, blob: string, upToAt: Date): Promise<void> {
+    await this.prisma.aiChat.update({
+      where: { id: chatId },
+      data: { compactionId: id, compactionBlob: blob, compactedUpToAt: upToAt },
+    });
+  }
+
+  /**
+   * Сообщения, созданные позже указанного момента, — «хвост» после компакции.
+   *
+   * Окно здесь не ограничиваем: истории в хвосте ровно столько, сколько накопилось после
+   * последнего сжатия, и она всё равно меньше порога, по которому сжатие запускается.
+   */
+  async messagesAfter(chatId: string, after: Date): Promise<{ role: ChatRole; content: string }[]> {
+    const rows = await this.prisma.aiMessage.findMany({
+      where: { chatId, createdAt: { gt: after } },
+      orderBy: { createdAt: 'asc' },
+      select: { role: true, content: true },
+    });
+    return rows.map((r) => ({ role: this.asRole(r.role), content: r.content }));
+  }
+
+  /**
+   * Вся переписка чата вместе с системной частью — то, что уходит в компакцию.
+   *
+   * В компакцию отдаём разговор целиком, а не окно: смысл в том, чтобы сжать как раз то, что
+   * иначе пересылалось бы в каждом следующем запросе.
+   */
+  async fullHistory(chatId: string): Promise<{ role: ChatRole; content: string }[]> {
+    const rows = await this.prisma.aiMessage.findMany({
+      where: { chatId },
+      orderBy: { createdAt: 'asc' },
+      select: { role: true, content: true },
+    });
+    return rows.map((r) => ({ role: this.asRole(r.role), content: r.content }));
+  }
+
+  /** Время последнего сообщения чата — граница компакции. */
+  async lastMessageAt(chatId: string): Promise<Date | null> {
+    const row = await this.prisma.aiMessage.findFirst({
+      where: { chatId },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true },
+    });
+    return row?.createdAt ?? null;
   }
 
   /** Сообщения чата в порядке отправки — то, что показывает открытый чат. */

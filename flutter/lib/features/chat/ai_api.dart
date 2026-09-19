@@ -170,12 +170,15 @@ class AiApi {
   ///
   /// Прерывание потока (кнопка «Стоп», уход с экрана) рвёт и HTTP-запрос — сервер по разрыву
   /// соединения гасит свой запрос к xAI, поэтому генерация не продолжается «в никуда».
-  Stream<AiChunk> send(String chatId, String text) async* {
+  Stream<AiChunk> send(String chatId, String text, {bool? search}) async* {
     final Response<ResponseBody> res;
     try {
       res = await _http.post<ResponseBody>(
         '/ai/chats/$chatId/messages',
-        data: {'text': text},
+        // `search` не отправляем, если режим «авто»: тогда решение принимает сервер по тексту
+        // вопроса (он же знает, что стоит денег). Null-aware запись `?` — то же, что
+        // `if (search != null)`, но её требует линтер проекта.
+        data: <String, dynamic>{'text': text, 'search': ?search},
         // тело читаем сами как поток байтов: Dio не должен пытаться разобрать SSE как JSON
         options: Options(responseType: ResponseType.stream),
       );

@@ -177,6 +177,9 @@ class ChatThreadState {
   /// Модель сейчас ищет в интернете — на экране это отдельная подпись вместо «печатает».
   final bool searching;
 
+  /// Режим поиска: `auto` (решает сервер по вопросу), `on` или `off`.
+  final String searchMode;
+
   /// Переписка и состояние её загрузки.
   const ChatThreadState({
     this.chatId = '',
@@ -189,6 +192,7 @@ class ChatThreadState {
     this.error,
     this.usage,
     this.searching = false,
+    this.searchMode = 'auto',
   });
 
   /// Копия состояния с заменёнными полями; ошибку и расход трогают только явные методы.
@@ -201,6 +205,7 @@ class ChatThreadState {
     bool? sending,
     AiUsage? usage,
     bool? searching,
+    String? searchMode,
   }) =>
       ChatThreadState(
         chatId: chatId,
@@ -213,6 +218,7 @@ class ChatThreadState {
         error: error,
         usage: usage ?? this.usage,
         searching: searching ?? this.searching,
+        searchMode: searchMode ?? this.searchMode,
       );
 
   /// Копия с проставленной ошибкой.
@@ -227,6 +233,7 @@ class ChatThreadState {
         error: message,
         usage: usage,
         searching: searching,
+        searchMode: searchMode,
       );
 
   /// Копия без ошибки.
@@ -240,6 +247,7 @@ class ChatThreadState {
         sending: sending,
         usage: usage,
         searching: searching,
+        searchMode: searchMode,
       );
 
   /// Последнее сообщение переписки (ответ, который дописывается потоком), либо `null`.
@@ -297,7 +305,13 @@ class ChatThreadController extends Notifier<ChatThreadState> {
   /// Модели нужны шапке (выбор модели): их список зависит от ключа сервера, поэтому приходит
   /// оттуда, а не хардкодится в приложении.
   Future<void> open(AiChat chat) async {
-    state = ChatThreadState(chatId: chat.id, title: chat.title, model: chat.model, loading: true);
+    state = ChatThreadState(
+      chatId: chat.id,
+      title: chat.title,
+      model: chat.model,
+      searchMode: ref.read(settingsProvider).ui.chatSearch,
+      loading: true,
+    );
     try {
       final messages = await _api.messages(chat.id);
       if (state.chatId != chat.id) return; // чат успели сменить, пока шла загрузка
@@ -326,6 +340,16 @@ class ChatThreadController extends Notifier<ChatThreadState> {
       return;
     }
     ref.read(chatsProvider.notifier).touch(chatId, model: model);
+  }
+
+  /// Меняет режим поиска и запоминает выбор на будущее.
+  ///
+  /// Режим один на всё приложение: это привычка («отвечай из головы, ищи только когда прошу»),
+  /// а не свойство отдельного разговора.
+  Future<void> setSearchMode(String mode) async {
+    if (mode == state.searchMode) return;
+    state = state.copyWith(searchMode: mode);
+    await ref.read(settingsProvider).ui.setChatSearch(mode);
   }
 
   /// Отправляет вопрос: дописывает его в переписку и запускает поток ответа.
@@ -375,7 +399,13 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     final done = Completer<void>();
     _done = done;
 
-    _sub = _api.send(chatId, question).listen(
+    // «авто» отправляем как отсутствие поля: решение принимает сервер по тексту вопроса
+    final search = switch (state.searchMode) {
+      'on' => true,
+      'off' => false,
+      _ => null,
+    };
+    _sub = _api.send(chatId, question, search: search).listen(
       _applyChunk,
       onError: (Object e) {
         if (!_cancelledByUser) _fail(e);

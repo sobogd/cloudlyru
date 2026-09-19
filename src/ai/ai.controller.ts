@@ -13,11 +13,11 @@ import {
   Res,
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { ChatsService } from './chats.service';
-import { GrokDelta, GrokError, GrokService } from './grok.service';
+import { ChatsService, COMPACT_AFTER_CHARS } from './chats.service';
+import { GrokDelta, GrokError, GrokMessage, GrokService } from './grok.service';
 import { ApiError, badRequest } from '../common/errors';
 import { AiSettingsService } from './ai-settings.service';
-import { systemPrompt } from './prompts';
+import { needsSearch, systemPrompt } from './prompts';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 
 /** Потолок длины вопроса: у модели контекст в сотни тысяч токенов, но платят за каждый. */
@@ -139,6 +139,10 @@ export class AiController {
     @Res() res: Response,
   ): Promise<void> {
     const question = typeof body.text === 'string' ? body.text.trim() : '';
+    // Поиск: клиент может настоять на своём (`search: true/false`), иначе решаем по тексту
+    // вопроса. Инструмент стоит $0.005 за вызов плюс десятки тысяч входных токенов на
+    // прочитанные страницы, поэтому «на всякий случай» его не подключаем.
+    const search = typeof body.search === 'boolean' ? body.search : needsSearch(question);
     if (!question) throw badRequest('текст сообщения пуст', 'empty_message');
     if (question.length > MAX_QUESTION_CHARS) {
       throw badRequest(`сообщение длиннее ${MAX_QUESTION_CHARS} символов`, 'message_too_long');
@@ -153,18 +157,19 @@ export class AiController {
 
     // владелец проверяется до сохранения вопроса: чужой чат не должен обрастать сообщениями
     const chat = await this.chats.owned(user.id, id);
-    const context = await this.chats.context(chat.id);
     // память читаем на каждый запрос, а не кэшируем: она меняется в настройках, и запрос после
     // правки должен уходить уже с новым текстом
     const memory = await this.settings.memory(user.id);
+    const history = await this.requestHistory(chat.id, memory, search);
     await this.chats.append({ chatId: chat.id, role: 'user', content: question });
-    // тема берётся из первого вопроса: у нового чата она ещё пустая
-    const titled = context.length === 0 && chat.title === 'Новый чат';
+    // тема берётся из первого вопроса: у нового чата в истории только системная часть
+    const titled = history.messages.length <= 1 && chat.title === 'Новый чат';
     const title = titled ? await this.chats.retitleFromQuestion(chat.id, question) : null;
 
     this.logger.log(
-      `чат ${chat.id}: вопрос ${question.length} симв., истории ${context.length} сообщений, ` +
-        `модель ${chat.model}, память ${memory.length} симв.`,
+      `чат ${chat.id}: вопрос ${question.length} симв., истории ${history.messages.length - 1} ` +
+        `сообщений${history.compacted ? ' (разговор сжат)' : ''}, модель ${chat.model}, ` +
+        `память ${memory.length} симв., поиск ${search ? 'включён' : 'выключен'}`,
     );
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -193,11 +198,11 @@ export class AiController {
     try {
       for await (const delta of this.grok.streamChat({
         model: chat.model,
-        messages: [
-          { role: 'system', content: systemPrompt(memory) },
-          ...context,
-          { role: 'user', content: question },
-        ],
+        messages: [...history.messages, { role: 'user', content: question }],
+        search,
+        // ключ кэша промпта: у xAI кэш живёт на конкретном сервере, и один ключ на разговор
+        // удерживает запросы на одной машине — иначе вход каждый раз оплачивается полностью
+        cacheKey: chat.id,
         signal: abort.signal,
       })) {
         if (delta.usage) usage = delta.usage;
@@ -240,11 +245,79 @@ export class AiController {
         usage: usage ?? null,
         interrupted: closed,
       });
+      this.compactIfNeeded(chat.id, chat.model, memory, search);
     } catch (e) {
       await this.fail(res, chat.id, e, answer, reasoning, usage, closed);
     } finally {
       if (!res.writableEnded) res.end();
     }
+  }
+
+  /**
+   * Собирает историю запроса: системная часть плюс то, что не уместилось в компакцию.
+   *
+   * Пока разговор не сжимали — это окно последних сообщений ([ChatsService.context]). После
+   * сжатия история живёт внутри непрозрачного блока, и в запрос уходят только сообщения,
+   * созданные позже границы (`compactedUpToAt`). Системную часть отправляем и в этом случае:
+   * она короткая, кэшируется, а память владельца может меняться — иначе правка памяти не
+   * действовала бы на сжатые разговоры.
+   */
+  private async requestHistory(
+    chatId: string,
+    memory: string,
+    search: boolean,
+  ): Promise<{ messages: GrokMessage[]; compacted: boolean }> {
+    const system: GrokMessage = { role: 'system', content: systemPrompt(memory, search) };
+    const compaction = await this.chats.compaction(chatId);
+    if (!compaction) {
+      return { messages: [system, ...(await this.chats.context(chatId))], compacted: false };
+    }
+    return {
+      compacted: true,
+      messages: [
+      // Блок передаём ровно в том виде, в каком его вернул провайдер: разбирать или собирать
+      // заново нельзя, он имеет смысл только целиком. Тип сообщения здесь не роль, а запись
+      // сжатия, поэтому в общий тип GrokMessage он не входит — отсюда приведение.
+      {
+        type: 'compaction',
+        id: compaction.id,
+        encrypted_content: compaction.blob,
+      } as unknown as GrokMessage,
+        system,
+        ...(await this.chats.messagesAfter(chatId, compaction.upToAt)),
+      ],
+    };
+  }
+
+  /**
+   * Сжимает разговор в фоне, если он перерос порог.
+   *
+   * В фоне — потому что вызов компакции сам стоит токенов и времени, а ответ человеку из-за него
+   * ждать не должен. Ошибку только логируем: без сжатия разговор просто продолжит дорожать,
+   * а не сломается.
+   */
+  private compactIfNeeded(chatId: string, model: string, memory: string, search: boolean): void {
+    void (async () => {
+      try {
+        const history = await this.chats.fullHistory(chatId);
+        const chars = history.reduce((sum, m) => sum + m.content.length, 0);
+        if (chars < COMPACT_AFTER_CHARS) return;
+        const result = await this.grok.compact({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt(memory, search) },
+            ...history,
+          ],
+        });
+        if (!result) return;
+        const upTo = await this.chats.lastMessageAt(chatId);
+        if (!upTo) return;
+        await this.chats.saveCompaction(chatId, result.id, result.blob, upTo);
+        this.logger.log(`чат ${chatId}: история ${chars} симв. сжата в блок ${result.id}`);
+      } catch (e) {
+        this.logger.warn(`чат ${chatId}: компакция не удалась — ${e instanceof Error ? e.message : e}`);
+      }
+    })();
   }
 
   /**

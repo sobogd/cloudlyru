@@ -1,6 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { env } from '../config/env';
 
+/**
+ * Потолок длины ответа в токенах.
+ *
+ * Не ограничение формата, а страховка: при ошибке в подсказке или вопросе модель может уйти в
+ * «простыню» на десятки тысяч токенов, и это сразу деньги. Обычные ответы до потолка не
+ * дотягивают — самый длинный замер в наших чатах был около 1900 токенов.
+ */
+const MAX_OUTPUT_TOKENS = 2000;
+
 /** Роль сообщения в том виде, в каком её понимает API провайдера. */
 export type GrokRole = 'system' | 'user' | 'assistant';
 
@@ -47,7 +56,18 @@ export interface GrokDelta {
    */
   searching?: boolean;
   /** Расход на ответ: приходит один раз, в завершающем событии потока. */
-  usage?: { promptTokens: number; completionTokens: number; searches: number; costUsd: number };
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    /**
+     * Сколько входных токенов взято из кэша промпта. Нужно для отладки экономии: кэш у xAI
+     * живёт на конкретном сервере, и без попаданий ключ разговора (`prompt_cache_key`) не
+     * помогает — по этому числу видно, работает ли он.
+     */
+    cachedTokens: number;
+    searches: number;
+    costUsd: number;
+  };
 }
 
 /**
@@ -139,6 +159,16 @@ export class GrokService {
   async *streamChat(params: {
     model: string;
     messages: GrokMessage[];
+    /** Искать ли в интернете: инструмент подключаем только когда он нужен (см. prompts.needsSearch). */
+    search: boolean;
+    /**
+     * Ключ разговора для кэша промпта (`prompt_cache_key`).
+     *
+     * Кэш у xAI живёт на конкретном сервере, и без этого ключа запросы одного разговора
+     * разъезжаются по машинам — кэш промахивается, и вход каждый раз оплачивается по $2 за 1M
+     * вместо $0.50. Ключ стабилен для чата, поэтому ведём его идентификатором чата.
+     */
+    cacheKey: string;
     signal: AbortSignal;
   }): AsyncGenerator<GrokDelta> {
     if (!this.configured) {
@@ -162,10 +192,15 @@ export class GrokService {
           // Историю храним сами, у провайдера переписке делать нечего: с `store: true` ответы
           // лежат у него 30 дней, и это ещё одна копия личной переписки на чужой стороне.
           store: false,
-          // Поиск в интернете. Инструмент включён всегда, а искать или нет — решает модель по
-          // вопросу (`auto`-поведение у инструментов: она вызывает его, только когда данных
-          // не хватает). Один вызов поиска стоит $0.005, поэтому в лог пишем их число.
-          tools: [{ type: 'web_search' }],
+          // Кэш промпта: тот же ключ для всего разговора — иначе вход оплачивается полностью.
+          prompt_cache_key: params.cacheKey,
+          // Потолок ответа: страховка от «простыни» на сотни строк. Обычные ответы сюда не
+          // доходят (самый длинный замер — около 1900 токенов с поиском), а бесконечная
+          // генерация по ошибке обошлась бы дорого.
+          max_output_tokens: MAX_OUTPUT_TOKENS,
+          // Поиск в интернете подключаем только когда он нужен: инструмент стоит $0.005 за вызов
+          // плюс десятки тысяч входных токенов на прочитанные страницы.
+          ...(params.search ? { tools: [{ type: 'web_search' }] } : {}),
         }),
         signal: params.signal,
       });
@@ -246,6 +281,7 @@ export class GrokService {
             this.logger.log(
               `xAI ${params.model}: ответ готов за ${Date.now() - started} мс, ` +
                 `токенов ${usage ? `${usage.promptTokens}→${usage.completionTokens}` : 'неизвестно'}` +
+                (usage ? `, из кэша ${usage.cachedTokens}` : '') +
                 (usage ? `, поисков ${usage.searches}, стоимость $${usage.costUsd.toFixed(4)}` : ''),
             );
             return;
@@ -260,6 +296,59 @@ export class GrokService {
       // отпускаем соединение и при нормальном конце, и при отмене
       await reader.cancel().catch(() => undefined);
     }
+  }
+
+  /**
+   * Сжимает разговор в один непрозрачный блок (компакция контекста).
+   *
+   * Нужна потому, что каждый ответ пересылает всю предыдущую переписку: десятый вопрос в
+   * разговоре оплачивает девять предыдущих. Блок заменяет историю целиком и передаётся в
+   * следующий запрос вместо неё (`GrokService.streamChat` принимает его как сообщение).
+   *
+   * Возвращает идентификатор блока и сам блоб. Стоимость вызова — токены разговора на входе
+   * плюс сжатая запись на выходе, поэтому вызывать её стоит по порогу, а не на каждом шаге.
+   */
+  async compact(params: { model: string; messages: unknown[] }): Promise<{ id: string; blob: string } | null> {
+    if (!this.configured) return null;
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/responses/compact`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${env.GROK_API_KEY.trim()}`,
+        },
+        body: JSON.stringify({ model: params.model, input: params.messages }),
+        signal: AbortSignal.timeout(120_000),
+      });
+    } catch (e) {
+      this.logger.warn(`xAI: компакция не отправлена — ${e instanceof Error ? e.message : e}`);
+      return null;
+    }
+    if (!res.ok) {
+      const details = await res.text().catch(() => '');
+      this.logger.warn(`xAI: компакция отклонена HTTP ${res.status} — ${details.slice(0, 300)}`);
+      return null;
+    }
+    const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    const output = data?.output;
+    const item = Array.isArray(output)
+      ? (output.find(
+          (o) => typeof o === 'object' && o !== null && (o as Record<string, unknown>).type === 'compaction',
+        ) as Record<string, unknown> | undefined)
+      : undefined;
+    const blob = typeof item?.encrypted_content === 'string' ? item.encrypted_content : '';
+    const id = typeof item?.id === 'string' ? item.id : '';
+    if (!blob || !id) {
+      this.logger.warn('xAI: компакция вернула неожиданный ответ — блок не сохранён');
+      return null;
+    }
+    const usage = data?.usage as Record<string, unknown> | undefined;
+    this.logger.log(
+      `xAI: разговор сжат (${typeof usage?.dropped_message_count === 'number' ? usage.dropped_message_count : '?'} сообщений, ` +
+        `токенов ${usage?.input_tokens ?? '?'}→${usage?.output_tokens ?? '?'})`,
+    );
+    return { id, blob };
   }
 
   /**
@@ -319,6 +408,10 @@ export class GrokService {
             usage: {
               promptTokens: typeof usage?.input_tokens === 'number' ? usage.input_tokens : 0,
               completionTokens: typeof usage?.output_tokens === 'number' ? usage.output_tokens : 0,
+              cachedTokens: (() => {
+                const details = usage?.input_tokens_details as Record<string, unknown> | undefined;
+                return typeof details?.cached_tokens === 'number' ? details.cached_tokens : 0;
+              })(),
               searches:
                 typeof usage?.num_server_side_tools_used === 'number'
                   ? usage.num_server_side_tools_used

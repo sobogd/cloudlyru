@@ -1239,6 +1239,13 @@ model AiChat {
   model     String      @default("grok-4.20-0309-non-reasoning")
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
+  // Компакция контекста: разговор, сжатый провайдером в один непрозрачный блок. Каждый ответ
+  // иначе пересылает всю историю заново, и десятый вопрос в разговоре оплачивает девять
+  // предыдущих. Блок заменяет историю в запросе; `compactedUpToAt` — граница: сообщения,
+  // созданные позже, уходят в запрос как есть, остальные живут внутри блока.
+  compactionId     String?
+  compactionBlob   String?   @db.Text
+  compactedUpToAt  DateTime?
   user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages  AiMessage[]
 

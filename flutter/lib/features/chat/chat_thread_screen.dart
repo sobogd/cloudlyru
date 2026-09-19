@@ -307,7 +307,9 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
                 onChanged: (_) => setState(() {}),
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 4),
+            _searchButton(state),
+            const SizedBox(width: 4),
             state.sending
                 ? IconButton(
                     tooltip: 'Стоп',
@@ -328,6 +330,33 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
           ],
         ),
       );
+
+  /// Кнопка режима поиска в интернете.
+  ///
+  /// Поиск стоит денег: один вызов — $0.005 плюс десятки тысяч входных токенов на прочитанные
+  /// страницы, поэтому в режиме «авто» сервер подключает его только к вопросам про свежие
+  /// данные. Кнопка даёт человеку решить самому: «искать» — принудительно, «не искать» — на
+  /// вопрос по своим знаниям.
+  Widget _searchButton(ChatThreadState state) {
+    final (icon, color, hint) = switch (state.searchMode) {
+      'on' => (Icons.travel_explore, C.accent, 'Поиск в интернете: включён'),
+      'off' => (Icons.explore_off_outlined, C.fg3, 'Поиск в интернете: выключен'),
+      _ => (Icons.travel_explore, C.fg3, 'Поиск в интернете: авто (по вопросу)'),
+    };
+    return PopupMenuButton<String>(
+      tooltip: hint,
+      onSelected: (mode) => _thread.setSearchMode(mode),
+      itemBuilder: (context) => const [
+        PopupMenuItem(value: 'auto', child: Text('Авто — искать, когда нужно')),
+        PopupMenuItem(value: 'on', child: Text('Искать всегда')),
+        PopupMenuItem(value: 'off', child: Text('Не искать')),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Icon(icon, size: 24, color: color),
+      ),
+    );
+  }
 
   /// Одно сообщение переписки: вопрос человека справа, ответ модели слева.
   ///
