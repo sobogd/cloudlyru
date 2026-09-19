@@ -150,6 +150,10 @@ jobs:
             mv incoming/node_modules ./node_modules
             cp incoming/package.json ./package.json
             cp incoming/pnpm-lock.yaml ./pnpm-lock.yaml
+            # prisma перезаписываем целиком: `cp -r incoming/prisma ./prisma` при существующем
+            # каталоге копирует внутрь него и оставляет на сервере prisma/prisma/migrations —
+            # свежие миграции лежали во вложенной копии, а видимый prisma/ оставался старым
+            rm -rf prisma
             cp -r incoming/prisma ./prisma
             # Веб-клиента больше нет: раньше здесь лежала SPA из web/dist, а сервер её
             # раздавал. Приложение — только мобильное, страниц сервер не отдаёт.

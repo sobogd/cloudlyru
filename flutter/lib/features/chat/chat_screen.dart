@@ -7,6 +7,7 @@ import '../../util/widgets.dart';
 import 'ai_types.dart';
 import 'chat_controller.dart';
 import 'chat_thread_screen.dart';
+import 'memory_screen.dart';
 
 /// Раздел «Чат»: список чатов и вход в переписку.
 ///
@@ -85,6 +86,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       appBar: AppBar(
         title: const Text('Чат', style: TextStyle(color: C.fg, fontSize: 18)),
         actions: [
+          IconButton(
+            // Память — про все чаты сразу, поэтому вход в неё из списка, а не из переписки
+            tooltip: 'Память',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const MemoryScreen()),
+            ),
+            icon: const Icon(Icons.psychology_outlined),
+          ),
           IconButton(
             tooltip: 'Обновить список',
             onPressed: state.loading ? null : () => _chats.load(),

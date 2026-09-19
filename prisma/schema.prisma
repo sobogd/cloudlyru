@@ -38,6 +38,7 @@ model User {
   clipboardMode String? // 'copy' | 'cut'
   clipboardAt   DateTime?
   aiChats       AiChat[]
+  aiSettings    AiSettings?
 }
 
 model Session {
@@ -1232,10 +1233,6 @@ model AiChat {
   title     String      @default("Новый чат")
   // Идентификатор модели, который уходит провайдеру в поле `model` (например, grok-4.6).
   model     String      @default("grok-4.6")
-  // Стиль ответа (normal | caveman | humanizer): из него собирается системная подсказка
-  // запроса (src/ai/prompts.ts). Стиль у чата, а не у приложения: разговор в «пещерном»
-  // стиле не должен менять манеру соседнего чата, но новый чат наследует последний выбор.
-  style     String      @default("normal")
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1245,6 +1242,21 @@ model AiChat {
   // под этот запрос индекс и заведён.
   @@index([userId, updatedAt])
   @@map("ai_chats")
+}
+
+/// Настройки раздела «Чат» у владельца: то, что подмешивается в каждый запрос.
+///
+/// Отдельной таблицей, а не полем в `User`: это состояние одного раздела, и в общем профиле
+/// ему места нет. Строка одна на пользователя (`userId` — первичный ключ).
+model AiSettings {
+  userId    String   @id
+  // Память: свободный текст владельца о себе и о том, как отвечать. Уходит в системную часть
+  // каждого запроса, поэтому модель знает контекст разговора без повторений в каждом сообщении.
+  memory    String   @default("") @db.Text
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("ai_settings")
 }
 
 /// Сообщение диалога: вопрос человека или ответ модели.

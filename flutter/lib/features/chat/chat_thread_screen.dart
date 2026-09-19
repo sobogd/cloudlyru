@@ -122,7 +122,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
-        actions: [_stylePicker(state), _modelPicker(state)],
+        actions: [_modelPicker(state)],
       ),
       body: Column(
         children: [
@@ -158,56 +158,6 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       itemCount: state.messages.length,
       itemBuilder: (context, i) =>
           _bubble(state.messages[i], isLast: i == state.messages.length - 1),
-    );
-  }
-
-  /// Выбор стиля ответа в шапке: «Обычный», «Кейвман», «Хуманайзер».
-  ///
-  /// Стиль — это подсказка, которую собирает сервер (`src/ai/prompts.ts`), поэтому список
-  /// приходит оттуда же: приложение не хранит ни подписей, ни самих подсказок. Выбранный стиль
-  /// остаётся и в этом чате, и в следующих — переключать его заново в каждом разговоре не нужно.
-  Widget _stylePicker(ChatThreadState state) {
-    final current = state.styles.where((s) => s.id == state.style).firstOrNull;
-    final label = Text(
-      current?.title ?? 'Обычный',
-      style: const TextStyle(color: C.fg2, fontSize: 13),
-    );
-    if (state.styles.isEmpty) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        child: Center(child: label),
-      );
-    }
-    return PopupMenuButton<String>(
-      tooltip: 'Стиль ответа',
-      onSelected: (id) => _thread.setStyle(id),
-      itemBuilder: (context) => [
-        for (final s in state.styles)
-          PopupMenuItem<String>(
-            value: s.id,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  s.title,
-                  style: TextStyle(color: s.id == state.style ? C.accent : C.fg, fontSize: 14),
-                ),
-                // пояснение под подписью: по одному слову «Хуманайзер» не понять, что это
-                Text(s.hint, style: const TextStyle(color: C.fg3, fontSize: 11)),
-              ],
-            ),
-          ),
-      ],
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        child: Row(
-          children: [
-            label,
-            const Icon(Icons.arrow_drop_down, color: C.fg2),
-          ],
-        ),
-      ),
     );
   }
 

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AiController } from './ai.controller';
+import { AiSettingsService } from './ai-settings.service';
 import { ChatsService } from './chats.service';
 import { GrokService } from './grok.service';
 
@@ -11,6 +12,6 @@ import { GrokService } from './grok.service';
  */
 @Module({
   controllers: [AiController],
-  providers: [GrokService, ChatsService],
+  providers: [GrokService, ChatsService, AiSettingsService],
 })
 export class AiModule {}

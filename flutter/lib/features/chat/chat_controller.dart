@@ -88,12 +88,9 @@ class ChatsController extends Notifier<ChatsState> {
   /// Созданный чат сразу подставляется в начало списка: сервер сортирует чаты по времени
   /// последнего сообщения, и новый там и окажется — ждать перезагрузки списка незачем.
   ///
-  /// Стиль берётся из последнего выбора человека ([UiStateStore.chatStyle]): новый разговор
-  /// продолжает выбранную манеру речи, а не сбрасывается в «обычную».
   Future<AiChat?> create({String? model}) async {
-    final style = ref.read(settingsProvider).ui.chatStyle;
     try {
-      final chat = await _api.createChat(model: model, style: style);
+      final chat = await _api.createChat(model: model);
       state = state.ready(chats: [chat, ...state.chats]);
       return chat;
     } on AiApiException catch (e) {
@@ -159,14 +156,8 @@ class ChatThreadState {
   /// Модель, которой отвечает этот чат.
   final String model;
 
-  /// Стиль ответа чата (`AiStyle.id`).
-  final String style;
-
   /// Модели, доступные ключу сервера, — для выбора модели в шапке.
   final List<AiModel> models;
-
-  /// Стили ответа, доступные на сервере, — для выбора в шапке.
-  final List<AiStyle> styles;
 
   /// Переписка в порядке отправки.
   final List<AiMessage> messages;
@@ -191,9 +182,7 @@ class ChatThreadState {
     this.chatId = '',
     this.title = '',
     this.model = '',
-    this.style = 'normal',
     this.models = const [],
-    this.styles = const [],
     this.messages = const [],
     this.loading = false,
     this.sending = false,
@@ -206,9 +195,7 @@ class ChatThreadState {
   ChatThreadState copyWith({
     String? title,
     String? model,
-    String? style,
     List<AiModel>? models,
-    List<AiStyle>? styles,
     List<AiMessage>? messages,
     bool? loading,
     bool? sending,
@@ -219,9 +206,7 @@ class ChatThreadState {
         chatId: chatId,
         title: title ?? this.title,
         model: model ?? this.model,
-        style: style ?? this.style,
         models: models ?? this.models,
-        styles: styles ?? this.styles,
         messages: messages ?? this.messages,
         loading: loading ?? this.loading,
         sending: sending ?? this.sending,
@@ -235,9 +220,7 @@ class ChatThreadState {
         chatId: chatId,
         title: title,
         model: model,
-        style: style,
         models: models,
-        styles: styles,
         messages: messages,
         loading: loading,
         sending: sending,
@@ -251,9 +234,7 @@ class ChatThreadState {
         chatId: chatId,
         title: title,
         model: model,
-        style: style,
         models: models,
-        styles: styles,
         messages: messages,
         loading: loading,
         sending: sending,
@@ -303,13 +284,7 @@ class ChatThreadController extends Notifier<ChatThreadState> {
   /// Модели нужны шапке (выбор модели): их список зависит от ключа сервера, поэтому приходит
   /// оттуда, а не хардкодится в приложении.
   Future<void> open(AiChat chat) async {
-    state = ChatThreadState(
-      chatId: chat.id,
-      title: chat.title,
-      model: chat.model,
-      style: chat.style,
-      loading: true,
-    );
+    state = ChatThreadState(chatId: chat.id, title: chat.title, model: chat.model, loading: true);
     try {
       final messages = await _api.messages(chat.id);
       if (state.chatId != chat.id) return; // чат успели сменить, пока шла загрузка
@@ -323,30 +298,6 @@ class ChatThreadController extends Notifier<ChatThreadState> {
       state = state.copyWith(models: reply.models);
     } on AiApiException {
       // без списка моделей переписка работает: модель уже выбрана и сохранена в чате
-    }
-    try {
-      final styles = await _api.styles();
-      if (state.chatId != chat.id) return;
-      state = state.copyWith(styles: styles);
-    } on AiApiException {
-      // без списка стилей тоже: стиль чата уже известен, просто переключить его не из чего
-    }
-  }
-
-  /// Меняет стиль ответа чата и запоминает выбор для следующих чатов.
-  ///
-  /// Стиль уходит на сервер: подсказку собирает он, приложение её не знает.
-  Future<void> setStyle(String style) async {
-    final chatId = state.chatId;
-    if (chatId.isEmpty || style == state.style) return;
-    state = state.copyWith(style: style);
-    await ref.read(settingsProvider).ui.setChatStyle(style);
-    try {
-      await _api.patchChat(chatId, style: style);
-    } on AiApiException catch (e) {
-      // стиль уже показан выбранным, но сервер его не принял — говорим об этом прямо,
-      // иначе человек будет думать, что модель отвечает в новом стиле, а она не будет
-      state = state.withError(e.message);
     }
   }
 

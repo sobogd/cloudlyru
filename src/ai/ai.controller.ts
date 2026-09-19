@@ -8,6 +8,7 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   Req,
   Res,
 } from '@nestjs/common';
@@ -15,7 +16,8 @@ import type { Request, Response } from 'express';
 import { ChatsService } from './chats.service';
 import { GrokDelta, GrokError, GrokService } from './grok.service';
 import { ApiError, badRequest } from '../common/errors';
-import { styleList, systemPrompt } from './prompts';
+import { AiSettingsService } from './ai-settings.service';
+import { systemPrompt } from './prompts';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 
 /** Потолок длины вопроса: у модели контекст в сотни тысяч токенов, но платят за каждый. */
@@ -37,6 +39,7 @@ export class AiController {
   constructor(
     private readonly grok: GrokService,
     private readonly chats: ChatsService,
+    private readonly settings: AiSettingsService,
   ) {}
 
   /**
@@ -51,15 +54,29 @@ export class AiController {
     return { configured: this.grok.configured, models };
   }
 
+  /** Память владельца: текст, который подмешивается в системную часть каждого запроса. */
+  @Get('settings')
+  async getSettings(@CurrentUser() user: RequestUser) {
+    return { memory: await this.settings.memory(user.id) };
+  }
+
   /**
-   * Стили ответа: идентификатор, подпись и короткое пояснение.
+   * Запись памяти владельца.
    *
-   * Подписи живут на сервере вместе с подсказками (src/ai/prompts.ts): приложение показывает
-   * ровно те стили, которые сервер умеет применить, и не хранит их список у себя.
+   * Тип проверяется руками (в проекте нет `ValidationPipe`): объект вместо строки уронил бы
+   * Prisma, а причина была бы не видна ни в логе, ни в интерфейсе.
    */
-  @Get('styles')
-  styles() {
-    return { styles: styleList() };
+  @Put('settings')
+  async putSettings(
+    @Body() body: Record<string, unknown> = {},
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (body.memory !== undefined && typeof body.memory !== 'string') {
+      throw badRequest('memory must be a string');
+    }
+    const memory = await this.settings.saveMemory(user.id, typeof body.memory === 'string' ? body.memory : '');
+    this.logger.log(`память обновлена: ${memory.length} симв.`);
+    return { memory };
   }
 
   /** Список чатов владельца — темы, свежие сверху. */
@@ -68,11 +85,11 @@ export class AiController {
     return this.chats.list(user.id).then((chats) => ({ chats }));
   }
 
-  /** Новый чат; модель и стиль можно не указывать — подставятся значения по умолчанию. */
+  /** Новый чат; модель можно не указывать — подставится модель по умолчанию. */
   @Post('chats')
   async createChat(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {
-    const chat = await this.chats.create(user.id, body.model, body.style);
-    this.logger.log(`чат создан: ${chat.id} (модель ${chat.model}, стиль ${chat.style})`);
+    const chat = await this.chats.create(user.id, body.model);
+    this.logger.log(`чат создан: ${chat.id} (модель ${chat.model})`);
     return chat;
   }
 
@@ -137,6 +154,9 @@ export class AiController {
     // владелец проверяется до сохранения вопроса: чужой чат не должен обрастать сообщениями
     const chat = await this.chats.owned(user.id, id);
     const context = await this.chats.context(chat.id);
+    // память читаем на каждый запрос, а не кэшируем: она меняется в настройках, и запрос после
+    // правки должен уходить уже с новым текстом
+    const memory = await this.settings.memory(user.id);
     await this.chats.append({ chatId: chat.id, role: 'user', content: question });
     // тема берётся из первого вопроса: у нового чата она ещё пустая
     const titled = context.length === 0 && chat.title === 'Новый чат';
@@ -144,7 +164,7 @@ export class AiController {
 
     this.logger.log(
       `чат ${chat.id}: вопрос ${question.length} симв., истории ${context.length} сообщений, ` +
-        `модель ${chat.model}, стиль ${chat.style}`,
+        `модель ${chat.model}, память ${memory.length} симв.`,
     );
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -174,7 +194,7 @@ export class AiController {
       for await (const delta of this.grok.streamChat({
         model: chat.model,
         messages: [
-          { role: 'system', content: systemPrompt(chat.style) },
+          { role: 'system', content: systemPrompt(memory) },
           ...context,
           { role: 'user', content: question },
         ],

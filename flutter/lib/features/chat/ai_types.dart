@@ -67,32 +67,6 @@ class AiModel {
   }
 }
 
-/// Стиль ответа: как модель говорит (задаётся подсказкой на сервере).
-///
-/// Список стилей приходит с сервера (`GET /ai/styles`) — там же живут их подсказки, поэтому
-/// приложение показывает ровно то, что сервер умеет применить.
-@immutable
-class AiStyle {
-  /// Идентификатор стиля для поля `style` (`normal`, `caveman`, `humanizer`).
-  final String id;
-
-  /// Подпись для списка выбора.
-  final String title;
-
-  /// Короткое пояснение: что стиль делает с ответом.
-  final String hint;
-
-  /// Стиль с подписью и пояснением.
-  const AiStyle({required this.id, required this.title, required this.hint});
-
-  /// Разбор стиля из ответа сервера.
-  factory AiStyle.fromJson(Map<String, dynamic> json) => AiStyle(
-        id: json['id']?.toString() ?? '',
-        title: json['title']?.toString() ?? '',
-        hint: json['hint']?.toString() ?? '',
-      );
-}
-
 /// Чат в списке: тема, модель и когда в нём последний раз что-то происходило.
 @immutable
 class AiChat {
@@ -105,9 +79,6 @@ class AiChat {
   /// Модель, которой отвечает этот чат.
   final String model;
 
-  /// Стиль ответа чата (`AiStyle.id`).
-  final String style;
-
   /// Время последнего сообщения (сервер отдаёт по нему сортировку списка).
   final DateTime? updatedAt;
 
@@ -119,7 +90,6 @@ class AiChat {
     required this.id,
     required this.title,
     required this.model,
-    this.style = 'normal',
     this.updatedAt,
     this.messages = 0,
   });
@@ -129,7 +99,6 @@ class AiChat {
         id: json['id']?.toString() ?? '',
         title: json['title']?.toString() ?? 'Чат',
         model: json['model']?.toString() ?? '',
-        style: json['style']?.toString() ?? 'normal',
         updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? '')?.toLocal(),
         messages: json['messages'] is int ? json['messages'] as int : 0,
       );
