@@ -13,45 +13,62 @@ import {
   Res,
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { ChatsService, COMPACT_AFTER_CHARS } from './chats.service';
-import { GrokDelta, GrokError, GrokMessage, GrokService } from './grok.service';
+import { randomUUID } from 'node:crypto';
+import { ChatsService, COMPACT_AFTER_CHARS, DEFAULT_AI_MODEL } from './chats.service';
+import { LlmDelta, LlmError, LlmMessage, LlmService } from './llm.service';
+import { SearchService } from './search.service';
+import {
+  COMPACT_HEADER,
+  COMPACT_PROMPT,
+  needsSearch,
+  searchBlock,
+  systemPrompt,
+} from './prompts';
 import { ApiError, badRequest } from '../common/errors';
 import { AiSettingsService } from './ai-settings.service';
-import { needsSearch, systemPrompt } from './prompts';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 
-/** Потолок длины вопроса: у модели контекст в сотни тысяч токенов, но платят за каждый. */
+/** Потолок длины вопроса: у модели контекст в сотни тысяч токенов, но префилл на маке — время. */
 const MAX_QUESTION_CHARS = 8_000;
 
 /**
  * Раздел «Чат»: модели, чаты, сообщения и поток ответа.
  *
- * Провайдера ИИ здесь представляет сервер, а не приложение: ключ xAI лежит в окружении сервера
- * (`GROK_API_KEY`) и на клиент не уходит, каждый запрос и ответ провайдера попадает в лог
- * (`pm2 logs`), а переписка хранится в БД и доступна с любого устройства. Первый заход был
- * сделан наоборот — ключ вшивался в сборку приложения, — и разобрать «не работает» было нечем:
- * ни причины отказа, ни истории, ни возможности что-то поправить без новой сборки.
+ * Отвечает локальная модель на домашнем маке (LM Studio), но запросы всё равно делает сервер:
+ * так история чатов живёт в БД и доступна с любого устройства, причины отказов попадают в лог
+ * (`pm2 logs`), а на телефоне не нужно ни адреса туннеля, ни ключа. Мак соединён с VPS
+ * reverse-SSH туннелем, поэтому для сервера это обычный `http://127.0.0.1:18812`.
+ *
+ * Плата за бесплатность — доступность: мак может спать или потерять сеть, и тогда раздел честно
+ * отвечает «локальная модель недоступна», а не притворяется, что модель думает.
  */
 @Controller('ai')
 export class AiController {
   private readonly logger = new Logger(AiController.name);
 
   constructor(
-    private readonly grok: GrokService,
+    private readonly llm: LlmService,
+    private readonly search: SearchService,
     private readonly chats: ChatsService,
     private readonly settings: AiSettingsService,
   ) {}
 
   /**
-   * Модели, доступные ключу сервера, и признак «ключ вообще задан».
+   * Модели, загруженные в LM Studio, и признак «раздел вообще может работать».
    *
-   * Признак нужен клиенту, чтобы отличить «на сервере нет ключа» (это чинится секретом
-   * репозитория, в приложении делать нечего) от «список не пришёл» (это сеть).
+   * Недоступный мак — это не ошибка запроса, а состояние: отдаём пустой список и
+   * `configured: false`, чтобы клиент показал «локальная модель недоступна» вместо «не удалось
+   * получить список». Иначе человек видел бы сбой сети там, где на самом деле спит его мак.
    */
   @Get('models')
   async models() {
-    const models = await this.grok.listModels();
-    return { configured: this.grok.configured, models };
+    try {
+      const models = await this.llm.listModels();
+      return { configured: true, models };
+    } catch (e) {
+      this.logger.warn(`список моделей не получен — ${e instanceof Error ? e.message : e}`);
+      return { configured: false, models: [] };
+    }
   }
 
   /** Память владельца: текст, который подмешивается в системную часть каждого запроса. */
@@ -120,14 +137,14 @@ export class AiController {
   /**
    * Отправка вопроса: ответ уходит потоком SSE, переписка сохраняется в БД.
    *
-   * Лимит 20 запросов в минуту на IP: каждый запрос — платный вызов провайдера, и «случайный»
-   * цикл на клиенте стоит денег, а не времени. Поток отдаём сами (`@Res`), потому что Nest не
-   * умеет отдавать незакрытый ответ: события пишутся по мере генерации, соединение живёт
-   * до конца ответа.
+   * Лимит 20 запросов в минуту на IP: модель локальная и бесплатная, но она одна и считает на
+   * одном маке — «случайный» цикл на клиенте займёт её целиком, и владелец будет ждать ответа
+   * минутами. Поток отдаём сами (`@Res`), потому что Nest не умеет отдавать незакрытый ответ:
+   * события пишутся по мере генерации, соединение живёт до конца ответа.
    *
-   * Коды до начала потока (нет ключа, пустой вопрос, чужой чат) уходят обычной ошибкой API —
-   * их ловит глобальный фильтр. Всё, что случилось внутри потока, приходит событием `error`:
-   * заголовки уже отправлены, и подменить ответ на JSON нельзя.
+   * Коды до начала потока (адрес модели не задан, пустой вопрос, чужой чат) уходят обычной
+   * ошибкой API — их ловит глобальный фильтр. Всё, что случилось внутри потока, приходит
+   * событием `error`: заголовки уже отправлены, и подменить ответ на JSON нельзя.
    */
   @Post('chats/:id/messages')
   @RateLimit(20, 60_000)
@@ -140,37 +157,33 @@ export class AiController {
   ): Promise<void> {
     const question = typeof body.text === 'string' ? body.text.trim() : '';
     // Поиск: клиент может настоять на своём (`search: true/false`), иначе решаем по тексту
-    // вопроса. Инструмент стоит $0.005 за вызов плюс десятки тысяч входных токенов на
-    // прочитанные страницы, поэтому «на всякий случай» его не подключаем.
-    const search = typeof body.search === 'boolean' ? body.search : needsSearch(question);
+    // вопроса. Поиск бесплатный, но не мгновенный (несколько секунд до выдачи), поэтому «на
+    // всякий случай» его не подключаем.
+    const wantSearch = typeof body.search === 'boolean' ? body.search : needsSearch(question);
     if (!question) throw badRequest('текст сообщения пуст', 'empty_message');
     if (question.length > MAX_QUESTION_CHARS) {
       throw badRequest(`сообщение длиннее ${MAX_QUESTION_CHARS} символов`, 'message_too_long');
     }
-    if (!this.grok.configured) {
+    if (!this.llm.configured) {
       throw new ApiError(
         HttpStatus.SERVICE_UNAVAILABLE,
-        'на сервере не задан ключ xAI (GROK_API_KEY)',
+        'на сервере не задан адрес локальной модели (LLM_BASE_URL)',
         'ai_not_configured',
       );
     }
 
     // владелец проверяется до сохранения вопроса: чужой чат не должен обрастать сообщениями
     const chat = await this.chats.owned(user.id, id);
+    // модель для запроса: у старых чатов в БД записан идентификатор xAI, которого на маке нет
+    const model = await this.llm.resolveModel(chat.model);
     // память читаем на каждый запрос, а не кэшируем: она меняется в настройках, и запрос после
     // правки должен уходить уже с новым текстом
     const memory = await this.settings.memory(user.id);
-    const history = await this.requestHistory(chat.id, memory, search);
+    const history = await this.requestHistory(chat.id, memory);
     await this.chats.append({ chatId: chat.id, role: 'user', content: question });
     // тема берётся из первого вопроса: у нового чата в истории только системная часть
     const titled = history.messages.length <= 1 && chat.title === 'Новый чат';
     const title = titled ? await this.chats.retitleFromQuestion(chat.id, question) : null;
-
-    this.logger.log(
-      `чат ${chat.id}: вопрос ${question.length} симв., истории ${history.messages.length - 1} ` +
-        `сообщений${history.compacted ? ' (разговор сжат)' : ''}, модель ${chat.model}, ` +
-        `память ${memory.length} симв., поиск ${search ? 'включён' : 'выключен'}`,
-    );
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -181,9 +194,29 @@ export class AiController {
 
     if (title) this.event(res, 'title', { title });
 
-    // Разрыв со стороны клиента (уход с экрана, «Стоп», потеря сети) должен гасить и запрос
-    // к xAI: иначе генерация идёт до конца, а токены списываются за ответ, которого никто
-    // не увидит.
+    // Поиск идёт до генерации и занимает секунды: без события экран не понимал бы, что
+    // происходит, и выглядел бы зависшим. Статус снимаем сразу после поиска, а не по первому
+    // слову ответа: между ними может пройти десяток секунд префилла.
+    let searched = 0;
+    let userContent = question;
+    if (wantSearch) {
+      this.event(res, 'status', { searching: true });
+      const outcome = await this.search.search(question);
+      this.event(res, 'status', { searching: false });
+      if (outcome.results.length) {
+        searched = 1;
+        userContent = `${searchBlock(outcome.results)}\n\nВопрос: ${question}`;
+      }
+    }
+
+    this.logger.log(
+      `чат ${chat.id}: вопрос ${question.length} симв., истории ${history.messages.length - 1} ` +
+        `сообщений${history.compacted ? ' (разговор сжат)' : ''}, модель ${model}, ` +
+        `память ${memory.length} симв., поиск ${wantSearch ? (searched ? 'с результатами' : 'без результатов') : 'выключен'}`,
+    );
+
+    // Разрыв со стороны клиента (уход с экрана, «Стоп», потеря сети) должен гасить и запрос к
+    // модели: иначе мак продолжит считать ответ, которого уже никто не увидит.
     const abort = new AbortController();
     let closed = false;
     req.on('close', () => {
@@ -194,21 +227,18 @@ export class AiController {
     let answer = '';
     let reasoning = '';
     // расход приходит одним событием в конце; тип берём у сервиса, чтобы поля не разъезжались
-    let usage: GrokDelta['usage'];
+    let usage: LlmDelta['usage'];
     try {
-      for await (const delta of this.grok.streamChat({
-        model: chat.model,
-        messages: [...history.messages, { role: 'user', content: question }],
-        search,
-        // ключ кэша промпта: у xAI кэш живёт на конкретном сервере, и один ключ на разговор
-        // удерживает запросы на одной машине — иначе вход каждый раз оплачивается полностью
-        cacheKey: chat.id,
+      for await (const delta of this.llm.streamChat({
+        model,
+        messages: [...history.messages, { role: 'user', content: userContent }],
         signal: abort.signal,
       })) {
-        if (delta.usage) usage = delta.usage;
-        // поиск в интернете виден отдельным событием: с ним ответ идёт десятками секунд, и
-        // экран должен показывать, что модель ищет, а не «зависла»
-        if (delta.searching !== undefined) this.event(res, 'status', { searching: delta.searching });
+        if (delta.usage) {
+          // поисков у локальной модели не бывает — их делает сервер, поэтому число подставляем
+          // здесь: сервис модели об этом ничего не знает
+          usage = { ...delta.usage, searches: searched };
+        }
         if (delta.reasoning) {
           reasoning += delta.reasoning;
           this.event(res, 'reasoning', { text: delta.reasoning });
@@ -229,15 +259,15 @@ export class AiController {
             reasoning,
             promptTokens: usage?.promptTokens,
             completionTokens: usage?.completionTokens,
-            // стоимость сохраняем вместе с ответом: по ней считается расход по чату
+            // стоимость сохраняем вместе с ответом: у локальной модели это всегда ноль, но поле
+            // остаётся — по нему старые ответы xAI продолжают считаться в расходе по чату
             costUsd: usage?.costUsd,
           })
         : null;
       this.logger.log(
         `чат ${chat.id}: ответ ${answer.length} симв., размышления ${reasoning.length} симв.` +
           (usage
-            ? `, токенов ${usage.promptTokens}→${usage.completionTokens}, ` +
-              `поисков ${usage.searches}, стоимость $${usage.costUsd.toFixed(4)}`
+            ? `, токенов ${usage.promptTokens}→${usage.completionTokens}, поисков ${usage.searches}`
             : ''),
       );
       this.event(res, 'done', {
@@ -245,7 +275,7 @@ export class AiController {
         usage: usage ?? null,
         interrupted: closed,
       });
-      this.compactIfNeeded(chat.id, chat.model, memory, search);
+      this.compactIfNeeded(chat.id, model);
     } catch (e) {
       await this.fail(res, chat.id, e, answer, reasoning, usage, closed);
     } finally {
@@ -257,17 +287,18 @@ export class AiController {
    * Собирает историю запроса: системная часть плюс то, что не уместилось в компакцию.
    *
    * Пока разговор не сжимали — это окно последних сообщений ([ChatsService.context]). После
-   * сжатия история живёт внутри непрозрачного блока, и в запрос уходят только сообщения,
-   * созданные позже границы (`compactedUpToAt`). Системную часть отправляем и в этом случае:
-   * она короткая, кэшируется, а память владельца может меняться — иначе правка памяти не
-   * действовала бы на сжатые разговоры.
+   * сжатия история живёт внутри выжимки, и в запрос уходят только сообщения, созданные позже
+   * границы (`compactedUpToAt`). Системную часть отправляем и в этом случае: она короткая и по
+   * ней модель понимает, как отвечать.
+   *
+   * Выжимка идёт отдельным сообщением сразу за системным, а не вклеивается в него: так модель
+   * видит, что это пересказ прежнего разговора, а не правило поведения.
    */
   private async requestHistory(
     chatId: string,
     memory: string,
-    search: boolean,
-  ): Promise<{ messages: GrokMessage[]; compacted: boolean }> {
-    const system: GrokMessage = { role: 'system', content: systemPrompt(memory, search) };
+  ): Promise<{ messages: LlmMessage[]; compacted: boolean }> {
+    const system: LlmMessage = { role: 'system', content: systemPrompt(memory) };
     const compaction = await this.chats.compaction(chatId);
     if (!compaction) {
       return { messages: [system, ...(await this.chats.context(chatId))], compacted: false };
@@ -275,15 +306,8 @@ export class AiController {
     return {
       compacted: true,
       messages: [
-      // Блок передаём ровно в том виде, в каком его вернул провайдер: разбирать или собирать
-      // заново нельзя, он имеет смысл только целиком. Тип сообщения здесь не роль, а запись
-      // сжатия, поэтому в общий тип GrokMessage он не входит — отсюда приведение.
-      {
-        type: 'compaction',
-        id: compaction.id,
-        encrypted_content: compaction.blob,
-      } as unknown as GrokMessage,
         system,
+        { role: 'system', content: `${COMPACT_HEADER}\n${compaction.blob}` },
         ...(await this.chats.messagesAfter(chatId, compaction.upToAt)),
       ],
     };
@@ -292,28 +316,31 @@ export class AiController {
   /**
    * Сжимает разговор в фоне, если он перерос порог.
    *
-   * В фоне — потому что вызов компакции сам стоит токенов и времени, а ответ человеку из-за него
-   * ждать не должен. Ошибку только логируем: без сжатия разговор просто продолжит дорожать,
-   * а не сломается.
+   * В фоне — потому что это отдельная генерация на маке (десятки секунд его времени), а ответ
+   * человеку из-за неё ждать не должен. Ошибку только логируем: без сжатия разговор просто
+   * продолжит отвечать медленнее, а не сломается.
    */
-  private compactIfNeeded(chatId: string, model: string, memory: string, search: boolean): void {
+  private compactIfNeeded(chatId: string, model: string): void {
     void (async () => {
       try {
         const history = await this.chats.fullHistory(chatId);
         const chars = history.reduce((sum, m) => sum + m.content.length, 0);
         if (chars < COMPACT_AFTER_CHARS) return;
-        const result = await this.grok.compact({
+        // В компакцию уходят только реплики разговора: системная подсказка (и память) в
+        // выжимке не нужны — они и так уходят в каждый запрос заново, а лишнее системное
+        // сообщение перед инструкцией сбивает модель с задачи (см. `LlmService.compact`).
+        const blob = await this.llm.compact({
           model,
-          messages: [
-            { role: 'system', content: systemPrompt(memory, search) },
-            ...history,
-          ],
+          prompt: COMPACT_PROMPT,
+          messages: history,
         });
-        if (!result) return;
+        if (!blob) return;
         const upTo = await this.chats.lastMessageAt(chatId);
         if (!upTo) return;
-        await this.chats.saveCompaction(chatId, result.id, result.blob, upTo);
-        this.logger.log(`чат ${chatId}: история ${chars} симв. сжата в блок ${result.id}`);
+        // Идентификатор блока больше не приходит от провайдера: выжимку пишем мы сами, и он
+        // нужен только чтобы в логах было видно, какая именно выжимка лежит в чате.
+        await this.chats.saveCompaction(chatId, randomUUID(), blob, upTo);
+        this.logger.log(`чат ${chatId}: история ${chars} симв. сжата в выжимку ${blob.length} симв.`);
       } catch (e) {
         this.logger.warn(`чат ${chatId}: компакция не удалась — ${e instanceof Error ? e.message : e}`);
       }
@@ -332,7 +359,7 @@ export class AiController {
     e: unknown,
     answer: string,
     reasoning: string,
-    usage: GrokDelta['usage'],
+    usage: LlmDelta['usage'],
     closed: boolean,
   ): Promise<void> {
     const aborted = closed || (e instanceof Error && e.name === 'AbortError');
@@ -352,9 +379,10 @@ export class AiController {
       return;
     }
 
-    // В логе — причина от провайдера целиком: по ней и разбирают, почему раздел не работает.
-    const message = e instanceof GrokError ? e.message : 'не удалось получить ответ';
-    const details = e instanceof GrokError ? e.details : e instanceof Error ? e.message : String(e);
+    // В логе — причина от сервера модели целиком: по ней и разбирают, почему раздел не работает
+    // (упал туннель, мак уснул, модель не загружена, контекст не влез).
+    const message = e instanceof LlmError ? e.message : 'не удалось получить ответ';
+    const details = e instanceof LlmError ? e.details : e instanceof Error ? e.message : String(e);
     this.logger.error(`чат ${chatId}: ${message}${details ? ` — ${details.slice(0, 500)}` : ''}`);
 
     if (answer) {

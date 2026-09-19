@@ -2,16 +2,19 @@ import { Module } from '@nestjs/common';
 import { AiController } from './ai.controller';
 import { AiSettingsService } from './ai-settings.service';
 import { ChatsService } from './chats.service';
-import { GrokService } from './grok.service';
+import { LlmService } from './llm.service';
+import { SearchService } from './search.service';
 
 /**
- * Раздел «Чат»: чаты, история и запросы к модели.
+ * Раздел «Чат»: чаты, история, поиск и запросы к модели.
  *
- * Провайдер ИИ подключён на стороне сервера (ключ в его окружении), поэтому модуль ни от
- * чего не зависит, кроме Prisma: клиент приложения ходит только в наши ручки.
+ * Сама модель живёт не на сервере, а на домашнем маке: сюда она приходит через reverse-SSH
+ * туннель (`LLM_BASE_URL`, по умолчанию 127.0.0.1:18812), поиск — оттуда же (18814). Модуль
+ * по-прежнему не зависит ни от чего, кроме Prisma: клиент приложения ходит только в наши ручки
+ * и ни адресов туннеля, ни ключей не знает.
  */
 @Module({
   controllers: [AiController],
-  providers: [GrokService, ChatsService, AiSettingsService],
+  providers: [LlmService, SearchService, ChatsService, AiSettingsService],
 })
 export class AiModule {}

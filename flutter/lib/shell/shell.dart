@@ -158,7 +158,7 @@ class _ShellState extends ConsumerState<Shell> {
           // инвойсов, расходы и квартальные декларации. Стоит рядом с «Картой», потому что
           // это такая же отдельная зона приложения, а не часть файлов.
           NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: 'Фактуры'),
-          // «Чат» — разговор с моделью ИИ по ключу владельца (xAI/Grok). Отдельный раздел, а не
+          // «Чат» — разговор с локальной моделью владельца (LM Studio на его маке). Отдельный раздел, а не
           // кнопка внутри другого: это такая же самостоятельная зона приложения, как «Файлы».
           NavigationDestination(icon: Icon(Icons.chat_bubble_outline), selectedIcon: Icon(Icons.chat_bubble), label: 'Чат'),
           NavigationDestination(icon: Icon(Icons.delete_outline), selectedIcon: Icon(Icons.delete), label: 'Корзина'),
