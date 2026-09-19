@@ -21,14 +21,33 @@ export interface GrokModel {
   outputPricePerMillion: number | null;
 }
 
+/**
+ * Разобранная строка потока: порция ответа ([delta]) и признак того, что поток на ней
+ * закончился ([terminal]).
+ *
+ * Терминальное событие приносит расход и стоимость, поэтому просто отбросить его нельзя:
+ * без пометки поток выглядел бы оборванным, и в лог на каждый ответ шло бы предупреждение.
+ */
+type ParsedFrame =
+  | { delta?: GrokDelta; terminal: boolean }
+  | 'failed'
+  | null;
+
 /** Порция ответа модели. */
 export interface GrokDelta {
   /** Кусок текста ответа. */
   text?: string;
   /** Кусок «размышлений» reasoning-модели. */
   reasoning?: string;
-  /** Расход токенов на текущий момент (провайдер присылает его в каждом чанке). */
-  usage?: { promptTokens: number; completionTokens: number };
+  /**
+   * Модель пошла искать в интернете (`true`) или закончила искать (`false`).
+   *
+   * Отдельным событием, а не молчанием: с поиском ответ идёт десятками секунд, и человек
+   * должен видеть, что происходит, а не решать, что чат завис.
+   */
+  searching?: boolean;
+  /** Расход на ответ: приходит один раз, в завершающем событии потока. */
+  usage?: { promptTokens: number; completionTokens: number; searches: number; costUsd: number };
 }
 
 /**
@@ -58,10 +77,15 @@ export class GrokError extends Error {
  * у провайдера причин отказа много (ключ, квота, недоступная модель, лимит), и по ответу
  * «не работает» без лога не отличить одну от другой.
  *
- * Почему `chat/completions`, хотя у xAI он помечен legacy: это документированный
- * OpenAI-совместимый SSE, которого достаточно для чата. `/v1/responses` тянет за собой
- * хранение истории на стороне провайдера — это отдельное решение, его принимают, когда
- * понадобятся инструменты и веб-поиск.
+ * Почему `responses`, а не `chat/completions`: поиск в интернете (серверный инструмент
+ * `web_search`) существует только здесь. Старый способ включить поиск в `chat/completions`
+ * (`search_parameters`, он же Live Search) провайдер отключил — на живой запрос он отвечает
+ * `410 Live search is deprecated`, из-за чего модель без инструментов честно говорила, что
+ * свежих данных у неё нет (её знания заканчиваются 1 февраля 2026). `chat/completions` при
+ * этом официально legacy, так что переезд нужен был в любом случае.
+ *
+ * Историю по-прежнему храним сами (`store: false`): переписка лежит в нашей БД, у провайдера
+ * ей делать нечего. Расход и точная стоимость ответа приходят в завершающем событии потока.
  */
 @Injectable()
 export class GrokService {
@@ -121,7 +145,7 @@ export class GrokService {
       throw new GrokError('на сервере не задан ключ xAI (GROK_API_KEY)');
     }
     const started = Date.now();
-    const url = `${this.baseUrl}/chat/completions`;
+    const url = `${this.baseUrl}/responses`;
     let res: Response;
     try {
       res = await fetch(url, {
@@ -132,13 +156,16 @@ export class GrokService {
         },
         body: JSON.stringify({
           model: params.model,
-          messages: params.messages,
+          // В Responses API история называется `input`; роли те же (system/user/assistant)
+          input: params.messages,
           stream: true,
-          // Без этого поля xAI не присылает `usage` в потоке вообще: расход токенов остаётся
-          // неизвестным, и «сколько это стоило» посчитать нечем. В документации xAI пример
-          // потока показывает usage как обычное дело, но по факту он приходит только по
-          // запросу — проверено на живом API.
-          stream_options: { include_usage: true },
+          // Историю храним сами, у провайдера переписке делать нечего: с `store: true` ответы
+          // лежат у него 30 дней, и это ещё одна копия личной переписки на чужой стороне.
+          store: false,
+          // Поиск в интернете. Инструмент включён всегда, а искать или нет — решает модель по
+          // вопросу (`auto`-поведение у инструментов: она вызывает его, только когда данных
+          // не хватает). Один вызов поиска стоит $0.005, поэтому в лог пишем их число.
+          tools: [{ type: 'web_search' }],
         }),
         signal: params.signal,
       });
@@ -173,6 +200,10 @@ export class GrokService {
     const decoder = new TextDecoder();
     let buffer = '';
     let usage: GrokDelta['usage'];
+    // Идёт ли поиск прямо сейчас. Следим за переходами сами: провайдер присылает «начал» и
+    // «закончил» на каждый вызов, а вызовов за один ответ бывает несколько — без склейки
+    // подпись «Ищу в интернете…» мигала бы на экране по три раза за ответ.
+    let searching = false;
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -182,22 +213,48 @@ export class GrokService {
         // последний кусок строки может быть неполным — оставляем его до следующего чтения
         buffer = lines.pop() ?? '';
         for (const line of lines) {
-          const delta = this.parseFrame(line);
-          if (delta === 'done') {
+          const parsed = this.parseFrame(line);
+          if (parsed === 'failed') {
+            // провайдер сам сообщил, что запрос не удался: причину уже залогировали в parseFrame
+            return;
+          }
+          if (!parsed) continue;
+
+          const delta = parsed.delta;
+          if (delta) {
+            if (delta.searching === true) {
+              // сообщаем только о начале поиска; «закончил искать» само по себе не показываем —
+              // модель может тут же пойти искать второй раз
+              if (!searching) {
+                searching = true;
+                yield { searching: true };
+              }
+            } else if (delta.searching === false) {
+              // переход «поиск закончен» на экран не отдаём: его снимает первый же текст
+            } else {
+              if (delta.usage) usage = delta.usage;
+              // пошёл текст — значит поиск позади, снимаем подпись
+              if (delta.text && searching) {
+                searching = false;
+                yield { searching: false };
+              }
+              yield delta;
+            }
+          }
+
+          if (parsed.terminal) {
             this.logger.log(
               `xAI ${params.model}: ответ готов за ${Date.now() - started} мс, ` +
-                `токенов ${usage ? `${usage.promptTokens}→${usage.completionTokens}` : 'неизвестно'}`,
+                `токенов ${usage ? `${usage.promptTokens}→${usage.completionTokens}` : 'неизвестно'}` +
+                (usage ? `, поисков ${usage.searches}, стоимость $${usage.costUsd.toFixed(4)}` : ''),
             );
             return;
           }
-          if (!delta) continue;
-          if (delta.usage) usage = delta.usage;
-          yield delta;
         }
       }
-      // поток кончился без [DONE]: так бывает при обрыве на стороне провайдера
+      // поток кончился без завершающего события: так бывает при обрыве на стороне провайдера
       this.logger.warn(
-        `xAI ${params.model}: поток закончился без [DONE] за ${Date.now() - started} мс`,
+        `xAI ${params.model}: поток закончился без завершающего события за ${Date.now() - started} мс`,
       );
     } finally {
       // отпускаем соединение и при нормальном конце, и при отмене
@@ -206,18 +263,27 @@ export class GrokService {
   }
 
   /**
-   * Разбирает одну строку SSE.
+   * Разбирает одну строку SSE Responses API.
    *
-   * Возвращает порцию ответа, строку `'done'` на признаке конца или `null`, если разбирать
-   * нечего. Битый JSON не считается ошибкой потока: одна неразобранная порция — потеря
-   * нескольких символов, тогда как исключение здесь оборвало бы всю генерацию.
+   * Возвращает порцию ответа, `'done'` на завершающем событии, `'failed'` на отказе провайдера
+   * или `null`, если разбирать нечего. Битый JSON не считается ошибкой потока: одна
+   * неразобранная порция — потеря нескольких символов, тогда как исключение здесь оборвало бы
+   * всю генерацию.
+   *
+   * Имена событий отличаются от `chat/completions`: текст приходит `response.output_text.delta`,
+   * «размышления» — `response.reasoning_summary_text.delta` (у Responses это краткое изложение
+   * хода мысли), расход и стоимость — одним событием `response.completed`, поиск виден по
+   * `response.web_search_call.*`. Набор проверен на живом API: перечисленные события приходят
+   * с включённым `web_search`, и завершающего `data: [DONE]` здесь нет вовсе.
    */
-  private parseFrame(rawLine: string): GrokDelta | 'done' | null {
+  private parseFrame(rawLine: string): ParsedFrame {
     const line = rawLine.trim();
     if (!line.startsWith('data:')) return null;
     const payload = line.slice('data:'.length).trim();
     if (!payload) return null;
-    if (payload === '[DONE]') return 'done';
+    // завершающая строка осталась от прежнего формата — принимаем и её, чтобы смена
+    // провайдером вида потока не превращалась в «поток без конца»
+    if (payload === '[DONE]') return { terminal: true };
 
     let decoded: unknown;
     try {
@@ -227,28 +293,63 @@ export class GrokService {
     }
     if (typeof decoded !== 'object' || decoded === null) return null;
     const frame = decoded as Record<string, unknown>;
+    const type = typeof frame.type === 'string' ? frame.type : '';
 
-    const out: GrokDelta = {};
-    const choices = frame.choices;
-    if (Array.isArray(choices) && choices.length > 0) {
-      const first = choices[0] as Record<string, unknown> | undefined;
-      const delta = first?.delta as Record<string, unknown> | undefined;
-      if (delta) {
-        if (typeof delta.content === 'string' && delta.content) out.text = delta.content;
-        // «размышления» reasoning-модели приходят тем же потоком, но отдельным полем
-        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
-          out.reasoning = delta.reasoning_content;
-        }
+    switch (type) {
+      case 'response.output_text.delta':
+        return typeof frame.delta === 'string' && frame.delta
+          ? { delta: { text: frame.delta }, terminal: false }
+          : null;
+      case 'response.reasoning_summary_text.delta':
+        return typeof frame.delta === 'string' && frame.delta
+          ? { delta: { reasoning: frame.delta }, terminal: false }
+          : null;
+      case 'response.web_search_call.in_progress':
+      case 'response.web_search_call.searching':
+        return { delta: { searching: true }, terminal: false };
+      case 'response.web_search_call.completed':
+        return { delta: { searching: false }, terminal: false };
+      case 'response.completed': {
+        const response = frame.response as Record<string, unknown> | undefined;
+        const usage = response?.usage as Record<string, unknown> | undefined;
+        const ticks = typeof usage?.cost_in_usd_ticks === 'number' ? usage.cost_in_usd_ticks : 0;
+        // завершающее событие: расход отдаём наверх и говорим, что поток на этом закончился
+        return {
+          delta: {
+            usage: {
+              promptTokens: typeof usage?.input_tokens === 'number' ? usage.input_tokens : 0,
+              completionTokens: typeof usage?.output_tokens === 'number' ? usage.output_tokens : 0,
+              searches:
+                typeof usage?.num_server_side_tools_used === 'number'
+                  ? usage.num_server_side_tools_used
+                  : 0,
+              // «тик» у xAI — стомиллионная доллара (10 000 000 000 тиков в долларе)
+              costUsd: ticks / 1e10,
+            },
+          },
+          terminal: true,
+        };
       }
+      case 'response.failed':
+      case 'response.incomplete': {
+        const response = frame.response as Record<string, unknown> | undefined;
+        const error = response?.error as Record<string, unknown> | undefined;
+        const message =
+          typeof error?.message === 'string' ? error.message : 'xAI не смог выполнить запрос';
+        this.logger.error(`xAI: ${type} — ${message}`);
+        return 'failed';
+      }
+      case 'error': {
+        // ошибки внутри потока xAI присылает этим событием; текст нужен и в лог, и клиенту
+        const message = typeof frame.message === 'string' ? frame.message : JSON.stringify(frame);
+        this.logger.error(`xAI: ошибка в потоке — ${message.slice(0, 500)}`);
+        return 'failed';
+      }
+      default:
+        // остальные события (создание ответа, добавление частей, done-события) для чата
+        // смысла не несут: текст, размышления и расход приходят перечисленными выше
+        return null;
     }
-    const usage = frame.usage as Record<string, unknown> | undefined;
-    if (usage) {
-      out.usage = {
-        promptTokens: typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0,
-        completionTokens: typeof usage.completion_tokens === 'number' ? usage.completion_tokens : 0,
-      };
-    }
-    return out.text || out.reasoning || out.usage ? out : null;
   }
 
   /** Чат-модели ключа с ценами — из `GET /v1/language-models`. */

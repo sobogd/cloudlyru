@@ -210,6 +210,12 @@ class AiChunk {
   /// Расход токенов на текущий момент.
   final AiUsage? usage;
 
+  /// Модель ищет в интернете (`true`) или закончила (`false`); `null` — событие не об этом.
+  ///
+  /// Отдельным событием, а не молчанием: с поиском ответ идёт десятками секунд, и на экране
+  /// должно быть видно, что происходит.
+  final bool? searching;
+
   /// Сервер закончил ответ; дальше событий не будет.
   final bool done;
 
@@ -222,6 +228,7 @@ class AiChunk {
     this.reasoning,
     this.title,
     this.usage,
+    this.searching,
     this.done = false,
     this.error,
   });

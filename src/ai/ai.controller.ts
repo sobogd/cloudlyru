@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { ChatsService } from './chats.service';
-import { GrokError, GrokService } from './grok.service';
+import { GrokDelta, GrokError, GrokService } from './grok.service';
 import { ApiError, badRequest } from '../common/errors';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 
@@ -161,7 +161,8 @@ export class AiController {
 
     let answer = '';
     let reasoning = '';
-    let usage: { promptTokens: number; completionTokens: number } | undefined;
+    // расход приходит одним событием в конце; тип берём у сервиса, чтобы поля не разъезжались
+    let usage: GrokDelta['usage'];
     try {
       for await (const delta of this.grok.streamChat({
         model: chat.model,
@@ -169,6 +170,9 @@ export class AiController {
         signal: abort.signal,
       })) {
         if (delta.usage) usage = delta.usage;
+        // поиск в интернете виден отдельным событием: с ним ответ идёт десятками секунд, и
+        // экран должен показывать, что модель ищет, а не «зависла»
+        if (delta.searching !== undefined) this.event(res, 'status', { searching: delta.searching });
         if (delta.reasoning) {
           reasoning += delta.reasoning;
           this.event(res, 'reasoning', { text: delta.reasoning });
@@ -193,7 +197,10 @@ export class AiController {
         : null;
       this.logger.log(
         `чат ${chat.id}: ответ ${answer.length} симв., размышления ${reasoning.length} симв.` +
-          (usage ? `, токенов ${usage.promptTokens}→${usage.completionTokens}` : ''),
+          (usage
+            ? `, токенов ${usage.promptTokens}→${usage.completionTokens}, ` +
+              `поисков ${usage.searches}, стоимость $${usage.costUsd.toFixed(4)}`
+            : ''),
       );
       this.event(res, 'done', {
         messageId: saved?.id ?? null,
@@ -219,7 +226,7 @@ export class AiController {
     e: unknown,
     answer: string,
     reasoning: string,
-    usage: { promptTokens: number; completionTokens: number } | undefined,
+    usage: GrokDelta['usage'],
     closed: boolean,
   ): Promise<void> {
     const aborted = closed || (e instanceof Error && e.name === 'AbortError');

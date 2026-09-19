@@ -173,6 +173,9 @@ class ChatThreadState {
   /// Расход токенов на последний ответ.
   final AiUsage? usage;
 
+  /// Модель сейчас ищет в интернете — на экране это отдельная подпись вместо «печатает».
+  final bool searching;
+
   /// Переписка и состояние её загрузки.
   const ChatThreadState({
     this.chatId = '',
@@ -184,6 +187,7 @@ class ChatThreadState {
     this.sending = false,
     this.error,
     this.usage,
+    this.searching = false,
   });
 
   /// Копия состояния с заменёнными полями; ошибку и расход трогают только явные методы.
@@ -195,6 +199,7 @@ class ChatThreadState {
     bool? loading,
     bool? sending,
     AiUsage? usage,
+    bool? searching,
   }) =>
       ChatThreadState(
         chatId: chatId,
@@ -206,6 +211,7 @@ class ChatThreadState {
         sending: sending ?? this.sending,
         error: error,
         usage: usage ?? this.usage,
+        searching: searching ?? this.searching,
       );
 
   /// Копия с проставленной ошибкой.
@@ -219,6 +225,7 @@ class ChatThreadState {
         sending: sending,
         error: message,
         usage: usage,
+        searching: searching,
       );
 
   /// Копия без ошибки.
@@ -231,6 +238,7 @@ class ChatThreadState {
         loading: loading,
         sending: sending,
         usage: usage,
+        searching: searching,
       );
 
   /// Последнее сообщение переписки (ответ, который дописывается потоком), либо `null`.
@@ -380,6 +388,7 @@ class ChatThreadController extends Notifier<ChatThreadState> {
       return;
     }
     if (chunk.usage != null) state = state.copyWith(usage: chunk.usage);
+    if (chunk.searching != null) state = state.copyWith(searching: chunk.searching);
 
     final last = state.last;
     if (last == null || last.isUser) return;
@@ -420,7 +429,8 @@ class ChatThreadController extends Notifier<ChatThreadState> {
       if (messages.isNotEmpty && !messages.last.isUser && messages.last.content.isEmpty) {
         messages.removeLast();
       }
-      state = state.copyWith(messages: messages, sending: false);
+      // признак «ищет» снимаем вместе с генерацией: иначе подпись осталась бы висеть
+      state = state.copyWith(messages: messages, sending: false, searching: false);
       ref.read(chatsProvider.notifier).touch(state.chatId);
     }
     if (done != null && !done.isCompleted) done.complete();

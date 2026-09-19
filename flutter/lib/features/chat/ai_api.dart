@@ -220,6 +220,8 @@ class AiApi {
       case 'title':
         final title = event['title'];
         return title is String ? AiChunk(title: title) : null;
+      case 'status':
+        return AiChunk(searching: event['searching'] == true);
       case 'done':
         final usage = event['usage'];
         return AiChunk(

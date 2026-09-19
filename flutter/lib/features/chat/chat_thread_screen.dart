@@ -153,7 +153,8 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       controller: _scroll,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
       itemCount: state.messages.length,
-      itemBuilder: (context, i) => _bubble(state.messages[i]),
+      itemBuilder: (context, i) =>
+          _bubble(state.messages[i], isLast: i == state.messages.length - 1),
     );
   }
 
@@ -314,7 +315,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
   ///
   /// Сторона разная не для красоты: так переписка читается глазами без подписей автора, а
   /// ответы модели с блоками кода визуально шире.
-  Widget _bubble(AiMessage message) {
+  Widget _bubble(AiMessage message, {required bool isLast}) {
     final isUser = message.isUser;
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
@@ -341,7 +342,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
                 style: const TextStyle(color: C.fg, fontSize: 14, height: 1.35),
               )
             else
-              _answer(message.content),
+              _answer(message.content, isLast: isLast),
           ],
         ),
       ),
@@ -352,9 +353,23 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
   ///
   /// Полноценный разбор markdown сюда не тянем — ответы моделей в основном текст и код, а
   /// блок кода без моноширинного шрифта нечитаем, тогда как заголовки и списки читаются и так.
-  Widget _answer(String text) {
-    // пустой текст у ответа означает «генерация ещё не началась» — показываем ожидание
+  Widget _answer(String text, {required bool isLast}) {
+    // пустой текст у ответа означает «генерация ещё не началась» — показываем ожидание, а
+    // если модель пошла искать в интернете, говорим об этом словами: поиск занимает десятки
+    // секунд, и молчащий спиннер в это время выглядит как зависание
     if (text.isEmpty) {
+      if (isLast && ref.read(chatThreadProvider).searching) {
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 2),
+          child: Row(
+            children: [
+              SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
+              SizedBox(width: 8),
+              Text('Ищу в интернете…', style: TextStyle(color: C.fg3, fontSize: 13)),
+            ],
+          ),
+        );
+      }
       return const Padding(
         padding: EdgeInsets.symmetric(vertical: 2),
         child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
