@@ -252,6 +252,9 @@ export class LlmService {
         for (const line of lines) {
           const parsed = this.parseFrame(line);
           if (!parsed) continue;
+          // Отказ внутри потока поднимаем исключением, а не тихим концом: контроллер поймает его
+          // и объяснит причину человеку, а уже пришедший текст сохранит как частичный ответ.
+          if (parsed.error) throw new LlmError(parsed.error, undefined, parsed.error);
           if (parsed.usage) usage = parsed.usage;
           // Чанк с расходом приходит пустым по тексту (choices пустой, один usage), поэтому
           // отдавать наверх нужно и его: иначе контроллер не увидит ни токенов, ни стоимости, и
@@ -346,9 +349,11 @@ export class LlmService {
    * Битый JSON не считается ошибкой потока: одна неразобранная порция — потеря нескольких
    * символов, тогда как исключение здесь оборвало бы всю генерацию. Чанки без текста (роль,
    * пустые дельты) пропускаем, а завершающий `data: [DONE]` — это терминальное событие:
-   * после него генерации уже нет, и ждать ещё чего-то нельзя.
+   * после него генерации уже нет, и ждать ещё чего-то нельзя. Отдельный случай — объект с
+   * `error`: он возвращается как есть, а исключение из него делает вызывающий код, потому что
+   * решение «показать человеку или проглотить» принимает не разбор строки.
    */
-  private parseFrame(rawLine: string): (LlmDelta & { terminal?: boolean }) | null {
+  private parseFrame(rawLine: string): (LlmDelta & { terminal?: boolean; error?: string }) | null {
     const line = rawLine.trim();
     if (!line.startsWith('data:')) return null;
     const payload = line.slice('data:'.length).trim();
@@ -369,7 +374,7 @@ export class LlmService {
     if (error) {
       const message = typeof error.message === 'string' ? error.message : JSON.stringify(error);
       this.logger.error(`локальная модель: ошибка в потоке — ${message.slice(0, 500)}`);
-      return { terminal: true };
+      return { error: message };
     }
 
     const usage = frame.usage as Record<string, unknown> | undefined;
@@ -378,7 +383,7 @@ export class LlmService {
       ? ((choices[0] as Record<string, unknown> | undefined)?.delta as Record<string, unknown> | undefined)
       : undefined;
 
-    const out: LlmDelta & { terminal?: boolean } = {};
+    const out: LlmDelta & { terminal?: boolean; error?: string } = {};
     if (typeof delta?.content === 'string' && delta.content) out.text = delta.content;
     // Имя поля у LM Studio — `reasoning_content` (как у DeepSeek и Qwen); у других серверов
     // встречается `reasoning`, поэтому принимаем оба, чтобы смена сервера не гасила размышления.
