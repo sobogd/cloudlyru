@@ -48,6 +48,15 @@ class AiApiException implements Exception {
   String toString() => message;
 }
 
+/// Стили ответа, доступные на сервере.
+class AiStylesReply {
+  /// Список стилей (подписи и пояснения приходят с сервера).
+  const AiStylesReply(this.styles);
+
+  /// Стили ответа по порядку, в котором их показывает сервер.
+  final List<AiStyle> styles;
+}
+
 /// Состояние раздела на сервере: задан ли ключ и какие модели по нему доступны.
 class AiModelsReply {
   /// Список моделей и признак «ключ на сервере задан».
@@ -100,6 +109,17 @@ class AiApi {
     return AiModelsReply(configured: configured, models: models);
   }
 
+  /// Стили ответа, доступные на сервере.
+  Future<List<AiStyle>> styles() async {
+    final data = await _send<Map<String, dynamic>>(() => _http.get('/ai/styles'));
+    final raw = data?['styles'];
+    return <AiStyle>[
+      if (raw is List)
+        for (final s in raw)
+          if (s is Map) AiStyle.fromJson(s.cast<String, dynamic>()),
+    ];
+  }
+
   /// Чаты владельца, свежие сверху.
   Future<List<AiChat>> chats() async {
     final data = await _send<Map<String, dynamic>>(() => _http.get('/ai/chats'));
@@ -111,23 +131,25 @@ class AiApi {
     ];
   }
 
-  /// Новый чат; модель можно не указывать — сервер подставит модель по умолчанию.
-  Future<AiChat> createChat({String? model}) async {
+  /// Новый чат; модель и стиль можно не указывать — сервер подставит значения по умолчанию.
+  Future<AiChat> createChat({String? model, String? style}) async {
     // тело собираем по частям, а не литералом: пустое поле `model` сервер понял бы как
     // «модель не выбрана», и это было бы то же самое, но лишним полем в запросе
     final body = <String, dynamic>{};
     if (model != null) body['model'] = model;
+    if (style != null) body['style'] = style;
     final data = await _send<Map<String, dynamic>>(
       () => _http.post('/ai/chats', data: body),
     );
     return AiChat.fromJson(data ?? const {});
   }
 
-  /// Переименование чата и смена его модели.
-  Future<AiChat> patchChat(String chatId, {String? title, String? model}) async {
+  /// Переименование чата, смена его модели и стиля ответа.
+  Future<AiChat> patchChat(String chatId, {String? title, String? model, String? style}) async {
     final body = <String, dynamic>{};
     if (title != null) body['title'] = title;
     if (model != null) body['model'] = model;
+    if (style != null) body['style'] = style;
     final data = await _send<Map<String, dynamic>>(
       () => _http.patch('/ai/chats/$chatId', data: body),
     );

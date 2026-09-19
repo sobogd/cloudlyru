@@ -20,7 +20,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # .github/workflows/android.yml, и номер сборки обязан расти с каждым выпуском.
 # Номер общий для платформ: из него же собирается CFBundleVersion настольной сборки
 # (workflow .github/workflows/macos.yml), поэтому поднимать его достаточно один раз.
-version: 1.0.0+106
+version: 1.0.0+107
 
 environment:
   sdk: ^3.13.3
@@ -58,6 +58,14 @@ dependencies:
   file_picker: ^13.0.0
   open_filex: ^4.7.0
   crypto: ^3.0.7
+  # Отрисовка markdown в ответах чата: модель отвечает заголовками, списками, таблицами и
+  # блоками кода, и показывать это сырым текстом нечитаемо. Пакет — продолжение закрытого
+  # `flutter_markdown` от Flutter-команды (у него в pubspec стоит «discontinued»), GFM из коробки.
+  flutter_markdown_plus: ^1.0.12
+  # Прямая зависимость, а не транзитивная: свой обработчик блока кода принимает узел разбора
+  # (`md.Element`), и без явной зависимости его тип не импортируется (`depend_on_referenced_packages`).
+  # Версия — та же, что тянет flutter_markdown_plus, иначе типы узлов разойдутся.
+  markdown: ^7.3.1
   # Прямая зависимость, а не транзитивная: номер файла в файловой системе берётся вызовом
   # `stat(2)` из libc (`lib/sync/device/native_stat.dart`), а этот пакет даёт для FFI
   # выделение памяти и C-строки (`calloc`, `toNativeUtf8`).

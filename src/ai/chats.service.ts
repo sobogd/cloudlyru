@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { badRequest, notFound } from '../common/errors';
+import { AiStyleId, DEFAULT_AI_STYLE, normalizeStyle } from './prompts';
 
 /**
  * Роль сообщения в том виде, в каком её понимает API провайдера: эти же имена лежат в колонке
@@ -16,6 +17,8 @@ export interface ChatSummary {
   id: string;
   title: string;
   model: string;
+  /** Стиль ответа чата (см. src/ai/prompts.ts). */
+  style: AiStyleId;
   updatedAt: Date;
   messages: number;
 }
@@ -47,6 +50,7 @@ export class ChatsService {
         id: true,
         title: true,
         model: true,
+        style: true,
         updatedAt: true,
         _count: { select: { messages: true } },
       },
@@ -55,17 +59,23 @@ export class ChatsService {
       id: r.id,
       title: r.title,
       model: r.model,
+      style: normalizeStyle(r.style),
       updatedAt: r.updatedAt,
       messages: r._count.messages,
     }));
   }
 
-  /** Новый чат с выбранной моделью (или моделью по умолчанию). */
-  async create(userId: string, model?: unknown) {
+  /**
+   * Новый чат с выбранной моделью и стилем (или значениями по умолчанию).
+   *
+   * Стиль приходит от клиента, который запоминает последний выбор человека: так «пещерный»
+   * разговор продолжается и в следующем чате, пока человек сам не переключит.
+   */
+  async create(userId: string, model?: unknown, style?: unknown) {
     const chosen = typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_AI_MODEL;
     return this.prisma.aiChat.create({
-      data: { userId, model: chosen },
-      select: { id: true, title: true, model: true, updatedAt: true },
+      data: { userId, model: chosen, style: style === undefined ? DEFAULT_AI_STYLE : normalizeStyle(style) },
+      select: { id: true, title: true, model: true, style: true, updatedAt: true },
     });
   }
 
@@ -84,7 +94,7 @@ export class ChatsService {
    */
   async patch(userId: string, chatId: string, body: Record<string, unknown>) {
     await this.owned(userId, chatId);
-    const data: { title?: string; model?: string } = {};
+    const data: { title?: string; model?: string; style?: AiStyleId } = {};
     if (body.title !== undefined) {
       if (typeof body.title !== 'string') throw badRequest('title must be a string');
       const title = body.title.trim();
@@ -95,11 +105,16 @@ export class ChatsService {
       if (typeof body.model !== 'string' || !body.model.trim()) throw badRequest('model must be a string');
       data.model = body.model.trim();
     }
+    if (body.style !== undefined) {
+      // незнакомый стиль не ошибка, а «обычный»: подсказка всё равно собирается на сервере,
+      // и падать из-за лишнего символа в поле стиля незачем
+      data.style = normalizeStyle(body.style);
+    }
     if (Object.keys(data).length === 0) throw badRequest('nothing to update');
     return this.prisma.aiChat.update({
       where: { id: chatId },
       data,
-      select: { id: true, title: true, model: true, updatedAt: true },
+      select: { id: true, title: true, model: true, style: true, updatedAt: true },
     });
   }
 

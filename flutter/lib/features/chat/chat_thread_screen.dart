@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:markdown/markdown.dart' as md;
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../theme.dart';
 import '../../util/widgets.dart';
@@ -119,7 +122,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
-        actions: [_modelPicker(state)],
+        actions: [_stylePicker(state), _modelPicker(state)],
       ),
       body: Column(
         children: [
@@ -155,6 +158,56 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       itemCount: state.messages.length,
       itemBuilder: (context, i) =>
           _bubble(state.messages[i], isLast: i == state.messages.length - 1),
+    );
+  }
+
+  /// Выбор стиля ответа в шапке: «Обычный», «Кейвман», «Хуманайзер».
+  ///
+  /// Стиль — это подсказка, которую собирает сервер (`src/ai/prompts.ts`), поэтому список
+  /// приходит оттуда же: приложение не хранит ни подписей, ни самих подсказок. Выбранный стиль
+  /// остаётся и в этом чате, и в следующих — переключать его заново в каждом разговоре не нужно.
+  Widget _stylePicker(ChatThreadState state) {
+    final current = state.styles.where((s) => s.id == state.style).firstOrNull;
+    final label = Text(
+      current?.title ?? 'Обычный',
+      style: const TextStyle(color: C.fg2, fontSize: 13),
+    );
+    if (state.styles.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: Center(child: label),
+      );
+    }
+    return PopupMenuButton<String>(
+      tooltip: 'Стиль ответа',
+      onSelected: (id) => _thread.setStyle(id),
+      itemBuilder: (context) => [
+        for (final s in state.styles)
+          PopupMenuItem<String>(
+            value: s.id,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  s.title,
+                  style: TextStyle(color: s.id == state.style ? C.accent : C.fg, fontSize: 14),
+                ),
+                // пояснение под подписью: по одному слову «Хуманайзер» не понять, что это
+                Text(s.hint, style: const TextStyle(color: C.fg3, fontSize: 11)),
+              ],
+            ),
+          ),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: Row(
+          children: [
+            label,
+            const Icon(Icons.arrow_drop_down, color: C.fg2),
+          ],
+        ),
+      ),
     );
   }
 
@@ -349,10 +402,13 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
     );
   }
 
-  /// Текст ответа: обычные абзацы и блоки кода.
+  /// Текст ответа: markdown, отрисованный как форматированный текст.
   ///
-  /// Полноценный разбор markdown сюда не тянем — ответы моделей в основном текст и код, а
-  /// блок кода без моноширинного шрифта нечитаем, тогда как заголовки и списки читаются и так.
+  /// Модель отвечает заголовками, списками, таблицами, ссылками и блоками кода, поэтому
+  /// показывать ответ сырым текстом нельзя: разметка лезет в глаза, а ссылки на источники
+  /// (поиск отдаёт их как `[[1]](url)`) вообще нечитаемы. Разбором занимается
+  /// `flutter_markdown_plus` (GFM), а блоку кода оставлен свой вид с кнопкой «копировать» —
+  /// его собирает [_CodeBlockBuilder].
   Widget _answer(String text, {required bool isLast}) {
     // пустой текст у ответа означает «генерация ещё не началась» — показываем ожидание, а
     // если модель пошла искать в интернете, говорим об этом словами: поиск занимает десятки
@@ -375,107 +431,140 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
         child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
       );
     }
-    final parts = _splitCode(text);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        for (final part in parts)
-          part.isCode
-              ? _codeBlock(part.text)
-              : SelectableText(
-                  part.text,
-                  style: const TextStyle(color: C.fg, fontSize: 14, height: 1.35),
-                ),
-      ],
+
+    return MarkdownBody(
+      data: text,
+      selectable: true,
+      // ссылки открываем в браузере: в приложении нет своего просмотрщика страниц, а «нажать
+      // и ничего не произошло» — худший вариант для ответа со ссылками на источники
+      onTapLink: (label, href, title) => _openLink(href),
+      styleSheet: _markdownStyle(context),
+      builders: {'pre': _CodeBlockBuilder()},
     );
   }
 
-  /// Блок кода: моноширинный текст и кнопка «копировать».
+  /// Открывает ссылку из ответа во внешнем приложении.
   ///
-  /// Копирование здесь важнее оформления: код из ответа почти всегда переносят в редактор, а
-  /// выделять его пальцем на телефоне неудобно.
-  Widget _codeBlock(String code) => Container(
-        width: double.infinity,
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        decoration: BoxDecoration(
-          color: C.canvas,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: C.brd),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Align(
-              alignment: Alignment.centerRight,
-              child: IconButton(
-                tooltip: 'Копировать',
-                iconSize: 16,
-                visualDensity: VisualDensity.compact,
-                onPressed: () async {
-                  await Clipboard.setData(ClipboardData(text: code));
-                  if (mounted) snack(context, 'Код скопирован');
-                },
-                icon: const Icon(Icons.copy, color: C.fg3),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
-              child: SelectableText(
-                code,
-                style: const TextStyle(
-                  color: C.fg,
-                  fontSize: 12.5,
-                  height: 1.35,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-}
-
-/// Разбор ответа на куски: обычный текст и блоки кода в тройных обратных кавычках.
-///
-/// Возвращает части по порядку следования в тексте. Незакрытый блок (ответ ещё генерируется)
-/// считается кодом до конца текста: иначе на глазах человека кусок кода мигал бы между
-/// оформлениями, пока модель его дописывает.
-List<({String text, bool isCode})> _splitCode(String text) {
-  const fence = '```';
-  final parts = <({String text, bool isCode})>[];
-  var rest = text;
-  while (true) {
-    final start = rest.indexOf(fence);
-    if (start < 0) {
-      if (rest.trim().isNotEmpty) parts.add((text: rest, isCode: false));
-      break;
+  /// Сбой не молчим: адрес приходит из ответа модели, и он бывает нерабочим — тогда человек
+  /// должен увидеть, что дело в ссылке, а не в приложении.
+  Future<void> _openLink(String? href) async {
+    if (href == null || href.isEmpty) return;
+    try {
+      final ok = await launchUrl(Uri.parse(href), mode: LaunchMode.externalApplication);
+      if (!ok && mounted) snack(context, 'Не удалось открыть ссылку');
+    } catch (_) {
+      if (mounted) snack(context, 'Ссылка не открывается: ${href.length > 60 ? '${href.substring(0, 60)}…' : href}');
     }
-    final before = rest.substring(0, start);
-    if (before.trim().isNotEmpty) parts.add((text: before, isCode: false));
-    final after = rest.substring(start + fence.length);
-    final end = after.indexOf(fence);
-    if (end < 0) {
-      parts.add((text: _stripLanguage(after), isCode: true));
-      break;
-    }
-    parts.add((text: _stripLanguage(after.substring(0, end)), isCode: true));
-    rest = after.substring(end + fence.length);
   }
-  return parts;
+
+  /// Стиль разметки под палитру приложения.
+  ///
+  /// Своих цветов у markdown нет: без этого заголовки и код выглядели бы чужеродно (тема
+  /// приложения тёмная, а пакет по умолчанию берёт цвета Material).
+  MarkdownStyleSheet _markdownStyle(BuildContext context) => MarkdownStyleSheet.fromTheme(
+        Theme.of(context),
+      ).copyWith(
+        p: const TextStyle(color: C.fg, fontSize: 14, height: 1.35),
+        h1: const TextStyle(color: C.fg, fontSize: 19, fontWeight: FontWeight.w600, height: 1.3),
+        h2: const TextStyle(color: C.fg, fontSize: 17, fontWeight: FontWeight.w600, height: 1.3),
+        h3: const TextStyle(color: C.fg, fontSize: 15, fontWeight: FontWeight.w600, height: 1.3),
+        listBullet: const TextStyle(color: C.fg, fontSize: 14, height: 1.35),
+        a: const TextStyle(color: C.accent, fontSize: 14, decoration: TextDecoration.underline),
+        em: const TextStyle(color: C.fg2, fontStyle: FontStyle.italic),
+        strong: const TextStyle(color: C.fg, fontWeight: FontWeight.w700),
+        code: const TextStyle(
+          color: C.fg,
+          fontSize: 12.5,
+          fontFamily: 'monospace',
+          backgroundColor: C.canvas,
+        ),
+        blockquote: const TextStyle(color: C.fg2, fontSize: 14, height: 1.35),
+        blockquoteDecoration: BoxDecoration(
+          color: C.surface2,
+          borderRadius: BorderRadius.circular(8),
+          border: const Border(left: BorderSide(color: C.brd2, width: 3)),
+        ),
+        blockquotePadding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+        horizontalRuleDecoration: const BoxDecoration(
+          border: Border(top: BorderSide(color: C.brd)),
+        ),
+        tableBorder: TableBorder.all(color: C.brd),
+        tableCellsPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        tableHead: const TextStyle(color: C.fg, fontSize: 13, fontWeight: FontWeight.w600),
+        tableBody: const TextStyle(color: C.fg2, fontSize: 13),
+      );
+
 }
 
-/// Срезает имя языка с первой строки блока кода — саму строку оставляем пустой.
+/// Блок кода из ответа: моноширинный текст и кнопка «копировать».
 ///
-/// Без этого в начале каждого блока висело бы лишнее слово (`dart`, `json`), которое в тексте
-/// ответа смысла не несёт.
-String _stripLanguage(String code) {
-  final nl = code.indexOf('\n');
-  if (nl < 0) return code;
-  final first = code.substring(0, nl).trim();
-  // имя языка — короткое слово без пробелов; всё прочее (например, первая строка самого кода)
-  // трогать нельзя
-  if (first.isEmpty || first.length > 12 || first.contains(' ')) return code;
-  return code.substring(nl + 1);
+/// Копирование здесь важнее оформления: код из ответа почти всегда переносят в редактор, а
+/// выделять его пальцем на телефоне неудобно. Виджет отдельный, потому что его собирает
+/// [_CodeBlockBuilder] — обработчик разметки, а не сам экран.
+class _CodeBlock extends StatelessWidget {
+  /// Код как он пришёл в ответе, без строки с именем языка.
+  final String code;
+
+  const _CodeBlock(this.code);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      decoration: BoxDecoration(
+        color: C.canvas,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: C.brd),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Align(
+            alignment: Alignment.centerRight,
+            child: IconButton(
+              tooltip: 'Копировать',
+              iconSize: 16,
+              visualDensity: VisualDensity.compact,
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: code));
+                if (context.mounted) snack(context, 'Код скопирован');
+              },
+              icon: const Icon(Icons.copy, color: C.fg3),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+            child: SelectableText(
+              code,
+              style: const TextStyle(
+                color: C.fg,
+                fontSize: 12.5,
+                height: 1.35,
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Отрисовка блока кода в markdown (`pre`) своим виджетом.
+///
+/// Имя языка (`dart`, `json`) из разметки не показываем: оно нужно подсветке, которой здесь
+/// нет, а в тексте ответа выглядело бы лишним словом. Первая строка содержимого `pre` — это
+/// как раз имя языка, поэтому её срезаем.
+class _CodeBlockBuilder extends MarkdownElementBuilder {
+  @override
+  Widget? visitElementAfter(md.Element element, TextStyle? preferredStyle) {
+    final raw = element.textContent;
+    final nl = raw.indexOf('\n');
+    final firstLine = nl < 0 ? raw : raw.substring(0, nl).trim();
+    final isLanguage = nl >= 0 && firstLine.isNotEmpty && firstLine.length <= 12 && !firstLine.contains(' ');
+    return _CodeBlock(isLanguage ? raw.substring(nl + 1) : raw);
+  }
 }
 
 /// Свёрнутый блок «размышлений» модели над ответом.

@@ -15,15 +15,11 @@ import type { Request, Response } from 'express';
 import { ChatsService } from './chats.service';
 import { GrokDelta, GrokError, GrokService } from './grok.service';
 import { ApiError, badRequest } from '../common/errors';
+import { styleList, systemPrompt } from './prompts';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 
 /** Потолок длины вопроса: у модели контекст в сотни тысяч токенов, но платят за каждый. */
 const MAX_QUESTION_CHARS = 8_000;
-
-/** Системная часть запроса: она задаёт рамку разговора и в БД не хранится. */
-const SYSTEM_PROMPT =
-  'Ты — помощник внутри приложения CloudlyRu (личное облако файлов и фото владельца). ' +
-  'Отвечай по делу, на языке вопроса, без лишних вступлений.';
 
 /**
  * Раздел «Чат»: модели, чаты, сообщения и поток ответа.
@@ -55,17 +51,28 @@ export class AiController {
     return { configured: this.grok.configured, models };
   }
 
+  /**
+   * Стили ответа: идентификатор, подпись и короткое пояснение.
+   *
+   * Подписи живут на сервере вместе с подсказками (src/ai/prompts.ts): приложение показывает
+   * ровно те стили, которые сервер умеет применить, и не хранит их список у себя.
+   */
+  @Get('styles')
+  styles() {
+    return { styles: styleList() };
+  }
+
   /** Список чатов владельца — темы, свежие сверху. */
   @Get('chats')
   listChats(@CurrentUser() user: RequestUser) {
     return this.chats.list(user.id).then((chats) => ({ chats }));
   }
 
-  /** Новый чат; модель можно не указывать — подставится модель по умолчанию. */
+  /** Новый чат; модель и стиль можно не указывать — подставятся значения по умолчанию. */
   @Post('chats')
   async createChat(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: RequestUser) {
-    const chat = await this.chats.create(user.id, body.model);
-    this.logger.log(`чат создан: ${chat.id} (модель ${chat.model})`);
+    const chat = await this.chats.create(user.id, body.model, body.style);
+    this.logger.log(`чат создан: ${chat.id} (модель ${chat.model}, стиль ${chat.style})`);
     return chat;
   }
 
@@ -137,7 +144,7 @@ export class AiController {
 
     this.logger.log(
       `чат ${chat.id}: вопрос ${question.length} симв., истории ${context.length} сообщений, ` +
-        `модель ${chat.model}`,
+        `модель ${chat.model}, стиль ${chat.style}`,
     );
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -166,7 +173,11 @@ export class AiController {
     try {
       for await (const delta of this.grok.streamChat({
         model: chat.model,
-        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...context, { role: 'user', content: question }],
+        messages: [
+          { role: 'system', content: systemPrompt(chat.style) },
+          ...context,
+          { role: 'user', content: question },
+        ],
         signal: abort.signal,
       })) {
         if (delta.usage) usage = delta.usage;
