@@ -1231,8 +1231,12 @@ model AiChat {
   // Тема чата. Своей темы у модели не спрашивают: она выводится из первого вопроса, как это
   // делают приложения ChatGPT и Gemini — иначе список чатов состоял бы из одинаковых «Новый чат».
   title     String      @default("Новый чат")
-  // Идентификатор модели, который уходит провайдеру в поле `model` (например, grok-4.6).
-  model     String      @default("grok-4.6")
+  // Идентификатор модели, который уходит провайдеру в поле `model`.
+  //
+  // По умолчанию — grok-4.20-0309-non-reasoning: он не тратит токены на «размышления», и в
+  // нашем чате короткий ответ стоит около $0.0013 против $0.003 у флагмана (см. комментарий к
+  // DEFAULT_AI_MODEL и миграцию 20260918180000). Флагман остаётся в выборе шапки переписки.
+  model     String      @default("grok-4.20-0309-non-reasoning")
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1275,6 +1279,10 @@ model AiMessage {
   // в логах провайдера: цена ошибки здесь — деньги, а не время.
   promptTokens     Int?
   completionTokens Int?
+  // Точная стоимость ответа в долларах, как её посчитал провайдер (`cost_in_usd_ticks`).
+  // Включает и токены, и вызовы поиска, поэтому по ней и считают расход по чату. У вопросов
+  // человека и у ответов, сделанных до появления этой колонки, значения нет.
+  costUsd          Float?
   createdAt DateTime @default(now())
   chat      AiChat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
 

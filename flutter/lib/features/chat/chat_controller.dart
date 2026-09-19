@@ -244,6 +244,19 @@ class ChatThreadState {
 
   /// Последнее сообщение переписки (ответ, который дописывается потоком), либо `null`.
   AiMessage? get last => messages.isEmpty ? null : messages.last;
+
+  /// Сколько стоил весь разговор: сумма стоимостей ответов, сохранённых на сервере.
+  ///
+  /// Считается по значениям провайдера, а не по прайсу: в них уже учтены и токены, и вызовы
+  /// поиска. Ответы, сделанные до появления учёта, в сумму не входят — их стоимости не знает
+  /// никто, и притворяться, что знаем, хуже, чем показать меньше.
+  double get totalCostUsd {
+    var sum = 0.0;
+    for (final m in messages) {
+      sum += m.costUsd ?? 0;
+    }
+    return sum;
+  }
 }
 
 /// Провайдер открытой переписки.
@@ -417,6 +430,19 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     state = state.copyWith(messages: messages).withError(message);
   }
 
+  /// Переносит стоимость завершённого ответа из события потока в само сообщение.
+  ///
+  /// Нужно, потому что сумма по чату считается по сообщениям: при следующем открытии чата
+  /// стоимость придёт из базы, а до перезагрузки её надо взять из последнего события.
+  void _applyCostToLast(double? costUsd) {
+    if (costUsd == null || costUsd <= 0) return;
+    final last = state.last;
+    if (last == null || last.isUser || last.costUsd == costUsd) return;
+    final messages = [...state.messages];
+    messages[messages.length - 1] = last.copyWith(costUsd: costUsd);
+    state = state.copyWith(messages: messages);
+  }
+
   /// Завершает генерацию: снимает признак, убирает пустую заготовку и отпускает ожидание.
   ///
   /// Вызывается из трёх мест — конец потока, ошибка и отмена, — поэтому защищена от повторного
@@ -426,6 +452,8 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     _done = null;
     _sub = null;
     if (state.sending) {
+      // стоимость приходит последним событием вместе с расходом токенов
+      _applyCostToLast(state.usage?.costUsd);
       final messages = [...state.messages];
       if (messages.isNotEmpty && !messages.last.isUser && messages.last.content.isEmpty) {
         messages.removeLast();

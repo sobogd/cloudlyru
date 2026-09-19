@@ -224,6 +224,8 @@ export class AiController {
             reasoning,
             promptTokens: usage?.promptTokens,
             completionTokens: usage?.completionTokens,
+            // стоимость сохраняем вместе с ответом: по ней считается расход по чату
+            costUsd: usage?.costUsd,
           })
         : null;
       this.logger.log(
@@ -270,6 +272,7 @@ export class AiController {
           reasoning,
           promptTokens: usage?.promptTokens,
           completionTokens: usage?.completionTokens,
+          costUsd: usage?.costUsd,
         });
       }
       this.logger.log(`чат ${chatId}: поток прерван клиентом, сохранено ${answer.length} симв.`);
@@ -289,6 +292,7 @@ export class AiController {
         reasoning,
         promptTokens: usage?.promptTokens,
         completionTokens: usage?.completionTokens,
+        costUsd: usage?.costUsd,
       });
     }
     this.event(res, 'error', { message, partial: answer.length > 0 });

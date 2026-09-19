@@ -128,7 +128,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
         children: [
           Expanded(child: _body(state)),
           if (state.error != null) _errorBar(state),
-          if (state.usage != null) _usageLine(state.usage!),
+          if (state.usage != null) _usageLine(state),
           _composer(state),
         ],
       ),
@@ -234,20 +234,35 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
         ),
       );
 
-  /// Строка расхода токенов за последний ответ.
+  /// Строка расхода за последний ответ и за весь разговор.
   ///
-  /// Мелко и отдельно от текста ответа: это справка, а не часть разговора. Цены за миллион
-  /// токенов видны в списке моделей — здесь только факт расхода.
-  Widget _usageLine(AiUsage usage) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
-        child: Align(
-          alignment: Alignment.centerRight,
-          child: Text(
-            'Токенов: ${usage.promptTokens} → ${usage.completionTokens}',
-            style: const TextStyle(color: C.fg3, fontSize: 11),
-          ),
+  /// Мелко, над полем ввода: это справка, а не часть разговора. Стоимость берётся у провайдера
+  /// (в неё входят и токены, и поиски), поэтому это не оценка, а факт по счёту.
+  Widget _usageLine(ChatThreadState state) {
+    final usage = state.usage!;
+    final parts = <String>['Токенов: ${usage.promptTokens} → ${usage.completionTokens}'];
+    if (usage.searches > 0) parts.add('поисков: ${usage.searches}');
+    if (usage.costUsd > 0) parts.add(_money(usage.costUsd));
+    final total = state.totalCostUsd;
+    if (total > 0) parts.add('за чат: ${_money(total)}');
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: Text(
+          parts.join(' · '),
+          style: const TextStyle(color: C.fg3, fontSize: 11),
         ),
-      );
+      ),
+    );
+  }
+
+  /// Сумма в долларах с точностью до цента, а мелочь — до четвёртого знака.
+  ///
+  /// Обычные ответы стоят десятые доли цента, и округление до цента показало бы «$0.00» вместо
+  /// реального расхода: по таким строкам человек и решает, дорогая модель или нет.
+  String _money(double usd) =>
+      usd >= 0.01 ? '\$${usd.toStringAsFixed(2)}' : '\$${usd.toStringAsFixed(4)}';
 
   /// Поле ввода и кнопка отправки (во время генерации — «Стоп»).
   ///

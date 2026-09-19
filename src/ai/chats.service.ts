@@ -8,8 +8,17 @@ import { badRequest, notFound } from '../common/errors';
  */
 export type ChatRole = 'system' | 'user' | 'assistant';
 
-/** Модель, которой отвечает новый чат, пока владелец не выбрал другую. */
-export const DEFAULT_AI_MODEL = 'grok-4.6';
+/**
+ * Модель, которой отвечает новый чат, пока владелец не выбрал другую.
+ *
+ * Не флагман, а дешёвая модель без «размышлений»: в нашем чате короткий ответ стоил у неё
+ * $0.0013 против $0.003 у `grok-4.6` (разница меньше, чем на голом запросе к API, потому что
+ * системная подсказка и память дают обеим моделям одинаковый вход, а флагман ещё и дописывает
+ * reasoning-токены, которые оплачиваются как выходные). Контекст у неё при этом вдвое больше —
+ * миллион токенов против полумиллиона. Флагман остаётся в выборе шапки: его берут для кода и
+ * сложных рассуждений, где разница в цене окупается качеством.
+ */
+export const DEFAULT_AI_MODEL = 'grok-4.20-0309-non-reasoning';
 
 /** Чат в списке: без сообщений — их подтягивает экран чата. */
 export interface ChatSummary {
@@ -122,6 +131,7 @@ export class ChatsService {
         reasoning: true,
         promptTokens: true,
         completionTokens: true,
+        costUsd: true,
         createdAt: true,
       },
     });
@@ -172,6 +182,7 @@ export class ChatsService {
     reasoning?: string;
     promptTokens?: number | null;
     completionTokens?: number | null;
+    costUsd?: number | null;
   }) {
     const created = await this.prisma.aiMessage.create({
       data: {
@@ -181,6 +192,7 @@ export class ChatsService {
         reasoning: params.reasoning ?? '',
         promptTokens: params.promptTokens ?? null,
         completionTokens: params.completionTokens ?? null,
+        costUsd: params.costUsd ?? null,
       },
       select: { id: true, role: true, content: true, reasoning: true, createdAt: true },
     });

@@ -123,6 +123,13 @@ class AiMessage {
   final int? promptTokens;
   final int? completionTokens;
 
+  /// Стоимость этого ответа в долларах, как её посчитал провайдер, или `null`.
+  ///
+  /// Значение включает и токены, и вызовы поиска, поэтому расход по чату — это сумма таких
+  /// значений, а не оценка по прайсу. У вопросов человека и у ответов, сделанных до появления
+  /// учёта, стоимости нет.
+  final double? costUsd;
+
   /// Сообщение переписки.
   const AiMessage({
     required this.id,
@@ -131,6 +138,7 @@ class AiMessage {
     this.reasoning = '',
     this.promptTokens,
     this.completionTokens,
+    this.costUsd,
   });
 
   /// Пустой ответ-заготовка, который дописывается потоком.
@@ -143,7 +151,8 @@ class AiMessage {
         content = '',
         reasoning = '',
         promptTokens = null,
-        completionTokens = null;
+        completionTokens = null,
+        costUsd = null;
 
   /// Это вопрос человека (а не ответ модели).
   bool get isUser => role == 'user';
@@ -157,16 +166,18 @@ class AiMessage {
         promptTokens: json['promptTokens'] is int ? json['promptTokens'] as int : null,
         completionTokens:
             json['completionTokens'] is int ? json['completionTokens'] as int : null,
+        costUsd: json['costUsd'] is num ? (json['costUsd'] as num).toDouble() : null,
       );
 
   /// Копия сообщения с дописанным текстом — так растёт ответ по мере генерации.
-  AiMessage copyWith({String? content, String? reasoning}) => AiMessage(
+  AiMessage copyWith({String? content, String? reasoning, double? costUsd}) => AiMessage(
         id: id,
         role: role,
         content: content ?? this.content,
         reasoning: reasoning ?? this.reasoning,
         promptTokens: promptTokens,
         completionTokens: completionTokens,
+        costUsd: costUsd ?? this.costUsd,
       );
 }
 
@@ -179,14 +190,27 @@ class AiUsage {
   /// Токенов в ответе, включая «размышления».
   final int completionTokens;
 
+  /// Сколько раз модель сходила в интернет за этот ответ.
+  final int searches;
+
+  /// Точная стоимость ответа в долларах (токены плюс вызовы поиска).
+  final double costUsd;
+
   /// Расход по одному ответу.
-  const AiUsage({required this.promptTokens, required this.completionTokens});
+  const AiUsage({
+    required this.promptTokens,
+    required this.completionTokens,
+    this.searches = 0,
+    this.costUsd = 0,
+  });
 
   /// Разбор расхода из события потока; поля приходят из ответа xAI.
   factory AiUsage.fromJson(Map<String, dynamic> json) => AiUsage(
         promptTokens: json['promptTokens'] is int ? json['promptTokens'] as int : 0,
         completionTokens:
             json['completionTokens'] is int ? json['completionTokens'] as int : 0,
+        searches: json['searches'] is int ? json['searches'] as int : 0,
+        costUsd: json['costUsd'] is num ? (json['costUsd'] as num).toDouble() : 0,
       );
 }
 
