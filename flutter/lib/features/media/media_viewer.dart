@@ -404,7 +404,8 @@ class _VidState extends State<_Vid> {
   /// Создаёт контроллер текущей стадии и инициализирует поток.
   ///
   /// Автовоспроизведения нет (в отличие от деталки файла): в ленте может открыться страница
-  /// с видео, которое пользователь не просил включать. Ошибка ловится и из `initialize`,
+  /// с видео, которое пользователь не просил включать, — ролик запускает кнопка поверх кадра
+  /// (см. `build`). Ошибка ловится и из `initialize`,
   /// и из событий контроллера — поток может не открыться уже после успешной инициализации.
   /// Побочно: `_c`, подписка на события, перерисовка; при неудаче — `_fallback`.
   Future<void> _init() async {
@@ -457,7 +458,30 @@ class _VidState extends State<_Vid> {
     }
     final c = _c;
     if (c != null && c.value.isInitialized) {
-      return AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c));
+      return AspectRatio(
+        aspectRatio: c.value.aspectRatio,
+        child: Stack(alignment: Alignment.center, children: [
+          VideoPlayer(c),
+          // Кнопка запуска поверх ролика: своих элементов управления у `VideoPlayer` нет,
+          // а автозапуска здесь нет намеренно (см. `_init`) — без этой кнопки ролик так и
+          // оставался бы кадром-заставкой, и запустить его было бы нечем.
+          //
+          // Подписка на сам контроллер, а не на состояние виджета: значок обязан смениться
+          // в тот же кадр, в котором ролик начал или перестал играть, — перерисовок по другим
+          // поводам у слайда может не быть вовсе.
+          ValueListenableBuilder<VideoPlayerValue>(
+            valueListenable: c,
+            builder: (context, v, _) => GestureDetector(
+              onTap: () => v.isPlaying ? c.pause() : c.play(),
+              child: Icon(
+                v.isPlaying ? Icons.pause_circle_filled : Icons.play_circle_filled,
+                size: 56,
+                color: Colors.white70,
+              ),
+            ),
+          ),
+        ]),
+      );
     }
     return const CircularProgressIndicator(color: Colors.white);
   }
