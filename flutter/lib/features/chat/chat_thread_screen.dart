@@ -1,19 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../theme.dart';
 import '../../util/markdown_view.dart';
 import '../../util/widgets.dart';
-import 'ai_types.dart';
 import 'chat_controller.dart';
+import 'chat_types.dart';
 
-/// Экран переписки одного чата: сообщения, выбор модели и поле ввода.
+/// Экран переписки одного чата: сообщения, источники ответов и поле ввода.
 ///
-/// История и ответы живут на сервере: он хранит переписку в БД, ходит к модели своим ключом
-/// и логирует каждый запрос. Здесь только показ и ввод — ключа провайдера в приложении нет.
+/// История и ответы живут на сервере: он хранит переписку в БД, ходит к модели и поиску на
+/// домашнем маке и логирует каждый запрос. Здесь только показ и ввод.
 class ChatThreadScreen extends ConsumerStatefulWidget {
   /// Чат, который открывается: id, тема и модель на момент открытия.
-  final AiChat chat;
+  final ChatSummary chat;
 
   /// Экран переписки открытого чата.
   const ChatThreadScreen({super.key, required this.chat});
@@ -38,9 +39,8 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
 
   /// Контроллер переписки, взятый один раз в `initState`.
   ///
-  /// Не `late final` с инициализатором: его значение понадобилось бы и в `dispose` (погасить
-  /// поток при уходе с экрана), а обращаться к провайдеру в момент уничтожения виджета уже
-  /// нельзя — контроллер берётся заранее.
+  /// Не `late final` с инициализатором: его значение нужно и в `dispose` (погасить поток при
+  /// уходе с экрана), а обращаться к провайдеру в момент уничтожения виджета уже нельзя.
   late final ChatThreadController _thread;
 
   @override
@@ -48,8 +48,8 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
     super.initState();
     _thread = ref.read(chatThreadProvider.notifier);
     _scroll.addListener(_trackScroll);
-    // историю и список моделей запрашиваем после первого кадра: провайдеры трогать в initState
-    // нельзя, а показать пустой экран до ответа сервера — это мигание
+    // историю запрашиваем после первого кадра: провайдеры трогать в initState нельзя, а
+    // показать пустой экран до ответа сервера — это мигание
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _thread.open(widget.chat);
     });
@@ -57,8 +57,8 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
 
   @override
   void dispose() {
-    // Уход с экрана рвёт поток: иначе ответ дописывался бы в закрытую переписку, а сервер
-    // продолжал бы платный запрос к модели. Сервер по разрыву соединения гасит и свой запрос.
+    // Уход с экрана рвёт поток: иначе ответ дописывался бы в закрытую переписку, а мак
+    // продолжал бы греть генерацию. Сервер по разрыву соединения гасит и свою работу.
     _thread.stop();
     _input.dispose();
     _scroll.dispose();
@@ -100,6 +100,15 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
     await _thread.send(text);
   }
 
+  /// Открывает источник во внешнем браузере.
+  ///
+  /// Ошибку показываем словами: без этого нажатие на ссылку «ничего не делало бы», и было бы
+  /// неясно, виноват телефон или адрес.
+  Future<void> _openSource(ChatSource source) async {
+    final ok = await launchUrl(Uri.parse(source.url), mode: LaunchMode.externalApplication);
+    if (!ok && mounted) snack(context, 'Не удалось открыть ссылку');
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(chatThreadProvider);
@@ -119,7 +128,6 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
-        actions: [_modelPicker(state)],
       ),
       body: Column(
         children: [
@@ -142,7 +150,9 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Text(
-            'Задайте вопрос — ответ появится здесь.\n\nМодель: ${state.model}',
+            'Задайте вопрос — ответ появится здесь.\n\n'
+            'Модель: ${state.model.isEmpty ? widget.chat.model : state.model}\n'
+            'Поиск в интернете: ${_searchModeLabel(state.searchMode)}',
             textAlign: TextAlign.center,
             style: const TextStyle(color: C.fg3, fontSize: 13, height: 1.4),
           ),
@@ -158,45 +168,12 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
     );
   }
 
-  /// Выбор модели в шапке: список из тех, что доступны ключу сервера.
-  ///
-  /// Список не хардкодится — его отдаёт сервер: набор зависит от ключа, а модели появляются
-  /// и снимаются. До загрузки списка в шапке видно только название текущей модели.
-  Widget _modelPicker(ChatThreadState state) {
-    final label = Text(
-      state.model,
-      style: const TextStyle(color: C.fg2, fontSize: 13),
-    );
-    if (state.models.isEmpty) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        child: Center(child: label),
-      );
-    }
-    return PopupMenuButton<String>(
-      tooltip: 'Модель',
-      onSelected: (id) => _thread.setModel(id),
-      itemBuilder: (context) => [
-        for (final m in state.models)
-          PopupMenuItem<String>(
-            value: m.id,
-            child: Text(
-              m.label,
-              style: TextStyle(color: m.id == state.model ? C.accent : C.fg, fontSize: 13),
-            ),
-          ),
-      ],
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        child: Row(
-          children: [
-            label,
-            const Icon(Icons.arrow_drop_down, color: C.fg2),
-          ],
-        ),
-      ),
-    );
-  }
+  /// Подпись режима поиска для пустого экрана и подсказок кнопки.
+  String _searchModeLabel(String mode) => switch (mode) {
+        'on' => 'всегда',
+        'off' => 'не искать',
+        _ => 'авто (ищет по вопросам о свежих данных)',
+      };
 
   /// Сообщение об ошибке над полем ввода.
   ///
@@ -231,42 +208,29 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
         ),
       );
 
-  /// Строка расхода за последний ответ и за весь разговор.
+  /// Строка расхода за последний ответ.
   ///
-  /// Мелко, над полем ввода: это справка, а не часть разговора. Стоимость берётся у провайдера
-  /// (в неё входят и токены, и поиски), поэтому это не оценка, а факт по счёту.
+  /// Мелко, над полем ввода: это справка, а не часть разговора. Стоимости в долларах здесь нет
+  /// и быть не может — модель считает на домашнем маке, и цена ответа измеряется временем, а не
+  /// деньгами; токены показываем потому, что по ним видно, во что обошёлся поиск и чтение страниц.
   Widget _usageLine(ChatThreadState state) {
     final usage = state.usage!;
-    final parts = <String>['Токенов: ${usage.promptTokens} → ${usage.completionTokens}'];
-    if (usage.searches > 0) parts.add('поисков: ${usage.searches}');
-    if (usage.costUsd > 0) parts.add(_money(usage.costUsd));
-    final total = state.totalCostUsd;
-    if (total > 0) parts.add('за чат: ${_money(total)}');
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
       child: Align(
         alignment: Alignment.centerRight,
         child: Text(
-          parts.join(' · '),
+          'Токенов: ${usage.promptTokens} → ${usage.completionTokens}',
           style: const TextStyle(color: C.fg3, fontSize: 11),
         ),
       ),
     );
   }
 
-  /// Сумма в долларах с точностью до цента, а мелочь — до четвёртого знака.
-  ///
-  /// Обычные ответы стоят десятые доли цента, и округление до цента показало бы «$0.00» вместо
-  /// реального расхода: по таким строкам человек и решает, дорогая модель или нет.
-  String _money(double usd) =>
-      usd >= 0.01 ? '\$${usd.toStringAsFixed(2)}' : '\$${usd.toStringAsFixed(4)}';
-
   /// Поле ввода и кнопка отправки (во время генерации — «Стоп»).
   ///
   /// Снизу прибавляем системный отступ ([navBarInset]): экран открыт отдельным маршрутом, а
-  /// `Scaffold` без своей нижней панели не резервирует место под полосу навигации Android —
-  /// без этого поле ввода уезжало под неё. С открытой клавиатурой отступ нулевой (клавиатура
-  /// уже перекрывает полосу), поэтому двойного сдвига не будет.
+  /// `Scaffold` без своей нижней панели не резервирует место под полосу навигации Android.
   Widget _composer(ChatThreadState state) => Container(
         padding: EdgeInsets.fromLTRB(12, 8, 12, 12 + navBarInset(context)),
         decoration: const BoxDecoration(
@@ -307,8 +271,6 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
             const SizedBox(width: 4),
             _searchButton(state),
             const SizedBox(width: 4),
-            _agentButton(state),
-            const SizedBox(width: 4),
             state.sending
                 ? IconButton(
                     tooltip: 'Стоп',
@@ -332,10 +294,9 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
 
   /// Кнопка режима поиска в интернете.
   ///
-  /// Поиск бесплатный, но не мгновенный: выдача занимает секунды, а знание модели датируется
-  /// январём 2025 года. В режиме «авто» сервер ищет только по вопросам про свежие данные, а
-  /// кнопка даёт человеку решить самому: «искать» — принудительно, «не искать» — по своим
-  /// знаниям.
+  /// Поиск не мгновенный: выдача и чтение страниц занимают секунды. В режиме «авто» сервер ищет
+  /// только по вопросам о свежих данных, а кнопка даёт человеку решить самому: «искать» —
+  /// принудительно, «не искать» — по знаниям модели.
   Widget _searchButton(ChatThreadState state) {
     final (icon, color, hint) = switch (state.searchMode) {
       'on' => (Icons.travel_explore, C.accent, 'Поиск в интернете: включён'),
@@ -343,10 +304,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       _ => (Icons.travel_explore, C.fg3, 'Поиск в интернете: авто (по вопросу)'),
     };
     return PopupMenuButton<String>(
-      // В режиме агента поиск не запускается (по интернету ходит телефон), поэтому кнопка
-      // неактивна: оставить её рабочей значило бы обещать поиск, которого не будет.
-      enabled: !state.agentMode,
-      tooltip: state.agentMode ? 'Поиск не нужен: в режиме агента ищет телефон' : hint,
+      tooltip: hint,
       onSelected: (mode) => _thread.setSearchMode(mode),
       itemBuilder: (context) => const [
         PopupMenuItem(value: 'auto', child: Text('Авто — искать, когда нужно')),
@@ -355,37 +313,15 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       ],
       child: Padding(
         padding: const EdgeInsets.all(8),
-        child: Icon(icon, size: 24, color: state.agentMode ? C.fg3 : color),
-      ),
-    );
-  }
-
-  /// Кнопка режима агента: включён — агент ходит по интернету на телефоне.
-  ///
-  /// Не «ещё один поиск», а другой способ его добыть: поиск возвращает сниппеты, а агент
-  /// открывает Chrome на телефоне, вводит запрос, читает выдачу и открывает нужные страницы.
-  /// Стоит это минут ожидания и занимает единственный телефон, поэтому режим — переключатель,
-  /// а не то, что сервер решает сам.
-  Widget _agentButton(ChatThreadState state) {
-    final on = state.agentMode;
-    return IconButton(
-      tooltip: on
-          ? 'Агент на телефоне: включён (ищет в браузере на телефоне)'
-          : 'Агент на телефоне: выключен',
-      onPressed: () => _thread.setAgentMode(!on),
-      icon: Icon(
-        on ? Icons.phone_android : Icons.phone_iphone_outlined,
-        size: 24,
-        color: on ? C.accent : C.fg3,
+        child: Icon(icon, size: 24, color: color),
       ),
     );
   }
 
   /// Одно сообщение переписки: вопрос человека справа, ответ модели слева.
   ///
-  /// Сторона разная не для красоты: так переписка читается глазами без подписей автора, а
-  /// ответы модели с блоками кода визуально шире.
-  Widget _bubble(AiMessage message, {required bool isLast}) {
+  /// Сторона разная не для красоты: так переписка читается глазами без подписей автора.
+  Widget _bubble(ChatMessage message, {required bool isLast}) {
     final isUser = message.isUser;
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
@@ -412,7 +348,8 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
                 style: const TextStyle(color: C.fg, fontSize: 14, height: 1.35),
               )
             else
-              _answer(message.content, isLast: isLast),
+              _answer(message, isLast: isLast),
+            if (!isUser && message.sources.isNotEmpty) _sourcesBlock(message.sources),
           ],
         ),
       ),
@@ -421,29 +358,23 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
 
   /// Текст ответа: markdown, отрисованный как форматированный текст.
   ///
-  /// Модель отвечает заголовками, списками, таблицами, ссылками и блоками кода, поэтому
-  /// показывать ответ сырым текстом нельзя: разметка лезет в глаза, а ссылки на источники
-  /// (поиск отдаёт их как `[[1]](url)`) вообще нечитаемы. Разбором занимается `MarkdownText`
-  /// (`util/markdown_view.dart`) — тот же виджет показывает содержимое `.md`-файлов в деталке.
-  Widget _answer(String text, {required bool isLast}) {
-    // пустой текст у ответа означает «генерация ещё не началась» — показываем ожидание, а
-    // если модель пошла искать в интернете, говорим об этом словами: поиск занимает десятки
-    // секунд, и молчащий спиннер в это время выглядит как зависание. То же с агентом на
-    // телефоне, только ждать дольше: там прогон идёт минутами, и подпись говорит про телефон —
-    // иначе человек решил бы, что завис поиск.
-    if (text.isEmpty) {
+  /// Модель отвечает заголовками, списками, таблицами и блоками кода, поэтому показывать ответ
+  /// сырым текстом нельзя. Ссылки на источники модель ставит номером (`[1]`), а не адресом —
+  /// адреса живут в сохранённых источниках, и подстановку делает [_withCitationLinks].
+  Widget _answer(ChatMessage message, {required bool isLast}) {
+    // пустой текст у ответа означает «генерация ещё не началась» — показываем ожидание, а если
+    // идёт поиск и чтение страниц, говорим об этом словами: это занимает десятки секунд, и
+    // молчащий спиннер в это время выглядит как зависание
+    if (message.content.isEmpty) {
       final thread = ref.read(chatThreadProvider);
-      if (isLast && (thread.searching || thread.agentRunning)) {
-        return Padding(
-          padding: const EdgeInsets.symmetric(vertical: 2),
+      if (isLast && thread.searching) {
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 2),
           child: Row(
             children: [
-              const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
-              const SizedBox(width: 8),
-              Text(
-                thread.agentRunning ? 'Работаю на телефоне…' : 'Ищу в интернете…',
-                style: const TextStyle(color: C.fg3, fontSize: 13),
-              ),
+              SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
+              SizedBox(width: 8),
+              Text('Ищу в интернете и читаю страницы…', style: TextStyle(color: C.fg3, fontSize: 13)),
             ],
           ),
         );
@@ -454,8 +385,68 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       );
     }
 
-    return MarkdownText(text);
+    return MarkdownText(_withCitationLinks(message.content, message.sources));
   }
+
+  /// Превращает номера источников в тексте (`[1]`) в markdown-ссылки на их адреса.
+  ///
+  /// Так задумано с двух сторон: модели проще назвать источник номером (её не заставляют
+  /// выписывать длинные адреса и ошибаться в них), а приложение по номеру достаёт точный адрес
+  /// из сохранённых источников. Номера, которых нет среди источников, остаются как есть: это
+  /// не ссылка, а часть текста. Квадратные скобки внутри уже готовых ссылок не трогаем, иначе
+  /// разметка поехала бы на повторной отрисовке.
+  String _withCitationLinks(String text, List<ChatSource> sources) {
+    if (sources.isEmpty) return text;
+    final byPosition = {for (final s in sources) s.position: s.url};
+    return text.replaceAllMapped(RegExp(r'(?<!\[)\[(\d{1,2})\](?!\()'), (m) {
+      final url = byPosition[int.parse(m.group(1)!)];
+      return url == null ? m.group(0)! : '[${m.group(1)}]($url)';
+    });
+  }
+
+  /// Список источников ответа под текстом: номер, заголовок и домен, нажатие открывает ссылку.
+  ///
+  /// Нужен именно списком, а не только ссылками в тексте: по нему видно, чем модель
+  /// пользовалась, — в том числе когда страницу прочитать не удалось и ответ построен на
+  /// выдержке из выдачи.
+  Widget _sourcesBlock(List<ChatSource> sources) => Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Источники', style: TextStyle(color: C.fg3, fontSize: 12)),
+            const SizedBox(height: 4),
+            for (final source in sources)
+              InkWell(
+                onTap: () => _openSource(source),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '[${source.position}]',
+                        style: const TextStyle(color: C.accent, fontSize: 12.5),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          // «только выдержка» — честная пометка: страницу открыть не удалось,
+                          // и человек должен знать, что доказательство слабее
+                          '${source.title.isEmpty ? source.host : source.title}'
+                          '${source.read ? '' : ' (только выдержка)'}',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: C.fg2, fontSize: 12.5, height: 1.3),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
 }
 
 /// Свёрнутый блок «размышлений» модели над ответом.
@@ -466,6 +457,7 @@ class _ReasoningBlock extends StatefulWidget {
   /// Текст размышлений целиком; дописывается по мере генерации.
   final String text;
 
+  /// Блок размышлений.
   const _ReasoningBlock({required this.text});
 
   @override
@@ -475,6 +467,7 @@ class _ReasoningBlock extends StatefulWidget {
 /// Состояние блока: раскрыт он или нет. Открытость живёт здесь, а не в состоянии чата: это
 /// оформление одного сообщения, и ему незачем переживать перерисовку переписки.
 class _ReasoningBlockState extends State<_ReasoningBlock> {
+  /// Раскрыт ли блок.
   bool _open = false;
 
   @override

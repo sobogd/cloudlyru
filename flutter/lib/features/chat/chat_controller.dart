@@ -3,21 +3,21 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers.dart';
-import 'ai_api.dart';
-import 'ai_types.dart';
+import 'chat_api.dart';
+import 'chat_types.dart';
 
 /// Состояние списка чатов: темы, признак загрузки и последняя ошибка.
 class ChatsState {
   /// Чаты владельца, свежие сверху.
-  final List<AiChat> chats;
+  final List<ChatSummary> chats;
 
   /// Идёт загрузка списка (для индикатора).
   final bool loading;
 
-  /// Доступна ли модель: `false` — сервер не видит LM Studio на маке.
+  /// Доступна ли модель: `false` — сервер не видит модель на маке.
   ///
-  /// `false` означает, что раздел не заработает ни при каких действиях в приложении: ключ
-  /// живёт в секретах репозитория и попадает на сервер при выкладке. Признак нужен, чтобы
+  /// `false` означает, что раздел не заработает ни при каких действиях в приложении: модель
+  /// живёт на домашней машине, и пока она недоступна, спрашивать некого. Признак нужен, чтобы
   /// вместо пустого списка показать это словами.
   final bool configured;
 
@@ -32,8 +32,8 @@ class ChatsState {
     this.error,
   });
 
-  /// Копия состояния; [error] по умолчанию не трогается — ошибку снимает [clearError].
-  ChatsState copyWith({List<AiChat>? chats, bool? loading, bool? configured}) => ChatsState(
+  /// Копия состояния; ошибку снимает только [ready].
+  ChatsState copyWith({List<ChatSummary>? chats, bool? loading, bool? configured}) => ChatsState(
         chats: chats ?? this.chats,
         loading: loading ?? this.loading,
         configured: configured ?? this.configured,
@@ -45,7 +45,7 @@ class ChatsState {
       ChatsState(chats: chats, loading: loading, configured: configured, error: message);
 
   /// Копия без ошибки и без признака загрузки.
-  ChatsState ready({List<AiChat>? chats, bool? configured}) => ChatsState(
+  ChatsState ready({List<ChatSummary>? chats, bool? configured}) => ChatsState(
         chats: chats ?? this.chats,
         loading: false,
         configured: configured ?? this.configured,
@@ -57,28 +57,27 @@ final chatsProvider = NotifierProvider<ChatsController, ChatsState>(ChatsControl
 
 /// Список чатов: загрузка, создание, переименование и удаление.
 ///
-/// Список живёт в провайдере, а не в состоянии экрана, чтобы возврат из переписки не тянул его
-/// заново и не мигал пустым экраном.
+/// Список живёт в провайдере, а не в состоянии экрана: так возврат из переписки не тянет его
+/// заново и не мигает пустым экраном.
 class ChatsController extends Notifier<ChatsState> {
   /// Клиент ручек чата поверх текущего облачного клиента (адрес и сессия — из него).
-  AiApi get _api => AiApi(ref.read(appStateProvider).api);
+  ChatApi get _api => ChatApi(ref.read(appStateProvider).api);
 
   @override
   ChatsState build() => const ChatsState();
 
   /// Читает список чатов с сервера.
   ///
-  /// Заодно узнаёт, задан ли на сервере ключ: без ключа список пуст не потому, что чатов нет,
-  /// а потому, что раздел не настроен, и на экране это разные сообщения.
+  /// Заодно узнаёт, доступна ли модель: пустой список без модели и пустой список с моделью —
+  /// разные сообщения на экране. Список моделей спрашиваем только при пустом списке чатов:
+  /// на каждый показ вкладки это был бы лишний запрос.
   Future<void> load() async {
     state = state.copyWith(loading: true).ready(chats: state.chats);
     try {
       final chats = await _api.chats();
-      // ключ проверяем только при пустом списке: ходить за моделями на каждый показ вкладки
-      // незачем, а признак нужен ровно для пустого экрана
       final configured = chats.isNotEmpty ? true : (await _api.models()).configured;
       state = state.ready(chats: chats, configured: configured);
-    } on AiApiException catch (e) {
+    } on ChatApiException catch (e) {
       state = state.withError(e.message);
     }
   }
@@ -86,33 +85,35 @@ class ChatsController extends Notifier<ChatsState> {
   /// Создаёт чат и возвращает его (или `null`, если не вышло).
   ///
   /// Созданный чат сразу подставляется в начало списка: сервер сортирует чаты по времени
-  /// последнего сообщения, и новый там и окажется — ждать перезагрузки списка незачем.
-  ///
-  Future<AiChat?> create({String? model}) async {
+  /// последнего сообщения, и новый окажется там же — ждать перезагрузки списка незачем.
+  Future<ChatSummary?> create() async {
     try {
-      final chat = await _api.createChat(model: model);
+      final chat = await _api.createChat();
       state = state.ready(chats: [chat, ...state.chats]);
       return chat;
-    } on AiApiException catch (e) {
+    } on ChatApiException catch (e) {
       state = state.withError(e.message);
       return null;
     }
   }
 
-  /// Переименовывает чат (тема правится и на сервере, и в списке).
-  Future<void> rename(AiChat chat, String title) async {
+  /// Переименовывает чат: правится и на сервере, и в списке.
+  Future<void> rename(ChatSummary chat, String title) async {
     try {
-      final updated = await _api.patchChat(chat.id, title: title);
+      final updated = await _api.renameChat(chat.id, title);
       state = state.ready(chats: [
-        for (final c in state.chats) c.id == updated.id ? AiChat(
-              id: updated.id,
-              title: updated.title,
-              model: updated.model,
-              updatedAt: updated.updatedAt ?? c.updatedAt,
-              messages: c.messages,
-            ) : c,
+        for (final c in state.chats)
+          c.id == updated.id
+              ? ChatSummary(
+                  id: updated.id,
+                  title: updated.title,
+                  model: updated.model,
+                  updatedAt: updated.updatedAt ?? c.updatedAt,
+                  messages: c.messages,
+                )
+              : c,
       ]);
-    } on AiApiException catch (e) {
+    } on ChatApiException catch (e) {
       state = state.withError(e.message);
     }
   }
@@ -122,21 +123,21 @@ class ChatsController extends Notifier<ChatsState> {
     try {
       await _api.deleteChat(chatId);
       state = state.ready(chats: [for (final c in state.chats) if (c.id != chatId) c]);
-    } on AiApiException catch (e) {
+    } on ChatApiException catch (e) {
       state = state.withError(e.message);
     }
   }
 
   /// Подтягивает тему и время чата, когда переписка их изменила (сервер назвал чат по первому
   /// вопросу). Дешёвая локальная правка: полный список перечитывать ради одной строки незачем.
-  void touch(String chatId, {String? title, String? model}) {
+  void touch(String chatId, {String? title}) {
     state = state.ready(chats: [
       for (final c in state.chats)
         c.id == chatId
-            ? AiChat(
+            ? ChatSummary(
                 id: c.id,
                 title: title ?? c.title,
-                model: model ?? c.model,
+                model: c.model,
                 updatedAt: DateTime.now(),
                 messages: c.messages,
               )
@@ -150,17 +151,14 @@ class ChatThreadState {
   /// Чат, который открыт; пустая строка — переписка ещё не открыта.
   final String chatId;
 
-  /// Тема чата (сервер выводит её из первого вопроса).
+  /// Тема чата (сервер выводит её из первого вопроса и присылает событием).
   final String title;
 
   /// Модель, которой отвечает этот чат.
   final String model;
 
-  /// Модели, доступные ключу сервера, — для выбора модели в шапке.
-  final List<AiModel> models;
-
   /// Переписка в порядке отправки.
-  final List<AiMessage> messages;
+  final List<ChatMessage> messages;
 
   /// Идёт загрузка истории.
   final bool loading;
@@ -172,20 +170,10 @@ class ChatThreadState {
   final String? error;
 
   /// Расход токенов на последний ответ.
-  final AiUsage? usage;
+  final ChatUsage? usage;
 
-  /// Модель сейчас ищет в интернете — на экране это отдельная подпись вместо «печатает».
+  /// Модель сейчас ищет в интернете и читает страницы — на экране это подпись вместо «печатает».
   final bool searching;
-
-  /// Агент сейчас работает на телефоне — тоже отдельная подпись, и другая: прогон занимает
-  /// минуты, и человеку важно понимать, что происходит именно на телефоне, а не поиск.
-  final bool agentRunning;
-
-  /// Режим агента: включён ли прогон на телефоне.
-  ///
-  /// В отличие от поиска режима «авто» здесь нет: агент занимает единственный телефон на минуты,
-  /// поэтому решение всегда за человеком — кнопкой в строке ввода.
-  final bool agentMode;
 
   /// Режим поиска: `auto` (решает сервер по вопросу), `on` или `off`.
   final String searchMode;
@@ -195,15 +183,12 @@ class ChatThreadState {
     this.chatId = '',
     this.title = '',
     this.model = '',
-    this.models = const [],
     this.messages = const [],
     this.loading = false,
     this.sending = false,
     this.error,
     this.usage,
     this.searching = false,
-    this.agentRunning = false,
-    this.agentMode = false,
     this.searchMode = 'auto',
   });
 
@@ -211,29 +196,23 @@ class ChatThreadState {
   ChatThreadState copyWith({
     String? title,
     String? model,
-    List<AiModel>? models,
-    List<AiMessage>? messages,
+    List<ChatMessage>? messages,
     bool? loading,
     bool? sending,
-    AiUsage? usage,
+    ChatUsage? usage,
     bool? searching,
-    bool? agentRunning,
-    bool? agentMode,
     String? searchMode,
   }) =>
       ChatThreadState(
         chatId: chatId,
         title: title ?? this.title,
         model: model ?? this.model,
-        models: models ?? this.models,
         messages: messages ?? this.messages,
         loading: loading ?? this.loading,
         sending: sending ?? this.sending,
         error: error,
         usage: usage ?? this.usage,
         searching: searching ?? this.searching,
-        agentRunning: agentRunning ?? this.agentRunning,
-        agentMode: agentMode ?? this.agentMode,
         searchMode: searchMode ?? this.searchMode,
       );
 
@@ -242,15 +221,12 @@ class ChatThreadState {
         chatId: chatId,
         title: title,
         model: model,
-        models: models,
         messages: messages,
         loading: loading,
         sending: sending,
         error: message,
         usage: usage,
         searching: searching,
-        agentRunning: agentRunning,
-        agentMode: agentMode,
         searchMode: searchMode,
       );
 
@@ -259,32 +235,16 @@ class ChatThreadState {
         chatId: chatId,
         title: title,
         model: model,
-        models: models,
         messages: messages,
         loading: loading,
         sending: sending,
         usage: usage,
         searching: searching,
-        agentRunning: agentRunning,
-        agentMode: agentMode,
         searchMode: searchMode,
       );
 
   /// Последнее сообщение переписки (ответ, который дописывается потоком), либо `null`.
-  AiMessage? get last => messages.isEmpty ? null : messages.last;
-
-  /// Сколько стоил весь разговор: сумма стоимостей ответов, сохранённых на сервере.
-  ///
-  /// Считается по значениям провайдера, а не по прайсу: в них уже учтены и токены, и вызовы
-  /// поиска. Ответы, сделанные до появления учёта, в сумму не входят — их стоимости не знает
-  /// никто, и притворяться, что знаем, хуже, чем показать меньше.
-  double get totalCostUsd {
-    var sum = 0.0;
-    for (final m in messages) {
-      sum += m.costUsd ?? 0;
-    }
-    return sum;
-  }
+  ChatMessage? get last => messages.isEmpty ? null : messages.last;
 }
 
 /// Провайдер открытой переписки.
@@ -297,9 +257,9 @@ final chatThreadProvider =
 /// экран переписки лежит отдельным маршрутом поверх списка.
 class ChatThreadController extends Notifier<ChatThreadState> {
   /// Подписка на поток ответа; `null` — генерации нет.
-  StreamSubscription<AiChunk>? _sub;
+  StreamSubscription<ChatChunk>? _sub;
 
-  /// Ожидание окончания генерации: `send` не возвращается, пока ответ не дописан или отменён.
+  /// Ожидание окончания генерации: [send] не возвращается, пока ответ не дописан или отменён.
   Completer<void>? _done;
 
   /// Отмену запросил человек — отличает «Стоп» от обрыва связи: в первом случае ошибку
@@ -307,12 +267,12 @@ class ChatThreadController extends Notifier<ChatThreadState> {
   bool _cancelledByUser = false;
 
   /// Клиент ручек чата поверх текущего облачного клиента.
-  AiApi get _api => AiApi(ref.read(appStateProvider).api);
+  ChatApi get _api => ChatApi(ref.read(appStateProvider).api);
 
   @override
   ChatThreadState build() {
-    // уход с экрана не должен оставлять висящий запрос: разрыв соединения гасит и запрос
-    // сервера к провайдеру
+    // уход с экрана не должен оставлять висящий запрос: разрыв соединения гасит и работу
+    // сервера (поиск, чтение страниц, генерацию)
     ref.onDispose(() {
       _sub?.cancel();
       _finish();
@@ -320,69 +280,32 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     return const ChatThreadState();
   }
 
-  /// Открывает чат: читает историю сообщений и список моделей.
-  ///
-  /// Модели нужны шапке (выбор модели): их список зависит от ключа сервера, поэтому приходит
-  /// оттуда, а не хардкодится в приложении.
-  Future<void> open(AiChat chat) async {
+  /// Открывает чат: читает историю сообщений вместе с источниками ответов.
+  Future<void> open(ChatSummary chat) async {
     state = ChatThreadState(
       chatId: chat.id,
       title: chat.title,
       model: chat.model,
       searchMode: ref.read(settingsProvider).ui.chatSearch,
-      agentMode: ref.read(settingsProvider).ui.chatAgent,
       loading: true,
     );
     try {
       final messages = await _api.messages(chat.id);
       if (state.chatId != chat.id) return; // чат успели сменить, пока шла загрузка
       state = state.copyWith(messages: messages, loading: false);
-    } on AiApiException catch (e) {
+    } on ChatApiException catch (e) {
       state = state.copyWith(loading: false).withError(e.message);
     }
-    try {
-      final reply = await _api.models();
-      if (state.chatId != chat.id) return;
-      state = state.copyWith(models: reply.models);
-    } on AiApiException {
-      // без списка моделей переписка работает: модель уже выбрана и сохранена в чате
-    }
-  }
-
-  /// Меняет модель чата (её запоминает сервер, поэтому выбор переживает перезапуск).
-  Future<void> setModel(String model) async {
-    final chatId = state.chatId;
-    if (chatId.isEmpty) return;
-    state = state.copyWith(model: model);
-    try {
-      await _api.patchChat(chatId, model: model);
-    } on AiApiException catch (e) {
-      state = state.withError(e.message);
-      return;
-    }
-    ref.read(chatsProvider.notifier).touch(chatId, model: model);
   }
 
   /// Меняет режим поиска и запоминает выбор на будущее.
   ///
-  /// Режим один на всё приложение: это привычка («отвечай из головы, ищи только когда прошу»),
-  /// а не свойство отдельного разговора.
+  /// Режим один на всё приложение: это привычка («ищи только когда прошу»), а не свойство
+  /// отдельного разговора.
   Future<void> setSearchMode(String mode) async {
     if (mode == state.searchMode) return;
     state = state.copyWith(searchMode: mode);
     await ref.read(settingsProvider).ui.setChatSearch(mode);
-  }
-
-  /// Включает и выключает режим агента на телефоне и запоминает выбор на будущее.
-  ///
-  /// Режим, как и поиск, один на всё приложение: это привычка («пусть ходит по телефону за меня»
-  /// против «пусть отвечает быстро»), а не свойство отдельного разговора. Запоминается потому,
-  /// что прогон стоит человеку минут ожидания — случайно оставленный включённым, он сделал бы
-  /// такой же долгой следующую отправку.
-  Future<void> setAgentMode(bool on) async {
-    if (on == state.agentMode) return;
-    state = state.copyWith(agentMode: on);
-    await ref.read(settingsProvider).ui.setChatAgent(on);
   }
 
   /// Отправляет вопрос: дописывает его в переписку и запускает поток ответа.
@@ -393,8 +316,8 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     state = state.copyWith(
       messages: [
         ...state.messages,
-        AiMessage(id: '', role: 'user', content: prompt),
-        const AiMessage.pending(),
+        ChatMessage(role: 'user', content: prompt),
+        const ChatMessage.pending(),
       ],
     ).clearError();
     await _run(chatId, prompt);
@@ -405,11 +328,12 @@ class ChatThreadController extends Notifier<ChatThreadState> {
   /// Ничего не дописывает: вопрос уже в переписке, а ответ на него не пришёл.
   Future<void> retry() async {
     final chatId = state.chatId;
-    final lastUser = state.messages.lastWhere((m) => m.isUser, orElse: () => const AiMessage.pending());
+    final lastUser = state.messages.lastWhere(
+      (m) => m.isUser,
+      orElse: () => const ChatMessage.pending(),
+    );
     if (chatId.isEmpty || state.sending || lastUser.content.isEmpty) return;
-    state = state.copyWith(
-      messages: [...state.messages, const AiMessage.pending()],
-    ).clearError();
+    state = state.copyWith(messages: [...state.messages, const ChatMessage.pending()]).clearError();
     await _run(chatId, lastUser.content);
   }
 
@@ -433,16 +357,12 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     _done = done;
 
     // «авто» отправляем как отсутствие поля: решение принимает сервер по тексту вопроса.
-    // В режиме агента поиск не нужен — агент сам ходит по интернету на телефоне, и сервер в этом
-    // случае поиск не запускает; `search: false` здесь говорит это явно, а не оставляет на догадки.
     final search = switch (state.searchMode) {
       'on' => true,
       'off' => false,
       _ => null,
     };
-    _sub = _api
-        .send(chatId, question, search: state.agentMode ? false : search, agent: state.agentMode)
-        .listen(
+    _sub = _api.send(chatId, question, search: search).listen(
           _applyChunk,
           onError: (Object e) {
             if (!_cancelledByUser) _fail(e);
@@ -457,9 +377,9 @@ class ChatThreadController extends Notifier<ChatThreadState> {
   /// Дописывает полученное событие в состояние экрана.
   ///
   /// Состояние обновляется на каждое событие: так текст появляется по мере генерации. Список
-  /// пересобирается целиком (состояние неизменяемое) — на длинных ответах это дешёво, потому
+  /// пересобирается целиком (состояние неизменяемое) — на длинных ответах это дёшево, потому
   /// что экран перестраивает только последний пузырь.
-  void _applyChunk(AiChunk chunk) {
+  void _applyChunk(ChatChunk chunk) {
     if (chunk.title != null) {
       state = state.copyWith(title: chunk.title);
       ref.read(chatsProvider.notifier).touch(state.chatId, title: chunk.title);
@@ -470,7 +390,9 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     }
     if (chunk.usage != null) state = state.copyWith(usage: chunk.usage);
     if (chunk.searching != null) state = state.copyWith(searching: chunk.searching);
-    if (chunk.agentRunning != null) state = state.copyWith(agentRunning: chunk.agentRunning);
+    // Источники приходят до генерации и относятся к ответу, который ещё пишется: кладём их в
+    // последний пузырь, чтобы ссылки были видны, пока модель печатает.
+    if (chunk.sources != null) _attachSources(chunk.sources!);
 
     final last = state.last;
     if (last == null || last.isUser) return;
@@ -485,30 +407,27 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     state = state.copyWith(messages: messages);
   }
 
+  /// Привязывает источники к последнему ответу (заготовке или уже написанному).
+  void _attachSources(List<ChatSource> sources) {
+    if (sources.isEmpty) return;
+    final last = state.last;
+    if (last == null || last.isUser) return;
+    final messages = [...state.messages];
+    messages[messages.length - 1] = last.copyWith(sources: sources);
+    state = state.copyWith(messages: messages);
+  }
+
   /// Показывает ошибку потока и убирает пустую заготовку ответа.
   ///
   /// Пустая заготовка после ошибки — это пузырь без текста, который ничего не объясняет:
   /// причину показывает сообщение об ошибке, а вопрос остаётся на месте, чтобы его повторить.
   void _fail(Object e) {
-    final message = e is AiApiException ? e.message : 'Не удалось получить ответ.';
+    final message = e is ChatApiException ? e.message : 'Не удалось получить ответ.';
     final messages = [...state.messages];
     if (messages.isNotEmpty && !messages.last.isUser && messages.last.content.isEmpty) {
       messages.removeLast();
     }
     state = state.copyWith(messages: messages).withError(message);
-  }
-
-  /// Переносит стоимость завершённого ответа из события потока в само сообщение.
-  ///
-  /// Нужно, потому что сумма по чату считается по сообщениям: при следующем открытии чата
-  /// стоимость придёт из базы, а до перезагрузки её надо взять из последнего события.
-  void _applyCostToLast(double? costUsd) {
-    if (costUsd == null || costUsd <= 0) return;
-    final last = state.last;
-    if (last == null || last.isUser || last.costUsd == costUsd) return;
-    final messages = [...state.messages];
-    messages[messages.length - 1] = last.copyWith(costUsd: costUsd);
-    state = state.copyWith(messages: messages);
   }
 
   /// Завершает генерацию: снимает признак, убирает пустую заготовку и отпускает ожидание.
@@ -520,20 +439,12 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     _done = null;
     _sub = null;
     if (state.sending) {
-      // стоимость приходит последним событием вместе с расходом токенов
-      _applyCostToLast(state.usage?.costUsd);
       final messages = [...state.messages];
       if (messages.isNotEmpty && !messages.last.isUser && messages.last.content.isEmpty) {
         messages.removeLast();
       }
-      // признаки «ищет» и «работает на телефоне» снимаем вместе с генерацией: иначе подпись
-      // осталась бы висеть
-      state = state.copyWith(
-        messages: messages,
-        sending: false,
-        searching: false,
-        agentRunning: false,
-      );
+      // признак «ищет» снимаем вместе с генерацией: иначе подпись осталась бы висеть
+      state = state.copyWith(messages: messages, sending: false, searching: false);
       ref.read(chatsProvider.notifier).touch(state.chatId);
     }
     if (done != null && !done.isCompleted) done.complete();

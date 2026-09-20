@@ -4,28 +4,27 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../theme.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
-import 'ai_types.dart';
 import 'chat_controller.dart';
 import 'chat_thread_screen.dart';
+import 'chat_types.dart';
 import 'memory_screen.dart';
 
 /// Раздел «Чат»: список чатов и вход в переписку.
 ///
 /// Раздел открывается на списке, как в приложениях ChatGPT и Gemini: чатов бывает много, темы
 /// разные, и начинать всегда с пустой переписки неудобно. История лежит на сервере, поэтому
-/// чаты общие для телефона и ноутбука, а не у каждого свои.
+/// чаты общие для телефона и ноутбука.
 class ChatScreen extends ConsumerStatefulWidget {
+  /// Экран списка чатов.
   const ChatScreen({super.key});
 
   @override
   ConsumerState<ChatScreen> createState() => _ChatScreenState();
 }
 
-/// Состояние экрана: список чатов живёт в провайдере, здесь — только навигация и подтверждения.
+/// Состояние экрана: список живёт в провайдере, здесь — только навигация и подтверждения.
 class _ChatScreenState extends ConsumerState<ChatScreen> {
-  /// Контроллер списка, взятый один раз в `initState`: обновлять список нужно и после
-  /// возврата из переписки, а держать ссылку на провайдер до этого момента проще, чем читать
-  /// его каждый раз заново.
+  /// Контроллер списка, взятый один раз в `initState`.
   late final ChatsController _chats;
 
   @override
@@ -50,7 +49,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   /// Открывает переписку чата и обновляет список после возврата.
-  Future<void> _openThread(AiChat chat) async {
+  Future<void> _openThread(ChatSummary chat) async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(builder: (_) => ChatThreadScreen(chat: chat)),
     );
@@ -58,14 +57,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   /// Переименование темы чата.
-  Future<void> _rename(AiChat chat) async {
+  Future<void> _rename(ChatSummary chat) async {
     final title = await promptDialog(context, 'Тема чата', initial: chat.title);
     if (title == null || title.trim().isEmpty || !mounted) return;
     await _chats.rename(chat, title.trim());
   }
 
   /// Удаление чата вместе с перепиской (спрашиваем подтверждение: удаление необратимо).
-  Future<void> _delete(AiChat chat) async {
+  Future<void> _delete(ChatSummary chat) async {
     final ok = await confirmDialog(
       context,
       'Удалить чат',
@@ -112,9 +111,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           : null,
       body: Column(
         children: [
-          // Без ключа на сервере чат не заработает ничем, что можно сделать в приложении:
-          // ключ задаётся секретом репозитория и попадает на сервер при выкладке. Говорим об
-          // этом словами, а не пустым списком.
+          // Модель считает на домашнем маке: если он спит или потерял сеть, отвечать некому.
+          // Это состояние раздела, а не сбой запроса, поэтому говорим словами, а не пустым списком.
           if (!state.configured) const _NotConfiguredNotice(),
           if (state.error != null) _errorBar(state.error!),
           Expanded(child: _body(state)),
@@ -153,7 +151,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   /// Строка списка: тема, модель, число сообщений и время последнего.
-  Widget _chatTile(AiChat chat) {
+  Widget _chatTile(ChatSummary chat) {
     return ListTile(
       leading: const Icon(Icons.chat_bubble_outline, color: C.fg2),
       title: Text(
@@ -210,10 +208,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
 /// Подсказка, когда модель недоступна.
 ///
-/// Это не сбой запроса, а состояние: модель считает на домашнем маке, и если он спит, выключен
-/// или потерял сеть — отвечать некому. В приложении это не чинится и повторять запрос
-/// бессмысленно, поэтому вместо ошибки запроса показывается состояние раздела.
+/// Это не сбой запроса, а состояние: модель считает на домашнем маке, и если он спит или потерял
+/// сеть — отвечать некому. В приложении это не чинится, и повторять запрос бессмысленно.
 class _NotConfiguredNotice extends StatelessWidget {
+  /// Подсказка о недоступной модели.
   const _NotConfiguredNotice();
 
   @override
