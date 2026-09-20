@@ -241,15 +241,15 @@ jobs:
             GEMINI_API_KEY=$GEMINI_API_KEY
 
             # ===== Чат с ИИ =====
-            # Модель, поиск и агент живут на домашнем маке и приходят через reverse-SSH туннель
-            # (agents/run-dsh-tunnel.sh на маке: 18812 — LM Studio, 18814 — поиск, 18816 — агент
-            # на телефоне). Мак выключен или спит — раздел «Чат» отвечает «локальная модель
-            # недоступна», остальное облако работает как обычно.
+            # Модель и поиск с чтением страниц живут на домашнем маке и приходят через
+            # reverse-SSH туннель (jevel.ai/agents/run-dsh-tunnel.sh: 18812 — LM Studio,
+            # 18814 — сервис поиска). Мак выключен или спит — раздел «Чат» отвечает
+            # «локальная модель недоступна», остальное облако работает как обычно.
             LLM_BASE_URL=$LLM_BASE_URL
             LLM_MODEL=$LLM_MODEL
             LLM_REASONING=none
             WEBSEARCH_URL=$WEBSEARCH_URL
-                        EOF
+            EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \
               || pm2 start dist/main.js --name cloudlyru --time --cwd /home/deploy/apps/cloudlyru
