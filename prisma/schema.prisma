@@ -18,10 +18,10 @@ datasource db {
 // ===== Пользователи, сессии, токены =====
 
 model User {
-  id            String     @id @default(uuid())
-  login         String     @unique
+  id            String        @id @default(uuid())
+  login         String        @unique
   passwordHash  String
-  createdAt     DateTime   @default(now())
+  createdAt     DateTime      @default(now())
   sessions      Session[]
   apiTokens     ApiToken[]
   mailAccounts  MailAccount[]
@@ -39,6 +39,8 @@ model User {
   clipboardAt   DateTime?
   aiChats       AiChat[]
   aiSettings    AiSettings?
+  chats         Chat[]
+  chatSettings  ChatSettings?
 }
 
 model Session {
@@ -62,21 +64,21 @@ model Session {
 }
 
 model ApiToken {
-  id         String    @id @default(uuid())
-  userId     String
-  label      String
-  tokenHash  String    @unique
-  scope      String    @default("files:rw") // files:rw | files:ro (проверяется в resolveApiToken)
+  id             String    @id @default(uuid())
+  userId         String
+  label          String
+  tokenHash      String    @unique
+  scope          String    @default("files:rw") // files:rw | files:ro (проверяется в resolveApiToken)
   // Колонка добавлена позже (миграция 0010), когда токены уже были выпущены и жили бессрочно:
   // проставить им срок задним числом значило бы выдумать дату, поэтому поле nullable, а NULL
   // честно читается как «бессрочный» — так и живут токены, выпущенные до появления TTL.
-  expiresAt  DateTime? // null = бессрочный (легаси-токены)
-  lastUsedAt DateTime?
-  revokedAt  DateTime?
-  createdAt  DateTime  @default(now())
+  expiresAt      DateTime? // null = бессрочный (легаси-токены)
+  lastUsedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
   // корень зеркала этого устройства («<Имя> - Файлы»); создаётся лениво
   mirrorFolderId String?
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
 }
@@ -86,25 +88,25 @@ model ApiToken {
 // Удаление — soft (deletedAt), hard delete только через purge (корзина, retention).
 
 model Folder {
-  id        String      @id @default(uuid())
-  parentId  String? // null = верхний уровень (корень пользователя)
-  name      String
+  id          String      @id @default(uuid())
+  parentId    String? // null = верхний уровень (корень пользователя)
+  name        String
   // зона: FILES (обычный диск, медиа хранится как есть) | PHOTOS (поддерево системной папки «Фото», медиа конвертируется)
-  zone      String      @default("FILES")
+  zone        String      @default("FILES")
   // легаси: флаг «держать офлайн» снят с поддержки. Колонка оставлена, чтобы не делать
   // миграцию по данным; код её больше не читает и не пишет.
-  keepOffline Boolean   @default(false)
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
-  deletedAt DateTime?
+  keepOffline Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  deletedAt   DateTime?
   // Физическое удаление (purge корзины) уносит только саму строку: FK на родителя объявлен
   // ON DELETE SET NULL (миграция 0001_init), поэтому у пережившего ребёнка parentId становится
   // NULL и поддерево выпадает из дерева пользователя. RESTRICT тут не годится: purge удаляет
   // папки одним deleteMany по списку id, порядок строк внутри него не определён, и запрет
   // удалять родителя с живым ребёнком валил бы всю транзакцию чистки.
-  parent    Folder?     @relation("FolderTree", fields: [parentId], references: [id])
-  children  Folder[]    @relation("FolderTree")
-  entries   FileEntry[]
+  parent      Folder?     @relation("FolderTree", fields: [parentId], references: [id])
+  children    Folder[]    @relation("FolderTree")
+  entries     FileEntry[]
 
   // Postgres: NULL-ы в unique-индексе не конфликтуют — дубли на верхнем уровне ловим в сервисе
   @@unique([parentId, name])
@@ -112,23 +114,23 @@ model Folder {
 }
 
 model FileEntry {
-  id         String      @id @default(uuid())
-  folderId   String
-  assetId    String
-  name       String
+  id             String          @id @default(uuid())
+  folderId       String
+  assetId        String
+  name           String
   // зона папки на момент создания (FILES|PHOTOS) — для фильтра таймлайна и политики конвертации
-  zone       String      @default("FILES")
+  zone           String          @default("FILES")
   // mtime файла на устройстве-источнике: без него синхронизация сравнивала бы даты,
   // которые сервер не знает, и каждый скан считал бы скачанный файл «изменённым»
-  clientMtime DateTime?
+  clientMtime    DateTime?
   // легаси-поле файла: флаг «держать офлайн» снят с поддержки, код его не использует
-  keepOffline Boolean     @default(false)
-  createdAt  DateTime    @default(now())
-  updatedAt  DateTime    @updatedAt
-  deletedAt  DateTime?
-  folder     Folder      @relation(fields: [folderId], references: [id], onDelete: Cascade)
-  asset      Asset       @relation(fields: [assetId], references: [id], onDelete: Restrict)
-  albumItems AlbumItem[]
+  keepOffline    Boolean         @default(false)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  deletedAt      DateTime?
+  folder         Folder          @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  asset          Asset           @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  albumItems     AlbumItem[]
   // обратная сторона MailAttachment.entryId: вложение письма — обычная запись дерева
   // (в скрытой зоне MAIL), поэтому её содержимое дедуплицируется с файлами пользователя
   mailAttachment MailAttachment?
@@ -143,25 +145,25 @@ model FileEntry {
 
 // Физический объект в S3 (один на уникальное содержимое)
 model Asset {
-  id            String      @id @default(uuid())
-  sha256        String      @unique
-  size          BigInt
-  mime          String
-  ext           String?
-  createdAt     DateTime    @default(now())
+  id           String        @id @default(uuid())
+  sha256       String        @unique
+  size         BigInt
+  mime         String
+  ext          String?
+  createdAt    DateTime      @default(now())
   // Состояние превью: 'none' — ещё нет (задача ждёт, упала или её ещё не ставили),
   // 'done' — собраны, 'impossible' — собрать нельзя (причина в previewError).
   // Превью строятся из содержимого, поэтому состояние живёт на ассете, а не на записи в дереве.
-  previewState  String      @default("none")
-  previewError  String?
+  previewState String        @default("none")
+  previewError String?
   // Число страниц PDF: по нему перечисляются превью страниц при удалении файла.
-  pageCount     Int?
-  entries       FileEntry[]
-  media         MediaMeta?
-  jobs          Job[]
+  pageCount    Int?
+  entries      FileEntry[]
+  media        MediaMeta?
+  jobs         Job[]
   // сырые .eml писем: объект в S3 тот же content-addressed files/<sha256>, а строка Asset
   // нужна, чтобы объект был на учёте (иначе его снесёт deploy/scripts/sweep-orphans.mjs)
-  mailRaw       MailMessage[] @relation("MailRawAsset")
+  mailRaw      MailMessage[] @relation("MailRawAsset")
 
   @@index([previewState])
 }
@@ -170,29 +172,29 @@ model Asset {
 // лежат в БД, а не в RAM: рестарт сервиса больше не теряет сессию, а complete может
 // собрать объект по ETag'ам, пришедшим с клиента (прямая загрузка в S3).
 model UploadSession {
-  id         String   @id @default(uuid())
-  userId     String
-  s3UploadId String   @unique
-  uploadKey  String // временный ключ объекта в S3 (files/tmp/<token>) для abort/cleanup
-  folderId   String?
-  name       String
-  size       BigInt
-  mime       String
-  partCount  Int      @default(0) // сколько частей принято
-  parts      Json? // [{ partNumber, etag, size }] — принятые части multipart
+  id                String    @id @default(uuid())
+  userId            String
+  s3UploadId        String    @unique
+  uploadKey         String // временный ключ объекта в S3 (files/tmp/<token>) для abort/cleanup
+  folderId          String?
+  name              String
+  size              BigInt
+  mime              String
+  partCount         Int       @default(0) // сколько частей принято
+  parts             Json? // [{ partNumber, etag, size }] — принятые части multipart
   // sha256, объявленный клиентом (браузер считает инкрементально до загрузки):
   // нужен для дедупа до передачи байтов и как ожидаемое значение при верификации.
-  declaredSha256 String?
-  direct     Boolean  @default(false) // части льются клиентом прямо в S3 (без релея через сервер)
+  declaredSha256    String?
+  direct            Boolean   @default(false) // части льются клиентом прямо в S3 (без релея через сервер)
   // Перезапись существующего файла с тем же именем: без неё зеркалирование на каждом
   // изменённом файле получало бы 409, а «удали + создай» меняло бы id записи у всех устройств
-  replace    Boolean  @default(false)
+  replace           Boolean   @default(false)
   // Имя занято записью из корзины, и клиент синхронизации разрешил её занять
   // (replaceTrashed в init): запись восстанавливается и перезаписывается. Без флага
   // поведение прежнее — 409 in_trash, и файл с таким именем не уезжает в облако никогда.
-  replaceTrashed Boolean @default(false)
+  replaceTrashed    Boolean   @default(false)
   // mtime файла на устройстве-источнике, чтобы он попал в FileEntry при создании записи
-  clientMtime DateTime?
+  clientMtime       DateTime?
   // Предполётное условие перезаписи (оптимистичная блокировка): клиент говорит, какую
   // версию файла он заменяет. Если на сервере уже другая — 409 со снимком текущей версии,
   // и клиент сохраняет свою копию как конфликтную, а не затирает чужую правку.
@@ -200,10 +202,10 @@ model UploadSession {
   expectedUpdatedAt DateTime?
   // Сессия не удаляется сразу после complete: ретрай после потерянного ответа должен
   // получить тот же результат, а не 404 (клиент на плохой сети иначе считает загрузку провалом)
-  completedAt DateTime?
-  result      Json?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  completedAt       DateTime?
+  result            Json?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
   @@index([userId])
   @@index([updatedAt])
@@ -268,7 +270,7 @@ model AlbumItem {
 // достаточно применить строку, а не восстанавливать состояние запросами.
 
 model ChangeLog {
-  seq         BigInt   @id @default(autoincrement())
+  seq         BigInt    @id @default(autoincrement())
   userId      String
   target      String // entry | folder
   op          String // create | update | move | delete | restore
@@ -281,10 +283,10 @@ model ChangeLog {
   mime        String?
   clientMtime DateTime?
   // легаси: снимок флага «держать офлайн» в событии журнала; новые события его не пишут
-  keepOffline Boolean  @default(false)
+  keepOffline Boolean   @default(false)
   // id ApiToken устройства, если изменение пришло от клиента синхронизации (иначе null)
   deviceId    String?
-  at          DateTime @default(now())
+  at          DateTime  @default(now())
 
   @@index([userId, seq])
   @@index([at])
@@ -371,33 +373,33 @@ model UnzipJob {
 // а корзин у нас ровно две (см. MailCursor.box).
 
 model MailAccount {
-  id          String    @id @default(uuid())
-  userId      String
-  kind        String // 'gmail' | 'icloud' | 'imap' — от него зависят имена папок источника
-  email       String // адрес, которым подписываются письма и по которому идёт дедуп
-  imapHost    String
-  imapPort    Int       @default(993)
-  smtpHost    String
-  smtpPort    Int       @default(465)
-  login       String // логин IMAP/SMTP (у Gmail и iCloud совпадает с email, но это не гарантия)
+  id            String              @id @default(uuid())
+  userId        String
+  kind          String // 'gmail' | 'icloud' | 'imap' — от него зависят имена папок источника
+  email         String // адрес, которым подписываются письма и по которому идёт дедуп
+  imapHost      String
+  imapPort      Int                 @default(993)
+  smtpHost      String
+  smtpPort      Int                 @default(465)
+  login         String // логин IMAP/SMTP (у Gmail и iCloud совпадает с email, но это не гарантия)
   // app password, зашифрованный AES-256-GCM ключом MAIL_SECRET_KEY: это ключ ко всей
   // переписке, в открытом виде он не хранится и в логи не попадает.
-  secretEnc   String
+  secretEnc     String
   // Отправка может идти через другой сервис, чем приём (у Brevo логин и ключ свои,
   // а не пароль ящика). Пусто — берём login/secretEnc: так живут Gmail и iCloud.
-  smtpLogin      String?
-  smtpSecretEnc  String?
-  authKind    String    @default("password") // password | oauth2 (задел под Gmail API)
-  enabled     Boolean   @default(true)
-  status      String    @default("idle") // idle | syncing | error
-  statusError String?
-  lastSyncAt  DateTime?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  cursors     MailCursor[]
-  messages    MailMessage[]
-  failures    MailIngestFailure[]
+  smtpLogin     String?
+  smtpSecretEnc String?
+  authKind      String              @default("password") // password | oauth2 (задел под Gmail API)
+  enabled       Boolean             @default(true)
+  status        String              @default("idle") // idle | syncing | error
+  statusError   String?
+  lastSyncAt    DateTime?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cursors       MailCursor[]
+  messages      MailMessage[]
+  failures      MailIngestFailure[]
 
   @@unique([userId, email])
   @@index([userId])
@@ -435,18 +437,18 @@ model MailCursor {
 /// Строка живёт до тех пор, пока письмо не сохранится (`MailSyncService.clearUnsaved`):
 /// сохранённое письмо удаляет запись по тем же координатам.
 model MailIngestFailure {
-  id          String   @id @default(uuid())
+  id          String      @id @default(uuid())
   accountId   String
   folderPath  String // папка источника на сервере
   uidValidity BigInt // без неё uid не уникален: провайдер перенумеровывает папку
   uid         BigInt
   /// Сколько раз пробовали сохранить. По этому числу видно, письмо ещё пробуют или уже нет.
-  tries       Int      @default(1)
+  tries       Int         @default(1)
   /// Причина последней неудачи: та же строка, что уходит в лог (обрезана до 200 знаков).
   error       String
   /// Когда письмо впервые не сохранилось и когда пытались в последний раз.
-  firstAt     DateTime @default(now())
-  lastAt      DateTime @updatedAt
+  firstAt     DateTime    @default(now())
+  lastAt      DateTime    @updatedAt
   account     MailAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
   /// Координаты письма: по ним запись обновляется и снимается.
@@ -455,65 +457,68 @@ model MailIngestFailure {
 }
 
 model MailMessage {
-  id             String    @id @default(uuid())
-  userId         String
-  accountId      String
-  box            String // основная папка: 'inbox' | 'sent'
+  id               String           @id @default(uuid())
+  userId           String
+  accountId        String
+  box              String // основная папка: 'inbox' | 'sent'
   // Папки сверх основной. Одно и то же письмо бывает сразу в двух: отправленное себе
   // (наша копия в «Исходящих» плюс пришедшая обратно) и две копии на сервере у iCloud
   // (INBOX и Sent Messages). Строка при этом одна — иначе задваивались бы вложения и файл .eml.
-  alsoBoxes      String[] @default([])
-  folderPath     String // папка источника: по ней и курсору письмо находится повторно
-  uid            BigInt
-  uidValidity    BigInt
+  alsoBoxes        String[]         @default([])
+  folderPath       String // папка источника: по ней и курсору письмо находится повторно
+  uid              BigInt
+  uidValidity      BigInt
   // X-GM-MSGID — стабильный идентификатор письма у Gmail: он не меняется при переносе
   // между папками, поэтому дедуп для Gmail идёт по нему, а не по uid.
-  gmailMsgId     String?
-  messageId      String? // Message-ID из заголовков
-  threadKey      String? // X-GM-THRID либо нормализованная тема для iCloud
-  subject        String?
-  fromName       String?
-  fromAddr       String?
-  toAddrs        String[]
-  ccAddrs        String[]
-  replyTo        String?
-  inReplyTo      String?
-  refs           String[] // References из заголовков — для сборки треда
-  sentAt         DateTime? // Date из заголовков (может врать и отсутствовать)
-  receivedAt     DateTime // INTERNALDATE — время прихода на сервер, ему и верим
+  gmailMsgId       String?
+  messageId        String? // Message-ID из заголовков
+  threadKey        String? // X-GM-THRID либо нормализованная тема для iCloud
+  subject          String?
+  fromName         String?
+  fromAddr         String?
+  toAddrs          String[]
+  ccAddrs          String[]
+  replyTo          String?
+  inReplyTo        String?
+  refs             String[] // References из заголовков — для сборки треда
+  sentAt           DateTime? // Date из заголовков (может врать и отсутствовать)
+  receivedAt       DateTime // INTERNALDATE — время прихода на сервер, ему и верим
   // Ключ сортировки ленты: receivedAt для входящих, sentAt (иначе receivedAt) для исходящих.
   // Отдельной колонкой, чтобы индекс ленты не зависел от выражения COALESCE.
-  sortAt         DateTime
-  size           Int
-  hasAttachments Boolean   @default(false)
-  seen           Boolean   @default(false)
-  flagged        Boolean   @default(false)
+  sortAt           DateTime
+  size             Int
+  hasAttachments   Boolean          @default(false)
+  seen             Boolean          @default(false)
+  flagged          Boolean          @default(false)
   // Первые ~2 КБ текста: превью в списке рисуется без разбора .eml из S3.
-  bodyText       String?
+  bodyText         String?
   // Текст под полнотекстовый поиск: тема, участники и ПОЛНОЕ тело письма одной строкой
   // (потолок — SEARCH_TEXT_MAX_CHARS в mail-parse.ts). Отдельная колонка нужна потому, что
   // `bodyText` — только превью первых 2 КБ, а искать надо по всему телу; разбирать .eml
   // из S3 на каждый поисковый запрос нечем. Индекс по этой колонке объявлен в миграции
   // 20260917140000_mail_search_text: он выражение (GIN по tsvector), а выражение в схеме
   // не записывается.
-  searchText     String?
+  searchText       String?
   // Когда письмо попало в поисковый индекс. NULL — ещё нет: письма, сохранённые до появления
   // поиска, добирает фоновый проход (src/mail/mail-index.service.ts), а отметка не даёт ему
   // вечно возвращаться к письмам, которые не разбираются.
-  searchIndexedAt DateTime?
-  rawAssetId     String // Asset сырого .eml (объект files/<sha256>)
+  searchIndexedAt  DateTime?
+  rawAssetId       String // Asset сырого .eml (объект files/<sha256>)
   // Удаление письма из веб-морды — soft (корзина общая с файлами); `remoteDeletedAt` — уже
   // про источник, когда копию убрали с сервера аккаунта.
-  deletedAt       DateTime?
-  remoteDeletedAt DateTime?
+  deletedAt        DateTime?
+  remoteDeletedAt  DateTime?
   // Сколько раз пытались убрать копию с сервера и чем кончилось. Нужно для разбора: без этих
   // полей «письмо почему-то не удаляется» выяснять неоткуда, а молчаливые повторы бесконечны.
-  remotePurgeTries Int       @default(0)
+  remotePurgeTries Int              @default(0)
   remotePurgeError String?
-  createdAt      DateTime  @default(now())
-  account        MailAccount     @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  rawAsset       Asset           @relation("MailRawAsset", fields: [rawAssetId], references: [id], onDelete: Restrict)
-  attachments    MailAttachment[]
+  createdAt        DateTime         @default(now())
+  account          MailAccount      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  rawAsset         Asset            @relation("MailRawAsset", fields: [rawAssetId], references: [id], onDelete: Restrict)
+  attachments      MailAttachment[]
+  // Индекс под догоняющую чистку (accountId + createdAt, только письма с живой копией
+  // у провайдера) тоже объявлен в миграции: он частичный (WHERE "remoteDeletedAt" IS NULL),
+  // а частичный индекс в схеме не выражается. См. 20260916000100_mail_purge_index.
 
   // Идемпотентность повторного прохода по папке: то же письмо не заводится второй раз.
   @@unique([accountId, folderPath, uidValidity, uid])
@@ -532,18 +537,15 @@ model MailMessage {
   // Postgres без GIN идёт перебором строк. Массив маленький (обычно 0–1 элемент), поэтому
   // индекс дешёвый и по размеру, и по записи.
   @@index([alsoBoxes], type: Gin)
-  // Индекс под догоняющую чистку (accountId + createdAt, только письма с живой копией
-  // у провайдера) тоже объявлен в миграции: он частичный (WHERE "remoteDeletedAt" IS NULL),
-  // а частичный индекс в схеме не выражается. См. 20260916000100_mail_purge_index.
 }
 
 // Вложение письма = обычная запись дерева в скрытой зоне MAIL плюс связь с письмом.
 // Через `entryId` файл открывается деталкой (превью, размер, скачивание), через
 // `messageId` — обратный переход «файл → письмо».
 model MailAttachment {
-  id        String   @id @default(uuid())
+  id        String      @id @default(uuid())
   messageId String
-  entryId   String   @unique
+  entryId   String      @unique
   // Порядковый номер части в разобранном письме. Путь MIME ('1.2') тут не годится: разбор
   // идёт через mailparser, который пути не отдаёт, а саму часть мы сохраняем в S3 — искать
   // её повторно в .eml не нужно.
@@ -552,8 +554,8 @@ model MailAttachment {
   mime      String
   size      Int
   contentId String? // Content-ID инлайн-картинки: по нему подменяется cid: в HTML письма
-  inline    Boolean  @default(false)
-  createdAt DateTime @default(now())
+  inline    Boolean     @default(false)
+  createdAt DateTime    @default(now())
   message   MailMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
   entry     FileEntry   @relation(fields: [entryId], references: [id], onDelete: Cascade)
 
@@ -591,18 +593,18 @@ model SenderFavicon {
 // `Onboarding*`-поля и `pendingCompanyName/pendingTaxId` — тоже наследие регистрации на лендинге.
 
 model FacturaUser {
-  id              String    @id @default(cuid())
-  email           String    @unique
-  otp             String?
-  otpExpiresAt    DateTime?
-  otpAttempts     Int       @default(0)
-  sessionToken    String?
-  preferredLocale String?
+  id                 String    @id @default(cuid())
+  email              String    @unique
+  otp                String?
+  otpExpiresAt       DateTime?
+  otpAttempts        Int       @default(0)
+  sessionToken       String?
+  preferredLocale    String?
   // Captured on signup before OTP verify, consumed when creating the first Company.
   pendingCompanyName String?
   pendingTaxId       String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
 
   companies       UserCompany[]
   sessions        FacturaSession[]
@@ -620,7 +622,7 @@ model FacturaSession {
   createdAt DateTime  @default(now())
   expiresAt DateTime?
 
-  user      FacturaUser      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user FacturaUser @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@map("sessions")
@@ -633,8 +635,8 @@ model UserCompany {
   role      Role     @default(OWNER)
   createdAt DateTime @default(now())
 
-  user    FacturaUser    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    FacturaUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
   @@unique([userId, companyId])
   @@index([companyId])
@@ -648,28 +650,28 @@ enum Role {
 }
 
 model Company {
-  id        String   @id @default(cuid())
-  name      String
+  id   String @id @default(cuid())
+  name String
 
   // --- Emitter profile (drives PDF "Sent by" block) ---
-  legalName     String?  // "Bogdan Sokolov" — falls back to name
-  taxId         String?  // NIF / CIF / VAT (e.g. "Z1894474S")
-  vatId         String?  // VAT identifier when different from taxId (e.g. "ESZ1894474S")
-  addressLine1  String?
-  addressLine2  String?
-  city          String?
-  postalCode    String?
-  region        String?
-  country       String?  // ISO 3166-1 alpha-2 (e.g. "ES")
+  legalName           String? // "Bogdan Sokolov" — falls back to name
+  taxId               String? // NIF / CIF / VAT (e.g. "Z1894474S")
+  vatId               String? // VAT identifier when different from taxId (e.g. "ESZ1894474S")
+  addressLine1        String?
+  addressLine2        String?
+  city                String?
+  postalCode          String?
+  region              String?
+  country             String? // ISO 3166-1 alpha-2 (e.g. "ES")
   // Banking
-  bankName      String?
-  iban          String?
-  swift         String?
+  bankName            String?
+  iban                String?
+  swift               String?
   // Manual IRPF override. When set, this rate wins over the auto-
   // computation from activityType + activityStartDate. Use when a
   // gestor told the user a specific rate that doesn't match the
   // default rules.
-  defaultIrpfRate Decimal? @db.Decimal(5, 2)
+  defaultIrpfRate     Decimal?  @db.Decimal(5, 2)
   // Tax profile — drives the auto IRPF computation:
   //   "profesional"          → 7% in alta year + 2 following, then 15
   //   "empresarial"          → 0% (estimación directa, no retention)
@@ -677,19 +679,19 @@ model Company {
   //   "modulos_agricola"     → 2%
   //   "alquiler"             → 15% (urban rental retention)
   // Null = treat as "profesional" for backwards compat with existing rows.
-  activityType      String?
+  activityType        String?
   /// Date the autónomo was registered. Used together with activityType
   /// to pick the 7% reduced rate during the first 3 calendar years.
   /// Stored as @db.Date so timezone doesn't shift the year boundary.
-  activityStartDate DateTime? @db.Date
+  activityStartDate   DateTime? @db.Date
   // Where to start invoice numbering within the current year. Useful when
   // migrating from another tool mid-year.
-  invoiceNumberOffset Int  @default(0)
+  invoiceNumberOffset Int       @default(0)
   /// ISO 4217 default invoice currency for this account. Picked in the
   /// account-settings currency selector. Used as the fallback when a
   /// Contact has no explicit currency. VeriFactu still receives EUR
   /// regardless — see Invoice.*Eur fields.
-  baseCurrency String @default("EUR")
+  baseCurrency        String    @default("EUR")
 
   // --- Onboarding ---
   onboardingStep Int @default(0) // 0=not started, 1=basic, 2=complete
@@ -703,8 +705,8 @@ model Company {
   // must re-upload; that's the deliberate trade-off vs storing the
   // user-typed password.
   verifactuCertCipher  Bytes?
-  verifactuCertNonce   Bytes?   // 12-byte AES-GCM nonce, unique per cert
-  verifactuCertTag     Bytes?   // 16-byte AES-GCM auth tag
+  verifactuCertNonce   Bytes? // 12-byte AES-GCM nonce, unique per cert
+  verifactuCertTag     Bytes? // 16-byte AES-GCM auth tag
   /// NIF read out of the cert at upload time; validated to match
   /// Company.taxId. Stored explicitly so the dashboard can show
   /// "Cert loaded — NIF X" without needing to decrypt.
@@ -773,35 +775,35 @@ model BankAccount {
 /// a flat array (Json) so the dashboard form can mirror the legacy PDF
 /// "up to N lines" layout without a rigid address schema.
 model Contact {
-  id          String   @id @default(cuid())
-  companyId   String
-  name        String   // display name in lists
-  taxId       String?  // VAT / NIF / Reg. no
-  countryCode String?  // ISO alpha-2
-  isEu        Boolean  @default(false)
+  id           String    @id @default(cuid())
+  companyId    String
+  name         String // display name in lists
+  taxId        String? // VAT / NIF / Reg. no
+  countryCode  String? // ISO alpha-2
+  isEu         Boolean   @default(false)
   /// What this client is billed for by default: "goods" or "service".
   /// Drives the 349 clave (E vs S) and, for Northern Ireland (XI), the
   /// territory class. Most SaaS clients buy services. See src/tax/territory.ts.
-  nature      String   @default("service")
+  nature       String    @default("service")
   /// True for Canarias / Ceuta / Melilla — Spain by ISO code (`ES`) but
   /// outside the IVA zone (territory class ES_NO_IVA). Cannot be inferred
   /// from countryCode alone, so it's an explicit flag.
-  esNoIva     Boolean  @default(false)
-  email       String?
+  esNoIva      Boolean   @default(false)
+  email        String?
   /// ISO 4217 currency this client is invoiced in. Null = use the
   /// account's Company.baseCurrency. Non-EUR is only allowed on 0%-VAT
   /// (non-Spanish) invoices — enforced at invoice create time.
-  currency    String?
+  currency     String?
   // --- Structured postal address (user types these directly now) ---
   addressLine1 String?
   addressLine2 String?
   postalCode   String?
   city         String?
   region       String?
-  notes       String?
-  archivedAt  DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  notes        String?
+  archivedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
   company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   invoices Invoice[]
@@ -812,13 +814,13 @@ model Contact {
 }
 
 model Invoice {
-  id              String   @id @default(cuid())
-  companyId       String
-  contactId       String?
+  id            String  @id @default(cuid())
+  companyId     String
+  contactId     String?
   /// Optional FK to the per-company bank account selected on the
   /// wizard's "Bank account" step. When set, the PDF "Payment details"
   /// block renders that account; when null, the block is omitted.
-  bankAccountId   String?
+  bankAccountId String?
 
   // --- Numbering ---
   // Number + serialIndex are nullable on DRAFTs. Spanish law requires
@@ -828,52 +830,52 @@ model Invoice {
   // released back to NULL if AEAT rejects. That way DRAFTs the user
   // never sends don't consume serial numbers and don't punch holes
   // in the sequence AEAT sees.
-  number          String?  // null on DRAFT; "FACT-YYYY-NNNNN" once allocated
-  serialYear      Int      // year from issueDate; set on create for the index below
-  serialIndex     Int?     // null on DRAFT; monotonic per (company, year) once allocated
-  series          String   @default("FACT") // letter prefix; future-proof for multiple series
+  number      String? // null on DRAFT; "FACT-YYYY-NNNNN" once allocated
+  serialYear  Int // year from issueDate; set on create for the index below
+  serialIndex Int? // null on DRAFT; monotonic per (company, year) once allocated
+  series      String  @default("FACT") // letter prefix; future-proof for multiple series
 
   // --- Dates ---
-  issueDate DateTime @db.Date
+  issueDate DateTime  @db.Date
   dueDate   DateTime? @db.Date
 
   // --- Counterparty snapshot at issue time (PDF stability) ---
-  contactSnapshot Json     // { lines: string[], name, taxId, countryCode, isEu }
-  emitterSnapshot Json     // snapshot of Company emitter fields used in the PDF
+  contactSnapshot Json // { lines: string[], name, taxId, countryCode, isEu }
+  emitterSnapshot Json // snapshot of Company emitter fields used in the PDF
 
   // --- Money ---
   // netAmount/vatAmount/totalAmount/toPayAmount are in the invoice
   // `currency` (the recipient's currency) — that's what the PDF and the
   // dashboard show. VeriFactu must report EUR, so the *Eur mirror below
   // holds the EUR equivalents that the AEAT submission + Huella read.
-  currency        String   @default("EUR") // ISO 4217 of the figures below
-  language        String   @default("en") // "en" | "en_eu" | "es"
+  currency       String    @default("EUR") // ISO 4217 of the figures below
+  language       String    @default("en") // "en" | "en_eu" | "es"
   /// "goods" | "service" — what was supplied. Drives the 349 clave
   /// (E = intra-EU goods, S = intra-EU services) and 303 routing. Also
   /// mirrored into contactSnapshot at issue time for PDF/audit stability.
-  nature          String   @default("service")
-  vatRate         Decimal  @db.Decimal(5, 2) // 0 or 21
-  irpfRate        Decimal  @db.Decimal(5, 2) @default(0) // 0, 7, or 15
-  netAmount       Decimal  @db.Decimal(12, 2)
-  vatAmount       Decimal  @db.Decimal(12, 2)
-  irpfAmount      Decimal  @db.Decimal(12, 2) @default(0)
-  totalAmount     Decimal  @db.Decimal(12, 2) // net + vat
-  toPayAmount     Decimal  @db.Decimal(12, 2) // total - irpf
+  nature         String    @default("service")
+  vatRate        Decimal   @db.Decimal(5, 2) // 0 or 21
+  irpfRate       Decimal   @default(0) @db.Decimal(5, 2) // 0, 7, or 15
+  netAmount      Decimal   @db.Decimal(12, 2)
+  vatAmount      Decimal   @db.Decimal(12, 2)
+  irpfAmount     Decimal   @default(0) @db.Decimal(12, 2)
+  totalAmount    Decimal   @db.Decimal(12, 2) // net + vat
+  toPayAmount    Decimal   @db.Decimal(12, 2) // total - irpf
   // --- EUR mirror for VeriFactu ---
   // EUR equivalents of net/vat/total. Populated on every new invoice
   // (== the amounts above when currency is EUR; manually entered per
   // line when currency != EUR). Nullable so legacy pre-feature rows
   // read back as null and the submit/hash code falls back to the plain
   // amount (which was EUR for every invoice issued before this feature).
-  netAmountEur    Decimal? @db.Decimal(12, 2)
-  vatAmountEur    Decimal? @db.Decimal(12, 2)
-  totalAmountEur  Decimal? @db.Decimal(12, 2)
+  netAmountEur   Decimal?  @db.Decimal(12, 2)
+  vatAmountEur   Decimal?  @db.Decimal(12, 2)
+  totalAmountEur Decimal?  @db.Decimal(12, 2)
   // FX rate + its reference date used to derive the EUR mirror when
   // currency != EUR. Rate = EUR per 1 unit of `currency` at the devengo
   // date (tipo de cambio publicado por el BCE/BOE en la fecha de devengo,
   // NOT the payment date). Stored for audit so the mirror is reproducible.
-  fxRate          Decimal? @db.Decimal(18, 8)
-  fxRateDate      DateTime? @db.Date
+  fxRate         Decimal?  @db.Decimal(18, 8)
+  fxRateDate     DateTime? @db.Date
 
   // --- Lifecycle ---
   // "DRAFT" → invoice exists in our DB only, no registry, no AEAT
@@ -884,37 +886,37 @@ model Invoice {
   // No SEND_FAILED state — failed submissions roll back the registry
   // row entirely so the chain doesn't reference a record AEAT didn't
   // accept. The invoice stays DRAFT and the UI shows the error modal.
-  status          String   @default("DRAFT")
+  status String @default("DRAFT")
 
   // --- Payment ---
-  paid            Boolean  @default(false)
-  paidAt          DateTime?
-  paymentMethod   String?  // free text: Stripe, Wise, SEPA, Cash, ...
+  paid          Boolean   @default(false)
+  paidAt        DateTime?
+  paymentMethod String? // free text: Stripe, Wise, SEPA, Cash, ...
 
   // --- Content ---
-  description     String   // legacy single-line; lines model added for multi-line
-  notes           String?  // free-form notes / legal footer override
-  legalNoteCode   String?  // "art69" | "reverseCharge" | null — drives the boilerplate
+  description   String // legacy single-line; lines model added for multi-line
+  notes         String? // free-form notes / legal footer override
+  legalNoteCode String? // "art69" | "reverseCharge" | null — drives the boilerplate
 
   // --- PDF artifact ---
-  pdfS3Key        String?  // S3 object key; null until generated
-  pdfGeneratedAt  DateTime?
+  pdfS3Key       String? // S3 object key; null until generated
+  pdfGeneratedAt DateTime?
   // SHA-256 of the rendered PDF bytes. Lets us detect tampering / S3
   // corruption (rehash on download); also seeds the Verifactu chain.
-  pdfSha256       String?
+  pdfSha256      String?
 
   // --- Verifactu (RD 1007/2023) ---
   // 1:1 with VerifactuRegistry. Optional because the registry is only
   // populated when VERIFACTU_MODE != "disabled" — pre-2026-07-01 default.
   verifactuRegistry VerifactuRegistry?
-  events           InvoiceEvent[]
+  events            InvoiceEvent[]
 
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  company     Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  contact     Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
-  bankAccount BankAccount? @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  company     Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contact     Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  bankAccount BankAccount?  @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
   lines       InvoiceLine[]
 
   @@unique([companyId, number])
@@ -939,11 +941,11 @@ model Invoice {
 /// onDelete: Cascade with Invoice means deleting a draft purges its
 /// events too (intentional — drafts have no legal retention duty).
 model InvoiceEvent {
-  id          String   @id @default(cuid())
-  invoiceId   String
+  id        String @id @default(cuid())
+  invoiceId String
   /// Denormalised for tenant filtering — querying "all events for
   /// company X" is the dashboard's job and we avoid a join.
-  companyId   String
+  companyId String
 
   /// Event taxonomy. Plain string (not enum) so adding new event
   /// types is a one-line code change with no DB migration.
@@ -955,28 +957,28 @@ model InvoiceEvent {
   ///   - VERIFACTU_SUBMIT_REJECTED (AEAT returned an error code)
   ///   - VERIFACTU_SUBMIT_NETWORK_ERROR
   ///   - VERIFACTU_REGISTRY_ROLLBACK
-  type        String
+  type String
 
   /// "ok" (success) | "error" (failure) | "info" (neutral). Drives
   /// the colour/icon in the timeline UI without us having to map
   /// every event type to a colour client-side.
-  outcome     String
+  outcome String
 
   /// One-line human-readable summary. Shown as the row title in
   /// the timeline. Examples:
   ///   "Submitted to AEAT — FACT-2026-00001"
   ///   "Accepted (CSV A-ZT6WR34SY4FB2T)"
   ///   "Rejected (code 1189): Destinatarios mandatory for F1"
-  summary     String   @db.Text
+  summary String @db.Text
 
   /// Free-form details. For VERIFACTU_SUBMIT_REQUEST this is the
   /// raw SOAP envelope; for VERIFACTU_SUBMIT_RESPONSE it includes
   /// AEAT's full XML + parsed result. Stored as Json so jsonb
   /// indexing remains an option if we ever need to grep events
   /// by AEAT code at scale.
-  payload     Json?
+  payload Json?
 
-  createdAt   DateTime @default(now())
+  createdAt DateTime @default(now())
 
   invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
@@ -993,8 +995,8 @@ model InvoiceLine {
   invoiceId   String
   sortOrder   Int      @default(0)
   description String
-  quantity    Decimal  @db.Decimal(12, 2) @default(1)
-  unit        String?  // "pc", "ud", "h", ...
+  quantity    Decimal  @default(1) @db.Decimal(12, 2)
+  unit        String? // "pc", "ud", "h", ...
   unitPrice   Decimal  @db.Decimal(12, 2)
   total       Decimal  @db.Decimal(12, 2)
   /// Manual EUR equivalent of this line's total, entered by the user
@@ -1019,22 +1021,22 @@ model InvoiceLine {
 /// ad-hoc when logging a receipt and rarely reused, so a snapshot keeps
 /// the model self-contained.
 model Expense {
-  id            String   @id @default(cuid())
-  companyId     String
+  id        String @id @default(cuid())
+  companyId String
 
   // --- Supplier (proveedor) ---
   supplierName        String
-  supplierTaxId       String?  // NIF / VAT of the supplier
-  supplierCountryCode String?  // ISO 3166-1 alpha-2
-  supplierIsEu        Boolean  @default(false)
+  supplierTaxId       String? // NIF / VAT of the supplier
+  supplierCountryCode String? // ISO 3166-1 alpha-2
+  supplierIsEu        Boolean @default(false)
   /// "goods" | "service" — what was acquired. Distinguishes 349 clave A
   /// (intra-EU goods) from I (intra-EU services). Ads/Cloud/SaaS = service.
   /// This axis was missing entirely (bug C-1): everything was treated as
   /// goods, so service acquisitions went out as clave A.
-  nature      String   @default("service")
+  nature              String  @default("service")
   /// Supplier in Canarias / Ceuta / Melilla — Spain but outside the IVA
   /// zone (territory class ES_NO_IVA). Explicit, see src/tax/territory.ts.
-  supplierEsNoIva Boolean @default(false)
+  supplierEsNoIva     Boolean @default(false)
 
   // --- Document ---
   issueDate   DateTime @db.Date // fecha de la factura del proveedor
@@ -1043,33 +1045,33 @@ model Expense {
   ///   e.g. the autónomo's monthly TGSS/RETA social-security quota (bug C-5).
   ///   These are deductible for IRPF (Modelo 130) but carry no deductible IVA.
   kind        String   @default("invoice")
-  category    String?           // free-form bucket for future analytics
+  category    String? // free-form bucket for future analytics
   description String?
   notes       String?
 
   // --- Money (figures in `currency`) ---
-  currency    String   @default("EUR") // ISO 4217
-  netAmount   Decimal  @db.Decimal(12, 2)               // base imponible
-  vatRate     Decimal  @db.Decimal(5, 2) @default(21)   // 0 / 4 / 10 / 21
-  vatAmount   Decimal  @db.Decimal(12, 2)               // IVA soportado
-  irpfRate    Decimal  @db.Decimal(5, 2) @default(0)    // retención practicada
-  irpfAmount  Decimal  @db.Decimal(12, 2) @default(0)   // (feeds a future 111)
-  totalAmount Decimal  @db.Decimal(12, 2)               // net + vat − irpf
+  currency    String  @default("EUR") // ISO 4217
+  netAmount   Decimal @db.Decimal(12, 2) // base imponible
+  vatRate     Decimal @default(21) @db.Decimal(5, 2) // 0 / 4 / 10 / 21
+  vatAmount   Decimal @db.Decimal(12, 2) // IVA soportado
+  irpfRate    Decimal @default(0) @db.Decimal(5, 2) // retención practicada
+  irpfAmount  Decimal @default(0) @db.Decimal(12, 2) // (feeds a future 111)
+  totalAmount Decimal @db.Decimal(12, 2) // net + vat − irpf
 
   // --- EUR mirror (declarations aggregate in EUR, like VeriFactu) ---
-  netAmountEur   Decimal? @db.Decimal(12, 2)
-  vatAmountEur   Decimal? @db.Decimal(12, 2)
-  totalAmountEur Decimal? @db.Decimal(12, 2)
+  netAmountEur   Decimal?  @db.Decimal(12, 2)
+  vatAmountEur   Decimal?  @db.Decimal(12, 2)
+  totalAmountEur Decimal?  @db.Decimal(12, 2)
   // FX rate + reference date used to derive the EUR mirror when currency
   // != EUR. Rate = EUR per 1 unit of `currency` at the devengo date
   // (BCE/BOE published rate, not the payment date). e.g. a NOK invoice
   // stores the original NOK amount, the rate, its date, and the EUR mirror.
-  fxRate         Decimal? @db.Decimal(18, 8)
+  fxRate         Decimal?  @db.Decimal(18, 8)
   fxRateDate     DateTime? @db.Date
 
   // Percentage of the IVA soportado that is actually deductible. Fuel,
   // phone, mixed personal/business items are often <100. Default 100.
-  deductibleVatPct Decimal @db.Decimal(5, 2) @default(100)
+  deductibleVatPct  Decimal @default(100) @db.Decimal(5, 2)
   // Whether this expense is deductible for IRPF (Modelo 130 box 02).
   // Almost always true; set false for non-deductible items kept only for
   // bookkeeping. TGSS/RETA (kind=recurring_no_invoice) is deductible here.
@@ -1117,9 +1119,9 @@ model FiledDeclaration {
 
   model   String // "303" | "130" | "349"
   year    Int
-  quarter Int    // 1..4
+  quarter Int // 1..4
 
-  justificante String?   // AEAT "número de justificante" from the receipt
+  justificante String? // AEAT "número de justificante" from the receipt
   submittedAt  DateTime? @db.Date
 
   /// Full box map as filed, e.g. { "07": 2674.04, "17": 2674.04 } for a 130
@@ -1158,8 +1160,8 @@ model SupportMessage {
   isAdmin   Boolean  @default(false)
   createdAt DateTime @default(now())
 
-  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  user    FacturaUser    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    FacturaUser @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([companyId, createdAt])
   @@map("support_messages")
@@ -1180,36 +1182,36 @@ model SupportMessage {
 /// looks the invoice up by NIF + serie + fecha + importe. Sandbox uses
 /// prewww1.aeat.es; production www1.aeat.es.
 model VerifactuRegistry {
-  id                String   @id @default(cuid())
-  companyId         String
-  invoiceId         String   @unique
+  id        String @id @default(cuid())
+  companyId String
+  invoiceId String @unique
 
   // Monotonic per company; uniqueness enforced so the chain can't fork.
-  sequenceNumber    Int
+  sequenceNumber Int
   // Empty string for the very first record of a company. Chain seed.
-  previousHash      String
+  previousHash   String
   // Uppercase hex SHA-256 of `hashInput`.
-  currentHash       String
+  currentHash    String
   // The canonicalised string that was hashed. Stored verbatim so a
   // future AEAT audit can recompute the hash without recomputing the
   // canonicalisation rules — those rules are pinned per the RD spec
   // that was current at issue time.
-  hashInput         String   @db.Text
+  hashInput      String @db.Text
 
   // F1 = Factura completa (default), F2 = Factura simplificada, etc.
   // We only emit F1 today; field stored for future expansion.
-  tipoFactura       String   @default("F1")
+  tipoFactura String @default("F1")
   // Pre-built QR-code URL embedded in the PDF.
-  qrUrl             String   @db.Text
+  qrUrl       String @db.Text
 
   // AEAT submission state — populated by the submit cron.
-  aeatStatus        String   @default("PENDING")
-  aeatSubmittedAt   DateTime?
-  aeatResponseCode  String?
-  aeatResponseRaw   Json?
-  aeatRetryCount    Int      @default(0)
+  aeatStatus       String    @default("PENDING")
+  aeatSubmittedAt  DateTime?
+  aeatResponseCode String?
+  aeatResponseRaw  Json?
+  aeatRetryCount   Int       @default(0)
 
-  signedAt          DateTime @default(now())
+  signedAt DateTime @default(now())
 
   invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
@@ -1226,11 +1228,11 @@ model VerifactuRegistry {
 
 /// Диалог с моделью: тема, выбранная модель и сообщения.
 model AiChat {
-  id        String      @id @default(uuid())
-  userId    String
+  id              String      @id @default(uuid())
+  userId          String
   // Тема чата. Своей темы у модели не спрашивают: она выводится из первого вопроса, как это
   // делают приложения ChatGPT и Gemini — иначе список чатов состоял бы из одинаковых «Новый чат».
-  title     String      @default("Новый чат")
+  title           String      @default("Новый чат")
   // Идентификатор модели, который уходит модели в поле `model`.
   //
   // По умолчанию — Gemma 4 E4B из LM Studio на домашнем маке (миграция 20260919130000). Это
@@ -1238,20 +1240,20 @@ model AiChat {
   // на проде то же значение приходит переменной `LLM_MODEL`, а здесь лежит как страховка для
   // ручных правок БД. Список доступных моделей всё равно берётся с сервера модели: чат, у
   // которого записана исчезнувшая модель, отвечает моделью по умолчанию (`LlmService.resolveModel`).
-  model     String      @default("google/gemma-4-e4b")
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+  model           String      @default("google/gemma-4-e4b")
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
   // Компакция контекста: разговор, сжатый в короткую текстовую выжимку. Каждый ответ иначе
   // пересылает всю историю заново, а на маке это стоит временем: префилл идёт ~300 токенов в
   // секунду. Выжимка заменяет историю в запросе и уходит отдельным системным сообщением;
   // `compactedUpToAt` — граница: сообщения, созданные позже, уходят в запрос как есть, остальные
   // живут внутри выжимки. Поле `compactionBlob` — обычный текст (раньше здесь лежал непрозрачный
   // зашифрованный блок xAI, который читала только та сторона).
-  compactionId     String?
-  compactionBlob   String?   @db.Text
-  compactedUpToAt  DateTime?
-  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  messages  AiMessage[]
+  compactionId    String?
+  compactionBlob  String?     @db.Text
+  compactedUpToAt DateTime?
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages        AiMessage[]
 
   // Список чатов всегда берётся по владельцу и сортируется по времени последнего сообщения —
   // под этот запрос индекс и заведён.
@@ -1276,16 +1278,16 @@ model AiSettings {
 
 /// Сообщение диалога: вопрос человека или ответ модели.
 model AiMessage {
-  id     String @id @default(uuid())
-  chatId String
+  id               String   @id @default(uuid())
+  chatId           String
   // 'user' | 'assistant' — те же имена ролей, что понимает API провайдера: их не приходится
   // переводить при сборе контекста запроса.
-  role   String
-  content String @db.Text
+  role             String
+  content          String   @db.Text
   // «Размышления» reasoning-модели. Отдельным полем, а не вклейкой в content: на экране они
   // показываются отдельным сворачиваемым блоком, а в контекст следующего запроса не уходят —
   // провайдеры такого поля во входных сообщениях не принимают.
-  reasoning String @default("") @db.Text
+  reasoning        String   @default("") @db.Text
   // Расход токенов на этот ответ (у вопроса — null). Нужен, чтобы расход был виден не только
   // в логах провайдера: цена ошибки здесь — деньги, а не время.
   promptTokens     Int?
@@ -1294,9 +1296,110 @@ model AiMessage {
   // Включает и токены, и вызовы поиска, поэтому по ней и считают расход по чату. У вопросов
   // человека и у ответов, сделанных до появления этой колонки, значения нет.
   costUsd          Float?
-  createdAt DateTime @default(now())
-  chat      AiChat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  createdAt        DateTime @default(now())
+  chat             AiChat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
   @@index([chatId, createdAt])
   @@map("ai_messages")
+}
+
+// ===== Раздел «Чат» (переписан с нуля; прежний раздел на таблицах ai_* удаляется вместе с ним) =====
+//
+// Модель и поиск живут на домашнем маке и приходят на VPS через reverse-SSH туннель. Сервер
+// собирает контекст, хранит историю и отдаёт её приложению — поэтому ни адресов туннеля, ни
+// ключа в сборке приложения нет, а причины отказов видно в логе сервера.
+
+/// Диалог: тема, модель и сообщения.
+model Chat {
+  id               String        @id @default(uuid())
+  userId           String
+  // Тема выводится из первого вопроса: своей темы у модели не спрашивают, иначе список
+  // состоял бы из одинаковых «Новый чат».
+  title            String        @default("Новый чат")
+  // Идентификатор модели в том виде, в каком его понимает сервер модели (у LM Studio это
+  // `qwen/qwen3.5-9b`). Значение по умолчанию — страховка для ручных правок БД; на проде то же
+  // имя приходит переменной `LLM_MODEL`, а чат с исчезнувшей моделью молча отвечает моделью по
+  // умолчанию (`LlmService.resolveModel`).
+  model            String        @default("qwen/qwen3.5-9b")
+  // Сжатие контекста. Каждый ответ пересылает историю заново, а префилл на маке идёт медленно,
+  // поэтому длинный разговор один раз пересказывается моделью в `summary`, и дальше в запрос
+  // уходит выжимка плюс сообщения, созданные после `summarizedUpToAt`.
+  //
+  // Своя реализация вместо прежней пары `compactionId`/`compactionBlob`: там лежал непрозрачный
+  // блок провайдера, который читала только та сторона, и после переезда на локальную модель он
+  // всё равно стал обычным текстом.
+  summary          String?       @db.Text
+  summarizedUpToAt DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages         ChatMessage[]
+
+  // Список чатов всегда берётся по владельцу и сортируется по свежести — под этот запрос индекс.
+  @@index([userId, updatedAt])
+  @@map("chats")
+}
+
+/// Настройки раздела у владельца: память — свободный текст, который подмешивается в системную
+/// часть каждого запроса. Отдельной таблицей, а не полем в `User`: это состояние одного раздела.
+model ChatSettings {
+  userId    String   @id
+  memory    String   @default("") @db.Text
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("chat_settings")
+}
+
+/// Сообщение диалога: вопрос человека или ответ модели.
+model ChatMessage {
+  id               String       @id @default(uuid())
+  chatId           String
+  // 'user' | 'assistant' — те же имена ролей, что понимает API модели: их не приходится
+  // переводить при сборке контекста.
+  role             String
+  content          String       @db.Text
+  // «Размышления» reasoning-модели. Отдельным полем, а не вклейкой в `content`: на экране они
+  // показываются свёрнутым блоком, а в контекст следующего запроса не уходят — такого поля во
+  // входных сообщениях API модели не существует.
+  reasoning        String       @default("") @db.Text
+  // Поисковый запрос, которым этот ответ добывал данные. Хранится, чтобы через неделю было
+  // видно, что именно искали, — в самом тексте ответа этого нет.
+  searchQuery      String?
+  // Расход токенов на ответ (у вопроса — null). Нужен, чтобы расход был виден не только в логе
+  // мака: на домашней модели это время человека, а не деньги, и всё же измерять его стоит.
+  promptTokens     Int?
+  completionTokens Int?
+  createdAt        DateTime     @default(now())
+  chat             Chat         @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  sources          ChatSource[]
+
+  @@index([chatId, createdAt])
+  @@map("chat_messages")
+}
+
+/// Источник ответа: страница, по которой модель отвечала.
+///
+/// Отдельной таблицей, а не ссылками внутри текста ответа: ссылку нужно открыть и через
+/// неделю, когда модель уже ничего не помнит, а разбирать URL регуляркой из Markdown — тот ещё
+/// способ. Полный текст страницы здесь не хранится (это мегабайты на каждый ответ): остаются
+/// адрес, заголовок, сниппет выдачи и число символов, которые реально ушли модели.
+model ChatSource {
+  id        String      @id @default(uuid())
+  messageId String
+  // Номер, под которым источник упоминается в тексте ответа: `[1]`, `[2]`. Именно по нему
+  // приложение превращает упоминание в ссылку.
+  position  Int
+  title     String      @default("")
+  url       String
+  snippet   String      @default("") @db.Text
+  // Страница прочитана целиком (а не только сниппет): false — сайт не отдал текст, и модель
+  // отвечала по выдержке из выдачи.
+  read      Boolean     @default(false)
+  chars     Int         @default(0)
+  createdAt DateTime    @default(now())
+  message   ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, position])
+  @@map("chat_sources")
 }
