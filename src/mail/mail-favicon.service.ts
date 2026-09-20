@@ -221,13 +221,18 @@ export class MailFaviconService {
   }
 }
 
-/** Домен из адреса: только валидное имя хоста, без IP-литералов и localhost. */
+/** Домен из адреса: только валидное имя хоста, без IP-литералов, localhost и поддоменов. */
 function normalizeDomain(raw: string): string | null {
   const s = String(raw ?? '').trim().toLowerCase();
   if (!s) return null;
   // Отсекаем IP-литералы (в т.ч. IPv6 в скобках) и любые пути/порты.
   if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(s)) return null;
   if (s === 'localhost' || s.endsWith('.localhost') || s.endsWith('.local') || s.endsWith('.internal')) return null;
+  // Отсекаем поддомены, оставляя только основной домен (последние две части).
+  const parts = s.split('.');
+  if (parts.length >= 3) {
+    return `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+  }
   return s;
 }
 
