@@ -189,34 +189,58 @@ def current_package(serial: str | None = None) -> str:
     return ""
 
 
-def launch_url(url: str, serial: str | None = None) -> None:
-    """Открыть ссылку системным намерением — откроется браузер по умолчанию."""
-    serial = pick_device(serial)
-    run("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url, serial=serial)
-    time.sleep(2.5)
-
-
 def open_chrome(serial: str | None = None) -> None:
-    """Открыть сам Chrome, без конкретной ссылки."""
+    """Открыть сам Chrome, без конкретной ссылки.
+
+    Нужен для возврата в браузер, когда агент ушёл в другое приложение: страница, на которой он
+    работал, остаётся той же — открывать её заново здесь нельзя.
+    """
     serial = pick_device(serial)
     run("shell", "am", "start", "-n", f"{CHROME_PACKAGE}/{CHROME_ACTIVITY}", serial=serial)
     time.sleep(2.5)
 
 
-def ensure_chrome(url: str | None = None, serial: str | None = None) -> str:
+def open_page(url: str, serial: str | None = None) -> None:
+    """Открыть адрес именно в Chrome, даже если браузер уже на переднем плане.
+
+    Отдельно от [ensure_chrome] и намеренно без проверки текущего пакета: Chrome, открытый на
+    произвольной странице, — это тоже Chrome, и «мы уже там» пропустило бы открытие стартовой
+    страницы. На живом прогоне это и случилось: на телефоне оставалась открыта вкладка Google
+    Flights, агент получил её как первый экран и принялся искать «что такое ллм» в форме поиска
+    авиабилетов.
+
+    Намерение адресуется Chrome по имени компонента, а не отдаётся браузеру по умолчанию: если
+    на телефоне по умолчанию открывается другое приложение, агент работал бы в нём, а проверка
+    привязки вытаскивала бы его обратно в Chrome — уже на пустую страницу.
+    """
+    serial = pick_device(serial)
+    run(
+        "shell",
+        "am",
+        "start",
+        "-a",
+        "android.intent.action.VIEW",
+        "-n",
+        f"{CHROME_PACKAGE}/{CHROME_ACTIVITY}",
+        "-d",
+        url,
+        serial=serial,
+    )
+    # Запас на запуск холодного Chrome и загрузку страницы: без него первый же шаг прочитает
+    # пустой экран и модель начнёт действовать вслепую.
+    time.sleep(4.0)
+
+
+def ensure_chrome(serial: str | None = None) -> str:
     """Гарантировать, что агент работает в Chrome.
 
-    Возвращает описание того, что сделано: пустая строка, если уже в Chrome,
-    иначе — что именно открыли. Агент обязан сообщать об этом в лог, иначе
-    непонятно, почему экран вдруг сменился.
+    Возвращает описание того, что сделано: пустая строка, если уже в Chrome, иначе — что именно
+    открыли. Агент обязан сообщать об этом в лог, иначе непонятно, почему экран вдруг сменился.
     """
     serial = pick_device(serial)
     package = current_package(serial)
     if package == CHROME_PACKAGE:
         return ""
-    if url:
-        launch_url(url, serial)
-        return f"открыл Chrome с {url} (был в {package or 'неизвестном приложении'})"
     open_chrome(serial)
     return f"открыл Chrome (был в {package or 'неизвестном приложении'})"
 
