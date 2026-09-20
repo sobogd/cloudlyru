@@ -16,8 +16,10 @@ import type { Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { ChatsService, COMPACT_AFTER_CHARS, DEFAULT_AI_MODEL } from './chats.service';
 import { LlmDelta, LlmError, LlmMessage, LlmService } from './llm.service';
+import { AgentError, AgentService } from './agent.service';
 import { SearchService } from './search.service';
 import {
+  agentBlock,
   COMPACT_HEADER,
   COMPACT_PROMPT,
   needsSearch,
@@ -41,7 +43,9 @@ const MAX_QUESTION_CHARS = 8_000;
  * reverse-SSH туннелем, поэтому для сервера это обычный `http://127.0.0.1:18812`.
  *
  * Плата за бесплатность — доступность: мак может спать или потерять сеть, и тогда раздел честно
- * отвечает «локальная модель недоступна», а не притворяется, что модель думает.
+ * отвечает «локальная модель недоступна», а не притворяется, что модель думает. То же и с
+ * агентом на телефоне (`AgentService`): он ходит по интернету с подключённого к маку телефона
+ * и стоит человеку минут ожидания, поэтому включается отдельной кнопкой в чате.
  */
 @Controller('ai')
 export class AiController {
@@ -50,6 +54,7 @@ export class AiController {
   constructor(
     private readonly llm: LlmService,
     private readonly search: SearchService,
+    private readonly agent: AgentService,
     private readonly chats: ChatsService,
     private readonly settings: AiSettingsService,
   ) {}
@@ -143,9 +148,12 @@ export class AiController {
    * минутами. Поток отдаём сами (`@Res`), потому что Nest не умеет отдавать незакрытый ответ:
    * события пишутся по мере генерации, соединение живёт до конца ответа.
    *
-   * Коды до начала потока (адрес модели не задан, пустой вопрос, чужой чат) уходят обычной
-   * ошибкой API — их ловит глобальный фильтр. Всё, что случилось внутри потока, приходит
+   * Коды до начала потока (адрес модели или агента не задан, пустой вопрос, чужой чат) уходят
+   * обычной ошибкой API — их ловит глобальный фильтр. Всё, что случилось внутри потока, приходит
    * событием `error`: заголовки уже отправлены, и подменить ответ на JSON нельзя.
+   *
+   * Режимы `search` и `agent` взаимоисключающие по смыслу: если включён агент, он сам ходит по
+   * интернету на телефоне, и поиск в том же запросе не запускается.
    */
   @Post('chats/:id/messages')
   @RateLimit(20, 60_000)
@@ -161,6 +169,11 @@ export class AiController {
     // вопроса. Поиск бесплатный, но не мгновенный (несколько секунд до выдачи), поэтому «на
     // всякий случай» его не подключаем.
     const wantSearch = typeof body.search === 'boolean' ? body.search : needsSearch(question);
+    // Агент на телефоне: включается только явно (`agent: true`) и никогда сам по себе. Он ходит
+    // по экрану минутами и занимает единственный телефон, поэтому решение о запуске — за
+    // человеком, и по тексту вопроса его не угадать: «найди курс» и «найди ошибку в коде»
+    // выглядят одинаково.
+    const wantAgent = body.agent === true;
     if (!question) throw badRequest('текст сообщения пуст', 'empty_message');
     if (question.length > MAX_QUESTION_CHARS) {
       throw badRequest(`сообщение длиннее ${MAX_QUESTION_CHARS} символов`, 'message_too_long');
@@ -170,6 +183,15 @@ export class AiController {
         HttpStatus.SERVICE_UNAVAILABLE,
         'на сервере не задан адрес локальной модели (LLM_BASE_URL)',
         'ai_not_configured',
+      );
+    }
+    // Проверяем до начала потока: заголовки ещё не отправлены, и отказать можно обычной ошибкой
+    // API с внятным текстом вместо события внутри потока.
+    if (wantAgent && !this.agent.configured) {
+      throw new ApiError(
+        HttpStatus.SERVICE_UNAVAILABLE,
+        'на сервере не задан адрес агента (AGENT_URL)',
+        'agent_not_configured',
       );
     }
 
@@ -195,12 +217,44 @@ export class AiController {
 
     if (title) this.event(res, 'title', { title });
 
-    // Поиск идёт до генерации и занимает секунды: без события экран не понимал бы, что
-    // происходит, и выглядел бы зависшим. Статус снимаем сразу после поиска, а не по первому
-    // слову ответа: между ними может пройти десяток секунд префилла.
+    // Разрыв со стороны клиента (уход с экрана, «Стоп», потеря сети) должен гасить и запрос к
+    // модели: иначе мак продолжит считать ответ, которого уже никто не увидит. Создаётся до
+    // работы агента, потому что прогон на телефоне идёт минутами — и уход с экрана в это время
+    // тоже должен прекращать ожидание на сервере.
+    const abort = new AbortController();
+    let closed = false;
+    req.on('close', () => {
+      closed = true;
+      abort.abort();
+    });
+
+    // Агент и поиск идут до генерации и занимают секунды (агент — минуты): без события экран не
+    // понимал бы, что происходит, и выглядел бы зависшим. Статус снимаем сразу после работы, а
+    // не по первому слову ответа: между ними может пройти десяток секунд префилла.
     let searched = 0;
     let userContent = question;
-    if (wantSearch) {
+    if (wantAgent) {
+      // Агент сам ходит по интернету на телефоне, поэтому поиск в этом же запросе не запускаем:
+      // два прохода по сети за один вопрос — это лишняя минута ожидания и два разных набора
+      // данных, из которых модели пришлось бы выбирать.
+      this.event(res, 'status', { agent: true });
+      let report: string;
+      try {
+        report = (await this.agent.run(question, abort.signal)).report;
+      } catch (e) {
+        this.event(res, 'status', { agent: false });
+        // Отказ агента срывает ответ целиком, а не оставляет модель без данных: агент — это и
+        // есть весь смысл такого запроса (человек включил режим и ждал минуты). Причина уходит
+        // в лог целиком, человеку — готовая фраза с мака: «телефон не подключён», «занят».
+        const message = e instanceof AgentError ? e.message : 'агент не смог выполнить задачу';
+        this.logger.error(`чат ${chat.id}: агент не отработал — ${message}`);
+        this.event(res, 'error', { message, partial: false });
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      this.event(res, 'status', { agent: false });
+      userContent = `${agentBlock(report)}\n\nВопрос: ${question}`;
+    } else if (wantSearch) {
       this.event(res, 'status', { searching: true });
       const outcome = await this.search.search(question);
       this.event(res, 'status', { searching: false });
@@ -218,17 +272,11 @@ export class AiController {
     this.logger.log(
       `чат ${chat.id}: вопрос ${question.length} симв., истории ${history.messages.length - 1} ` +
         `сообщений${history.compacted ? ' (разговор сжат)' : ''}, модель ${model}, ` +
-        `память ${memory.length} симв., поиск ${wantSearch ? (searched ? 'с результатами' : 'без результатов') : 'выключен'}`,
+        `память ${memory.length} симв., ` +
+        (wantAgent
+          ? 'агент на телефоне'
+          : `поиск ${wantSearch ? (searched ? 'с результатами' : 'без результатов') : 'выключен'}`),
     );
-
-    // Разрыв со стороны клиента (уход с экрана, «Стоп», потеря сети) должен гасить и запрос к
-    // модели: иначе мак продолжит считать ответ, которого уже никто не увидит.
-    const abort = new AbortController();
-    let closed = false;
-    req.on('close', () => {
-      closed = true;
-      abort.abort();
-    });
 
     let answer = '';
     let reasoning = '';

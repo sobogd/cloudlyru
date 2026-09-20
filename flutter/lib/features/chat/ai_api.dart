@@ -171,8 +171,14 @@ class AiApi {
   ///
   /// Прерывание потока (кнопка «Стоп», уход с экрана) рвёт и HTTP-запрос — сервер по разрыву
   /// соединения гасит свой запрос к модели, поэтому генерация не продолжается «в никуда»
-  /// и не занимает единственный поток мака.
-  Stream<AiChunk> send(String chatId, String text, {bool? search}) async* {
+  /// и не занимает единственный поток мака. Прогон агента на телефоне при этом доигрывается до
+  /// конца: отмены у него нет, и бросить его на середине значит оставить телефон в непонятном
+  /// состоянии (см. `AgentService.run` на сервере).
+  ///
+  /// [agent] включает режим агента на телефоне. В этом режиме поиск не нужен (агент сам ходит
+  /// по интернету), поэтому вызывающий код отправляет `search: false` — но решает всё равно
+  /// сервер, он же и объясняет причину отказа.
+  Stream<AiChunk> send(String chatId, String text, {bool? search, bool? agent}) async* {
     final Response<ResponseBody> res;
     try {
       res = await _http.post<ResponseBody>(
@@ -180,7 +186,7 @@ class AiApi {
         // `search` не отправляем, если режим «авто»: тогда решение принимает сервер по тексту
         // вопроса (он же знает, что стоит денег). Null-aware запись `?` — то же, что
         // `if (search != null)`, но её требует линтер проекта.
-        data: <String, dynamic>{'text': text, 'search': ?search},
+        data: <String, dynamic>{'text': text, 'search': ?search, 'agent': ?agent},
         // тело читаем сами как поток байтов: Dio не должен пытаться разобрать SSE как JSON
         options: Options(responseType: ResponseType.stream),
       );
@@ -240,7 +246,12 @@ class AiApi {
         final title = event['title'];
         return title is String ? AiChunk(title: title) : null;
       case 'status':
-        return AiChunk(searching: event['searching'] == true);
+        // Одно событие несёт оба признака: сервер помечает в нём и поиск, и работу агента, а
+        // отсутствующий ключ означает «про это не изменилось» — поэтому `null`, а не `false`.
+        return AiChunk(
+          searching: event['searching'] is bool ? event['searching'] as bool : null,
+          agentRunning: event['agent'] is bool ? event['agent'] as bool : null,
+        );
       case 'done':
         final usage = event['usage'];
         return AiChunk(

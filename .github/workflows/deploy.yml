@@ -129,18 +129,19 @@ jobs:
           VERIFACTU_MASTER_KEY: ${{ secrets.VERIFACTU_MASTER_KEY }}
           # Ключ Gemini: разбор сканов расходов и поданных деклараций, разбор текста контрагента.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # Раздел «Чат»: модель на домашнем маке (LM Studio) и поиск рядом с ней.
+          # Раздел «Чат»: модель на домашнем маке (LM Studio), поиск и агент на телефоне рядом.
           # Адреса — это порты reverse-SSH туннеля мака, открытые на VPS только на loopback;
           # по умолчанию они совпадают со значениями в src/config/env.ts, а секретами
           # переопределяются, если туннель когда-нибудь переедет на другие порты.
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL || 'http://127.0.0.1:18812' }}
           LLM_MODEL: ${{ secrets.LLM_MODEL || 'google/gemma-4-e4b' }}
           SEARCH_URL: ${{ secrets.SEARCH_URL || 'http://127.0.0.1:18814' }}
+          AGENT_URL: ${{ secrets.AGENT_URL || 'http://127.0.0.1:18816' }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,LLM_BASE_URL,LLM_MODEL,SEARCH_URL
+          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,LLM_BASE_URL,LLM_MODEL,SEARCH_URL,AGENT_URL
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -241,14 +242,15 @@ jobs:
             GEMINI_API_KEY=$GEMINI_API_KEY
 
             # ===== Чат с ИИ =====
-            # Модель и поиск живут на домашнем маке и приходят через reverse-SSH туннель
-            # (agents/run-dsh-tunnel.sh на маке: 18812 — LM Studio, 18814 — поиск). Мак выключен
-            # или спит — раздел «Чат» отвечает «локальная модель недоступна», остальное облако
-            # работает как обычно.
+            # Модель, поиск и агент живут на домашнем маке и приходят через reverse-SSH туннель
+            # (agents/run-dsh-tunnel.sh на маке: 18812 — LM Studio, 18814 — поиск, 18816 — агент
+            # на телефоне). Мак выключен или спит — раздел «Чат» отвечает «локальная модель
+            # недоступна», остальное облако работает как обычно.
             LLM_BASE_URL=$LLM_BASE_URL
             LLM_MODEL=$LLM_MODEL
             LLM_REASONING=none
             SEARCH_URL=$SEARCH_URL
+            AGENT_URL=$AGENT_URL
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

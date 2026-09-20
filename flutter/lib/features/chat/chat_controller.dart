@@ -177,6 +177,16 @@ class ChatThreadState {
   /// Модель сейчас ищет в интернете — на экране это отдельная подпись вместо «печатает».
   final bool searching;
 
+  /// Агент сейчас работает на телефоне — тоже отдельная подпись, и другая: прогон занимает
+  /// минуты, и человеку важно понимать, что происходит именно на телефоне, а не поиск.
+  final bool agentRunning;
+
+  /// Режим агента: включён ли прогон на телефоне.
+  ///
+  /// В отличие от поиска режима «авто» здесь нет: агент занимает единственный телефон на минуты,
+  /// поэтому решение всегда за человеком — кнопкой в строке ввода.
+  final bool agentMode;
+
   /// Режим поиска: `auto` (решает сервер по вопросу), `on` или `off`.
   final String searchMode;
 
@@ -192,6 +202,8 @@ class ChatThreadState {
     this.error,
     this.usage,
     this.searching = false,
+    this.agentRunning = false,
+    this.agentMode = false,
     this.searchMode = 'auto',
   });
 
@@ -205,6 +217,8 @@ class ChatThreadState {
     bool? sending,
     AiUsage? usage,
     bool? searching,
+    bool? agentRunning,
+    bool? agentMode,
     String? searchMode,
   }) =>
       ChatThreadState(
@@ -218,6 +232,8 @@ class ChatThreadState {
         error: error,
         usage: usage ?? this.usage,
         searching: searching ?? this.searching,
+        agentRunning: agentRunning ?? this.agentRunning,
+        agentMode: agentMode ?? this.agentMode,
         searchMode: searchMode ?? this.searchMode,
       );
 
@@ -233,6 +249,8 @@ class ChatThreadState {
         error: message,
         usage: usage,
         searching: searching,
+        agentRunning: agentRunning,
+        agentMode: agentMode,
         searchMode: searchMode,
       );
 
@@ -247,6 +265,8 @@ class ChatThreadState {
         sending: sending,
         usage: usage,
         searching: searching,
+        agentRunning: agentRunning,
+        agentMode: agentMode,
         searchMode: searchMode,
       );
 
@@ -310,6 +330,7 @@ class ChatThreadController extends Notifier<ChatThreadState> {
       title: chat.title,
       model: chat.model,
       searchMode: ref.read(settingsProvider).ui.chatSearch,
+      agentMode: ref.read(settingsProvider).ui.chatAgent,
       loading: true,
     );
     try {
@@ -350,6 +371,18 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     if (mode == state.searchMode) return;
     state = state.copyWith(searchMode: mode);
     await ref.read(settingsProvider).ui.setChatSearch(mode);
+  }
+
+  /// Включает и выключает режим агента на телефоне и запоминает выбор на будущее.
+  ///
+  /// Режим, как и поиск, один на всё приложение: это привычка («пусть ходит по телефону за меня»
+  /// против «пусть отвечает быстро»), а не свойство отдельного разговора. Запоминается потому,
+  /// что прогон стоит человеку минут ожидания — случайно оставленный включённым, он сделал бы
+  /// такой же долгой следующую отправку.
+  Future<void> setAgentMode(bool on) async {
+    if (on == state.agentMode) return;
+    state = state.copyWith(agentMode: on);
+    await ref.read(settingsProvider).ui.setChatAgent(on);
   }
 
   /// Отправляет вопрос: дописывает его в переписку и запускает поток ответа.
@@ -399,20 +432,24 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     final done = Completer<void>();
     _done = done;
 
-    // «авто» отправляем как отсутствие поля: решение принимает сервер по тексту вопроса
+    // «авто» отправляем как отсутствие поля: решение принимает сервер по тексту вопроса.
+    // В режиме агента поиск не нужен — агент сам ходит по интернету на телефоне, и сервер в этом
+    // случае поиск не запускает; `search: false` здесь говорит это явно, а не оставляет на догадки.
     final search = switch (state.searchMode) {
       'on' => true,
       'off' => false,
       _ => null,
     };
-    _sub = _api.send(chatId, question, search: search).listen(
-      _applyChunk,
-      onError: (Object e) {
-        if (!_cancelledByUser) _fail(e);
-        _finish();
-      },
-      onDone: _finish,
-    );
+    _sub = _api
+        .send(chatId, question, search: state.agentMode ? false : search, agent: state.agentMode)
+        .listen(
+          _applyChunk,
+          onError: (Object e) {
+            if (!_cancelledByUser) _fail(e);
+            _finish();
+          },
+          onDone: _finish,
+        );
 
     await done.future;
   }
@@ -433,6 +470,7 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     }
     if (chunk.usage != null) state = state.copyWith(usage: chunk.usage);
     if (chunk.searching != null) state = state.copyWith(searching: chunk.searching);
+    if (chunk.agentRunning != null) state = state.copyWith(agentRunning: chunk.agentRunning);
 
     final last = state.last;
     if (last == null || last.isUser) return;
@@ -488,8 +526,14 @@ class ChatThreadController extends Notifier<ChatThreadState> {
       if (messages.isNotEmpty && !messages.last.isUser && messages.last.content.isEmpty) {
         messages.removeLast();
       }
-      // признак «ищет» снимаем вместе с генерацией: иначе подпись осталась бы висеть
-      state = state.copyWith(messages: messages, sending: false, searching: false);
+      // признаки «ищет» и «работает на телефоне» снимаем вместе с генерацией: иначе подпись
+      // осталась бы висеть
+      state = state.copyWith(
+        messages: messages,
+        sending: false,
+        searching: false,
+        agentRunning: false,
+      );
       ref.read(chatsProvider.notifier).touch(state.chatId);
     }
     if (done != null && !done.isCompleted) done.complete();

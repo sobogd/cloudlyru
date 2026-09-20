@@ -310,6 +310,8 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
             const SizedBox(width: 4),
             _searchButton(state),
             const SizedBox(width: 4),
+            _agentButton(state),
+            const SizedBox(width: 4),
             state.sending
                 ? IconButton(
                     tooltip: 'Стоп',
@@ -344,7 +346,10 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       _ => (Icons.travel_explore, C.fg3, 'Поиск в интернете: авто (по вопросу)'),
     };
     return PopupMenuButton<String>(
-      tooltip: hint,
+      // В режиме агента поиск не запускается (по интернету ходит телефон), поэтому кнопка
+      // неактивна: оставить её рабочей значило бы обещать поиск, которого не будет.
+      enabled: !state.agentMode,
+      tooltip: state.agentMode ? 'Поиск не нужен: в режиме агента ищет телефон' : hint,
       onSelected: (mode) => _thread.setSearchMode(mode),
       itemBuilder: (context) => const [
         PopupMenuItem(value: 'auto', child: Text('Авто — искать, когда нужно')),
@@ -353,7 +358,28 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       ],
       child: Padding(
         padding: const EdgeInsets.all(8),
-        child: Icon(icon, size: 24, color: color),
+        child: Icon(icon, size: 24, color: state.agentMode ? C.fg3 : color),
+      ),
+    );
+  }
+
+  /// Кнопка режима агента: включён — агент ходит по интернету на телефоне.
+  ///
+  /// Не «ещё один поиск», а другой способ его добыть: поиск возвращает сниппеты, а агент
+  /// открывает Chrome на телефоне, вводит запрос, читает выдачу и открывает нужные страницы.
+  /// Стоит это минут ожидания и занимает единственный телефон, поэтому режим — переключатель,
+  /// а не то, что сервер решает сам.
+  Widget _agentButton(ChatThreadState state) {
+    final on = state.agentMode;
+    return IconButton(
+      tooltip: on
+          ? 'Агент на телефоне: включён (ищет в браузере на телефоне)'
+          : 'Агент на телефоне: выключен',
+      onPressed: () => _thread.setAgentMode(!on),
+      icon: Icon(
+        on ? Icons.phone_android : Icons.phone_iphone_outlined,
+        size: 24,
+        color: on ? C.accent : C.fg3,
       ),
     );
   }
@@ -406,16 +432,22 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
   Widget _answer(String text, {required bool isLast}) {
     // пустой текст у ответа означает «генерация ещё не началась» — показываем ожидание, а
     // если модель пошла искать в интернете, говорим об этом словами: поиск занимает десятки
-    // секунд, и молчащий спиннер в это время выглядит как зависание
+    // секунд, и молчащий спиннер в это время выглядит как зависание. То же с агентом на
+    // телефоне, только ждать дольше: там прогон идёт минутами, и подпись говорит про телефон —
+    // иначе человек решил бы, что завис поиск.
     if (text.isEmpty) {
-      if (isLast && ref.read(chatThreadProvider).searching) {
-        return const Padding(
-          padding: EdgeInsets.symmetric(vertical: 2),
+      final thread = ref.read(chatThreadProvider);
+      if (isLast && (thread.searching || thread.agentRunning)) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
           child: Row(
             children: [
-              SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
-              SizedBox(width: 8),
-              Text('Ищу в интернете…', style: TextStyle(color: C.fg3, fontSize: 13)),
+              const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(width: 8),
+              Text(
+                thread.agentRunning ? 'Работаю на телефоне…' : 'Ищу в интернете…',
+                style: const TextStyle(color: C.fg3, fontSize: 13),
+              ),
             ],
           ),
         );
