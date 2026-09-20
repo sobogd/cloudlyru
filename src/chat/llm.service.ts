@@ -5,12 +5,41 @@ import { env } from '../config/env';
  * Роль сообщения в запросе к модели. Те же имена, что понимает OpenAI-совместимый API, —
  * переводить их при сборке контекста не приходится.
  */
-export type LlmRole = 'system' | 'user' | 'assistant';
+/** Роль в запросе: к системной, пользовательской и ассистентской добавляется результат инструмента. */
+export type LlmRole = 'system' | 'user' | 'assistant' | 'tool';
 
-/** Сообщение запроса к модели. */
+/**
+ * Вызов инструмента, как его вернула модель: имя, аргументы строкой JSON и идентификатор,
+ * которым потом помечается результат.
+ */
+export interface LlmToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/**
+ * Сообщение запроса к модели.
+ *
+ * `tool_calls` есть только у ответа ассистента, который просит вызвать инструмент, а
+ * `tool_call_id` — только у результата инструмента: так модель понимает, на какую просьбу
+ * этот результат отвечает.
+ */
 export interface LlmMessage {
   role: LlmRole;
   content: string;
+  tool_calls?: LlmToolCall[];
+  tool_call_id?: string;
+}
+
+/** Описание инструмента в формате OpenAI: имя, назначение и схема аргументов. */
+export interface LlmTool {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
 }
 
 /** Расход токенов, как его посчитал сервер модели. */
@@ -30,6 +59,11 @@ export interface LlmDelta {
   text?: string;
   reasoning?: string;
   usage?: LlmUsage;
+  /**
+   * Вызовы инструментов, накопленные за шаг. Приходят одним куском в конце потока: аргументы
+   * модель присылает по частям, и до конца шага их нельзя разобрать как JSON.
+   */
+  toolCalls?: LlmToolCall[];
 }
 
 /** Ошибка обращения к модели: текст пригоден для показа человеку. */
@@ -145,6 +179,7 @@ export class LlmService {
   async *streamChat(params: {
     model: string;
     messages: LlmMessage[];
+    tools?: LlmTool[];
     signal: AbortSignal;
   }): AsyncGenerator<LlmDelta> {
     if (!this.configured) {
@@ -155,6 +190,10 @@ export class LlmService {
       messages: params.messages,
       stream: true,
     };
+    if (params.tools?.length) {
+      body.tools = params.tools;
+      body.tool_choice = 'auto';
+    }
     // `reasoning_effort` — не из стандарта OpenAI (его понимал LM Studio, который на маке больше
     // не стоит; llama.cpp это поле игнорирует, а «размышления» выключает флагом шаблона). Без `none` модель
     // тратит на размышления весь ответ и текста не отдаёт вовсе, поэтому значение по умолчанию
@@ -182,6 +221,10 @@ export class LlmService {
     // переносится в следующую итерацию, а не выбрасывается.
     const decoder = new TextDecoder();
     let buffer = '';
+    // Кусок вызова приходит по частям: имя один раз, аргументы — сколько угодно порций JSON.
+    // Склеиваем по индексу вызова (модель может просить несколько инструментов сразу —
+    // на «сравни реддит и амазон» она именно так и делает).
+    const pending = new Map<number, { id: string; name: string; args: string }>();
     for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
       buffer += decoder.decode(chunk, { stream: true });
       let index: number;
@@ -191,9 +234,21 @@ export class LlmService {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (!payload || payload === '[DONE]') continue;
-        const delta = this.parseDelta(payload);
+        const delta = this.parseDelta(payload, pending);
         if (delta) yield delta;
       }
+    }
+    if (pending.size) {
+      // Отдаём вызовы последним событием шага: раньше аргументы ещё не собраны целиком.
+      yield {
+        toolCalls: [...pending.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([index, call]) => ({
+            id: call.id || `call_${index}`,
+            name: call.name,
+            arguments: call.args || '{}',
+          })),
+      };
     }
   }
 
@@ -252,9 +307,23 @@ export class LlmService {
    * против `reasoning`, поэтому принимаем оба — иначе после смены сервера размышления просто
    * исчезли бы с экрана, а причина была бы не видна.
    */
-  private parseDelta(payload: string): LlmDelta | null {
+  private parseDelta(
+    payload: string,
+    pending: Map<number, { id: string; name: string; args: string }>,
+  ): LlmDelta | null {
     let parsed: {
-      choices?: Array<{ delta?: { content?: string; reasoning_content?: string; reasoning?: string } }>;
+      choices?: Array<{
+        delta?: {
+          content?: string;
+          reasoning_content?: string;
+          reasoning?: string;
+          tool_calls?: Array<{
+            index?: number;
+            id?: string;
+            function?: { name?: string; arguments?: string };
+          }>;
+        };
+      }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     try {
@@ -263,6 +332,15 @@ export class LlmService {
       return null;
     }
     const delta = parsed.choices?.[0]?.delta ?? {};
+    // Порции вызова инструмента копим молча: наружу они уйдут одним событием в конце шага.
+    for (const call of delta.tool_calls ?? []) {
+      const index = call.index ?? 0;
+      const acc = pending.get(index) ?? { id: '', name: '', args: '' };
+      if (call.id) acc.id = call.id;
+      if (call.function?.name) acc.name = call.function.name;
+      if (call.function?.arguments) acc.args += call.function.arguments;
+      pending.set(index, acc);
+    }
     const out: LlmDelta = {};
     if (typeof delta.content === 'string' && delta.content) out.text = delta.content;
     const reasoning = delta.reasoning_content ?? delta.reasoning;

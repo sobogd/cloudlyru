@@ -136,11 +136,14 @@ jobs:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL || 'http://127.0.0.1:18812' }}
           LLM_MODEL: ${{ secrets.LLM_MODEL || 'qwen/qwen3.5-9b' }}
           WEBSEARCH_URL: ${{ secrets.WEBSEARCH_URL || 'http://127.0.0.1:18814' }}
+          # Агент на телефоне: открывает сайты в Chrome телефона (ADB + DevTools).
+          AGENT_URL: ${{ secrets.AGENT_URL || 'http://127.0.0.1:18816' }}
+          AGENT_MAX_STEPS: ${{ secrets.AGENT_MAX_STEPS || '6' }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,LLM_BASE_URL,LLM_MODEL,WEBSEARCH_URL
+          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,LLM_BASE_URL,LLM_MODEL,WEBSEARCH_URL,AGENT_URL,AGENT_MAX_STEPS
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -249,6 +252,8 @@ jobs:
             LLM_MODEL=$LLM_MODEL
             LLM_REASONING=none
             WEBSEARCH_URL=$WEBSEARCH_URL
+            AGENT_URL=$AGENT_URL
+            AGENT_MAX_STEPS=$AGENT_MAX_STEPS
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \
