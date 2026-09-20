@@ -38,7 +38,8 @@ MAX_RESULTS = 8
 CONSENT_WORDS = (
     "accept", "aceptar", "принять", "согласен", "согласиться", "agree", "akzeptieren",
     "accetta", "tout accepter", "alle akzeptieren", "i agree", "got it", "понятно",
-    "accept all", "aceptar todo", "принять все",
+    "accept all", "aceptar todo", "принять все", "aceptar y cerrar", "consentir",
+    "accepter", "akkoord", "aceito", "прийняти", "zustimmen", "godta", "acceptera",
 )
 
 # Профили сайтов: где у сайта поисковая строка, чем он отправляет запрос и как выглядит
@@ -165,9 +166,17 @@ LANG_NAMES = {
 LLM_URL = os.environ.get("PHONE_AGENT_LLM_URL", "http://127.0.0.1:1234/v1")
 LLM_MODEL = os.environ.get("PHONE_AGENT_LLM_MODEL", "qwen/qwen3.5-9b")
 
+# Проверки, которые проходят сами: Cloudflare показывает «Just a moment» и через несколько
+# секунд пускает настоящий браузер. Это не капча — ждать и перечитать.
+TRANSIENT_WALL = ("just a moment", "checking your browser", "проверка браузера", "un momento")
+
 # Признак того, что страница — проверка на бота, а не статья.
-BOT_WALL = ("prove your humanity", "are you a robot", "verify you are human",
-            "unusual traffic", "подтвердите, что вы не робот")
+BOT_WALL = (
+    "prove your humanity", "are you a robot", "verify you are human", "unusual traffic",
+    "подтвердите, что вы не робот", "confirma que no eres un robot", "verifica que eres humano",
+    "complete the challenge", "just a moment", "checking your browser", "attention required",
+    "captcha", "recaptcha", "hcaptcha", "нажмите, чтобы продолжить", "проверка безопасности",
+)
 
 
 class BrowseError(Exception):
@@ -265,6 +274,43 @@ def dismiss_consent(phone) -> list[str]:
         if phone.tap_selector("#" + item["id"]):
             pressed.append(item["label"])
     return pressed
+
+
+# Вырезает из дерева окна согласия и проверки, чтобы их текст не попадал в содержимое статьи.
+# Проблема была не косметической: у elpais.com весь «текст страницы» оказался окном cookies —
+# 3997 символов из 3997, и модель получила баннер вместо статьи. Читаем ПОСЛЕ удаления: иначе
+# простыня про «browsing modes» уезжает в контекст и вытесняет настоящий текст.
+STRIP_OVERLAYS_JS = """
+(() => {
+  const words = %s;
+  const sels = ['[role=dialog]', '[aria-modal="true"]', '[id*=consent i]', '[class*=consent i]',
+                '[id*=cookie i]', '[class*=cookie i]', '[id*=gdpr i]', '[class*=gdpr i]',
+                '[id*=privacy i]', '[class*=privacy i]', '[id*=captcha i]', '[class*=captcha i]'];
+  const kill = new Set();
+  for (const sel of sels) {
+    for (const el of document.querySelectorAll(sel)) {
+      const t = (el.innerText || '').toLowerCase();
+      if (!t) continue;
+      if (!words.some(w => t.includes(w))) continue;
+      kill.add(el);
+    }
+  }
+  for (const el of kill) el.remove();
+  return kill.size;
+})()
+""" % json.dumps(list(CONSENT_WORDS) + ["cookie", "cookies", "captcha", "проверка"])
+
+
+def strip_overlays(phone) -> int:
+    """Убирает окна согласия и проверок из страницы; возвращает, сколько удалил.
+
+    Ошибку гасим: уборка — вспомогательный шаг, и падение на ней не должно отменять чтение
+    страницы. Если не вышло — текст придёт с баннером, но придёт.
+    """
+    try:
+        return int(phone.eval_js(STRIP_OVERLAYS_JS) or 0)
+    except Exception:
+        return 0
 
 
 def reveal_search(phone, words: tuple[str, ...]) -> str | None:
@@ -382,6 +428,10 @@ def search_on(phone, site: str, query: str, limit: int = MAX_RESULTS,
         # Часть сайтов (и все, где поле в shadow DOM) отправляют форму по Enter.
         phone.press_enter()
     phone.settle(5.0)
+    # Баннер поверх выдачи встречается и после отправки запроса: убираем его до разбора,
+    # иначе карточки товара перекрыты, а в тексте оказывается согласие.
+    dismiss_consent(phone)
+    strip_overlays(phone)
 
     extractor = profile.get("results")
     if extractor:
@@ -425,19 +475,48 @@ def read_page(phone, url: str, max_chars: int = 4000) -> dict:
     против 238 символов заглушки).
     """
     phone.open(url)
+    # Согласие закрываем и здесь, а не только при поиске внутри сайта: раньше простой переход
+    # по ссылке оставлял баннер, и его текст становился «содержимым страницы».
+    dismiss_consent(phone)
+    strip_overlays(phone)
     text = phone.text(limit=max_chars)
     title = phone.title()
 
-    if any(mark in text.lower() for mark in BOT_WALL) and "reddit.com" in url:
+    # Если после уборки текста почти нет, а на экране всё ещё согласие — жмём ещё раз: часть
+    # сайтов показывает баннер повторно (или он дорисовался скриптом уже после первого нажатия).
+    if len(text) < 400:
+        dismiss_consent(phone)
+        strip_overlays(phone)
+        phone.settle(1.5)
+        text = phone.text(limit=max_chars)
+
+    blocked = any(mark in text.lower() for mark in BOT_WALL)
+
+    # Проходная проверка Cloudflare: ждём и перечитываем один раз — обычно после этого
+    # на странице настоящий текст, и отдельный источник не нужен.
+    if blocked and any(mark in text.lower() for mark in TRANSIENT_WALL):
+        phone.settle(6.0)
+        strip_overlays(phone)
+        retry = phone.text(limit=max_chars)
+        if retry and not any(mark in retry.lower() for mark in BOT_WALL):
+            text, blocked, title = retry, False, phone.title() or title
+
+    # Reddit разметку не отдаёт вовсе, но тот же адрес с `.json` отдаёт ветку данными —
+    # проверено: 59 тысяч символов против 238 символов заглушки.
+    if blocked and "reddit.com" in url:
         data = _reddit_json(phone, url)
         if data:
             return data
+
+    # Капчу не решаем принципиально: обходить проверку сайта — не наша задача. Но и отдавать
+    # модели страницу проверки нельзя, поэтому источник помечается `blocked`, а в тексте
+    # остаётся только то, что успело загрузиться: агент увидит пометку и возьмёт другой сайт.
     return {
         "url": phone.url() or url,
         "title": title,
         "text": text,
         "chars": len(text),
-        "blocked": any(mark in text.lower() for mark in BOT_WALL),
+        "blocked": blocked,
     }
 
 
