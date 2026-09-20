@@ -106,7 +106,12 @@ SITES = {
     },
     "reddit.com": {
         "url": "https://www.reddit.com/",
-        "field": ("input[name=q]", "#search-input", "input[type=search]"),
+        # На главной Reddit поля ввода нет вовсе — в разметке только скрытый input, а поиск
+        # открывается кнопкой «Search Reddit». Это выяснилось на живом прогоне: агент получил
+        # «на reddit.com не нашлась поисковая строка» и не смог ничего найти. Поэтому у сайта
+        # есть шаг `reveal` — сначала нажать кнопку, потом искать поле.
+        "reveal": ("search reddit", "search", "поиск"),
+        "field": ("input[name=q]", "#search-input", "input[type=search]", "input[name=query]"),
         "submit": ("button[type=submit]", "#search-submit", "button[aria-label*=earch]"),
         "results": """
         (() => {
@@ -262,19 +267,69 @@ def dismiss_consent(phone) -> list[str]:
     return pressed
 
 
-def _find_field(phone, selectors: tuple[str, ...]) -> str | None:
-    """Находит поисковое поле на странице: селекторы по очереди, потом общие признаки сайта."""
-    js = """
+def reveal_search(phone, words: tuple[str, ...]) -> str | None:
+    """Нажимает кнопку, которая раскрывает поиск, и возвращает её подпись.
+
+    Нужно там, где поисковой строки на странице сразу нет (Reddit): сайт показывает кнопку
+    «Search Reddit», а поле появляется после нажатия. Нажимаем настоящим тапом по координатам —
+    так же, как это сделал бы человек: часть таких кнопок игнорирует программный `click()`.
+    """
+    found = phone.eval_js("""
     (() => {
-      const sels = %s;
-      for (const s of sels) {
-        const el = document.querySelector(s);
-        if (el && (el.offsetWidth || el.offsetHeight)) return s;
+      const words = %s;
+      for (const el of document.querySelectorAll('button, [role=button], a, [role=link]')) {
+        const t = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+        if (!t) continue;
+        const r = el.getBoundingClientRect();
+        if (!r.width && !r.height) continue;
+        if (!words.some(w => t === w || t.startsWith(w) || t.includes(w))) continue;
+        el.id = 'agent-reveal';
+        return t.slice(0, 40);
       }
       return null;
     })()
-    """ % json.dumps(list(selectors))
-    return phone.eval_js(js)
+    """ % json.dumps(list(words)))
+    if not found:
+        return None
+    return found if phone.tap_selector("#agent-reveal") else None
+
+
+def focus_field(phone, selectors: tuple[str, ...]) -> str | None:
+    """Находит поисковое поле, ставит в него курсор и возвращает, чем оно оказалось.
+
+    Ищем и в обычном дереве, и внутри shadow DOM: у Reddit поисковая строка — `textarea[name=q]`
+    внутри `<faceplate-search-input>`, и обычный `document.querySelector` её не находит вовсе
+    (на живом прогоне это и дало «на reddit.com не нашлась поисковая строка»). Курсор ставим
+    здесь же: после этого текст вводится через CDP в сфокусированное поле, независимо от того,
+    где оно лежит в дереве.
+    """
+    return phone.eval_js("""
+    (() => {
+      const sels = %s;
+      const deep = (sel) => {
+        const walk = (root, depth) => {
+          if (depth > 6) return null;
+          for (const el of root.querySelectorAll('*')) {
+            if (el.shadowRoot) {
+              const hit = el.shadowRoot.querySelector(sel);
+              if (hit) return hit;
+              const nested = walk(el.shadowRoot, depth + 1);
+              if (nested) return nested;
+            }
+          }
+          return null;
+        };
+        return document.querySelector(sel) || walk(document, 0);
+      };
+      for (const sel of sels) {
+        const el = deep(sel);
+        if (!el || (!el.offsetWidth && !el.offsetHeight)) continue;
+        el.focus();
+        return sel;
+      }
+      return null;
+    })()
+    """ % json.dumps(list(selectors)))
 
 
 def search_on(phone, site: str, query: str, limit: int = MAX_RESULTS,
@@ -298,28 +353,33 @@ def search_on(phone, site: str, query: str, limit: int = MAX_RESULTS,
     dismiss_consent(phone)
 
     profile = SITES.get(key, {})
-    field = _find_field(phone, tuple(profile.get("field", ())) or GENERIC_FIELD)
+    field = focus_field(phone, tuple(profile.get("field", ())) or GENERIC_FIELD)
     if not field:
-        # Второй заход: возможно, страница была не главной (редирект на статью) — пробуем
-        # корень сайта ещё раз и общие признаки поля.
+        # Поля нет сразу — возможно, поиск раскрывается кнопкой (Reddit).
+        revealed = reveal_search(phone, tuple(profile.get("reveal", ())) or ("search", "поиск", "buscar"))
+        if revealed:
+            phone.settle(2.5)
+            field = focus_field(phone, tuple(profile.get("field", ())) or GENERIC_FIELD)
+    if not field:
+        # Последняя попытка: перезагрузить корень сайта (страница могла уехать на статью)
+        # и поискать поле общими признаками.
         phone.open(site_url(key))
         dismiss_consent(phone)
-        field = _find_field(phone, GENERIC_FIELD)
+        field = focus_field(phone, GENERIC_FIELD)
     if not field:
         raise BrowseError(f"на {key} не нашлась поисковая строка")
 
-    # Фокус в поле, затем ввод: `Input.insertText` пишет юникод как есть, в отличие от
-    # `adb shell input text`, который молча теряет кириллицу (на этом спотыкался прежний агент).
-    phone.eval_js("(() => { const el = document.querySelector(%s); el.focus(); return true; })()"
-                  % json.dumps(field))
+    # Ввод. Поле уже в фокусе — его поставил `focus_field` (и только он умеет попадать в shadow
+    # DOM). `Input.insertText` пишет юникод как есть, в отличие от `adb shell input text`,
+    # который молча теряет кириллицу — на этом спотыкался прежний агент.
     phone.type_text(search_query)
 
     submitted = False
-    for selector in tuple(profile.get("submit", ())) or ("form input[type=submit]", "form button[type=submit]"):
-        if phone.tap_selector(selector):
-            submitted = True
-            break
+    submit_selectors = tuple(profile.get("submit", ())) or ("form input[type=submit]", "form button[type=submit]")
+    if phone.tap_deep(submit_selectors):
+        submitted = True
     if not submitted:
+        # Часть сайтов (и все, где поле в shadow DOM) отправляют форму по Enter.
         phone.press_enter()
     phone.settle(5.0)
 

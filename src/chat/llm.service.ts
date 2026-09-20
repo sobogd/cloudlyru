@@ -28,7 +28,12 @@ export interface LlmToolCall {
 export interface LlmMessage {
   role: LlmRole;
   content: string;
-  tool_calls?: LlmToolCall[];
+  /**
+   * Вызовы инструментов в ответе ассистента — в форме OpenAI, а не в той, в какой их удобно
+   * читать: llama.cpp разбирает шаблоном и на плоской форме падает с «Missing tool call type».
+   * LM Studio такую форму принимал, и ошибка вылезла только после переезда на llama.cpp.
+   */
+  tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
   tool_call_id?: string;
 }
 

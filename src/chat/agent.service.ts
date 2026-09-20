@@ -208,7 +208,17 @@ export class AgentService {
         return { answer, reasoning, sources, promptTokens, completionTokens, steps };
       }
 
-      messages.push({ role: 'assistant', content: turn.text, tool_calls: turn.toolCalls });
+      // Форма вызова здесь — та, что ждёт сервер модели (OpenAI-стиль с `type: function`):
+      // плоскую llama.cpp отвергает с «Missing tool call type».
+      messages.push({
+        role: 'assistant',
+        content: turn.text,
+        tool_calls: turn.toolCalls.map((call) => ({
+          id: call.id,
+          type: 'function' as const,
+          function: { name: call.name, arguments: call.arguments },
+        })),
+      });
       for (const call of turn.toolCalls) {
         const result = await this.execute(call, sources, params.events);
         messages.push({ role: 'tool', tool_call_id: call.id, content: result });

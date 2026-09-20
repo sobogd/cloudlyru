@@ -223,7 +223,11 @@ class Phone:
             timeout=timeout,
         )
         if "exceptionDetails" in res:
-            raise PhoneError(f"JS упал: {str(res['exceptionDetails'])[:200]}")
+            # Показываем НАСТОЯЩИЙ текст ошибки JS, а не дамп объекта: при отладке разбора
+            # страниц важно, что именно не так в выражении, а не номера строк.
+            details = res["exceptionDetails"]
+            description = (details.get("exception") or {}).get("description") or details.get("text")
+            raise PhoneError(f"JS упал: {str(description)[:300]}")
         return res.get("result", {}).get("value")
 
     def url(self) -> str:
@@ -293,6 +297,48 @@ class Phone:
                 "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1,
             })
         await asyncio.sleep(0.4)
+
+    def tap_deep(self, selectors: tuple[str, ...]) -> bool:
+        """Нажимает первый подходящий элемент, включая элементы внутри shadow DOM.
+
+        `document.querySelector` в shadow-дерево не заглядывает, а современные сайты прячут туда
+        именно поля и кнопки: у Reddit поисковая строка — это `textarea[name=q]` внутри
+        `<faceplate-search-input>`, и обычный селектор её не видит. Ищем вручную по дереву,
+        прокручиваем к элементу и жмём настоящим тапом по его координатам.
+        """
+        box = self.eval_js("""
+        (() => {
+          const sels = %s;
+          const deep = (sel) => {
+            const walk = (root, depth) => {
+              if (depth > 6) return null;
+              for (const el of root.querySelectorAll('*')) {
+                if (el.shadowRoot) {
+                  const hit = el.shadowRoot.querySelector(sel);
+                  if (hit) return hit;
+                  const nested = walk(el.shadowRoot, depth + 1);
+                  if (nested) return nested;
+                }
+              }
+              return null;
+            };
+            return document.querySelector(sel) || walk(document, 0);
+          };
+          for (const sel of sels) {
+            const el = deep(sel);
+            if (!el) continue;
+            el.scrollIntoView({block: 'center'});
+            const r = el.getBoundingClientRect();
+            if (!r.width && !r.height) continue;
+            return {x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, sel};
+          }
+          return null;
+        })()
+        """ % json.dumps(list(selectors)))
+        if not box or not box.get('w'):
+            return False
+        self._run(self._tap(box['x'], box['y']))
+        return True
 
     def close(self) -> None:
         """Закрывает вкладку и соединение: за телефоном не должно оставаться мусора."""
