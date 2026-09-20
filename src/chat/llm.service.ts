@@ -155,11 +155,13 @@ export class LlmService {
       messages: params.messages,
       stream: true,
     };
-    // `reasoning_effort` — не из стандарта OpenAI; его понимает LM Studio. Без `none` модель
+    // `reasoning_effort` — не из стандарта OpenAI (его понимал LM Studio, который на маке больше
+    // не стоит; llama.cpp это поле игнорирует, а «размышления» выключает флагом шаблона). Без `none` модель
     // тратит на размышления весь ответ и текста не отдаёт вовсе, поэтому значение по умолчанию
     // именно `none`. Сервер, который параметра не знает, просто его проигнорирует.
     const reasoning = env.LLM_REASONING.trim();
     if (reasoning) body.reasoning_effort = reasoning;
+    this.applyTemplateKwargs(body);
 
     let res: Response;
     try {
@@ -211,6 +213,7 @@ export class LlmService {
     };
     const reasoning = env.LLM_REASONING.trim();
     if (reasoning) body.reasoning_effort = reasoning;
+    this.applyTemplateKwargs(body);
 
     const data = await this.postJson<{ choices?: Array<{ message?: { content?: string } }> }>(
       '/v1/chat/completions',
@@ -221,9 +224,31 @@ export class LlmService {
   }
 
   /**
+   * Дополнительные поля тела запроса из `LLM_TEMPLATE_KWARGS` (JSON-объект строкой).
+   *
+   * Зачем отдельная настройка: «размышления» выключаются у разных серверов по-разному —
+   * LM Studio понимал `reasoning_effort`, а llama.cpp (на нём считает мак) ждёт
+   * `chat_template_kwargs`. Держать это в коде значило бы пересобирать сервер при смене
+   * сервера модели; строка в окружении позволяет переехать одной настройкой.
+   *
+   * Битая строка не срывает запрос: пишем в лог и отправляем без этих полей — иначе
+   * опечатка в настройке выключила бы раздел целиком.
+   */
+  private applyTemplateKwargs(body: Record<string, unknown>): void {
+    const raw = env.LLM_TEMPLATE_KWARGS.trim();
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      body.chat_template_kwargs = parsed;
+    } catch {
+      this.logger.warn('LLM_TEMPLATE_KWARGS не разобран как JSON — отправляю запрос без него');
+    }
+  }
+
+  /**
    * Достаёт из строки SSE кусок ответа и расход токенов.
    *
-   * Имена полей у разных серверов расходятся: `reasoning_content` (LM Studio, DeepSeek, Qwen)
+   * Имена полей у разных серверов расходятся: `reasoning_content` (LM Studio, DeepSeek, Qwen;
    * против `reasoning`, поэтому принимаем оба — иначе после смены сервера размышления просто
    * исчезли бы с экрана, а причина была бы не видна.
    */

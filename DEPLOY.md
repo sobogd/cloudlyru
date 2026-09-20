@@ -82,22 +82,22 @@ gh secret set MAIL_PURGE_ENABLED  --body true    # затем само удал�
 
 ## Раздел «Чат»: модель и поиск живут на маке
 
-Модель (qwen3.5-9b в LM Studio) и сервис поиска с чтением страниц работают не на сервере, а на
+Модель (qwen3.5-9b в llama.cpp) и сервис поиска с чтением страниц работают не на сервере, а на
 домашнем маке владельца. Сюда они приходят **reverse-SSH туннелем мака**
 (`jevel.ai/agents/run-dsh-tunnel.sh`, launchd `com.agent.dsh-reverse-tunnel`), который открывает
 на VPS два loopback-порта:
 
 | Порт на VPS | Что это |
 |---|---|
-| `127.0.0.1:18812` | LM Studio (на маке — `127.0.0.1:1234`) |
+| `127.0.0.1:18812` | llama-server (на маке — `127.0.0.1:1234`) |
 | `127.0.0.1:18814` | поиск и чтение страниц (`agents/websearch/`) |
 
 Наружу порты не смотрят вовсе: cloudflared и nginx для чата не нужны, потому что облачный сервер
 и конец туннеля — одна и та же машина. Переменные `LLM_BASE_URL`, `LLM_MODEL`, `LLM_REASONING`,
 `WEBSEARCH_URL` задаются в `deploy.yml` (переопределяются одноимёнными секретами репозитория).
 
-Что держит мак в строю, тоже на маке: launchd `com.agent.lmstudio` (сторожит приложение, сервер
-на 1234 и загруженную модель) и `com.agent.websearch` (сервис поиска; плист лежит рядом с кодом —
+Что держит мак в строю, тоже на маке: launchd `com.agent.llm` (сторожит `llama-server` на порту
+1234; скрипт — `jevel.ai/agents/run-llm.sh`) и `com.agent.websearch` (сервис поиска; плист лежит рядом с кодом —
 `agents/websearch/com.agent.websearch.plist`, ставится копированием в `~/Library/LaunchAgents`).
 Плюс `pmset` с выставленным `sleep 0` — иначе уснувший мак выглядит как «модель недоступна».
 
@@ -105,8 +105,8 @@ gh secret set MAIL_PURGE_ENABLED  --body true    # затем само удал�
 
 ```bash
 # на маке: живы ли туннель и сторожевые агенты
-launchctl list | grep -E "dsh-reverse-tunnel|lmstudio|websearch"
-tail -20 /tmp/lmstudio-agent.log /tmp/websearch.log
+launchctl list | grep -E "dsh-reverse-tunnel|agent.llm|websearch"
+tail -20 /tmp/llm-agent.log /tmp/llm-server.log /tmp/websearch.log
 # на VPS: слушают ли порты (пусто — туннель не поднялся)
 ss -ltn | grep -E "18812|18814"
 # на VPS: отвечают ли модель и поиск
@@ -114,8 +114,9 @@ curl -s http://127.0.0.1:18812/v1/models | head -c 200
 curl -s http://127.0.0.1:18814/health
 ```
 
-Модель не в памяти — первый ответ ждёт её загрузки (десяток секунд, LM Studio грузит её сама по
-запросу). Размышления у модели выключены переменной `LLM_REASONING=none`: без неё qwen3.5-9b
+Модель грузится при старте `llama-server` — это занимает несколько секунд и 7.3 ГБ памяти (Q6_K
+с контекстом 32768). Если процесса нет, сторож поднимет его сам; если модели нет на диске, в
+`/tmp/llm-agent.log` будет строка про отсутствующий файл `~/models/*.gguf`. Размышления у модели выключены переменной `LLM_REASONING=none`: без неё qwen3.5-9b
 тратит на них весь ответ и текста не отдаёт вовсе.
 
 ### Как собирается ответ с источниками
