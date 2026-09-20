@@ -50,6 +50,15 @@ CLICKABLE_CLASSES = {
     "android.widget.AutoCompleteTextView",
 }
 
+# Классы настоящих полей ввода — по ним проверяется действие `type`. Список узкий намеренно:
+# почти всё остальное на экране телефона тоже «текст с подписью», и ошибка здесь означает не
+# неудачный набор, а уход браузера на чужую страницу.
+TEXT_FIELD_CLASSES = {
+    "android.widget.EditText",
+    "android.widget.AutoCompleteTextView",
+    "android.widget.MultiAutoCompleteTextView",
+}
+
 
 def find_adb() -> str:
     """Найти исполняемый файл adb. Бросает исключение, если его нет."""
@@ -148,6 +157,17 @@ class Element:
     def short_role(self) -> str:
         """Короткое имя класса для промпта."""
         return self.class_name.rsplit(".", 1)[-1].lower()
+
+    @property
+    def is_text_field(self) -> bool:
+        """Поле ли это ввода, а не строка списка или ссылка.
+
+        Проверка нужна перед набором текста: в интерфейсе телефона поле ввода и строка подсказки
+        выглядят для модели одинаково — «текст с подписью», и номер она выбирает наугад. На живом
+        прогоне `type` попал в строку подсказки Chrome, тап увёл браузер на чужой запрос, а
+        набранный текст достался уже другой странице.
+        """
+        return self.class_name in TEXT_FIELD_CLASSES
 
 
 @dataclass
