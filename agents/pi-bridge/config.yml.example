@@ -1,0 +1,35 @@
+# Пример настроек cloudflared для моста pi (agents/pi-bridge).
+#
+# Кладётся в ~/.cloudflared/config.yml ПОСЛЕ того, как туннель создан:
+#   cloudflared tunnel login                       # браузер, выбор зоны iq-factura.com
+#   cloudflared tunnel create pi                   # печатает UUID — он нужен ниже
+#   cloudflared tunnel route dns pi pi.iq-factura.com
+#
+# <UUID> заменить на идентификатор из вывода `cloudflared tunnel create pi`: файл с ключом
+# туннеля лежит рядом — ~/.cloudflared/<UUID>.json, и без него туннель не поднимется.
+#
+# Авторизация: сам по себе туннель — это опубликованный в интернет адрес агента, у которого
+# есть права писать файлы и запускать команды на маке. Поэтому на хостнейм вешается политика
+# Cloudflare Access (Zero Trust → Access → Applications → Self-hosted) с действием Service
+# Auth: приложение ходит с парой CF-Access-Client-Id / CF-Access-Client-Secret. Оба значения
+# вписываются в настройках раздела «Проекты» в приложении и в репозиторий не попадают.
+
+tunnel: pi
+credentials-file: /Users/sobogd/.cloudflared/<UUID>.json
+
+# Логи: launchd перенаправляет их сам (com.agent.pi-tunnel.plist), поэтому уровень info —
+# при разборе видно, дошёл ли запрос до мака.
+loglevel: info
+
+ingress:
+  - hostname: pi.iq-factura.com
+    service: http://127.0.0.1:18820
+    originRequest:
+      # Ответ агента приходит потоком (SSE) и молчит между событиями минутами, пока модель
+      # думает или выполняется команда: короткий таймаут чтения рвал бы разговор на середине.
+      connectTimeout: 30s
+      # Заголовок Host оставляем как есть — мост слушает loopback и по хосту ничего не решает.
+      noTLSVerify: false
+  # Всё остальное на этот туннель не идёт: без последнего правила cloudflared отвечает 404
+  # на любое другое имя, и случайный поддомен не откроет мост.
+  - service: http_status:404

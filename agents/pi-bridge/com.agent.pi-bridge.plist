@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd-агент моста до харнесса pi (agents/pi-bridge/server.py).
+
+  Ставится копированием в ~/Library/LaunchAgents и загрузкой:
+    cp agents/pi-bridge/com.agent.pi-bridge.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.agent.pi-bridge.plist
+
+  Python системный из Homebrew: мост пользуется только стандартной библиотекой (http.server,
+  subprocess, json), поэтому venv с браузерными зависимостями, как у поиска, здесь не нужен.
+
+  Порт 18820 слушает только loopback — снаружи к нему ходит исключительно cloudflared
+  (com.agent.pi-tunnel), а тот закрыт Cloudflare Access. Менять порт нужно вместе с
+  ~/.cloudflared/config.yml.
+
+  KeepAlive: раздел «Проекты» в приложении без моста не работает вовсе, поэтому упавший
+  сервис обязан вернуться сам. ThrottleInterval не даёт ему крутиться в цикле перезапусков,
+  если он падает сразу (например, порт занят другим процессом).
+
+  HOME задан явно: launchd не наследует окружение оболочки, а pi ищет свои сессии, настройки
+  и список моделей по ~/.pi/agent — без HOME он стартовал бы как чужой пользователь.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.pi-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/sobogd/work/iq-rest/cloudlyru/agents/pi-bridge/server.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/sobogd/work/iq-rest/cloudlyru/agents/pi-bridge</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/sobogd/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/sobogd</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/pi-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pi-bridge.err.log</string>
+</dict>
+</plist>

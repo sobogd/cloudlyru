@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd-агент туннеля Cloudflare до моста pi (agents/pi-bridge/server.py).
+
+  Ставится после `cloudflared tunnel login` и `cloudflared tunnel create pi`:
+    cp agents/pi-bridge/com.agent.pi-tunnel.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.agent.pi-tunnel.plist
+
+  Почему Cloudflare, а не reverse-SSH туннель, как у чата: раздел «Проекты» даёт агенту
+  право писать файлы и запускать команды на маке, поэтому вход должен быть закрыт
+  авторизацией, а не только тем, что адрес никому не известен. Cloudflare Access проверяет
+  service token до того, как запрос дойдёт до моста, и работает с телефона из любой сети.
+
+  `--config` указан явно: launchd не наследует окружение, а без него cloudflared ищет
+  конфиг в ~/.cloudflared/config.yml через переменные, которых у него тут нет.
+  `--no-autoupdate` — чтобы туннель не перезапускался сам посреди разговора с агентом.
+
+  KeepAlive: без туннеля раздел в приложении отвечает «мост недоступен», поэтому упавший
+  процесс обязан подняться сам.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.pi-tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/cloudflared</string>
+    <string>tunnel</string>
+    <string>--config</string>
+    <string>/Users/sobogd/.cloudflared/config.yml</string>
+    <string>--no-autoupdate</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/sobogd</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/pi-tunnel.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pi-tunnel.err.log</string>
+</dict>
+</plist>
