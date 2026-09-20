@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -12,6 +13,7 @@ import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/download.dart';
 import '../../util/format.dart';
+import '../../util/markdown_view.dart';
 import '../../util/widgets.dart';
 
 /// Высота заглушки превью, пока картинка или страница ещё едет: спиннер должен занимать
@@ -19,6 +21,8 @@ import '../../util/widgets.dart';
 const _imageBoxH = 180.0;
 /// То же для страницы PDF: она ниже картинки, потому что под ней ещё строка с номером страницы.
 const _pdfBoxH = 160.0;
+/// То же для текста: содержимое бывает любой длины, но заглушка не должна занимать весь экран.
+const _textBoxH = 140.0;
 
 /// Предел размера файла, который деталка показывает оригиналом (вторая стадия превью картинки).
 ///
@@ -31,6 +35,59 @@ const _pdfBoxH = 160.0;
 /// ограничить нечем, и оригинал тянется как раньше — иначе пустой файл считался бы
 /// гигантским и оставался бы вообще без превью.
 const _maxOriginalPreviewBytes = 24 * 1024 * 1024;
+
+/// Предел размера текстового файла, содержимое которого деталка читает целиком.
+///
+/// Текст, в отличие от картинки, показывается без сжатия и разбирается целиком в памяти (плюс
+/// разбор разметки), поэтому предел нужен: лог или дамп на сотню мегабайт деталка читать не
+/// станет — на такой файл будет строка «слишком велик» с кнопкой «Скачать».
+const _maxTextPreviewBytes = 2 * 1024 * 1024;
+
+/// Расширения, которые показываем текстом, когда внятного типа у файла нет.
+///
+/// Нужны ровно там, где сервер отдал `application/octet-stream`: так приходят файлы, залитые
+/// браузером или вынутые из письма, и без этой таблицы `.md` оставался бы без превью.
+const _textExts = {
+  'md', 'markdown', 'txt', 'log', 'csv', 'json', 'yaml', 'yml', 'ini', 'cfg', 'conf',
+};
+
+/// Текстовый файл — тот, у которого деталка показывает содержимое, а не только метаданные.
+///
+/// Смотрим и на mime, и на расширение (по той же причине, что и у PDF ниже): сервер тип знает
+/// не всегда, а расширение есть у всех записей, залитых с именем.
+bool _isTextFile(FileMeta m) {
+  final mime = m.mime.toLowerCase();
+  if (mime.startsWith('text/') || mime == 'application/json') return true;
+  return _textExts.contains(m.ext?.toLowerCase());
+}
+
+/// Markdown — тот текст, который показывается размеченным, а не как есть.
+///
+/// Отдельно от [_isTextFile], потому что разметка меняет вид содержимого: у `.csv` и `.json`
+/// её нет, и попытка разобрать их как markdown испортила бы данные (звёздочки и подчёркивания
+/// в тексте стали бы курсивом).
+bool _isMarkdownFile(FileMeta m) {
+  final ext = m.ext?.toLowerCase();
+  return m.mime.toLowerCase() == 'text/markdown' || ext == 'md' || ext == 'markdown';
+}
+
+/// Строка «показать не вышло» с кнопкой «Скачать».
+///
+/// Общая для превью, которые не смогли показать содержимое: скачать и открыть файл системным
+/// приложением — единственное, что с ним осталось сделать, поэтому кнопка стоит рядом
+/// с объяснением, а не только в шапке экрана.
+Widget _previewNote(BuildContext context, CloudlyApi api, FileMeta meta, String text) {
+  return Padding(
+    padding: const EdgeInsets.all(12),
+    child: Row(children: [
+      Expanded(child: Text(text, style: const TextStyle(color: C.fg3))),
+      TextButton(
+        onPressed: () => _download(context, api, meta),
+        child: const Text('Скачать'),
+      ),
+    ]),
+  );
+}
 
 /// Ширина, до которой ужимается превью при декодировании: примерно ширина экрана телефона
 /// в физических пикселях. Больше не нужно — превью рисуется в ширину карточки, а распакованный
@@ -501,17 +558,19 @@ class _FileDetailScreenState extends ConsumerState<FileDetailScreen> {
 
   /// Каким превью показать файл, или `null`, если показывать нечем.
   ///
-  /// Смотрим на mime, а для PDF ещё и на расширение: браузеры и почтовые клиенты кладут
-  /// `application/octet-stream`, и без второй проверки такой PDF остался бы без превью.
+  /// Смотрим на mime, а для PDF и текста ещё и на расширение: браузеры и почтовые клиенты
+  /// кладут `application/octet-stream`, и без второй проверки такой PDF остался бы без превью,
+  /// а `.md` и `.txt` — без показа содержимого.
   String? _previewKind(FileMeta m) {
     if (m.mime.startsWith('image/')) return 'image';
     if (m.mime.startsWith('video/')) return 'video';
     if (m.mime == 'application/pdf' || m.name.toLowerCase().endsWith('.pdf')) return 'pdf';
+    if (_isTextFile(m)) return 'text';
     return null;
   }
 
   /// Разводит превью по типу файла: у каждого свой виджет, потому что и источник данных,
-  /// и отказы у картинки, видео и PDF разные (см. классы превью ниже).
+  /// и отказы у картинки, видео, PDF и текста разные (см. классы превью ниже).
   Widget _preview(CloudlyApi api, FileMeta m) {
     switch (_previewKind(m)) {
       case 'image':
@@ -520,6 +579,8 @@ class _FileDetailScreenState extends ConsumerState<FileDetailScreen> {
         return VideoPreview(api: api, meta: m);
       case 'pdf':
         return PdfPreview(api: api, meta: m);
+      case 'text':
+        return TextPreview(api: api, meta: m);
       default:
         return const SizedBox.shrink();
     }
@@ -723,22 +784,13 @@ class _ImagePreviewState extends State<ImagePreview> {
   /// или он больше [_maxOriginalPreviewBytes].
   ///
   /// Текст в двух случаях разный: «слишком велик» — это не сбой сборки превью, а наше решение
-  /// не тянуть файл в память, и читать про это надо другое. Кнопка «Скачать» здесь, а не только
-  /// в AppBar: это единственное, что осталось сделать с файлом.
+  /// не тянуть файл в память, и читать про это надо другое. Сама строка с кнопкой — общая
+  /// для всех неудачных превью (см. [_previewNote]).
   Widget _note() {
     final text = widget.meta.size > _maxOriginalPreviewBytes
         ? 'Файл слишком велик для показа здесь — откройте его через «Скачать»'
         : 'Превью не собрано';
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Row(children: [
-        Expanded(child: Text(text, style: const TextStyle(color: C.fg3))),
-        TextButton(
-          onPressed: () => _download(context, widget.api, widget.meta),
-          child: const Text('Скачать'),
-        ),
-      ]),
-    );
+    return _previewNote(context, widget.api, widget.meta, text);
   }
 }
 
@@ -1015,5 +1067,114 @@ class _PdfPreviewState extends State<PdfPreview> {
         ),
       ]),
     ]);
+  }
+}
+
+/// Превью текстового файла: содержимое прямо в деталке.
+///
+/// До этого у текстовых типов превью не было вовсе (`_previewKind` возвращал `null`), и
+/// посмотреть `.md` или `.txt` на телефоне можно было только через «Скачать» — то есть чужим
+/// приложением. Содержимое берётся по id записи ([CloudlyApi.fileInlineUrl]) — тем же путём,
+/// каким картинка тянет оригинал: сервер отдаёт текст вложением с нейтральным типом, но байты
+/// при этом те же самые.
+///
+/// Markdown показывается размеченным ([MarkdownText]), остальной текст — как есть моноширинным
+/// шрифтом: у `.csv`, `.json` и логов разметки нет, и разбирать их как markdown значило бы
+/// портить данные.
+class TextPreview extends StatefulWidget {
+  final CloudlyApi api;
+  final FileMeta meta;
+  const TextPreview({super.key, required this.api, required this.meta});
+  @override
+  State<TextPreview> createState() => _TextPreviewState();
+}
+
+/// Состояние превью: прочитанный текст и признак «показать не вышло».
+class _TextPreviewState extends State<TextPreview> {
+  /// Текст файла; `null` — ещё грузим.
+  String? _text;
+  /// Показать нечего: файл больше предела или запрос не прошёл.
+  bool _failed = false;
+  /// Отмена запроса вместе с виджетом: без неё ответ продолжал бы ехать в память после ухода
+  /// с экрана.
+  final _cancel = CancelToken();
+
+  /// Слишком велик для показа: файл читается в память целиком, поэтому предел проверяется
+  /// до запроса, а не по факту приезда содержимого.
+  bool get _tooBig => widget.meta.size > _maxTextPreviewBytes;
+
+  @override
+  /// Содержимое грузится сразу: деталка открывается ради него.
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  /// Уход с экрана отменяет запрос содержимого.
+  void dispose() {
+    _cancel.cancel();
+    super.dispose();
+  }
+
+  /// Читает файл целиком и превращает байты в текст.
+  ///
+  /// Файл больше [_maxTextPreviewBytes] не запрашиваем вовсе: содержимое приходит в память
+  /// целиком, и на многомегабайтном логе это лишний трафик и риск по памяти — честнее сразу
+  /// сказать «откройте через „Скачать“». `allowMalformed` — потому что байты приходят из чужого
+  /// файла: текст не в UTF-8 (например, из старой Windows-программы) не должен ронять показ,
+  /// лучше показать его с заменёнными символами.
+  ///
+  /// Побочно: `_text` или `_failed` и перерисовка. Запрос отменяется в `dispose`, поэтому ответ
+  /// может прийти уже к мёртвому виджету — состояние трогаем только при `mounted`.
+  Future<void> _load() async {
+    if (!mounted) return;
+    if (_tooBig) {
+      setState(() => _failed = true);
+      return;
+    }
+    try {
+      final bytes = await _fetchBytes(
+        widget.api,
+        widget.api.fileInlineUrl(widget.meta.id),
+        cancelToken: _cancel,
+      );
+      if (!mounted) return;
+      setState(() => _text = utf8.decode(bytes, allowMalformed: true));
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_failed) {
+      return _previewNote(
+        context,
+        widget.api,
+        widget.meta,
+        _tooBig
+            ? 'Файл слишком велик для показа здесь — откройте его через «Скачать»'
+            : 'Не удалось прочитать содержимое',
+      );
+    }
+    final text = _text;
+    if (text == null) {
+      return const SizedBox(height: _textBoxH, child: Center(child: CircularProgressIndicator()));
+    }
+    // Рамка и фон как у блока кода: текст занимает всю ширину карточки, и без границы он
+    // сливался бы с метаданными выше — не видно, где кончается файл.
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: C.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: C.brd),
+      ),
+      child: _isMarkdownFile(widget.meta)
+          ? MarkdownText(text)
+          : SelectableText(text, style: monoTextStyle),
+    );
   }
 }
