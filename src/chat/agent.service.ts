@@ -163,8 +163,21 @@ export class AgentService {
     events: AgentEvents;
   }): Promise<AgentOutcome> {
     const maxSteps = env.AGENT_MAX_STEPS;
+
+    // Доступность телефона выясняем ДО сборки сообщений: пометка «инструментов нет» должна
+    // попасть в самое первое системное сообщение. Шаблон Qwen (Jinja) запрещает системные
+    // сообщения где-либо, кроме начала, и отказ выглядит как 500 «System message must be at
+    // the beginning» — на этом падал каждый прогон, пока пометка добавлялась в конец.
+    const available = await this.phone.available();
+    let system = this.systemPrompt(params.memory, maxSteps);
+    if (!available.ok) {
+      this.logger.warn(`агент недоступен: ${available.reason}`);
+      params.events.status(`Интернет недоступен: ${available.reason}`);
+      system += '\n\nTools are unavailable right now (' + available.reason + '). Answer the user in ' +
+        'Russian from your own knowledge and say in the first line that you could not reach the internet.';
+    }
     const messages: LlmMessage[] = [
-      { role: 'system', content: this.systemPrompt(params.memory, maxSteps) },
+      { role: 'system', content: system },
       ...params.history,
       { role: 'user', content: params.question },
     ];
@@ -175,19 +188,6 @@ export class AgentService {
     let promptTokens: number | undefined;
     let completionTokens: number | undefined;
     let steps = 0;
-
-    // Заранее выясняем, доступен ли телефон: если нет — не тратим шаг модели на попытку,
-    // а сразу говорим ей, что интернета не будет.
-    const available = await this.phone.available();
-    if (!available.ok) {
-      this.logger.warn(`агент недоступен: ${available.reason}`);
-      params.events.status(`Интернет недоступен: ${available.reason}`);
-      messages.push({
-        role: 'system',
-        content: `Tools are unavailable right now (${available.reason}). Answer the user in Russian ` +
-          'from your own knowledge and say in the first line that you could not reach the internet.',
-      });
-    }
 
     for (let step = 1; step <= maxSteps; step++) {
       const turn = await this.turn({
@@ -228,8 +228,10 @@ export class AgentService {
     // Шаги кончились: просим ответить тем, что уже собрано. Без этого прогон оборвался бы
     // молча, а человек ждал бы ответ, которого не будет.
     params.events.status('Собираю ответ из найденного…');
+    // Пользовательским сообщением, а не системным: системное в середине диалога ломает шаблон
+    // Qwen (см. выше), а роль пользователя шаблон допускает в любом месте.
     messages.push({
-      role: 'system',
+      role: 'user',
       content: 'You have reached the tool limit. Answer now in Russian using what you already have, ' +
         'and mention in one line if something important could not be checked.',
     });
