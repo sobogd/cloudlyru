@@ -175,6 +175,9 @@ class ChatThreadState {
   /// Модель сейчас ищет в интернете и читает страницы — на экране это подпись вместо «печатает».
   final bool searching;
 
+  /// Что агент делает прямо сейчас, словами сервера («Ищу на reddit.com: …»).
+  final String step;
+
   /// Режим поиска: `auto` (решает сервер по вопросу), `on` или `off`.
   final String searchMode;
 
@@ -189,6 +192,7 @@ class ChatThreadState {
     this.error,
     this.usage,
     this.searching = false,
+    this.step = '',
     this.searchMode = 'auto',
   });
 
@@ -201,6 +205,7 @@ class ChatThreadState {
     bool? sending,
     ChatUsage? usage,
     bool? searching,
+    String? step,
     String? searchMode,
   }) =>
       ChatThreadState(
@@ -213,6 +218,7 @@ class ChatThreadState {
         error: error,
         usage: usage ?? this.usage,
         searching: searching ?? this.searching,
+        step: step ?? this.step,
         searchMode: searchMode ?? this.searchMode,
       );
 
@@ -227,6 +233,7 @@ class ChatThreadState {
         error: message,
         usage: usage,
         searching: searching,
+        step: step,
         searchMode: searchMode,
       );
 
@@ -240,6 +247,7 @@ class ChatThreadState {
         sending: sending,
         usage: usage,
         searching: searching,
+        step: step,
         searchMode: searchMode,
       );
 
@@ -390,6 +398,7 @@ class ChatThreadController extends Notifier<ChatThreadState> {
     }
     if (chunk.usage != null) state = state.copyWith(usage: chunk.usage);
     if (chunk.searching != null) state = state.copyWith(searching: chunk.searching);
+    if (chunk.step != null) state = state.copyWith(step: chunk.step);
     // Источники приходят до генерации и относятся к ответу, который ещё пишется: кладём их в
     // последний пузырь, чтобы ссылки были видны, пока модель печатает.
     if (chunk.sources != null) _attachSources(chunk.sources!);
@@ -443,8 +452,9 @@ class ChatThreadController extends Notifier<ChatThreadState> {
       if (messages.isNotEmpty && !messages.last.isUser && messages.last.content.isEmpty) {
         messages.removeLast();
       }
-      // признак «ищет» снимаем вместе с генерацией: иначе подпись осталась бы висеть
-      state = state.copyWith(messages: messages, sending: false, searching: false);
+      // Признак «ищет» и строку состояния снимаем вместе с генерацией: иначе подпись
+      // «Ищу на reddit.com…» осталась бы висеть над уже готовым ответом.
+      state = state.copyWith(messages: messages, sending: false, searching: false, step: '');
       ref.read(chatsProvider.notifier).touch(state.chatId);
     }
     if (done != null && !done.isCompleted) done.complete();

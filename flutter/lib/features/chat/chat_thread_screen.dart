@@ -368,13 +368,20 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
     if (message.content.isEmpty) {
       final thread = ref.read(chatThreadProvider);
       if (isLast && thread.searching) {
-        return const Padding(
-          padding: EdgeInsets.symmetric(vertical: 2),
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
           child: Row(
             children: [
-              SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
-              SizedBox(width: 8),
-              Text('Ищу в интернете и читаю страницы…', style: TextStyle(color: C.fg3, fontSize: 13)),
+              const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(width: 8),
+              Expanded(
+                // Показываем, что агент делает прямо сейчас: прогон занимает десятки секунд,
+                // и молчащий спиннер в это время выглядит как зависание.
+                child: Text(
+                  thread.step.isEmpty ? 'Ищу в интернете и читаю страницы…' : thread.step,
+                  style: const TextStyle(color: C.fg3, fontSize: 13),
+                ),
+              ),
             ],
           ),
         );

@@ -203,7 +203,12 @@ class ChatApi {
         return title is String && title.isNotEmpty ? ChatChunk(title: title) : null;
       case 'status':
         final searching = event['searching'];
-        return searching is bool ? ChatChunk(searching: searching) : null;
+        final step = event['step'];
+        if (searching is! bool && step is! String) return null;
+        return ChatChunk(
+          searching: searching is bool ? searching : null,
+          step: step is String && step.isNotEmpty ? step : null,
+        );
       case 'sources':
         final raw = event['sources'];
         if (raw is! List) return null;

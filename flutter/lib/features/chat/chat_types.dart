@@ -240,6 +240,12 @@ class ChatChunk {
   /// Идёт поиск в интернете (и чтение страниц) — на экране это подпись вместо «печатает».
   final bool? searching;
 
+  /// Что именно делает агент сейчас: «Ищу на reddit.com: …», «Читаю источник 2».
+  ///
+  /// Нужен потому, что прогон агента занимает десятки секунд: без этой строки человек видит
+  /// молчащий спиннер и решает, что всё зависло.
+  final String? step;
+
   /// Готовые источники ответа: приходят до генерации, чтобы ссылки были видны сразу.
   final List<ChatSource>? sources;
 
@@ -258,6 +264,7 @@ class ChatChunk {
     this.reasoning,
     this.title,
     this.searching,
+    this.step,
     this.sources,
     this.done = false,
     this.error,
