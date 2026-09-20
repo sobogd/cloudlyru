@@ -1,0 +1,261 @@
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpStatus,
+  Logger,
+  Param,
+  Post,
+  Query,
+  Req,
+  Res,
+} from '@nestjs/common';
+import type { Request, Response } from 'express';
+import { Readable } from 'node:stream';
+import { ApiError, badRequest } from '../common/errors';
+import { RateLimit } from '../common/decorators';
+import { ProjectsError, ProjectsService } from './projects.service';
+
+/** Потолок длины сообщения агенту: его принимает и мост, но отказ лучше дать здесь, с текстом. */
+const MAX_PROMPT_CHARS = 20_000;
+
+/**
+ * Раздел «Проекты»: выбор папки проекта на домашнем маке и работа с агентом pi внутри неё.
+ *
+ * Устроено как раздел «Чат»: агент, модель и история живут на маке, но запросы делает сервер.
+ * Клиент приложения ходит только в ручки `/projects/*`, поэтому адреса туннеля, портов и
+ * токенов в сборке нет; доступ закрыт той же сессией, что и остальные разделы.
+ *
+ * Отличие от чата одно и по сути: там агент ищет в интернете и отвечает со источниками, здесь
+ * он работает в папке проекта — читает и правит файлы, запускает команды. Поэтому наружу
+ * отдаются не только ответы, но и действия: карточки инструментов, вывод команд, состояние
+ * контекста.
+ *
+ * Плата за это — доверие к маку: песочницы у pi нет, инструменты работают с правами
+ * пользователя, и единственные границы — список разрешённых корней на маке (allowlist в
+ * `~/.pi-bridge.json`) и то, что порт моста открыт только на loopback обоих концов туннеля.
+ */
+@Controller('projects')
+export class ProjectsController {
+  private readonly logger = new Logger(ProjectsController.name);
+
+  constructor(private readonly projects: ProjectsService) {}
+
+  /**
+   * Состояние моста: версия харнесса, выбранная модель, разрешённые корни.
+   *
+   * Недоступный мак — это не сбой запроса, а состояние раздела: клиент по этому ответу решает,
+   * показать список проектов или «мост недоступен, мак спит».
+   */
+  @Get('health')
+  async health() {
+    return this.wrap(() => this.projects.call<Record<string, unknown>>('GET', '/health'));
+  }
+
+  /** Проекты: папки внутри разрешённых корней, в которых можно работать. */
+  @Get()
+  async list() {
+    return this.wrap(() => this.projects.call<Record<string, unknown>>('GET', '/projects'));
+  }
+
+  /** Сессии проекта: их мост читает из файлов pi на маке. */
+  @Get('sessions')
+  async sessions(@Query('path') path?: string) {
+    const dir = (path ?? '').trim();
+    if (!dir) throw badRequest('path обязателен');
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'GET',
+        `/sessions?path=${encodeURIComponent(dir)}`,
+      ),
+    );
+  }
+
+  /** Состояние открытой сессии: модель, занятость, расход контекста. */
+  @Get('sessions/:id')
+  async session(@Param('id') id: string) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>('GET', `/sessions/${encodeURIComponent(id)}`),
+    );
+  }
+
+  /** Переписка сессии в виде, готовом для экрана. */
+  @Get('sessions/:id/messages')
+  async messages(@Param('id') id: string) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'GET',
+        `/sessions/${encodeURIComponent(id)}/messages`,
+      ),
+    );
+  }
+
+  /**
+   * Открывает сессию в папке проекта: мост поднимает процесс pi (или продолжает [sessionId]).
+   *
+   * Сессия — это процесс на маке, и он занимает память под контекст модели, поэтому по простою
+   * мост гасит его сам; продолжение разговора поднимает процесс заново из файла истории.
+   */
+  @Post('sessions')
+  async open(@Body() body: Record<string, unknown> = {}) {
+    const path = typeof body.path === 'string' ? body.path.trim() : '';
+    if (!path) throw badRequest('path обязателен');
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>('POST', '/sessions', {
+        body: { path, ...(sessionId ? { sessionId } : {}) },
+        // запуск процесса pi на маке — секунды, но не мгновение
+        timeoutMs: 120_000,
+      }),
+    );
+  }
+
+  /**
+   * Отправляет сообщение агенту и отдаёт поток событий ответа.
+   *
+   * Тело ответа моста перекладывается в ответ клиенту как есть (SSE), а разрыв соединения с
+   * приложением гасит и работу агента: по обрыву мост шлёт `abort` в pi, поэтому команды не
+   * продолжают выполняться на маке, когда экран уже закрыт.
+   */
+  @Post('sessions/:id/prompt')
+  @RateLimit(20, 60_000)
+  async prompt(
+    @Param('id') id: string,
+    @Body() body: Record<string, unknown> = {},
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) throw badRequest('text обязателен');
+    if (text.length > MAX_PROMPT_CHARS) {
+      throw badRequest(`сообщение длиннее ${MAX_PROMPT_CHARS} символов`);
+    }
+
+    const abort = new AbortController();
+    req.on('close', () => abort.abort());
+
+    // Запрос к мосту делается ДО отправки заголовков потока: отказ (занятая сессия, мост
+    // недоступен) должен прийти обычным HTTP-кодом с текстом, а не молчанием в потоке.
+    const upstream = await this.wrap(() =>
+      this.projects.stream(`/sessions/${encodeURIComponent(id)}/prompt`, { text }, { signal: abort.signal }),
+    );
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    // без этого nginx копит ответ в буфере и поток превращается в «ответ приходит целиком в конце»
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const body_ = Readable.fromWeb(upstream as Parameters<typeof Readable.fromWeb>[0]);
+    // Ошибки чтения (обрыв туннеля, отмена) закрывают ответ: клиент увидит конец потока и
+    // покажет причину из своего же состояния, а не «вечный спиннер».
+    body_.on('error', (e) => {
+      this.logger.warn(`поток агента прерван: ${String(e)}`);
+      res.end();
+    });
+    body_.pipe(res);
+  }
+
+  /** Останавливает генерацию: мост шлёт `abort` в pi и дожидается свободной сессии. */
+  @Post('sessions/:id/abort')
+  async abort(@Param('id') id: string) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'POST',
+        `/sessions/${encodeURIComponent(id)}/abort`,
+        { timeoutMs: 60_000 },
+      ),
+    );
+  }
+
+  /**
+   * Сжимает контекст сессии: длинная работа иначе перестанет влезать в окно модели.
+   *
+   * Таймаут большой осознанно: это отдельный вызов модели на маке, и на девятимиллиардной
+   * модели пересказ длинного разговора идёт минутами.
+   */
+  @Post('sessions/:id/compact')
+  async compact(@Param('id') id: string, @Body() body: Record<string, unknown> = {}) {
+    const instructions = typeof body.instructions === 'string' ? body.instructions : '';
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'POST',
+        `/sessions/${encodeURIComponent(id)}/compact`,
+        { body: { ...(instructions ? { instructions } : {}) }, timeoutMs: 15 * 60_000 },
+      ),
+    );
+  }
+
+  /** Смена модели для сессии: список моделей живёт у pi. */
+  @Post('sessions/:id/model')
+  async model(@Param('id') id: string, @Body() body: Record<string, unknown> = {}) {
+    const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
+    const modelId = typeof body.modelId === 'string' ? body.modelId.trim() : '';
+    if (!provider || !modelId) throw badRequest('нужны provider и modelId');
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'POST',
+        `/sessions/${encodeURIComponent(id)}/model`,
+        { body: { provider, modelId } },
+      ),
+    );
+  }
+
+  /**
+   * Закрывает процесс pi (файл истории остаётся).
+   *
+   * Нужно, когда человек уходит с экрана: живой процесс держит контекст модели в памяти мака,
+   * а память там дороже пары секунд на следующий запуск.
+   */
+  @Delete('sessions/:id')
+  async close(@Param('id') id: string) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'DELETE',
+        `/sessions/${encodeURIComponent(id)}`,
+      ),
+    );
+  }
+
+  /**
+   * Переводит ошибку моста в HTTP-ответ с тем же кодом и текстом.
+   *
+   * Коды сохраняются намеренно: 409 значит «сессия занята» и приложение показывает это
+   * отдельной подсказкой, а 502/504 — «мост недоступен», где повторять бессмысленно. Тексты
+   * моста уже сформулированы для человека, поэтому уходят клиенту без правки.
+   */
+  private async wrap<T>(run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (e) {
+      if (!(e instanceof ProjectsError)) throw e;
+      // 499 — внутренний признак «человек ушёл»; в HTTP такого кода нет, отдаём 400
+      const status = e.status === 499 ? HttpStatus.BAD_REQUEST : (e.status as HttpStatus);
+      if (status >= 500) this.logger.warn(`проекты: ${status} ${e.message}`);
+      throw new ApiError(status, e.message, codeFor(status));
+    }
+  }
+}
+
+/**
+ * Машиночитаемый код ответа по коду HTTP.
+ *
+ * Нужен приложению: по нему оно различает «сессия занята» и «мост недоступен» независимо от
+ * текста, который может поменяться на стороне моста.
+ */
+function codeFor(status: number): string {
+  switch (status) {
+    case HttpStatus.BAD_REQUEST:
+      return 'bad_request';
+    case HttpStatus.CONFLICT:
+      return 'busy';
+    case HttpStatus.SERVICE_UNAVAILABLE:
+    case HttpStatus.BAD_GATEWAY:
+    case HttpStatus.GATEWAY_TIMEOUT:
+      return 'bridge_unavailable';
+    default:
+      return 'error';
+  }
+}

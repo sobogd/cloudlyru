@@ -19,20 +19,10 @@ class Settings {
   // и адрес сервера, и сессию.
   static const _kServer = 'server_url';
   static const _kSession = 'cloudly_session';
-  static const _kAgentUrl = 'pi_bridge_url';
-  static const _kAgentToken = 'pi_bridge_token';
-  static const _kAgentCfId = 'pi_bridge_cf_id';
-  static const _kAgentCfSecret = 'pi_bridge_cf_secret';
 
   /// Адрес прода по умолчанию: на первом запуске человек не должен вводить его руками,
   /// а свой сервер он вписывает на экране входа (`LoginScreen`, поле «Адрес сервера»).
   static const _kDefaultServer = 'https://files.iq-factura.com';
-
-  /// Адрес моста до харнесса pi (раздел «Проекты»).
-  ///
-  /// Тот же по умолчанию, что и адрес сервера: на первом запуске раздел должен работать без
-  /// настройки, а поле ввода нужно только тому, кто поднял мост на другом домене.
-  static const _kDefaultAgentUrl = 'https://pi.iq-factura.com';
 
   final SharedPreferences _prefs;
 
@@ -79,42 +69,6 @@ class Settings {
   /// Стирает cookie (выход из аккаунта). Адрес сервера остаётся: выход не должен заставлять
   /// вводить его заново.
   Future<void> clearSession() => _prefs.remove(_kSession);
-
-  /// Адрес моста до харнесса pi (раздел «Проекты»); пустое значение — адрес по умолчанию.
-  String get agentUrl {
-    final v = _prefs.getString(_kAgentUrl);
-    return (v == null || v.trim().isEmpty) ? _kDefaultAgentUrl : v.trim();
-  }
-
-  /// Запоминает адрес моста (пробелы по краям срезаем — адрес часто вставляют копированием).
-  Future<void> setAgentUrl(String url) => _prefs.setString(_kAgentUrl, url.trim());
-
-  /// Токен моста из `~/.pi-bridge.json` на маке.
-  ///
-  /// Лежит рядом с cookie сессии и с тем же принятым риском (см. описание класса): на
-  /// рутованном устройстве он читается, а с ним открыт агент с правом писать файлы и запускать
-  /// команды на маке. Отзыв — смена токена в файле настроек моста: приложение сразу получает
-  /// 401 и раздел перестаёт работать, пока новый токен не вписан.
-  String get agentToken => _prefs.getString(_kAgentToken)?.trim() ?? '';
-
-  /// Запоминает токен моста.
-  Future<void> setAgentToken(String token) => _prefs.setString(_kAgentToken, token.trim());
-
-  /// Пара Cloudflare Access: идентификатор клиента service token.
-  ///
-  /// Нужна потому, что адрес моста опубликован в интернет, и закрывает его именно Access —
-  /// до того, как запрос дойдёт до мака. Пустые значения означают «Access настроен иначе»
-  /// (например, по почте владельца): тогда заголовки просто не отправляются.
-  String get agentCfId => _prefs.getString(_kAgentCfId)?.trim() ?? '';
-
-  /// Секрет того же service token (вторая половина пары).
-  String get agentCfSecret => _prefs.getString(_kAgentCfSecret)?.trim() ?? '';
-
-  /// Сохраняет пару Cloudflare Access.
-  Future<void> setAgentCf(String id, String secret) async {
-    await _prefs.setString(_kAgentCfId, id.trim());
-    await _prefs.setString(_kAgentCfSecret, secret.trim());
-  }
 
   /// Хранилище UI-состояния поверх тех же prefs (выбранная вкладка и прочая мелочь).
   UiStateStore get ui => UiStateStore(_prefs);

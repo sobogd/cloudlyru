@@ -151,56 +151,53 @@ Bing) лежат в `agents/websearch/browser.py`.
 Проверить руками: `curl -s 'http://127.0.0.1:18814/search?q=test&n=2'` и
 `curl -s 'http://127.0.0.1:18814/page?url=https://example.com/&max=500'`.
 
-## Раздел «Проекты»: агент pi на маке, снаружи — Cloudflare
+## Раздел «Проекты»: агент pi работает в папке проекта на маке
 
 Раздел «Проекты» в приложении (вход — иконка терминала в шапке «Чата») даёт агенту папку
 проекта: он читает и правит файлы, запускает команды. Агентом работает харнесс
 [pi](https://github.com/earendil-works/pi) (`@earendil-works/pi-coding-agent`), моделью — та же
 локальная llama.cpp, что и у чата.
 
-Как это устроено (подробности — в `agents/pi-bridge/README.md`):
+Схема та же, что у чата: сервер на VPS ходит к мосту на маке через reverse-SSH туннель, порт
+открыт только на loopback обоих концов, наружу не смотрит никто, поэтому ни TLS, ни ключей на
+этом плече нет — доступ к разделу закрыт сессией приложения.
 
 | Слой | Где живёт | Что делает |
 |---|---|---|
 | Мост `agents/pi-bridge/server.py` | мак, `127.0.0.1:18820` | HTTP+SSE наружу, `pi --mode rpc` по stdio внутрь; пул процессов, allowlist корней |
-| Туннель `com.agent.pi-tunnel` | мак | `cloudflared` публикует мост как `pi.iq-factura.com` |
-| Access | Cloudflare | service token: без него до мака запрос не доходит |
+| Туннель `com.agent.dsh-reverse-tunnel` | мак → VPS | пробрасывает `VPS 127.0.0.1:18820 -> мак 127.0.0.1:18820` |
+| Сервер `src/projects` | VPS | проксирует `/projects/*` к мосту, поток событий отдаёт как есть |
 | Раздел в приложении | телефон и мак | список проектов, сессии, переписка с карточками инструментов |
 
-Почему Cloudflare, а не reverse-SSH туннель, как у чата: этот раздел — не чтение страниц, а
-удалённый шелл на маке. Loopback-порт защищён только тем, что о нём никто не знает, а здесь
-нужен вход с телефона из любой сети и настоящая проверка доступа, поэтому наружу смотрит
-Cloudflare Access, а мост дополнительно требует свой токен (`~/.pi-bridge.json`).
+Подробности — в `agents/pi-bridge/README.md`.
 
-Установка на маке — три шага, первый из них интерактивный (браузер):
+Установка на маке и на VPS:
 
 ```bash
 # 1) мост
 cp agents/pi-bridge/com.agent.pi-bridge.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.agent.pi-bridge.plist
-# 2) туннель: login/create/route dns, затем конфиг из примера и второй агент
-cloudflared tunnel login && cloudflared tunnel create pi
-cloudflared tunnel route dns pi pi.iq-factura.com
-cp agents/pi-bridge/config.yml.example ~/.cloudflared/config.yml   # вписать UUID
-cp agents/pi-bridge/com.agent.pi-tunnel.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.agent.pi-tunnel.plist
-# 3) в Cloudflare Zero Trust — приложение на pi.iq-factura.com с политикой Service Auth
+# 2) порт в туннеле: в jevel.ai/agents/run-dsh-tunnel.sh строка -R 127.0.0.1:18820
+#    и порт в очистке залипших слушателей, затем перезапуск туннеля
+launchctl kickstart -k gui/$(id -u)/com.agent.dsh-reverse-tunnel
+# 3) проверка: порт слушает loopback VPS и мост отвечает
+ssh root@46.225.143.221 'ss -ltn | grep 18820; curl -s http://127.0.0.1:18820/health'
 ```
 
-Дальше в приложении: «Чат» → иконка терминала → шестерёнка → адрес моста, токен из
-`~/.pi-bridge.json` и пара `CF-Access-Client-Id` / `CF-Access-Client-Secret`.
+Переменная сервера `PI_BRIDGE_URL` (по умолчанию `http://127.0.0.1:18820`) задаётся в
+`deploy.yml` и переопределяется одноимённым секретом репозитория.
 
 Диагностика:
 
 ```bash
-launchctl list | grep -E "pi-bridge|pi-tunnel"
-tail -20 /tmp/pi-bridge.err.log /tmp/pi-tunnel.err.log     # автоответы агента тоже здесь
-curl -s -o /dev/null -w '%{http_code}\n' https://pi.iq-factura.com/health
+launchctl list | grep pi-bridge
+tail -20 /tmp/pi-bridge.err.log        # автоответы агента тоже здесь
+ssh root@46.225.143.221 'curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18820/health'
 ```
 
-Первый запуск моста создаёт `~/.pi-bridge.json` (режим 600) с токеном и списком разрешённых
-корней (по умолчанию `~/work`). Это единственная граница раздела: песочницы у pi нет, и
-инструменты работают с правами пользователя.
+Первый запуск моста создаёт `~/.pi-bridge.json` (режим 600) со списком разрешённых корней (по
+умолчанию `~/work`). Это единственная граница раздела: песочницы у pi нет, и инструменты
+работают с правами пользователя.
 
 ## Первичная настройка сервера (один раз, root)
 

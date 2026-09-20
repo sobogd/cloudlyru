@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
@@ -16,8 +15,10 @@ import 'agent_types.dart';
 /// папке и запускает команды. Смешивать их в одном списке значило бы показывать рядом
 /// «разговоры о свежих данных» и «работу в репозитории».
 ///
-/// Список проектов приходит от моста на маке (`agents/pi-bridge`): это папки внутри
-/// разрешённых корней, а не файловый браузер — выбрать домашний каталог или `/` нельзя.
+/// Список проектов приходит от сервера, а тот берёт его у моста на маке
+/// (`agents/pi-bridge`): это папки внутри разрешённых корней, а не файловый браузер — выбрать
+/// домашний каталог или `/` нельзя. Адресов и ключей в приложении нет: доступ к разделу
+/// закрыт той же сессией, что и у остальных разделов.
 class ProjectsScreen extends ConsumerStatefulWidget {
   /// Экран списка проектов.
   const ProjectsScreen({super.key});
@@ -36,7 +37,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     super.initState();
     _projects = ref.read(agentProjectsProvider.notifier);
     // список читаем после первого кадра: до этого провайдеры трогать нельзя, а пустой экран
-    // до ответа моста выглядел бы как «проектов нет»
+    // до ответа сервера выглядел бы как «проектов нет»
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _projects.load();
     });
@@ -51,30 +52,6 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     if (mounted) await _projects.load();
   }
 
-  /// Диалог настроек доступа к мосту: адрес, токен моста и пара Cloudflare Access.
-  ///
-  /// Всё, что нужно для доступа, лежит в приложении, а не в репозитории: токен моста — в
-  /// `~/.pi-bridge.json` на маке, пара Access — в панели Cloudflare. После сохранения список
-  /// перечитывается сразу: человек должен увидеть, что новый адрес работает, а не гадать.
-  Future<void> _settings() async {
-    final settings = ref.read(settingsProvider);
-    final saved = await showDialog<bool>(
-      context: context,
-      builder: (_) => _BridgeSettingsDialog(
-        url: settings.agentUrl,
-        token: settings.agentToken,
-        cfId: settings.agentCfId,
-        cfSecret: settings.agentCfSecret,
-        onSave: (url, token, cfId, cfSecret) async {
-          await settings.setAgentUrl(url);
-          await settings.setAgentToken(token);
-          await settings.setAgentCf(cfId, cfSecret);
-        },
-      ),
-    );
-    if (saved == true && mounted) await _projects.load();
-  }
-
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(agentProjectsProvider);
@@ -84,11 +61,6 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         title: const Text('Проекты', style: TextStyle(color: C.fg, fontSize: 18)),
         actions: [
           IconButton(
-            tooltip: 'Настройки доступа',
-            onPressed: _settings,
-            icon: const Icon(Icons.settings_outlined),
-          ),
-          IconButton(
             tooltip: 'Обновить список',
             onPressed: state.loading ? null : () => _projects.load(),
             icon: const Icon(Icons.refresh),
@@ -97,8 +69,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       ),
       body: Column(
         children: [
-          // чем отвечает харнесс: без этой строки непонятно, куда уходит запрос и какая
-          // модель его считает — а на маке она одна на чат и на агента
+          // чем отвечает харнесс: без этой строки непонятно, какая модель считает — а на маке
+          // она одна на чат и на агента
           if (state.health.label.isNotEmpty) _harnessLine(state.health),
           if (state.error != null) _errorBar(state.error!),
           Expanded(child: _body(state)),
@@ -117,8 +89,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Text(
-            'Проектов нет. Мост показывает папки внутри разрешённых корней — обычно это '
-            '~/work; список корней правится в ~/.pi-bridge.json на маке.',
+            'Проектов нет. Мост на маке показывает папки внутри разрешённых корней — обычно '
+            'это ~/work; список корней правится в ~/.pi-bridge.json.',
             textAlign: TextAlign.center,
             style: const TextStyle(color: C.fg3, fontSize: 13, height: 1.4),
           ),
@@ -191,110 +163,6 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
             ),
             TextButton(onPressed: () => _projects.load(), child: const Text('Повторить')),
           ],
-        ),
-      );
-}
-
-/// Диалог настроек доступа к мосту.
-///
-/// Четыре поля одним экраном, а не по одному: это один и тот же доступ (туннель + токен
-/// моста), и заполнять его человек будет за один заход — копируя значения из терминала
-/// мака и из панели Cloudflare.
-class _BridgeSettingsDialog extends StatefulWidget {
-  /// Текущие значения — то, что уже сохранено в настройках.
-  final String url;
-  final String token;
-  final String cfId;
-  final String cfSecret;
-
-  /// Сохранение: вызывающий пишет значения в настройки приложения.
-  final Future<void> Function(String url, String token, String cfId, String cfSecret) onSave;
-
-  /// Диалог настроек доступа.
-  const _BridgeSettingsDialog({
-    required this.url,
-    required this.token,
-    required this.cfId,
-    required this.cfSecret,
-    required this.onSave,
-  });
-
-  @override
-  State<_BridgeSettingsDialog> createState() => _BridgeSettingsDialogState();
-}
-
-/// Состояние диалога: контроллеры полей и признак «идёт сохранение».
-class _BridgeSettingsDialogState extends State<_BridgeSettingsDialog> {
-  /// Контроллеры полей; создаются один раз и освобождаются в [dispose].
-  late final TextEditingController _url = TextEditingController(text: widget.url);
-  late final TextEditingController _token = TextEditingController(text: widget.token);
-  late final TextEditingController _cfId = TextEditingController(text: widget.cfId);
-  late final TextEditingController _cfSecret = TextEditingController(text: widget.cfSecret);
-
-  /// Идёт запись настроек: кнопка блокируется, чтобы не сохранить дважды.
-  bool _saving = false;
-
-  @override
-  void dispose() {
-    _url.dispose();
-    _token.dispose();
-    _cfId.dispose();
-    _cfSecret.dispose();
-    super.dispose();
-  }
-
-  /// Сохраняет введённое и закрывает диалог с признаком успеха.
-  Future<void> _save() async {
-    setState(() => _saving = true);
-    await widget.onSave(_url.text, _token.text, _cfId.text, _cfSecret.text);
-    if (mounted) Navigator.of(context).pop(true);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: C.surface,
-      title: const Text('Доступ к мосту', style: TextStyle(color: C.fg, fontSize: 16)),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _field(_url, 'Адрес моста', 'https://pi.iq-factura.com'),
-            const SizedBox(height: 10),
-            _field(_token, 'Токен моста', 'из ~/.pi-bridge.json на маке'),
-            const SizedBox(height: 10),
-            _field(_cfId, 'Cloudflare Access: Client Id', ''),
-            const SizedBox(height: 10),
-            _field(_cfSecret, 'Cloudflare Access: Client Secret', ''),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: _saving ? null : () => Navigator.of(context).pop(false),
-          child: const Text('Отмена'),
-        ),
-        TextButton(
-          onPressed: _saving ? null : _save,
-          child: const Text('Сохранить'),
-        ),
-      ],
-    );
-  }
-
-  /// Одно поле диалога с подписью-подсказкой.
-  Widget _field(TextEditingController controller, String label, String hint) => TextField(
-        controller: controller,
-        style: const TextStyle(color: C.fg, fontSize: 13),
-        decoration: InputDecoration(
-          labelText: label,
-          labelStyle: const TextStyle(color: C.fg3, fontSize: 12),
-          hintText: hint.isEmpty ? null : hint,
-          hintStyle: const TextStyle(color: C.fg3, fontSize: 12),
-          filled: true,
-          fillColor: C.canvas,
-          border: const OutlineInputBorder(),
-          isDense: true,
         ),
       );
 }

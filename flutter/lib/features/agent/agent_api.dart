@@ -3,77 +3,74 @@ import 'dart:convert';
 
 import 'package:dio/dio.dart';
 
-import '../../storage/settings.dart';
+import '../../api/cloudly_api.dart';
 import 'agent_types.dart';
 
-/// Ошибка обращения к мосту до харнесса pi.
+/// Ошибка обращения к разделу «Проекты».
 ///
 /// Отдельный тип, а не [ApiException] облака, ради одного различия: «мост недоступен» — это
-/// состояние раздела (мак спит, туннель не поднялся, токен не вписан), а не сбой запроса.
-/// Человеку тут нечего повторять, и показывать это надо словами, а не красным «ошибка сети».
+/// состояние раздела (мак спит, туннель отключился), а не сбой запроса, и человеку тут нечего
+/// повторять. Всё остальное — обычные сбои с кодом и текстом сервера.
 class AgentApiException implements Exception {
   /// Ошибка с кодом HTTP (0 — ответа не было) и текстом для человека.
-  const AgentApiException(this.status, this.message);
+  const AgentApiException(this.status, this.message, {this.code});
 
   /// Код HTTP; 0 — ответа не было вовсе (нет связи, таймаут).
   final int status;
 
-  /// Готовая причина для экрана: её формулирует мост, а для сетевых сбоев — этот клиент.
+  /// Готовая причина для экрана: её формулирует сервер (а он — мост).
   final String message;
 
-  /// Мост не ответил: мак спит, туннель отключён или адрес в настройках неверный.
-  bool get unreachable => status == 0;
+  /// Машиночитаемый код ответа сервера: по нему различаются «занято» и «мост недоступен».
+  final String? code;
 
-  /// Мост ответил отказом в доступе: не тот токен моста или Access не пропустил запрос.
-  bool get unauthorized => status == 401 || status == 403;
+  /// Мост не отвечает: мак спит или туннель отключился. Повторять бессмысленно.
+  bool get bridgeUnavailable => code == 'bridge_unavailable' || status == 502 || status == 503;
+
+  /// Сессия занята: в ней уже идёт генерация.
+  bool get busy => code == 'busy' || status == 409;
 
   @override
   String toString() => message;
 }
 
-/// Клиент моста до pi (`agents/pi-bridge`).
+/// Клиент раздела «Проекты» — ручек `/projects/*` сервера приложения.
 ///
-/// Ходит напрямую, не через сервер Cloudly: история разговора и модель живут на маке, серверу
-/// в этой цепочке делать нечего — он только перекладывал бы запросы. Адрес и токены берутся из
-/// настроек приложения, поэтому смена адреса применяется к следующему же запросу.
+/// Собирается поверх облачного клиента, как раздел «Чат»: адрес сервера и cookie веб-сессии
+/// берутся у него замыканием, поэтому смена сервера в настройках применяется и здесь.
+///
+/// Прямого доступа к маку у приложения нет и быть не должно: агент работает на домашнем маке,
+/// но запросы делает сервер (он видит мост через туннель), и в сборке приложения поэтому нет ни
+/// адреса моста, ни порта туннеля, ни ключей — как и у чата.
 class AgentApi {
-  /// Клиент моста поверх настроек: адрес, токен и пара Cloudflare Access — из них.
-  AgentApi(this.settings) {
+  /// Клиент раздела поверх облачного: адрес и сессия — из него.
+  AgentApi(this.cloudly) {
     _http = Dio(BaseOptions(
-      baseUrl: settings.agentUrl,
+      baseUrl: cloudly.baseUrl,
       connectTimeout: const Duration(seconds: 20),
-      // Ответ идёт потоком, и между порциями бывают минуты: агент читает файлы и выполняет
+      // Ответ приходит потоком, и между порциями бывают минуты: агент читает файлы, выполняет
       // команды, а локальная модель думает молча. Таймаут на чтение поэтому не задаём —
       // прерывает ответ кнопка «Стоп» или уход с экрана.
       receiveTimeout: Duration.zero,
     ));
     _http.interceptors.add(InterceptorsWrapper(
       onRequest: (o, h) {
-        final token = settings.agentToken;
-        if (token.isNotEmpty) o.headers['Authorization'] = 'Bearer $token';
-        // Пара Cloudflare Access: без неё туннель отвечает 403 ещё до мака, поэтому
-        // заголовки уходят на каждый запрос раздела (для истории они не нужны, но и не мешают).
-        final cfId = settings.agentCfId;
-        final cfSecret = settings.agentCfSecret;
-        if (cfId.isNotEmpty && cfSecret.isNotEmpty) {
-          o.headers['CF-Access-Client-Id'] = cfId;
-          o.headers['CF-Access-Client-Secret'] = cfSecret;
-        }
-        o.headers['Accept'] = o.headers['Accept'] ?? 'application/json';
+        o.headers.addAll(cloudly.authHeaders);
+        o.headers['Accept'] = 'application/json';
         h.next(o);
       },
     ));
   }
 
-  /// Настройки приложения, из которых взяты адрес и токены.
-  final Settings settings;
+  /// Облачный клиент, у которого взяты адрес и сессия.
+  final CloudlyApi cloudly;
 
   /// HTTP-клиент раздела.
   late final Dio _http;
 
   /// Состояние моста: версия pi, выбранная модель, разрешённые корни.
   Future<AgentHealth> health() async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/health'));
+    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/health'));
     return AgentHealth.fromJson(data ?? const {});
   }
 
@@ -88,10 +85,10 @@ class AgentApi {
     ];
   }
 
-  /// Сессии проекта, свежие сверху: их мост читает из файлов pi.
+  /// Сессии проекта, свежие сверху: их сервер берёт у моста, а мост — из файлов pi.
   Future<List<AgentSession>> sessions(String path) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/sessions', queryParameters: <String, dynamic>{'path': path}),
+      () => _http.get('/projects/sessions', queryParameters: <String, dynamic>{'path': path}),
     );
     final raw = data?['sessions'];
     return <AgentSession>[
@@ -101,13 +98,11 @@ class AgentApi {
     ];
   }
 
-  /// Открывает сессию в папке проекта: поднимает процесс pi (или продолжает сессию [sessionId]).
-  ///
-  /// Мост отвечает описанием сессии, в том числе её идентификатором: у новой сессии его
-  /// генерирует pi, и до этого ответа приложению нечего показывать.
+  /// Открывает сессию в папке проекта: сервер просит мост поднять процесс pi в этой папке
+  /// (или продолжить сессию [sessionId], если она уже есть в истории).
   Future<AgentSessionInfo> openSession(String path, {String? sessionId}) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/sessions', data: <String, dynamic>{
+      () => _http.post('/projects/sessions', data: <String, dynamic>{
         'path': path,
         if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
       }),
@@ -116,14 +111,19 @@ class AgentApi {
   }
 
   /// Состояние сессии: модель, занятость, расход контекста.
+  ///
+  /// Нужно после сжатия контекста и смены модели: числа в шапке экрана должны быть свежими, а
+  /// из потока ответа они приходят только к концу прогона.
   Future<AgentSessionInfo> session(String id) async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/sessions/$id'));
+    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/sessions/$id'));
     return _sessionOf(data);
   }
 
   /// Переписка сессии в виде элементов экрана.
   Future<List<AgentItem>> messages(String id) async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/sessions/$id/messages'));
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get('/projects/sessions/$id/messages'),
+    );
     final raw = data?['items'];
     return <AgentItem>[
       if (raw is List)
@@ -134,14 +134,14 @@ class AgentApi {
 
   /// Отправляет сообщение агенту и отдаёт поток событий ответа.
   ///
-  /// Прерывание потока (кнопка «Стоп», уход с экрана) рвёт и HTTP-запрос: мост по разрыву
-  /// соединения гасит работу агента, поэтому команды не продолжают выполняться «в никуда»
-  /// и не занимают единственный процесс pi с его контекстом.
+  /// Прерывание потока (кнопка «Стоп», уход с экрана) рвёт и HTTP-запрос: сервер по разрыву
+  /// соединения гасит работу агента на маке, поэтому команды не продолжают выполняться «в
+  /// никуда» и не занимают единственный процесс pi с его контекстом.
   Stream<AgentEvent> prompt(String id, String text) async* {
     final Response<ResponseBody> res;
     try {
       res = await _http.post<ResponseBody>(
-        '/sessions/$id/prompt',
+        '/projects/sessions/$id/prompt',
         data: <String, dynamic>{'text': text},
         // тело читаем сами как поток байтов: Dio не должен пытаться разобрать SSE как JSON
         options: Options(responseType: ResponseType.stream),
@@ -151,7 +151,7 @@ class AgentApi {
     }
 
     final body = res.data;
-    if (body == null) throw const AgentApiException(0, 'Мост закрыл соединение, не прислав ответ');
+    if (body == null) throw const AgentApiException(0, 'Сервер закрыл соединение, не прислав ответ');
 
     // `cast<List<int>>()` обязателен, а не косметика: `body.stream` — поток `Uint8List`, а
     // `utf8.decoder` объявлен над `List<int>`; без приведения код собирается, но падает в рантайме.
@@ -176,30 +176,28 @@ class AgentApi {
     }
   }
 
-  /// Останавливает генерацию: мост шлёт `abort` в pi и ждёт, пока сессия станет свободной.
+  /// Останавливает генерацию: сервер просит мост прервать работу агента.
   Future<void> abort(String id) async {
-    await _send<Map<String, dynamic>>(() => _http.post('/sessions/$id/abort'));
+    await _send<Map<String, dynamic>>(() => _http.post('/projects/sessions/$id/abort'));
   }
 
-  /// Сжимает контекст сессии: длинный разговор иначе перестанет влезать в окно модели.
+  /// Сжимает контекст сессии: длинная работа иначе перестанет влезать в окно модели.
   Future<String> compact(String id) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/sessions/$id/compact'),
-      // сжатие — отдельный вызов модели: на локальном маке это десятки секунд, не секунды
-      timeout: const Duration(minutes: 15),
+      () => _http.post('/projects/sessions/$id/compact'),
     );
     return data?['summary']?.toString() ?? '';
   }
 
-  /// Закрывает процесс pi (файл истории остаётся: разговор можно продолжить позже).
+  /// Закрывает процесс pi на маке (файл истории остаётся: разговор можно продолжить позже).
   ///
   /// Нужно, когда человек уходит из раздела: живой процесс держит контекст модели в памяти
-  /// мака, а она тут дороже пары секунд на следующий запуск.
+  /// мака, а она там дороже пары секунд на следующий запуск.
   Future<void> closeSession(String id) async {
-    await _send<Map<String, dynamic>>(() => _http.delete('/sessions/$id'));
+    await _send<Map<String, dynamic>>(() => _http.delete('/projects/sessions/$id'));
   }
 
-  /// Описание сессии из ответа моста (`{"session": {...}}`).
+  /// Описание сессии из ответа сервера (`{"session": {...}}`).
   AgentSessionInfo _sessionOf(Map<String, dynamic>? data) {
     final raw = data?['session'];
     return AgentSessionInfo.fromJson(raw is Map ? raw.cast<String, dynamic>() : const {});
@@ -258,9 +256,8 @@ class AgentApi {
         // переписке отдельной служебной строкой — иначе агент «что-то сделал сам» без следа.
         final title = json['title']?.toString() ?? '';
         final auto = json['auto']?.toString() ?? '';
-        final text = ['Подтверждение', if (title.isNotEmpty) '«$title»', auto]
-            .where((s) => s.isNotEmpty)
-            .join(': ');
+        final text =
+            ['Подтверждение', if (title.isNotEmpty) '«$title»', auto].where((s) => s.isNotEmpty).join(': ');
         return text.isEmpty ? null : AgentEvent(note: text);
       case 'usage':
         return AgentEvent(
@@ -285,53 +282,41 @@ class AgentApi {
     }
   }
 
-  /// Выполняет запрос и переводит сбой в [AgentApiException] с текстом для человека.
-  Future<T?> _send<T>(
-    Future<Response<T>> Function() request, {
-    Duration? timeout,
-  }) async {
+  /// Выполняет запрос и переводит сбой в [AgentApiException] с текстом сервера.
+  Future<T?> _send<T>(Future<Response<T>> Function() request) async {
     try {
-      if (timeout == null) {
-        final res = await request();
-        return res.data;
-      }
-      final res = await request().timeout(timeout);
+      final res = await request();
       return res.data;
     } on DioException catch (e) {
       throw _error(e);
-    } on TimeoutException {
-      throw AgentApiException(0, 'Мост не ответил за отведённое время.');
     }
   }
 
-  /// Сбой клиента → ошибка раздела с причиной, которую уже сформулировал мост.
+  /// Сбой клиента → ошибка раздела с причиной, которую уже сформулировал сервер.
   ///
-  /// Свои тексты — про то, что чинится на стороне мака и туннеля: у сетевого сбоя причина
-  /// почти всегда в этом, а не в запросе, и человеку важно понять, куда смотреть.
+  /// Текст берём из тела ответа (`{statusCode, message, code}` от `AllExceptionsFilter`): сервер
+  /// отдаёт причину моста как есть. Свои тексты остаются на случай, когда ответа нет вовсе.
   static AgentApiException _error(DioException e) {
     final status = e.response?.statusCode ?? 0;
     final data = e.response?.data;
     String? message;
+    String? code;
     if (data is Map) {
       final m = data['message'];
       if (m is String && m.isNotEmpty) message = m;
-      final body = data['error'];
-      if (message == null && body is String && body.isNotEmpty) message = body;
+      if (m is List && m.isNotEmpty) message = m.first.toString();
+      final c = data['code'];
+      if (c is String) code = c;
     }
-    message ??= switch (status) {
-      401 => 'Мост отклонил токен: проверьте токен из ~/.pi-bridge.json в настройках раздела.',
-      403 => 'Cloudflare не пропустил запрос: проверьте пару Access (Client Id и Secret).',
-      409 => 'Сессия занята: дождитесь конца ответа или нажмите «Стоп».',
-      _ => switch (e.type) {
-          DioExceptionType.connectionError ||
-          DioExceptionType.connectionTimeout ||
-          DioExceptionType.receiveTimeout ||
-          DioExceptionType.sendTimeout =>
-            'Мост недоступен: мак спит, туннель отключён или адрес в настройках неверный.',
-          DioExceptionType.cancel => 'Запрос отменён.',
-          _ => status == 0 ? 'Мост не ответил.' : 'Мост ответил ошибкой $status.',
-        },
+    message ??= switch (e.type) {
+      DioExceptionType.connectionError ||
+      DioExceptionType.connectionTimeout ||
+      DioExceptionType.receiveTimeout ||
+      DioExceptionType.sendTimeout =>
+        'Нет связи с сервером. Проверьте интернет и повторите.',
+      DioExceptionType.cancel => 'Запрос отменён.',
+      _ => status == 0 ? 'Не удалось обратиться к серверу.' : 'Сервер ответил ошибкой $status.',
     };
-    return AgentApiException(status, message);
+    return AgentApiException(status, message, code: code);
   }
 }

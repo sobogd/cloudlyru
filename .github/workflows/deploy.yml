@@ -139,11 +139,13 @@ jobs:
           # Агент на телефоне: открывает сайты в Chrome телефона (ADB + DevTools).
           AGENT_URL: ${{ secrets.AGENT_URL || 'http://127.0.0.1:18816' }}
           AGENT_MAX_STEPS: ${{ secrets.AGENT_MAX_STEPS || '6' }}
+          # Мост до харнесса pi: раздел «Проекты» — агент работает в папке проекта на маке.
+          PI_BRIDGE_URL: ${{ secrets.PI_BRIDGE_URL || 'http://127.0.0.1:18820' }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,LLM_BASE_URL,LLM_MODEL,WEBSEARCH_URL,AGENT_URL,AGENT_MAX_STEPS
+          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,LLM_BASE_URL,LLM_MODEL,WEBSEARCH_URL,AGENT_URL,AGENT_MAX_STEPS,PI_BRIDGE_URL
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -254,6 +256,7 @@ jobs:
             WEBSEARCH_URL=$WEBSEARCH_URL
             AGENT_URL=$AGENT_URL
             AGENT_MAX_STEPS=$AGENT_MAX_STEPS
+            PI_BRIDGE_URL=$PI_BRIDGE_URL
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \
