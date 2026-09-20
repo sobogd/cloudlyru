@@ -134,7 +134,7 @@ jobs:
           # по умолчанию они совпадают со значениями в src/config/env.ts, а секретами
           # переопределяются, если туннель когда-нибудь переедет на другие порты.
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL || 'http://127.0.0.1:18812' }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL || 'google/gemma-4-e4b' }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL || 'qwen/qwen3.5-9b' }}
           SEARCH_URL: ${{ secrets.SEARCH_URL || 'http://127.0.0.1:18814' }}
           AGENT_URL: ${{ secrets.AGENT_URL || 'http://127.0.0.1:18816' }}
         with:
