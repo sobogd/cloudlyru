@@ -14,6 +14,15 @@
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/sobogd/work/iq-rest/cloudlyru/agents/android-agent</string>
+  <!-- Режим разбора: 1 — в лог пишется то, на что агент смотрел (текст экрана, ответ модели,
+       выполненное действие с подписью элемента). По умолчанию 0: в логе мака не должно быть
+       содержимого страниц владельца. Включается на время разбора, потом обратно в 0, и каждый
+       раз требует перезапуска: launchctl kickstart -k gui/501/com.agent.android-agent -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_DEBUG</key>
+    <string>0</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <!-- KeepAlive: сервер вечный и в штатном режиме не выходит, но если упадёт (например, на
