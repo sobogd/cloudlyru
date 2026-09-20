@@ -172,16 +172,20 @@ class Element:
 
 @dataclass
 class PageView:
-    """Экран целиком: чем кликать и что прочитать."""
+    """Экран целиком: чем кликать, что прочитать и что за страница открыта."""
 
     elements: list[Element]
     texts: list[str]
     package: str = ""
+    # Адрес открытой страницы из адресной строки Chrome. Нужен, чтобы агент понимал, где он
+    # находится, и мог посчитать прочитанные страницы: без адреса «сколько ссылок я открыл»
+    # определить нечем — на экране видны только заголовки и текст.
+    url: str = ""
 
     @property
     def signature(self) -> int:
         """Отпечаток экрана — по нему определяем, что он сменился."""
-        return hash((self.package, tuple(e.label for e in self.elements[:40])))
+        return hash((self.package, self.url, tuple(e.label for e in self.elements[:40])))
 
 
 # Пакет Chrome на Android. Агент должен работать в браузере, а не бродить
@@ -297,12 +301,13 @@ def _bounds(node: ET.Element) -> tuple[int, int, int, int]:
 
 
 def read_page(serial: str | None = None) -> PageView:
-    """Прочитать текущий экран: элементы для действий и текст для чтения."""
+    """Прочитать текущий экран: элементы для действий, текст для чтения и адрес страницы."""
     serial = pick_device(serial)
     root = ET.fromstring(dump_ui(serial))
 
     elements: list[Element] = []
     texts: list[str] = []
+    url = ""
     # Пакет из разметки приходит пустым, поэтому спрашиваем систему.
     package = root.get("package") or current_package(serial)
 
@@ -314,6 +319,16 @@ def read_page(serial: str | None = None) -> PageView:
         text = (node.get("text") or "").strip()
         description = (node.get("content-desc") or "").strip()
         label = text or description
+
+        # Адрес страницы берём из адресной строки Chrome: у неё фиксированный идентификатор
+        # ресурса, поэтому её не спутать с текстом страницы. Запасной вариант — первый похожий
+        # на адрес текст: он выручает, если в новой версии Chrome идентификатор переименуют.
+        if not url:
+            resource = node.get("resource-id", "")
+            if resource.endswith("url_bar") and text:
+                url = text
+            elif re.match(r"^https?://\S+", text) and " " not in text:
+                url = text
 
         # Текст экрана собираем отдельно и целиком: именно в нём лежит ответ,
         # а кликать по нему не обязательно.
@@ -339,7 +354,7 @@ def read_page(serial: str | None = None) -> PageView:
             )
         )
 
-    return PageView(elements=elements, texts=texts, package=package)
+    return PageView(elements=elements, texts=texts, package=package, url=url)
 
 
 def format_for_model(page: PageView, element_limit: int = 60, text_limit: int = 1200) -> str:
