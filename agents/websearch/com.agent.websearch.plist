@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd-агент сервиса поиска и чтения страниц (agents/websearch/server.py).
+
+  Ставится копированием в ~/Library/LaunchAgents и загрузкой:
+    cp agents/websearch/com.agent.websearch.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.agent.websearch.plist
+
+  Python берётся из venv, а не системный: сервис работает через Playwright, которого в
+  системе нет. venv с Playwright уже существует для прежнего сервиса поиска и
+  переиспользуется, чтобы не держать вторую копию браузерных библиотек.
+
+  KeepAlive: сервер вечный и в штатном режиме не выходит, но если упадёт (например, на
+  необработанном исключении), поиск обязан вернуться сам — иначе сервер приложения молча
+  отвечает без свежих данных до следующего входа в систему.
+
+  Порт 18814 — тот же, что проброшен туннелем (VPS 127.0.0.1:18814 -> мак 18814):
+  менять его нужно вместе с agents/run-dsh-tunnel.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.websearch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/sobogd/work/jevel.ai/agents/.venv-search/bin/python</string>
+    <string>/Users/sobogd/work/iq-rest/cloudlyru/agents/websearch/server.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/sobogd/work/iq-rest/cloudlyru/agents/websearch</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/websearch.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/websearch.err.log</string>
+</dict>
+</plist>
