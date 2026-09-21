@@ -198,13 +198,31 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          (state.session?.name.isNotEmpty ?? false)
-              ? state.session!.name
-              : widget.project.name,
-          style: const TextStyle(color: C.fg, fontSize: 18),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
+        // В шапке две строки: имя сессии сверху, под ним мелким шрифтом папка, в которой она
+        // запущена, и выбранная для неё модель. Сама панель снизу за это больше не отвечает.
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              (state.session?.name.isNotEmpty ?? false)
+                  ? state.session!.name
+                  : widget.project.name,
+              style: const TextStyle(color: C.fg, fontSize: 17),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 1),
+            Text(
+              [
+                widget.project.name,
+                state.session?.modelLabel ?? widget.session.modelLabel,
+              ].where((s) => s.isNotEmpty).join(' · '),
+              style: const TextStyle(color: C.fg3, fontSize: 11),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
         ),
         actions: [
           IconButton(
@@ -245,7 +263,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           if (!_details) _jumpButton(state),
           if (_details) _detailsPanel(state),
           if (state.error != null) _errorBar(state),
-          if (state.session != null) _infoBar(state),
           _composer(state),
         ],
       ),
@@ -271,7 +288,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           padding: const EdgeInsets.all(24),
           child: Text(
             'Агент работает в папке ${widget.project.path}.\n\n'
-            'Модель: ${state.session?.modelLabel ?? widget.session.modelLabel}\n'
             'Он может читать и править файлы проекта и запускать команды — '
             'спрашивать подтверждение он не будет.',
             textAlign: TextAlign.center,
@@ -508,94 +524,30 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
   );
 
-  /// Строка состояния: чем считает модель, где она живёт, сколько занято контекста и сколько
-  /// уже идёт работа.
-  ///
-  /// Нужна потому, что прогон агента занимает минуты (чтение файлов, команды, локальная
-  /// модель): без неё человек видит молчащий экран и решает, что всё зависло. Заполнение окна
-  /// показывается полосой и числами сразу: по нему понятно, когда пора сжимать разговор, а
-  /// «свободно N» отвечает на вопрос, влезет ли ещё одна большая команда.
-  Widget _infoBar(AgentThreadState state) {
-    final session = state.session!;
-    final used = session.contextTokens;
-    final window = session.contextWindow;
-    final percent = session.contextPercent;
-    final free = session.contextFree;
-    final elapsed = _elapsed(state.runStartedAt);
+  /// Верхняя граница поля ввода — полоса прогресса заполнения контекста.
+  Widget _contextBorder(AgentThreadState state) {
+    final percent = state.session?.contextPercent ?? 0;
 
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(12, 6, 12, 4),
-      decoration: const BoxDecoration(
-        border: Border(top: BorderSide(color: C.brd)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    return SizedBox(
+      height: 14,
+      child: Stack(
         children: [
-          if (used != null && window != null) ...[
-            ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: LinearProgressIndicator(
-                value: (percent / 100).clamp(0.0, 1.0),
-                minHeight: 5,
-                backgroundColor: C.surface2,
-                // цвет предупреждает заранее: на 85% окна следующий большой вывод уже не влезет
-                valueColor: AlwaysStoppedAnimation(
-                  percent >= 85
-                      ? C.danger
-                      : (percent >= 65 ? C.warn : C.accent),
-                ),
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              // у Claude Code заполнение окна — оценка из расхода последнего хода, поэтому
-              // процент помечается знаком «≈», а не выдаётся за точное число, как у pi
-              'контекст ${_num(used)} / ${_num(window)} · '
-              '${session.contextEstimated ? '≈' : ''}${percent.toStringAsFixed(1)}% · '
-              'свободно ${free == null ? '—' : _num(free)}',
-              style: const TextStyle(color: C.fg3, fontSize: 11),
-            ),
-          ],
-          const SizedBox(height: 2),
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  [
-                    session.harnessName.isEmpty ? 'pi' : session.harnessName,
-                    session.modelLabel.isEmpty
-                        ? widget.session.modelLabel
-                        : session.modelLabel,
-                    session.whereLabel,
-                    if (state.sending)
-                      elapsed.isEmpty ? 'работает…' : 'идёт $elapsed',
-                    if (!state.sending && state.usage != null)
-                      'токенов: ${state.usage!.input} → ${state.usage!.output}',
-                    // Очередь — доказательство, что дописанное сообщение живое: ответа на него
-                    // ещё нет, и без этой подписи оно выглядит потерянным
-                    if (state.queued > 0) 'в очереди: ${state.queued}',
-                  ].where((s) => s.isNotEmpty).join(' · '),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: C.fg3, fontSize: 11),
-                ),
-              ),
-              if (state.sending)
-                const SizedBox(
-                  width: 10,
-                  height: 10,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-            ],
+          Container(
+            color: C.surface2,
           ),
-          if (state.sending && state.step.isNotEmpty)
-            Text(
-              state.step,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(color: C.fg3, fontSize: 11),
+          Align(
+            alignment: Alignment.center,
+            child: LinearProgressIndicator(
+              value: (percent / 100).clamp(0.0, 1.0),
+              minHeight: 2,
+              backgroundColor: Colors.transparent,
+              valueColor: AlwaysStoppedAnimation(
+                percent >= 85
+                    ? C.danger
+                    : (percent >= 65 ? C.warn : C.accent),
+              ),
             ),
+          ),
         ],
       ),
     );
@@ -634,12 +586,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
             'ответов ${_num(session.assistantMessages)})',
       ),
       ('Вызовов инструментов', _num(session.toolCalls)),
-      (
-        'Токенов за сессию',
-        'вход ${_num(session.tokensInput)} · выход ${_num(session.tokensOutput)} · '
-            'из кэша ${_num(session.tokensCacheRead)}',
-      ),
-      ('Токенов всего', _num(session.tokensTotal)),
       if (session.cost > 0) ('Стоимость', session.cost.toStringAsFixed(4)),
       if (session.sessionFile.isNotEmpty) ('Файл на маке', session.sessionFile),
     ];
@@ -687,73 +633,86 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     );
   }
 
-  /// Поле ввода и кнопка отправки (во время работы агента — «Стоп»).
+  /// Поле ввода на всю ширину низа экрана и кнопки справа.
   ///
-  /// Снизу прибавляем системный отступ ([navBarInset]): экран открыт отдельным маршрутом, а
-  /// `Scaffold` без своей нижней панели не резервирует место под полосу навигации Android.
+  /// Текстарея занимает весь низ без боковых и нижних отступов — правый внутренний отступ
+  /// оставлен только под кнопки. Сверху её ограничивает полоса контекста с подписью
+  /// ([_contextBorder]). Системный отступ под полосу навигации Android прибавляем сами: экран
+  /// открыт отдельным маршрутом, и `Scaffold` без своей нижней панели его не резервирует.
   Widget _composer(AgentThreadState state) => Container(
-    padding: EdgeInsets.fromLTRB(12, 8, 12, 12 + navBarInset(context)),
-    child: Row(
-      crossAxisAlignment: CrossAxisAlignment.end,
+    color: C.canvas,
+    padding: EdgeInsets.only(bottom: navBarInset(context)),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
-        Expanded(
-          child: TextField(
-            controller: _input,
-            // Поле доступно и во время работы: дописанное сообщение уходит в очередь и доезжает
-            // до агента, как только он освободится, — ждать с пустым полем незачем
-            enabled: true,
-            minLines: 1,
-            maxLines: 5,
-            textInputAction: TextInputAction.newline,
-            keyboardType: TextInputType.multiline,
-            style: const TextStyle(color: C.fg, fontSize: 14),
-            decoration: InputDecoration(
-              hintText: state.sending
-                  ? 'Дописать — уйдёт в очередь'
-                  : 'Что сделать в проекте?',
-              hintStyle: const TextStyle(color: C.fg3, fontSize: 14),
-              filled: true,
-              fillColor: C.surface,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 14,
-                vertical: 10,
+        const SizedBox(height: 6),
+        _contextBorder(state),
+        Stack(
+          children: [
+            TextField(
+              controller: _input,
+              // Поле доступно и во время работы: дописанное сообщение уходит в очередь и
+              // доезжает до агента, как только он освободится, — ждать с пустым полем незачем
+              enabled: true,
+              minLines: 1,
+              maxLines: 6,
+              textInputAction: TextInputAction.newline,
+              keyboardType: TextInputType.multiline,
+              style: const TextStyle(color: C.fg, fontSize: 15),
+              decoration: InputDecoration(
+                hintText: state.sending
+                    ? 'Дописать — уйдёт в очередь'
+                    : 'Что сделать в проекте?',
+                hintStyle: const TextStyle(color: C.fg3, fontSize: 15),
+                border: InputBorder.none,
+                enabledBorder: InputBorder.none,
+                focusedBorder: InputBorder.none,
+                // справа — место под кнопку отправки (и «Стоп» рядом с ней во время работы),
+                // слева — обычный отступ текста от края экрана
+                contentPadding: const EdgeInsets.fromLTRB(
+                  14,
+                  10,
+                  state.sending ? 100 : 52,
+                  10,
+                ),
               ),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(20),
-                borderSide: const BorderSide(color: C.brd),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(20),
-                borderSide: const BorderSide(color: C.brd),
+              onChanged: (_) => setState(() {}),
+            ),
+            // Кнопки у правого нижнего края: отправка доступна и во время работы агента —
+            // сообщение встанет в очередь. «Стоп» рядом, потому что остановить прогон и
+            // дописать сообщение — разные действия.
+            Positioned(
+              right: 4,
+              bottom: 2,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    tooltip: state.sending ? 'Отправить в очередь' : 'Отправить',
+                    // кнопка активна только при непустом тексте: серая кнопка честнее кнопки,
+                    // которая молча ничего не делает
+                    onPressed: _input.text.trim().isEmpty ? null : _send,
+                    icon: Icon(
+                      state.sending ? Icons.playlist_add : Icons.send,
+                      size: 28,
+                      color: _input.text.trim().isEmpty ? C.fg3 : C.accent,
+                    ),
+                  ),
+                  if (state.sending)
+                    IconButton(
+                      tooltip: 'Стоп',
+                      onPressed: () => _thread.stop(),
+                      icon: const Icon(
+                        Icons.stop_circle_outlined,
+                        color: C.danger,
+                        size: 32,
+                      ),
+                    ),
+                ],
               ),
             ),
-            onChanged: (_) => setState(() {}),
-          ),
+          ],
         ),
-        const SizedBox(width: 4),
-        // Кнопка отправки остаётся и во время работы агента: сообщение встанет в очередь. Рядом
-        // «Стоп» — потому что остановить прогон и дописать сообщение это разные действия.
-        IconButton(
-          tooltip: state.sending ? 'Отправить в очередь' : 'Отправить',
-          // кнопка активна только при непустом тексте: серая кнопка честнее кнопки,
-          // которая молча ничего не делает
-          onPressed: _input.text.trim().isEmpty ? null : _send,
-          icon: Icon(
-            state.sending ? Icons.playlist_add : Icons.send,
-            size: 28,
-            color: _input.text.trim().isEmpty ? C.fg3 : C.accent,
-          ),
-        ),
-        if (state.sending)
-          IconButton(
-            tooltip: 'Стоп',
-            onPressed: () => _thread.stop(),
-            icon: const Icon(
-              Icons.stop_circle_outlined,
-              color: C.danger,
-              size: 32,
-            ),
-          ),
       ],
     ),
   );

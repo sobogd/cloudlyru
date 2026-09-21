@@ -2865,7 +2865,9 @@ class Handler(BaseHTTPRequestHandler):
             "harnessName": HARNESS_NAMES.get(session.harness, session.harness),
             "contextEstimated": context_estimated,
             "path": session.cwd,
-            "name": str(state.get("sessionName") or ""),
+            # имя: у живого pi оно в состоянии, а если человек его не задавал, падает на
+            # имя/заголовок из файла сессии — иначе шапка показывала бы папку вместо разговора
+            "name": str(state.get("sessionName") or meta.get("name") or ""),
             "model": str(model.get("id") or ""),
             "modelName": str(model.get("name") or ""),
             "provider": str(model.get("provider") or ""),
