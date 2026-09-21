@@ -669,7 +669,8 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 focusedBorder: InputBorder.none,
                 // справа — место под кнопку отправки (и «Стоп» рядом с ней во время работы),
                 // слева — обычный отступ текста от края экрана
-                contentPadding: const EdgeInsets.fromLTRB(
+                // const здесь нельзя: правый отступ зависит от состояния отправки
+                contentPadding: EdgeInsets.fromLTRB(
                   14,
                   10,
                   state.sending ? 100 : 52,
