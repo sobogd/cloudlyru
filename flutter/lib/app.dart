@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -87,6 +88,12 @@ class _CloudlyAppState extends ConsumerState<CloudlyApp> {
     final sync = ref.read(syncControllerProvider);
     sync.foreground = value;
     if (value && sync.access != SyncAccess.granted) unawaited(sync.recheckAccess());
+    // iOS: фоновой работы у приложения нет вовсе — система останавливает его целиком, и всё,
+    // что случилось за это время, догоняется только здесь. Без этого синхронизация после
+    // возвращения в приложение ждала бы ближайшего прохода сторожа (до пяти минут), а человек
+    // видел бы, что изменённые файлы «не едут». На Android и macOS фоновые проходы есть,
+    // поэтому там поведение прежнее.
+    if (value && Platform.isIOS) unawaited(sync.checkAndResume());
   }
 
   @override
