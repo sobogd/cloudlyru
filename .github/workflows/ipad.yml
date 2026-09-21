@@ -36,7 +36,7 @@ jobs:
 
       - name: Build for iPad (arm64)
         working-directory: flutter
-        run: flutter build macos --release --no-codesign --dart-define=flutter.buildMode=release
+        run: flutter build macos --release --dart-define=flutter.buildMode=release
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
