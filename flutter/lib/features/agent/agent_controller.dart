@@ -637,6 +637,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   }
 
   /// Открывает сессию: показывает её описание и читает историю.
+  ///
+  /// Если сессия занята, экран подключается к идущему прогону: показывать ошибку «занята» и
+  /// запрещать ввод бессмысленно — ответ уже пишется, и его надо просто показать.
   Future<void> attach(AgentSessionInfo session) async {
     state = AgentThreadState(session: session, loading: true);
     try {
@@ -645,9 +648,36 @@ class AgentThreadController extends Notifier<AgentThreadState> {
         return; // сессию успели сменить, пока шёл ответ
       }
       state = state.copyWith(items: items, loading: false);
+      if (session.busy) await _followRunning(session.id);
     } on AgentApiException catch (e) {
       state = state.copyWith(loading: false).withError(e.message);
     }
+  }
+
+  /// Подключается к уже идущему прогону и дописывает его в переписку.
+  ///
+  /// Свой вопрос при этом не отправляется: агент занят предыдущим. Разрыв соединения прогон не
+  /// прерывает — «Стоп» для этого есть отдельно.
+  Future<void> _followRunning(String sessionId) async {
+    state = state.copyWith(
+      sending: true,
+      step: 'агент уже работает',
+      runStartedAt: DateTime.now(),
+    );
+    _cancelledByUser = false;
+    final done = Completer<void>();
+    _done = done;
+    _sub = _api
+        .running(sessionId)
+        .listen(
+          _applyEvent,
+          onError: (Object e) {
+            if (!_cancelledByUser) _fail(e);
+            _finish();
+          },
+          onDone: _finish,
+        );
+    await done.future;
   }
 
   /// Отправляет сообщение: дописывает его в переписку и запускает поток ответа.
@@ -688,16 +718,19 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final sub = _sub;
     final session = state.session;
     if (sub == null || session == null) return;
+    final wasSending = state.sending;
     _cancelledByUser = true;
     await sub.cancel();
-    // Отдельный abort, а не только разрыв соединения: мост гасит работу и по обрыву, но
-    // явная команда снимает занятость сессии сразу, и следующий вопрос не упрётся в 409.
+    _finish();
+    if (!wasSending) return;
+    // Отдельный abort, а не только разрыв соединения: мост гасит работу и по обрыву, но явная
+    // команда снимает занятость сессии сразу, и следующий вопрос не упрётся в 409. Для
+    // закрытой сессии мост отвечает «нечего останавливать» — это не ошибка.
     try {
       await _api.abort(session.id);
     } on AgentApiException catch (e) {
       state = state.withError(e.message);
     }
-    _finish();
   }
 
   /// Закрывает процесс pi на маке по явной просьбе, оставляя разговор в истории.

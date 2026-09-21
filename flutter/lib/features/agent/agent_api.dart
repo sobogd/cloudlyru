@@ -345,19 +345,40 @@ class AgentApi {
     } on DioException catch (e) {
       throw _error(e);
     }
+    yield* _eventsFrom(res.data);
+  }
 
-    final body = res.data;
+  /// Подключается к уже идущему прогону агента и отдаёт его события.
+  ///
+  /// Так экран показывает ответ, который пишется прямо сейчас (его начали с другого устройства
+  /// или экран открыли заново во время работы), вместо отказа «сессия занята». Если прогона нет,
+  /// сервер сразу присылает событие `idle`, и поток закрывается — ничего не происходит.
+  Stream<AgentEvent> running(String id) async* {
+    final Response<ResponseBody> res;
+    try {
+      res = await _http.get<ResponseBody>(
+        '/projects/sessions/$id/events',
+        options: Options(responseType: ResponseType.stream),
+      );
+    } on DioException catch (e) {
+      throw _error(e);
+    }
+    yield* _eventsFrom(res.data);
+  }
+
+  /// Разбирает поток SSE сервера в события экрана.
+  ///
+  /// `cast<List<int>>()` обязателен, а не косметика: `body.stream` — поток `Uint8List`, а
+  /// `utf8.decoder` объявлен над `List<int>`; без приведения код собирается, но падает в рантайме.
+  /// Декодер потоковый: русский текст занимает два байта на символ, и сетевой чанк может
+  /// разрезать символ или строку JSON посередине — склейку держит `LineSplitter`.
+  Stream<AgentEvent> _eventsFrom(ResponseBody? body) async* {
     if (body == null) {
       throw const AgentApiException(
         0,
         'Сервер закрыл соединение, не прислав ответ',
       );
     }
-
-    // `cast<List<int>>()` обязателен, а не косметика: `body.stream` — поток `Uint8List`, а
-    // `utf8.decoder` объявлен над `List<int>`; без приведения код собирается, но падает в рантайме.
-    // Декодер потоковый: русский текст занимает два байта на символ, и сетевой чанк может
-    // разрезать символ или строку JSON посередине — склейку держит `LineSplitter`.
     final lines = body.stream
         .cast<List<int>>()
         .transform(utf8.decoder)

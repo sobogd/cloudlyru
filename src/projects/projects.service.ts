@@ -76,9 +76,10 @@ export class ProjectsService {
   async stream(
     path: string,
     body: unknown,
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; method?: 'GET' | 'POST' } = {},
   ): Promise<ReadableStream<Uint8Array>> {
-    const res = await this.send('POST', path, { ...options, body });
+    const { method = 'POST', ...rest } = options;
+    const res = await this.send(method, path, { ...rest, body });
     if (!res.body) throw new ProjectsError(502, 'мост закрыл соединение, не прислав ответ');
     return res.body as ReadableStream<Uint8Array>;
   }

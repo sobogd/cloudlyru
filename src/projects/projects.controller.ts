@@ -77,10 +77,18 @@ export class ProjectsController {
    * Список целиком определяется настройками pi на маке (`~/.pi/agent/models.json` и его
    * каталог провайдеров) — сервер и приложение его только показывают. Ключи от API остаются
    * на маке и наружу не уходят: приложению приходит признак «ключ задан», а не сам ключ.
+   *
+   * Харнесс приходит от клиента (`?harness=pi|claude`): у pi модели задаются провайдерами, у
+   * Claude Code — своим фиксированным набором. Мост без него отвечает моделями pi, поэтому
+   * не пробрасывать параметр означает показывать в выборе Claude Code модели pi.
    */
   @Get('models')
-  async models() {
-    return this.wrap(() => this.projects.call<Record<string, unknown>>('GET', '/models'));
+  async models(@Query('harness') harness?: string) {
+    const target = (harness ?? '').trim();
+    const query = target ? `?harness=${encodeURIComponent(target)}` : '';
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>('GET', `/models${query}`),
+    );
   }
 
   /**
@@ -210,6 +218,9 @@ export class ProjectsController {
     const path = typeof body.path === 'string' ? body.path.trim() : '';
     if (!path) throw badRequest('path обязателен');
     const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+    // какой агент ведёт разговор: без него мост открывает сессию pi, и выбранный Claude Code
+    // молча превращался бы в разговор pi
+    const harness = typeof body.harness === 'string' ? body.harness.trim() : '';
     // модель выбирается при открытии: у pi их бывает несколько (локальная и удалённая по API),
     // а после открытия её меняет ручка model, не перезапуская разговор
     const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
@@ -219,6 +230,7 @@ export class ProjectsController {
         body: {
           path,
           ...(sessionId ? { sessionId } : {}),
+          ...(harness ? { harness } : {}),
           ...(provider ? { provider } : {}),
           ...(model ? { model } : {}),
         },
@@ -273,6 +285,37 @@ export class ProjectsController {
       res.end();
     });
     body_.pipe(res);
+  }
+
+  /**
+   * Подключает приложение к уже идущему прогону агента.
+   *
+   * Нужно, когда разговор идёт (его начали с другого устройства или экран открыли заново во
+   * время работы): вместо отказа «сессия занята» приложение смотрит ответ со стороны. Разрыв
+   * этого соединения работу не прерывает — за прерывание отвечает `abort`.
+   */
+  @Get('sessions/:id/events')
+  async events(@Param('id') id: string, @Req() req: Request, @Res() res: Response) {
+    const abort = new AbortController();
+    req.on('close', () => abort.abort());
+
+    const upstream = await this.wrap(() =>
+      this.projects.stream(
+        `/sessions/${encodeURIComponent(id)}/events`,
+        undefined,
+        { signal: abort.signal, method: 'GET' },
+      ),
+    );
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const body = Readable.fromWeb(upstream as Parameters<typeof Readable.fromWeb>[0]);
+    body.on('error', () => res.end());
+    body.pipe(res);
   }
 
   /** Останавливает генерацию: мост шлёт `abort` в pi и дожидается свободной сессии. */

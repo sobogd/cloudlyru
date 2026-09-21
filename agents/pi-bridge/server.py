@@ -26,6 +26,7 @@ stdio и умеет ровно то, что нужно разделу «Прое
   POST   /sessions                    — открыть сессию: поднять процесс pi в этой папке;
   GET    /sessions/<id>               — состояние сессии (модель, контекст, занятость);
   GET    /sessions/<id>/messages      — переписка в нормализованном виде;
+  GET    /sessions/<id>/events        — подключиться к уже идущему прогону (SSE);
   POST   /sessions/<id>/prompt        — отправить сообщение, ответ потоком SSE;
   POST   /sessions/<id>/abort         — остановить генерацию;
   POST   /sessions/<id>/compact       — сжать контекст;
@@ -684,6 +685,44 @@ def session_files(path):
     files = [p for p in folder.glob("*.jsonl") if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files
+
+
+def read_file_messages(harness, file):
+    """Переписка сессии прямо из её файла, без живого процесса агента.
+
+    Нужна потому, что открыть разговор и посмотреть, что в нём было, — это чтение истории, а не
+    работа агента: процесс мог быть погашен по простою или мост перезапускался, и отказывать в
+    истории по этой причине нельзя (именно так приложение получало 400 на ровном месте).
+    """
+    if not file or not file.exists():
+        return []
+    if harness == HARNESS_CLAUDE:
+        return normalize_claude_messages(read_jsonl(file))
+    messages = []
+    for entry in read_jsonl(file):
+        if entry.get("type") == "message" and isinstance(entry.get("message"), dict):
+            messages.append(entry["message"])
+    return normalize_messages(messages)
+
+
+def read_jsonl(file):
+    """Читает JSONL-файл в список объектов; битые строки пропускаются."""
+    entries = []
+    try:
+        with file.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except OSError as e:
+        log("не смог прочитать %s: %s" % (file, e))
+    return entries
 
 
 def read_session_meta(file):
@@ -2143,14 +2182,27 @@ class Pool:
             self.sessions[session.key] = session
             return session
 
-    def find(self, key):
-        """Находит живую сессию по ключу (`харнесс--id`) или бросает понятную ошибку."""
+    def maybe(self, key):
+        """Живая сессия по ключу или `None`; идентификатор без имени харнесса считается pi.
+
+        Имя харнесса в идентификаторе появилось вместе со вторым агентом, и сборка приложения,
+        которая про него не знает, присылает прежний вид (`<id>` без префикса). Такой запрос
+        относится к pi — и раньше, когда агент был один, это было ровно то же самое.
+        """
+        keys = [str(key)]
+        if not any(str(key).startswith(h + "--") for h in HARNESS_NAMES):
+            keys.append(session_key(HARNESS_PI, key))
         with self.lock:
-            session = self.sessions.get(key)
+            session = next((self.sessions[k] for k in keys if k in self.sessions), None)
+        if session is not None and not session.alive():
+            session._restart()
+        return session
+
+    def find(self, key):
+        """Находит живую сессию по ключу или бросает понятную ошибку."""
+        session = self.maybe(key)
         if session is None:
             raise PiError("сессия не открыта: сначала откройте её в приложении")
-        if not session.alive():
-            session._restart()
         return session
 
     def list(self):
@@ -2295,13 +2347,36 @@ class Handler(BaseHTTPRequestHandler):
                 self._list_sessions(params)
             elif path.startswith("/sessions/"):
                 parts = path.split("/")
-                session = POOL.find(parts[2])
+                # Историю отдаём и без живого процесса: чтение разговора не должно требовать,
+                # чтобы агент был запущен (процесс гасится по простою, мост перезапускается).
+                session = POOL.maybe(parts[2])
                 if len(parts) == 4 and parts[3] == "messages":
-                    self._json(200, {"session": self._session_brief(session),
-                                     "items": session.messages()})
+                    if session is not None:
+                        self._json(200, {"session": self._session_brief(session),
+                                         "items": session.messages()})
+                    else:
+                        harness, native_id = split_key(parts[2])
+                        file = find_session_file(harness, native_id)
+                        if file is None:
+                            raise PiError("сессия не найдена: %s" % parts[2])
+                        self._json(200, {
+                            "session": self._file_brief(harness, native_id, file),
+                            "items": read_file_messages(harness, file),
+                        })
+                elif len(parts) == 4 and parts[3] == "events":
+                    if session is None:
+                        raise PiError("сессия не открыта: подключиться к её ответу нельзя")
+                    self._events(session)
                 elif len(parts) == 3:
-                    session.refresh_state()
-                    self._json(200, {"session": self._session_brief(session)})
+                    if session is not None:
+                        session.refresh_state()
+                        self._json(200, {"session": self._session_brief(session)})
+                    else:
+                        harness, native_id = split_key(parts[2])
+                        file = find_session_file(harness, native_id)
+                        if file is None:
+                            raise PiError("сессия не найдена: %s" % parts[2])
+                        self._json(200, {"session": self._file_brief(harness, native_id, file)})
                 else:
                     self._json(404, {"error": "неизвестная ручка: %s" % path})
             else:
@@ -2341,17 +2416,23 @@ class Handler(BaseHTTPRequestHandler):
             parts = path.split("/")
             if len(parts) >= 4 and parts[1] == "sessions":
                 action = parts[3]
-                # закрытие обрабатывается до поиска в пуле: закрыть уже закрытую сессию — не
-                # ошибка, приложение зовёт эту ручку и при уходе с экрана, и явной кнопкой
+                # Закрытие и остановка обрабатываются до поиска в пуле: и то, и другое —
+                # уборка, и повторять её на уже закрытой сессии не ошибка. Раньше «Стоп» на
+                # такой сессии отвечал 400, и человек видел ошибку там, где всё в порядке.
                 if action == "close":
                     self._close(parts[2])
+                    return
+                if action == "abort":
+                    session = POOL.maybe(parts[2])
+                    if session is None:
+                        self._json(200, {"ok": True, "aborted": False})
+                        return
+                    session.abort()
+                    self._json(200, {"ok": True, "aborted": True})
                     return
                 session = POOL.find(parts[2])
                 if action == "prompt":
                     self._prompt(session, body)
-                elif action == "abort":
-                    session.abort()
-                    self._json(200, {"ok": True})
                 elif action == "compact":
                     if session.harness != HARNESS_PI:
                         raise PiError("сжатие контекста есть только у pi: Claude Code сжимает его сам")
@@ -2538,6 +2619,42 @@ class Handler(BaseHTTPRequestHandler):
             "sessionFile": str(file) if file else "",
         }
 
+    def _file_brief(self, harness, native_id, file):
+        """Описание сессии по её файлу: для закрытой сессии, когда процессов нет.
+
+        Числа контекста и расхода здесь отсутствуют намеренно: их знает только живой агент, а
+        придумывать нули значило бы показывать «контекст 0» как факт. Остальное — имя, модель,
+        время, счётчики — лежит в файле и отдаётся как есть.
+        """
+        reader = read_claude_meta if harness == HARNESS_CLAUDE else read_session_meta
+        meta = reader(file)
+        return {
+            "id": session_key(harness, native_id),
+            "harness": harness,
+            "harnessName": HARNESS_NAMES.get(harness, harness),
+            "contextEstimated": harness == HARNESS_CLAUDE,
+            "path": str(meta.get("cwd") or ""),
+            "name": str(meta.get("name") or ""),
+            "model": str(meta.get("model") or ""),
+            "modelName": str(meta.get("model") or ""),
+            "provider": str(meta.get("provider") or ""),
+            "local": harness != HARNESS_CLAUDE and is_local_model({"provider": str(meta.get("provider") or ""), "baseUrl": ""}),
+            "thinkingLevel": "",
+            "busy": False,
+            "messages": int(meta.get("messages") or 0),
+            "contextTokens": None,
+            "contextWindow": None,
+            "contextPercent": 0,
+            "tokens": {"input": 0, "output": 0, "cacheRead": 0, "total": 0},
+            "cost": 0,
+            "userMessages": int(meta.get("userMessages") or 0),
+            "assistantMessages": int(meta.get("assistantMessages") or 0),
+            "toolCalls": int(meta.get("toolCalls") or 0),
+            "startedAt": meta.get("startedAt"),
+            "updatedAt": meta.get("updatedAt"),
+            "sessionFile": str(file),
+        }
+
     def _settled_brief(self, session):
         """Описание сессии после прогона: с обновлённым расходом контекста.
 
@@ -2550,6 +2667,55 @@ class Handler(BaseHTTPRequestHandler):
         except PiError as e:
             log("не смог обновить состояние сессии %s: %s" % (session.id, e))
         return self._session_brief(session)
+
+    def _events(self, session):
+        """Отдаёт поток событий уже идущего прогона, ничего агенту не отправляя.
+
+        Зачем: приложение подключается к разговору, который идёт (его начали с другого
+        устройства, или экран открыли заново во время работы). Без этой ручки оставался только
+        отказ «сессия занята», и человек видел ошибку вместо ответа, который в этот момент
+        писался. Здесь мы просто смотрим со стороны: разрыв соединения работу НЕ прерывает —
+        за это отвечает ручка `prompt`, у которой своя семантика.
+        """
+        if not session.busy:
+            # Свободна: говорить нечего, и держать поток открытым значило бы показывать вечную
+            # загрузку. Приложение по этому событию остаётся в обычном состоянии.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self._event({"type": "idle"})
+            return
+
+        events = session.subscribe()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self._event({"type": "accepted"})
+            while True:
+                try:
+                    event = events.get(timeout=1.0)
+                except queue.Empty:
+                    if not session.alive():
+                        self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
+                        break
+                    continue
+                translated, done = translate(session, event)
+                for ours in translated:
+                    self._event(ours)
+                if done:
+                    self._event({"type": "done", "session": self._settled_brief(session)})
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # смотрящий ушёл: прогон продолжается, это его дело
+        finally:
+            session.unsubscribe(events)
 
     def _manual_ui(self, session, body):
         """Ответ человека на диалог расширения (нужен, только если политику поменяют)."""
