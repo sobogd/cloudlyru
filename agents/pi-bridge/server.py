@@ -18,6 +18,11 @@ stdio и умеет ровно то, что нужно разделу «Прое
   GET    /projects                    — проекты из allowlist-корней (папки с .git);
   GET    /sessions?path=<папка>       — сессии проекта (файлы pi), свежие сверху;
   GET    /models                      — модели, доступные pi (локальные и по API);
+  GET    /providers                   — провайдеры и признак «ключ задан» (самих ключей нет);
+  POST   /providers                   — создать или изменить своего провайдера (models.json);
+  POST   /providers/probe             — проверить адрес и ключ, получить список моделей;
+  POST   /providers/key               — задать или убрать ключ встроенного провайдера (auth.json);
+  DELETE /providers/<key>             — удалить своего провайдера;
   POST   /sessions                    — открыть сессию: поднять процесс pi в этой папке;
   GET    /sessions/<id>               — состояние сессии (модель, контекст, занятость);
   GET    /sessions/<id>/messages      — переписка в нормализованном виде;
@@ -56,7 +61,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -73,6 +80,28 @@ CONFIG_PATH = Path(os.environ.get("PI_BRIDGE_CONFIG", str(Path.home() / ".pi-bri
 PI_SESSIONS = Path.home() / ".pi" / "agent" / "sessions"
 # Каталог моделей pi: из него берём провайдера и модель по умолчанию, чтобы не хардкодить.
 PI_MODELS = Path.home() / ".pi" / "agent" / "models.json"
+# Файл ключей pi для встроенных провайдеров (anthropic, openai, deepseek, …). Формат задан pi:
+# `{"<провайдер>": {"type": "api_key", "key": "…"}}`, права 600 — файл создаёт и читает сам pi,
+# поэтому при правке мы сохраняем и структуру, и права.
+PI_AUTH = Path.home() / ".pi" / "agent" / "auth.json"
+
+# Встроенные провайдеры pi, для которых приложению разрешено класть ключ в auth.json. Список
+# нужен только для подсказки в интерфейсе: pi знает их сам и подхватит ключ из файла, поэтому
+# значение здесь — просто идентификатор и человеческое название.
+BUILTIN_PROVIDERS = [
+    {"key": "anthropic", "name": "Anthropic (Claude)"},
+    {"key": "openai", "name": "OpenAI"},
+    {"key": "google", "name": "Google (Gemini)"},
+    {"key": "deepseek", "name": "DeepSeek"},
+    {"key": "xai", "name": "xAI (Grok)"},
+    {"key": "mistral", "name": "Mistral"},
+    {"key": "groq", "name": "Groq"},
+    {"key": "openrouter", "name": "OpenRouter"},
+    {"key": "cerebras", "name": "Cerebras"},
+    {"key": "together", "name": "Together AI"},
+    {"key": "nvidia", "name": "NVIDIA NIM"},
+    {"key": "xiaomi", "name": "Xiaomi (MiMo)"},
+]
 
 # Потолки и таймауты. Все — про предсказуемость: без них зависший pi держал бы поток
 # приложения открытым бесконечно, а ответ без единого события выглядел бы как работа.
@@ -685,6 +714,253 @@ def purge_session(session_id):
     return removed
 
 
+def read_json_file(path):
+    """Читает JSON-файл настроек pi; отсутствие файла и мусор — пустой объект.
+
+    Настройки pi правятся и руками, и им самим, поэтому битый или недописанный файл не должен
+    ронять мост: интерфейс покажет провайдеров без этого файла, а не откажет целиком.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_json_file(path, data, mode=0o600):
+    """Пишет JSON атомарно, сохраняя копию прежнего файла и права доступа.
+
+    Атомарно — потому что в этом файле лежат ключи: обрыв записи (или падение моста в этот
+    момент) не должен оставить pi без настроек или с обрезанным ключом. Копия `.bak` нужна,
+    чтобы правку из интерфейса можно было откатить руками; права 600 — чтобы ключи не стали
+    читаемыми для других пользователей мака.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            backup = path.with_suffix(path.suffix + ".bak")
+            backup.write_bytes(path.read_bytes())
+            os.chmod(backup, mode)
+        except OSError as e:
+            log("не смог сохранить копию %s: %s" % (path, e))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.chmod(tmp, mode)
+    tmp.replace(path)
+
+
+def provider_list():
+    """Провайдеры для интерфейса: свои из models.json и встроенные с признаком «ключ задан».
+
+    Ключ не отдаётся наружу ни целиком, ни хвостом: приложению достаточно знать, задан ли он и
+    какой длины (по длине видно, вставился ли ключ полностью). Встроенные провайдеры идут
+    отдельным списком — у них ключ лежит не в models.json, а в auth.json, и моделей в интерфейсе
+    наперёд нет: они появляются у pi после того, как ключ задан.
+    """
+    models = read_json_file(PI_MODELS)
+    providers = models.get("providers") if isinstance(models.get("providers"), dict) else {}
+    auth = read_json_file(PI_AUTH)
+
+    result = []
+    for key, body in providers.items():
+        if not isinstance(body, dict):
+            continue
+        api_key = str(body.get("apiKey") or "")
+        base_url = str(body.get("baseUrl") or "")
+        result.append({
+            "key": str(key),
+            "name": str(body.get("name") or key),
+            "baseUrl": base_url,
+            "api": str(body.get("api") or "openai-completions"),
+            "custom": True,
+            "hasKey": bool(api_key.strip()),
+            "keyLength": len(api_key.strip()),
+            "local": is_local_model({"baseUrl": base_url, "provider": str(key)}),
+            "models": [
+                {
+                    "id": str(m.get("id")),
+                    "name": str(m.get("name") or m.get("id")),
+                    "contextWindow": m.get("contextWindow"),
+                    "maxTokens": m.get("maxTokens"),
+                    "thinking": bool(m.get("reasoning")),
+                }
+                for m in (body.get("models") or [])
+                if isinstance(m, dict) and m.get("id")
+            ],
+        })
+
+    for entry in BUILTIN_PROVIDERS:
+        credential = auth.get(entry["key"])
+        key_value = ""
+        if isinstance(credential, dict):
+            key_value = str(credential.get("key") or "")
+        result.append({
+            "key": entry["key"],
+            "name": entry["name"],
+            "baseUrl": "",
+            "api": "",
+            "custom": False,
+            "hasKey": bool(key_value.strip()),
+            "keyLength": len(key_value.strip()),
+            "local": False,
+            "models": [],
+        })
+    return result
+
+
+def provider_probe(base_url, api_key):
+    """Проверяет провайдера: спрашивает у него список моделей тем же ключом.
+
+    Одна проверка отвечает сразу на два вопроса человека: «ключ рабочий?» и «какие модели мне
+    доступны?» — поэтому интерфейс по этой ручке и подтягивает список моделей вместо того,
+    чтобы просить вписать их руками. Обращаемся к стандартной ручке OpenAI-совместимых
+    провайдеров `/models`; у кого её нет — покажем ошибку провайдера как есть.
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        raise PiError("нужен адрес провайдера")
+    if not base.startswith("http://") and not base.startswith("https://"):
+        raise PiError("адрес должен начинаться с http:// или https://")
+    request = urllib.request.Request(base + "/models", headers={
+        "Authorization": "Bearer %s" % api_key,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise PiError("провайдер ответил %s: %s" % (e.code, e.read()[:200].decode("utf-8", "replace")))
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        raise PiError("провайдер недоступен: %s" % e)
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        # некоторые провайдеры отвечают просто списком
+        data = payload if isinstance(payload, list) else []
+    models = []
+    for item in data:
+        if isinstance(item, dict) and item.get("id"):
+            models.append({"id": str(item["id"]), "name": str(item.get("name") or item["id"])})
+        elif isinstance(item, str):
+            models.append({"id": item, "name": item})
+    return models
+
+
+def save_provider(body):
+    """Создаёт или обновляет своего провайдера в models.json.
+
+    Пустой `apiKey` при обновлении означает «оставить прежний ключ»: интерфейс не показывает
+    сохранённый ключ, поэтому человек правит название и адрес, не вводя ключ заново. Пустой
+    `apiKey` при создании — провайдер без ключа (бывает у локальных серверов).
+    """
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise PiError("нужен идентификатор провайдера (латиницей, без пробелов)")
+    if not re.match(r"^[a-zA-Z0-9._-]+$", key):
+        raise PiError("идентификатор провайдера: только латиница, цифры, точка, дефис и подчёркивание")
+    base_url = str(body.get("baseUrl") or "").strip()
+    if not base_url.startswith("http://") and not base_url.startswith("https://"):
+        raise PiError("адрес провайдера должен начинаться с http:// или https://")
+
+    models = read_json_file(PI_MODELS)
+    providers = models.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        models["providers"] = providers
+    existing = providers.get(key) if isinstance(providers.get(key), dict) else {}
+
+    api_key = str(body.get("apiKey") or "").strip()
+    if not api_key:
+        api_key = str(existing.get("apiKey") or "")
+
+    new_models = []
+    for item in body.get("models") or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        entry = {
+            "id": str(item["id"]),
+            "name": str(item.get("name") or item["id"]),
+            "reasoning": bool(item.get("thinking")),
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        }
+        if item.get("contextWindow"):
+            entry["contextWindow"] = int(item["contextWindow"])
+        if item.get("maxTokens"):
+            entry["maxTokens"] = int(item["maxTokens"])
+        new_models.append(entry)
+    if not new_models:
+        raise PiError("нужна хотя бы одна модель: без неё pi не сможет выбрать, чем отвечать")
+
+    providers[key] = {
+        "name": str(body.get("name") or existing.get("name") or key),
+        "baseUrl": base_url,
+        "apiKey": api_key,
+        "api": str(body.get("api") or existing.get("api") or "openai-completions"),
+        "models": new_models,
+    }
+    write_json_file(PI_MODELS, models)
+    invalidate_models_cache()
+    log("сохранил провайдера %s (%s, моделей %d)" % (key, base_url, len(new_models)))
+    return provider_list()
+
+
+def delete_provider(key):
+    """Удаляет своего провайдера из models.json.
+
+    Не даём удалить провайдера, которым мост отвечает по умолчанию: на него смотрит вся работа
+    на этом маке, когда модель не выбрана, и снести его одной кнопкой из телефона было бы
+    неприятным сюрпризом. Проверяем именно текущий провайдер по умолчанию, а не «любой на
+    loopback»: свой сервер на localhost — обычное дело, и запрет на него был бы непонятен.
+    Встроенные провайдеры живут не здесь — у них убирается ключ (`/providers/key`), а не запись.
+    """
+    models = read_json_file(PI_MODELS)
+    providers = models.get("providers") if isinstance(models.get("providers"), dict) else {}
+    body = providers.get(key) if isinstance(providers.get(key), dict) else None
+    if body is None:
+        raise PiError("провайдер не найден: %s" % key)
+    if key == (default_model()[0] or ""):
+        raise PiError(
+            "это провайдер по умолчанию: на нём работает мак, когда модель не выбрана — "
+            "сначала назначьте другого провайдера в ~/.pi-bridge.json"
+        )
+    providers.pop(key)
+    write_json_file(PI_MODELS, models)
+    invalidate_models_cache()
+    log("удалил провайдера %s" % key)
+    return provider_list()
+
+
+def save_provider_key(provider, api_key):
+    """Кладёт или убирает ключ встроенного провайдера в auth.json.
+
+    Пустой ключ означает «убрать»: так человек отключает провайдера, не трогая ни файлы pi, ни
+    свои ключи на бумаге. Формат файла задан pi (`{"<провайдер>": {"type": "api_key", "key": …}}`),
+    поэтому остальные записи сохраняются как есть.
+    """
+    name = str(provider or "").strip()
+    if not name:
+        raise PiError("нужен провайдер")
+    auth = read_json_file(PI_AUTH)
+    value = str(api_key or "").strip()
+    if value:
+        auth[name] = {"type": "api_key", "key": value}
+        log("сохранил ключ провайдера %s (длина %d)" % (name, len(value)))
+    else:
+        auth.pop(name, None)
+        log("убрал ключ провайдера %s" % name)
+    write_json_file(PI_AUTH, auth)
+    invalidate_models_cache()
+    return provider_list()
+
+
+def invalidate_models_cache():
+    """Сбрасывает кэш списка моделей: после правки провайдеров он показывает устаревшее."""
+    global _models_cache
+    with models_lock:
+        _models_cache = None
+
+
 class PiError(Exception):
     """Ошибка работы с харнессом: текст пригоден и для лога, и для показа в приложении."""
 
@@ -1112,6 +1388,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"projects": list_projects()})
             elif path == "/models":
                 self._json(200, {"models": list_models()})
+            elif path == "/providers":
+                self._json(200, {"providers": provider_list()})
             elif path == "/sessions":
                 self._list_sessions(params)
             elif path.startswith("/sessions/"):
@@ -1138,6 +1416,26 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             if path == "/sessions":
                 self._open_session(body)
+                return
+            if path == "/providers":
+                self._json(200, {"providers": save_provider(body)})
+                return
+            if path == "/providers/probe":
+                # Ключ можно не присылать повторно: если провайдер уже сохранён, берём его ключ
+                # с мака — человек правит адрес, не вводя ключ заново.
+                api_key = str(body.get("apiKey") or "").strip()
+                provider = str(body.get("provider") or "").strip()
+                if not api_key and provider:
+                    saved = read_json_file(PI_MODELS).get("providers") or {}
+                    entry = saved.get(provider) if isinstance(saved.get(provider), dict) else {}
+                    api_key = str(entry.get("apiKey") or "")
+                models = provider_probe(body.get("baseUrl"), api_key)
+                self._json(200, {"models": models})
+                return
+            if path == "/providers/key":
+                self._json(200, {
+                    "providers": save_provider_key(body.get("provider"), body.get("apiKey")),
+                })
                 return
             parts = path.split("/")
             if len(parts) >= 4 and parts[1] == "sessions":
@@ -1190,6 +1488,9 @@ class Handler(BaseHTTPRequestHandler):
 
         def run():
             parts = path.split("/")
+            if len(parts) == 3 and parts[1] == "providers":
+                self._json(200, {"providers": delete_provider(parts[2])})
+                return
             if len(parts) == 3 and parts[1] == "sessions":
                 session = POOL.take(parts[2])
                 if session is not None:

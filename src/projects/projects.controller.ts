@@ -71,6 +71,90 @@ export class ProjectsController {
     return this.wrap(() => this.projects.call<Record<string, unknown>>('GET', '/models'));
   }
 
+  /**
+   * Провайдеры, настроенные у pi на маке: свои (со своим адресом и ключом) и встроенные.
+   *
+   * Ключи наружу не уходят ни целиком, ни хвостом — приложению приходит только признак «ключ
+   * задан» и его длина. Сам ключ живёт на маке: в `models.json` для своих провайдеров и в
+   * `auth.json` для встроенных, как того требует pi.
+   */
+  @Get('providers')
+  async providers() {
+    return this.wrap(() => this.projects.call<Record<string, unknown>>('GET', '/providers'));
+  }
+
+  /**
+   * Создаёт или изменяет своего провайдера: адрес, API, ключ и список моделей.
+   *
+   * Пустой ключ при изменении означает «оставить прежний»: приложение не показывает сохранённый
+   * ключ, поэтому человек правит адрес или название, не вводя ключ заново.
+   */
+  @Post('providers')
+  async saveProvider(@Body() body: Record<string, unknown> = {}) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>('POST', '/providers', {
+        body: {
+          key: str(body.key),
+          name: str(body.name),
+          baseUrl: str(body.baseUrl),
+          api: str(body.api),
+          ...(str(body.apiKey) ? { apiKey: str(body.apiKey) } : {}),
+          models: Array.isArray(body.models) ? body.models : [],
+        },
+        // запись в models.json на маке — мгновенная, но ждать её дольше секунды незачем
+        timeoutMs: 30_000,
+      }),
+    );
+  }
+
+  /**
+   * Проверяет адрес и ключ провайдера и возвращает его список моделей.
+   *
+   * Один запрос отвечает на два вопроса сразу: рабочий ли ключ и какие модели доступны, —
+   * поэтому приложение подтягивает модели отсюда, а не просит вписать их руками.
+   */
+  @Post('providers/probe')
+  async probeProvider(@Body() body: Record<string, unknown> = {}) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>('POST', '/providers/probe', {
+        body: {
+          baseUrl: str(body.baseUrl),
+          provider: str(body.provider),
+          ...(str(body.apiKey) ? { apiKey: str(body.apiKey) } : {}),
+        },
+        // провайдер может отвечать медленно, но дольше полуминуты ждать смысла нет
+        timeoutMs: 40_000,
+      }),
+    );
+  }
+
+  /** Задаёт или убирает ключ встроенного провайдера pi (пустой ключ — убрать). */
+  @Post('providers/key')
+  async saveProviderKey(@Body() body: Record<string, unknown> = {}) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>('POST', '/providers/key', {
+        body: { provider: str(body.provider), apiKey: str(body.apiKey) },
+        timeoutMs: 30_000,
+      }),
+    );
+  }
+
+  /**
+   * Удаляет своего провайдера из настроек pi.
+   *
+   * Провайдера по умолчанию мост удалить не даст: на нём работает мак, когда модель не выбрана.
+   */
+  @Delete('providers/:key')
+  async deleteProvider(@Param('key') key: string) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'DELETE',
+        `/providers/${encodeURIComponent(key)}`,
+        { timeoutMs: 30_000 },
+      ),
+    );
+  }
+
   /** Сессии проекта: их мост читает из файлов pi на маке. */
   @Get('sessions')
   async sessions(@Query('path') path?: string) {
@@ -273,6 +357,11 @@ export class ProjectsController {
       throw new ApiError(status, e.message, codeFor(status));
     }
   }
+}
+
+/** Строка из тела запроса: у необязательных полей пустая строка вместо `undefined`. */
+function str(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 /**

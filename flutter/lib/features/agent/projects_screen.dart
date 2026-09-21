@@ -5,6 +5,7 @@ import '../../theme.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
 import 'agent_controller.dart';
+import 'agent_providers_screen.dart';
 import 'agent_sessions_screen.dart';
 import 'agent_types.dart';
 
@@ -60,6 +61,15 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       appBar: AppBar(
         title: const Text('Проекты', style: TextStyle(color: C.fg, fontSize: 18)),
         actions: [
+          IconButton(
+            // Провайдеры и ключи — рядом с моделями, а не в «Настройках» приложения: это
+            // настройка харнесса на маке, и живёт она там же, где список проектов
+            tooltip: 'Модели и ключи',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const AgentProvidersScreen()),
+            ),
+            icon: const Icon(Icons.vpn_key_outlined),
+          ),
           IconButton(
             tooltip: 'Обновить список',
             onPressed: state.loading ? null : () => _projects.load(),

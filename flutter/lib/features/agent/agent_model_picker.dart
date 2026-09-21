@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../theme.dart';
 import 'agent_controller.dart';
+import 'agent_providers_screen.dart';
 import 'agent_types.dart';
 
 /// Диалог выбора модели: локальная llama.cpp на маке или удалённый провайдер по API.
@@ -82,9 +83,8 @@ class _ModelPickerDialog extends ConsumerWidget {
                     ],
                     const SizedBox(height: 8),
                     const Text(
-                      'Удалённую модель добавляют на маке: провайдер и ключ прописываются в '
-                      '~/.pi/agent/models.json. В приложении ключей нет — оно выбирает из уже '
-                      'настроенного.',
+                      'Удалённую модель добавляют кнопкой «Добавить провайдера»: адрес и ключ '
+                      'уедут на мак и останутся там — в приложении ключей нет.',
                       style: TextStyle(color: C.fg3, fontSize: 11.5, height: 1.35),
                     ),
                   ],
@@ -93,8 +93,19 @@ class _ModelPickerDialog extends ConsumerWidget {
       ),
       actions: [
         TextButton(
+          // Добавить провайдера можно прямо отсюда: чаще всего выбор модели открывают именно
+          // для того, чтобы понять, чего в списке не хватает
+          onPressed: () {
+            Navigator.of(context).pop();
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const AgentProvidersScreen()),
+            );
+          },
+          child: const Text('Добавить провайдера'),
+        ),
+        TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Отмена'),
+          child: const Text('Закрыть'),
         ),
       ],
     );

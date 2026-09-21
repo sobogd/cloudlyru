@@ -87,6 +87,106 @@ class AgentApi {
     ];
   }
 
+  /// Провайдеры, настроенные у pi на маке: свои и встроенные.
+  ///
+  /// Ключи сюда не приходят: только признак «задан» и длина. Сам ключ лежит на маке.
+  Future<List<AgentProvider>> providers() async {
+    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/providers'));
+    final raw = data?['providers'];
+    return <AgentProvider>[
+      if (raw is List)
+        for (final p in raw)
+          if (p is Map) AgentProvider.fromJson(p.cast<String, dynamic>()),
+    ];
+  }
+
+  /// Создаёт или изменяет своего провайдера (адрес, API, ключ, модели) и отдаёт список заново.
+  ///
+  /// Пустой [apiKey] при изменении означает «оставить прежний ключ»: сохранённый ключ
+  /// приложение не показывает, поэтому правка адреса или названия ключа не требует.
+  Future<List<AgentProvider>> saveProvider({
+    required String key,
+    required String name,
+    required String baseUrl,
+    required String api,
+    required String apiKey,
+    required List<AgentModel> models,
+  }) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post('/projects/providers', data: <String, dynamic>{
+        'key': key,
+        'name': name,
+        'baseUrl': baseUrl,
+        'api': api,
+        'apiKey': apiKey,
+        'models': <Map<String, dynamic>>[
+          for (final m in models)
+            <String, dynamic>{
+              'id': m.id,
+              'name': m.name,
+              if (m.contextWindow != null) 'contextWindow': m.contextWindow,
+              if (m.maxTokens != null) 'maxTokens': m.maxTokens,
+              'thinking': m.thinking,
+            },
+        ],
+      }),
+    );
+    return _providersOf(data);
+  }
+
+  /// Удаляет своего провайдера.
+  Future<List<AgentProvider>> deleteProvider(String key) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.delete('/projects/providers/${Uri.encodeComponent(key)}'),
+    );
+    return _providersOf(data);
+  }
+
+  /// Проверяет адрес и ключ провайдера и возвращает его список моделей.
+  ///
+  /// [provider] нужен, чтобы проверить уже сохранённого провайдера, не вводя ключ заново:
+  /// тогда ключ берётся на маке.
+  Future<List<AgentModel>> probeProvider({
+    required String baseUrl,
+    String provider = '',
+    String apiKey = '',
+  }) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post('/projects/providers/probe', data: <String, dynamic>{
+        'baseUrl': baseUrl,
+        if (provider.isNotEmpty) 'provider': provider,
+        if (apiKey.isNotEmpty) 'apiKey': apiKey,
+      }),
+    );
+    final raw = data?['models'];
+    return <AgentModel>[
+      if (raw is List)
+        for (final m in raw)
+          if (m is Map) AgentModel.fromJson(m.cast<String, dynamic>()),
+    ];
+  }
+
+  /// Задаёт или убирает ключ встроенного провайдера (пустая строка — убрать).
+  Future<List<AgentProvider>> saveProviderKey(String provider, String apiKey) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post('/projects/providers/key', data: <String, dynamic>{
+        'provider': provider,
+        'apiKey': apiKey,
+      }),
+    );
+    return _providersOf(data);
+  }
+
+  /// Список провайдеров из ответа сервера.
+  List<AgentProvider> _providersOf(Map<String, dynamic>? data) {
+    final raw = data?['providers'];
+    return <AgentProvider>[
+      if (raw is List)
+        for (final p in raw)
+          if (p is Map) AgentProvider.fromJson(p.cast<String, dynamic>()),
+    ];
+  }
+
   /// Проекты: папки внутри разрешённых корней, в которых можно работать.
   Future<List<AgentProject>> projects() async {
     final data = await _send<Map<String, dynamic>>(() => _http.get('/projects'));

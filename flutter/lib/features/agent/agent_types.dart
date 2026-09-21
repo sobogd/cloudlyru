@@ -230,6 +230,78 @@ class AgentSessionInfo {
   String get whereLabel => local ? 'локальная (на маке)' : 'по API (удалённая)';
 }
 
+/// Провайдер моделей, настроенный у pi на маке: свой (с адресом и ключом) или встроенный.
+///
+/// Ключ сюда не попадает никогда — только признак «задан» и его длина: приложению незачем
+/// знать сам ключ, а показать «ключ сохранён» и «похоже, вставился не полностью» по длине можно.
+class AgentProvider {
+  /// Идентификатор провайдера у pi (`local`, `deepseek`, `openai`, …).
+  final String key;
+
+  /// Человеческое название.
+  final String name;
+
+  /// Адрес API; у встроенных провайдеров пусто — pi знает его сам.
+  final String baseUrl;
+
+  /// Тип API (`openai-completions` и подобные) — только у своих провайдеров.
+  final String api;
+
+  /// Свой провайдер из `models.json` (можно править и удалять) или встроенный (`auth.json`).
+  final bool custom;
+
+  /// Ключ задан (или не нужен, как у локальной модели).
+  final bool hasKey;
+
+  /// Длина сохранённого ключа: по ней видно, вставился ли он целиком.
+  final int keyLength;
+
+  /// Провайдер считает на этом маке (llama.cpp), а не по API.
+  final bool local;
+
+  /// Модели, описанные у своего провайдера (у встроенных список даёт сам pi).
+  final List<AgentModel> models;
+
+  /// Провайдер из ответа моста.
+  const AgentProvider({
+    required this.key,
+    this.name = '',
+    this.baseUrl = '',
+    this.api = '',
+    this.custom = false,
+    this.hasKey = false,
+    this.keyLength = 0,
+    this.local = false,
+    this.models = const [],
+  });
+
+  /// Разбор провайдера из ответа моста.
+  factory AgentProvider.fromJson(Map<String, dynamic> json) => AgentProvider(
+        key: json['key']?.toString() ?? '',
+        name: json['name']?.toString() ?? '',
+        baseUrl: json['baseUrl']?.toString() ?? '',
+        api: json['api']?.toString() ?? '',
+        custom: json['custom'] == true,
+        hasKey: json['hasKey'] == true,
+        keyLength: json['keyLength'] is num ? (json['keyLength'] as num).toInt() : 0,
+        local: json['local'] == true,
+        models: <AgentModel>[
+          if (json['models'] is List)
+            for (final m in json['models'] as List)
+              if (m is Map)
+                AgentModel.fromJson({
+                  ...m.cast<String, dynamic>(),
+                  'provider': json['key']?.toString() ?? '',
+                  'local': json['local'] == true,
+                  'hasKey': json['hasKey'] == true,
+                }),
+        ],
+      );
+
+  /// Подпись для экрана: название, а если его нет — идентификатор.
+  String get label => name.isNotEmpty ? name : key;
+}
+
 /// Модель, доступная харнессу на маке: локальная llama.cpp или удалённая по API.
 ///
 /// Список приходит от pi, поэтому в нём ровно то, что он действительно может запустить.

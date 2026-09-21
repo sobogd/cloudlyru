@@ -69,6 +69,131 @@ class AgentModelsController extends Notifier<AgentModelsState> {
   }
 }
 
+// --- провайдеры ---
+
+/// Состояние списка провайдеров: свои (models.json) и встроенные (auth.json) на маке.
+class AgentProvidersState {
+  /// Все провайдеры, как их отдаёт мост.
+  final List<AgentProvider> providers;
+
+  /// Идёт загрузка или запись.
+  final bool loading;
+
+  /// Причина последней неудачи или `null`.
+  final String? error;
+
+  /// Состояние списка провайдеров.
+  const AgentProvidersState({this.providers = const [], this.loading = false, this.error});
+
+  /// Свои провайдеры: их можно править и удалять.
+  List<AgentProvider> get custom => [for (final p in providers) if (p.custom) p];
+
+  /// Встроенные провайдеры pi: у них задаётся только ключ.
+  List<AgentProvider> get builtin => [for (final p in providers) if (!p.custom) p];
+}
+
+/// Провайдер списка провайдеров.
+final agentProvidersProvider =
+    NotifierProvider<AgentProvidersController, AgentProvidersState>(AgentProvidersController.new);
+
+/// Провайдеры на маке: чтение, сохранение, удаление и ключи.
+///
+/// Всё, что здесь меняется, меняется в файлах pi на маке (`models.json`, `auth.json`), а не в
+/// приложении: поэтому после каждого действия список перечитывается с мака, а не правится
+/// локально — иначе экран показывал бы состояние, которого на маке нет.
+class AgentProvidersController extends Notifier<AgentProvidersState> {
+  /// Клиент раздела.
+  AgentApi get _api => ref.read(agentApiProvider);
+
+  @override
+  AgentProvidersState build() => const AgentProvidersState();
+
+  /// Читает провайдеров с мака.
+  Future<void> load() async {
+    state = AgentProvidersState(providers: state.providers, loading: true);
+    try {
+      final providers = await _api.providers();
+      state = AgentProvidersState(providers: providers);
+    } on AgentApiException catch (e) {
+      state = AgentProvidersState(providers: state.providers, error: e.message);
+    }
+  }
+
+  /// Сохраняет своего провайдера и возвращает `null` при успехе либо текст ошибки.
+  ///
+  /// Ошибку возвращаем текстом, а не только кладём в состояние: форма показывает её рядом с
+  /// полями, где человек как раз и находится.
+  Future<String?> save({
+    required String key,
+    required String name,
+    required String baseUrl,
+    required String api,
+    required String apiKey,
+    required List<AgentModel> models,
+  }) async {
+    state = AgentProvidersState(providers: state.providers, loading: true);
+    try {
+      final providers = await _api.saveProvider(
+        key: key,
+        name: name,
+        baseUrl: baseUrl,
+        api: api,
+        apiKey: apiKey,
+        models: models,
+      );
+      state = AgentProvidersState(providers: providers);
+      // новый провайдер — новые модели: список моделей в выборе устарел
+      await ref.read(agentModelsProvider.notifier).load();
+      return null;
+    } on AgentApiException catch (e) {
+      state = AgentProvidersState(providers: state.providers, error: e.message);
+      return e.message;
+    }
+  }
+
+  /// Удаляет своего провайдера.
+  Future<void> remove(String key) async {
+    try {
+      final providers = await _api.deleteProvider(key);
+      state = AgentProvidersState(providers: providers);
+      await ref.read(agentModelsProvider.notifier).load();
+    } on AgentApiException catch (e) {
+      state = AgentProvidersState(providers: state.providers, error: e.message);
+    }
+  }
+
+  /// Задаёт или убирает ключ встроенного провайдера.
+  Future<String?> setKey(String provider, String apiKey) async {
+    try {
+      final providers = await _api.saveProviderKey(provider, apiKey);
+      state = AgentProvidersState(providers: providers);
+      await ref.read(agentModelsProvider.notifier).load();
+      return null;
+    } on AgentApiException catch (e) {
+      state = AgentProvidersState(providers: state.providers, error: e.message);
+      return e.message;
+    }
+  }
+
+  /// Проверяет адрес и ключ и отдаёт список моделей провайдера (или ошибку текстом).
+  Future<(List<AgentModel>, String?)> probe({
+    required String baseUrl,
+    String provider = '',
+    String apiKey = '',
+  }) async {
+    try {
+      final models = await _api.probeProvider(
+        baseUrl: baseUrl,
+        provider: provider,
+        apiKey: apiKey,
+      );
+      return (models, null);
+    } on AgentApiException catch (e) {
+      return (const <AgentModel>[], e.message);
+    }
+  }
+}
+
 // --- проекты ---
 
 /// Состояние списка проектов: сами проекты, признак загрузки, состояние моста и ошибка.
