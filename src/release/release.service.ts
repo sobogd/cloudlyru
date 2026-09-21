@@ -36,6 +36,18 @@ export const RELEASE_ARTIFACTS = {
     mime: 'application/zip',
     path: 'macos',
   },
+  /**
+   * Сборка для iPad и iPhone: Ad Hoc архив `.ipa` (подписан distribution-профилем со списком
+   * устройств). Тип отдачи — `application/octet-stream`, а не что-то «айошное»: браузер по нему
+   * только скачивает файл, а установку ведёт Safari по манифесту (`/ios/manifest.plist`).
+   */
+  ios: {
+    key: 'release/ios/cloudlyru-sync.ipa',
+    metaKey: 'release/ios/latest.json',
+    name: 'Cloudly.ipa',
+    mime: 'application/octet-stream',
+    path: 'ios',
+  },
 } as const satisfies Record<string, ReleaseArtifact>;
 
 export type ReleasePlatform = keyof typeof RELEASE_ARTIFACTS;
