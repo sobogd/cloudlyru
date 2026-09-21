@@ -380,9 +380,11 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           padding: EdgeInsets.zero,
           constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
         ),
+        const SizedBox(width: 8),
         Expanded(child: _title(state)),
+        const SizedBox(width: 8),
         _actions(state),
-        const SizedBox(width: 6),
+        const SizedBox(width: 8),
       ],
     ),
   );
@@ -503,7 +505,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
     _EntryKind.tool => _message(
       muted: true,
-      danger: entry.tool!.isError,
       copyText: entry.copyText,
       child: _ToolCard(tool: entry.tool!),
     ),
@@ -583,7 +584,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     required Widget child,
     bool isUser = false,
     bool muted = false,
-    bool danger = false,
   }) {
     final bubble = ConstrainedBox(
       constraints: BoxConstraints(
@@ -597,9 +597,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           // боковым зрением, и оно не спорит с ответом агента
           color: muted ? C.surface2 : (isUser ? C.accentSoft : C.surface),
           borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: isUser ? C.accent : (danger ? C.danger : C.brd),
-          ),
+          // Рамка одна на все виды сообщений, включая неудачные вызовы: об ошибке говорит
+          // красная иконка внутри карточки, а красная рамка делала бы из этого сообщения
+          // самое заметное в переписке.
+          border: Border.all(color: isUser ? C.accent : C.brd),
         ),
         child: child,
       ),
@@ -611,7 +612,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Row(
         mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.end,
+        // кнопка стоит по центру пузыря по вертикали: у высокого сообщения она не уезжает
+        // к нижнему краю и не выглядит приклеенной к тексту
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: isUser
             ? [?button, bubble]
             : [bubble, ?button],
@@ -671,31 +674,22 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
   );
 
-  /// Верхняя граница поля ввода — полоса прогресса заполнения контекста.
+  /// Заполнение контекста — полоса во всю ширину над полем ввода.
+  ///
+  /// Тонкая полоса без рамок и внешних отступов, фон — как у поля ввода: она примыкает к
+  /// нему сверху и читается его границей, а не отдельным элементом. Числа и проценты живут
+  /// в «Сведениях о сессии» — здесь нужен только сам расход.
   Widget _contextBorder(AgentThreadState state) {
     final percent = state.session?.contextPercent ?? 0;
 
-    return SizedBox(
-      height: 14,
-      child: Stack(
-        children: [
-          Container(
-            color: C.surface2,
-          ),
-          Align(
-            alignment: Alignment.center,
-            child: LinearProgressIndicator(
-              value: (percent / 100).clamp(0.0, 1.0),
-              minHeight: 2,
-              backgroundColor: Colors.transparent,
-              valueColor: AlwaysStoppedAnimation(
-                percent >= 85
-                    ? C.danger
-                    : (percent >= 65 ? C.warn : C.accent),
-              ),
-            ),
-          ),
-        ],
+    return LinearProgressIndicator(
+      value: (percent / 100).clamp(0.0, 1.0),
+      minHeight: 3,
+      backgroundColor: C.canvas,
+      // M3 дорисовывает точку-стоп у конца полосы; здесь она была бы мусором
+      stopIndicatorRadius: 0,
+      valueColor: AlwaysStoppedAnimation(
+        percent >= 85 ? C.danger : (percent >= 65 ? C.warn : C.accent),
       ),
     );
   }
@@ -792,7 +786,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        const SizedBox(height: 6),
         _contextBorder(state),
         Stack(
           children: [
@@ -960,28 +953,22 @@ class _ToolCardState extends State<_ToolCard> {
   Widget build(BuildContext context) {
     final tool = widget.tool;
     final summary = tool.summary;
+    // пустые строки вывода убираем один раз на построение: они съедают высоту сообщения,
+    // ничего не сообщая (см. [_compactLines])
+    final output = _compactLines(tool.output);
+    final hasOutput = output.isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         InkWell(
-          onTap: tool.output.isEmpty
-              ? null
-              : () => setState(() => _open = !_open),
+          onTap: hasOutput ? () => setState(() => _open = !_open) : null,
           child: Row(
-            // минимум по содержимому: короткая команда — узкий пузырь, а длина строки вывода
-            // задаётся пределом ширины пузыря, на котором текст переносится
+            // минимум по содержимому: короткая команда — узкий пузырь, а длина строки задаётся
+            // пределом ширины пузыря, на котором текст переносится
             mainAxisSize: MainAxisSize.min,
             children: [
+              // имя инструмента не пишем: вид действия видно по значку
               Icon(_icon, size: 16, color: C.fg3),
-              const SizedBox(width: 6),
-              Text(
-                tool.name,
-                style: const TextStyle(
-                  color: C.fg2,
-                  fontSize: _textSize,
-                  fontFamily: 'monospace',
-                ),
-              ),
               if (summary.isNotEmpty) ...[
                 const SizedBox(width: 8),
                 Flexible(
@@ -990,7 +977,7 @@ class _ToolCardState extends State<_ToolCard> {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                      color: C.fg3,
+                      color: C.fg2,
                       fontSize: _textSize,
                       fontFamily: 'monospace',
                     ),
@@ -1017,7 +1004,7 @@ class _ToolCardState extends State<_ToolCard> {
                   padding: EdgeInsets.only(left: 8),
                   child: Icon(Icons.check, size: 16, color: C.ok),
                 ),
-              if (tool.output.isNotEmpty)
+              if (hasOutput)
                 Padding(
                   padding: const EdgeInsets.only(left: 4),
                   child: Icon(
@@ -1029,11 +1016,11 @@ class _ToolCardState extends State<_ToolCard> {
             ],
           ),
         ),
-        if (_open && tool.output.isNotEmpty)
+        if (_open && hasOutput)
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: SelectableText(
-              tool.output,
+              output,
               style: const TextStyle(
                 color: C.fg3,
                 fontSize: _textSize,
@@ -1116,6 +1103,18 @@ Future<void> copyMessage(BuildContext context, String text) async {
   if (context.mounted) snack(context, 'Скопировано');
 }
 
+/// Убирает пустые строки из служебного текста: вывода команды и «размышлений».
+///
+/// И то и другое приходит с пустыми строками пачками (разделители прогресса, отступы
+/// форматирования) — в переписке они ничего не сообщают, зато удлиняют сообщение. Отступы
+/// в начале строки сохраняем: в выводе кода они значат вложенность.
+String _compactLines(String text) => text
+    .split('\n')
+    .map((line) => line.trimRight())
+    .where((line) => line.trim().isNotEmpty)
+    .join('\n')
+    .trim();
+
 /// Кегль текста сообщений: один и тот же у ответа, команды и «размышлений».
 ///
 /// Совпадает с `fontSize` обычного абзаца разметки (`markdownStyle`): ответ модели приходит
@@ -1142,7 +1141,13 @@ class _CopyButton extends StatelessWidget {
     tooltip: 'Скопировать сообщение',
     // копировать пустое нечего: у ещё не начатого ответа и служебных строк кнопки и нет
     onPressed: text.trim().isEmpty ? null : () => copyMessage(context, text),
-    icon: const Icon(Icons.content_copy, size: 16, color: C.fg3),
+    // Приглушённее остальных иконок: кнопка стоит вне пузыря и не должна спорить за внимание
+    // с содержимым сообщения — оттенок берём от fg3, своего цвета для неё в палитре нет.
+    icon: Icon(
+      Icons.content_copy,
+      size: 16,
+      color: C.fg3.withValues(alpha: 0.6),
+    ),
     visualDensity: VisualDensity.compact,
     padding: EdgeInsets.zero,
     constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
@@ -1174,7 +1179,9 @@ class _BashCardState extends State<_BashCard> {
 
   @override
   Widget build(BuildContext context) {
-    final hasOutput = widget.output.trim().isNotEmpty;
+    // пустые строки вывода убираем: команда печатает их пачками, а несут они только высоту
+    final output = _compactLines(widget.output);
+    final hasOutput = output.isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1210,7 +1217,7 @@ class _BashCardState extends State<_BashCard> {
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: SelectableText(
-              widget.output,
+              output,
               style: const TextStyle(
                 color: C.fg3,
                 fontSize: _textSize,
@@ -1246,6 +1253,9 @@ class _ReasoningBlockState extends State<_ReasoningBlock> {
 
   @override
   Widget build(BuildContext context) {
+    // пустые строки в размышлениях убираем: модель ставит их пачками, и они занимают высоту
+    // у сообщения, которое в свёрнутом виде и так одна строка
+    final text = _compactLines(widget.text);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1260,20 +1270,26 @@ class _ReasoningBlockState extends State<_ReasoningBlock> {
                 color: C.fg3,
               ),
               const SizedBox(width: 4),
-              Text(
-                _open
-                    ? 'Размышления'
-                    : 'Размышления (${widget.text.length} симв.)',
-                style: const TextStyle(color: C.fg3, fontSize: _textSize),
+              // Свёрнуто — одна обрезанная строка: по ней видно, о чём модель думала, и она не
+              // отнимает высоту у ответа; полностью текст показывается по нажатию.
+              Flexible(
+                child: Text(
+                  _open || text.isEmpty
+                      ? 'Размышления'
+                      : text.split('\n').first,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: C.fg3, fontSize: _textSize),
+                ),
               ),
             ],
           ),
         ),
         if (_open)
           Padding(
-            padding: const EdgeInsets.only(top: 6, bottom: 6),
+            padding: const EdgeInsets.only(top: 6),
             child: SelectableText(
-              widget.text,
+              text,
               style: const TextStyle(
                 color: C.fg2,
                 fontSize: _textSize,

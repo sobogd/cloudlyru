@@ -77,7 +77,9 @@ MarkdownStyleSheet markdownStyle(BuildContext context) => MarkdownStyleSheet.fro
         color: C.fg,
         fontSize: 12.5,
         fontFamily: 'monospace',
-        backgroundColor: C.canvas,
+        // Подложка светлее пузыря, а не тёмнее (раньше здесь был `canvas`): тёмная плашка на
+        // тёмном пузыре читалась дыркой, и кусок кода в тексте не был виден как код.
+        backgroundColor: C.surface3,
       ),
       blockquote: const TextStyle(color: C.fg2, fontSize: 14, height: 1.35),
       blockquoteDecoration: BoxDecoration(

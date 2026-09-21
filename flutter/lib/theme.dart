@@ -156,6 +156,14 @@ ThemeData buildTheme() {
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       behavior: SnackBarBehavior.floating,
     ),
+    // Выделение текста задано явно: по умолчанию M3 берёт цвет подсветки из `primary` с малой
+    // прозрачностью, и на тёмной подложке выделенные команды и вывод почти не видно — а в
+    // разделе «Проекты» именно их и выделяют, чтобы перенести в терминал.
+    textSelectionTheme: TextSelectionThemeData(
+      selectionColor: C.accent.withValues(alpha: 0.45),
+      selectionHandleColor: C.accent,
+      cursorColor: C.accent,
+    ),
     dividerTheme: const DividerThemeData(color: C.brd, thickness: 1),
   );
 }
