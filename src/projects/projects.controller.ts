@@ -194,16 +194,18 @@ export class ProjectsController {
     );
   }
 
-  /** Сессии проекта: их мост читает из файлов pi на маке. */
+  /**
+   * Сессии проекта или всех проектов сразу: их мост читает из файлов pi на маке.
+   *
+   * Без `path` приходят сессии всех разрешённых проектов одним списком, свежие сверху — по
+   * нему приложение рисует общий список разговоров. С `path` — разговоры одной папки.
+   */
   @Get('sessions')
   async sessions(@Query('path') path?: string) {
     const dir = (path ?? '').trim();
-    if (!dir) throw badRequest('path обязателен');
+    const query = dir ? `?path=${encodeURIComponent(dir)}` : '';
     return this.wrap(() =>
-      this.projects.call<Record<string, unknown>>(
-        'GET',
-        `/sessions?path=${encodeURIComponent(dir)}`,
-      ),
+      this.projects.call<Record<string, unknown>>('GET', `/sessions${query}`),
     );
   }
 

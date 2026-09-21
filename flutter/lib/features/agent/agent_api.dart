@@ -275,12 +275,17 @@ class AgentApi {
     ];
   }
 
-  /// Сессии проекта, свежие сверху: их сервер берёт у моста, а мост — из файлов pi.
-  Future<List<AgentSession>> sessions(String path) async {
+  /// Сессии: одной папки или всех проектов сразу.
+  ///
+  /// Без [path] мост обходит все разрешённые проекты и отдаёт один список разговоров обоих
+  /// харнессов, свежие сверху — им приложение рисует общий список. С [path] — разговоры одной
+  /// папки.
+  Future<List<AgentSession>> sessions([String? path]) async {
+    final dir = (path ?? '').trim();
     final data = await _send<Map<String, dynamic>>(
       () => _http.get(
         '/projects/sessions',
-        queryParameters: <String, dynamic>{'path': path},
+        queryParameters: dir.isEmpty ? null : <String, dynamic>{'path': dir},
       ),
     );
     final raw = data?['sessions'];

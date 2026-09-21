@@ -156,6 +156,67 @@ class AgentModelsController extends Notifier<AgentModelsState> {
   }
 }
 
+// --- модели всех харнессов (для новой сессии) ---
+
+/// Модели всех харнессов сразу: нужны выбору модели для новой сессии, где рядом стоят
+/// локальные, удалённые и модели Claude Code.
+///
+/// Отдельно от [agentModelsProvider], который держит список одного харнесса: там выбор идёт
+/// внутри уже открытого разговора, где харнесс известен, а здесь его только предстоит выбрать.
+class AgentAllModelsState {
+  /// Модели по имени харнесса (`pi`, `claude`).
+  final Map<String, List<AgentModel>> byHarness;
+
+  /// Идёт загрузка.
+  final bool loading;
+
+  /// Причина последней неудачи или `null`.
+  final String? error;
+
+  /// Состояние списка моделей всех харнессов.
+  const AgentAllModelsState({
+    this.byHarness = const {},
+    this.loading = false,
+    this.error,
+  });
+
+  /// Модели харнесса; пусто, если он ещё не загружен или их нет.
+  List<AgentModel> of(String harness) => byHarness[harness] ?? const [];
+}
+
+/// Провайдер моделей всех харнессов.
+final agentAllModelsProvider =
+    NotifierProvider<AgentAllModelsController, AgentAllModelsState>(
+      AgentAllModelsController.new,
+    );
+
+/// Модели всех доступных харнессов: читаются разом при открытии выбора для новой сессии.
+class AgentAllModelsController extends Notifier<AgentAllModelsState> {
+  /// Клиент раздела.
+  AgentApi get _api => ref.read(agentApiProvider);
+
+  @override
+  AgentAllModelsState build() => const AgentAllModelsState();
+
+  /// Читает модели перечисленных харнессов.
+  ///
+  /// Отказ одного харнесса не отменяет остальные: у Claude Code бывает свой капризный вход, и
+  /// терять из-за него список локальных моделей pi было бы неправильно.
+  Future<void> load(List<String> harnesses) async {
+    state = AgentAllModelsState(byHarness: state.byHarness, loading: true);
+    final byHarness = <String, List<AgentModel>>{...state.byHarness};
+    String? error;
+    for (final harness in harnesses) {
+      try {
+        byHarness[harness] = await _api.models(harness: harness);
+      } on AgentApiException catch (e) {
+        error ??= e.message;
+      }
+    }
+    state = AgentAllModelsState(byHarness: byHarness, error: error);
+  }
+}
+
 // --- работа на маке ---
 
 /// Состояние работы на маке: что считается и что закончилось без нас.
@@ -441,51 +502,38 @@ class AgentProjectsController extends Notifier<AgentProjectsState> {
   }
 }
 
-// --- сессии проекта ---
+// --- сессии ---
 
-/// Состояние списка сессий одного проекта.
+/// Состояние общего списка разговоров: сессии всех проектов и обоих харнессов.
 class AgentSessionsState {
-  /// Проект, чьи сессии показаны.
-  final AgentProject? project;
-
   /// Сессии, свежие сверху.
   final List<AgentSession> sessions;
 
   /// Идёт загрузка списка или открытие сессии.
   final bool loading;
 
-  /// Какой харнесс убирать при уборке старых сессий (его выбирает экран).
-  final String purgeHarness;
-
   /// Причина последней неудачи или `null`.
   final String? error;
 
   /// Состояние списка сессий.
   const AgentSessionsState({
-    this.project,
     this.sessions = const [],
     this.loading = false,
-    this.purgeHarness = 'pi',
     this.error,
   });
-
-  /// Копия состояния с выбранным для уборки харнессом.
-  AgentSessionsState withHarness(String harness) => AgentSessionsState(
-    project: project,
-    sessions: sessions,
-    loading: loading,
-    purgeHarness: harness,
-    error: error,
-  );
 }
 
-/// Провайдер сессий проекта.
+/// Провайдер общего списка разговоров.
 final agentSessionsProvider =
     NotifierProvider<AgentSessionsController, AgentSessionsState>(
       AgentSessionsController.new,
     );
 
-/// Сессии проекта: список из файлов pi и открытие новой сессии.
+/// Разговоры со всех проектов: список из файлов обоих харнессов, открытие и уборка.
+///
+/// Список приходит одним запросом (`GET /projects/sessions` без папки), а не обходом проектов:
+/// экран показывает разговоры со всего мака сразу, и запрос на каждую папку на каждое
+/// обновление был бы и медленнее, и шумнее.
 class AgentSessionsController extends Notifier<AgentSessionsState> {
   /// Клиент моста.
   AgentApi get _api => ref.read(agentApiProvider);
@@ -493,30 +541,23 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
   @override
   AgentSessionsState build() => const AgentSessionsState();
 
-  /// Читает сессии проекта.
-  Future<void> load(AgentProject project, {bool silent = false}) async {
+  /// Читает общий список разговоров.
+  Future<void> load({bool silent = false}) async {
     state = AgentSessionsState(
-      project: project,
       sessions: state.sessions,
       // Тихий режим для периодического обновления: список перечитывается, но спиннер не мигает,
       // иначе экран дёргался бы каждые несколько секунд
       loading: !silent,
+      error: state.error,
     );
     try {
-      final sessions = await _api.sessions(project.path);
-      // проект могли сменить, пока шёл ответ: тогда список относится уже не к тому экрану
-      if (state.project?.path != project.path) return;
-      state = AgentSessionsState(project: project, sessions: sessions);
+      state = AgentSessionsState(sessions: await _api.sessions());
     } on AgentApiException catch (e) {
-      state = AgentSessionsState(
-        project: project,
-        sessions: state.sessions,
-        error: e.message,
-      );
+      state = AgentSessionsState(sessions: state.sessions, error: e.message);
     }
   }
 
-  /// Открывает сессию проекта: новую или существующую.
+  /// Открывает сессию: новую в папке проекта или существующую.
   ///
   /// Возвращает описание открытой сессии (её идентификатор выдаёт pi) либо `null`, если мост
   /// отказал: причина при этом уже лежит в состоянии и показывается на экране.
@@ -527,7 +568,6 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     String? modelKey,
   }) async {
     state = AgentSessionsState(
-      project: project,
       sessions: state.sessions,
       loading: true,
       error: state.error,
@@ -540,26 +580,25 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
         sessionId: sessionId,
         modelKey: sessionId == null ? modelKey : null,
       );
-      state = AgentSessionsState(project: project, sessions: state.sessions);
+      state = AgentSessionsState(sessions: state.sessions);
       return session;
     } on AgentApiException catch (e) {
-      state = AgentSessionsState(
-        project: project,
-        sessions: state.sessions,
-        error: e.message,
-      );
+      state = AgentSessionsState(sessions: state.sessions, error: e.message);
       return null;
     }
   }
 
   /// Убирает старые сессии проекта и перечитывает список с мака.
   ///
-  /// Возвращает итог (сколько удалилось и сколько вернулось) или `null`, если мост отказал:
-  /// причина при этом уже лежит в состоянии и показывается на экране.
-  Future<AgentDeleteResult?> purgeOld({int? olderThanDays, int? keep}) async {
-    final project = state.project;
-    if (project == null) return null;
-    final harness = state.purgeHarness;
+  /// Папку и харнесс выбирает человек (в общем списке они не заданы). Возвращает итог (сколько
+  /// удалилось и сколько вернулось) или `null`, если мост отказал: причина при этом уже лежит в
+  /// состоянии и показывается на экране.
+  Future<AgentDeleteResult?> purgeOld({
+    required AgentProject project,
+    required String harness,
+    int? olderThanDays,
+    int? keep,
+  }) async {
     try {
       final result = await _api.purgeSessions(
         path: project.path,
@@ -569,7 +608,7 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
       );
       // Список перечитываем с мака: удаление идёт по файлам, и показывать список, собранный
       // до него, значит однажды снова увидеть удалённый разговор в списке.
-      await load(project);
+      await load();
       return result;
     } on AgentApiException catch (e) {
       showError(e.message);
@@ -585,19 +624,13 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
   Future<AgentDeleteResult?> remove(String sessionId) async {
     try {
       final result = await _api.deleteSession(sessionId);
-      // Строку убираем сразу (ответ уже есть), потом перечитываем список с мака: если файл
-      // вернул живой процесс, разговор останется в списке — и это честнее, чем показать
-      // его удалённым.
       state = AgentSessionsState(
-        project: state.project,
         sessions: [
           for (final s in state.sessions)
             if (s.id != sessionId) s,
         ],
-        purgeHarness: state.purgeHarness,
       );
-      final project = state.project;
-      if (project != null) await load(project);
+      await load();
       return result;
     } on AgentApiException catch (e) {
       showError(e.message);
@@ -614,21 +647,9 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     }
   }
 
-  /// Запоминает, какой харнесс выбран на экране: им убираются старые сессии.
-  ///
-  /// Уборка идёт по файлам на маке, а список приходит сразу по обоим харнессам — поэтому
-  /// разбирать, чьи разговоры удалять, должен экран, а контроллеру нужно только знать ответ.
-  void selectHarness(String harness) {
-    state = state.withHarness(harness);
-  }
-
   /// Показывает ошибку, полученную не от списка (например, отказ моста на открытии).
   void showError(String message) {
-    state = AgentSessionsState(
-      project: state.project,
-      sessions: state.sessions,
-      error: message,
-    );
+    state = AgentSessionsState(sessions: state.sessions, error: message);
   }
 }
 

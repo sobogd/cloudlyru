@@ -16,7 +16,8 @@ stdio и умеет ровно то, что нужно разделу «Прое
 Ручки (все отдаёт наружу сервер приложения, `src/projects` с префиксом `/projects/*`):
   GET    /health                      — жив ли сервис, есть ли pi, что с процессами;
   GET    /projects                    — проекты из allowlist-корней (папки с .git);
-  GET    /sessions?path=<папка>       — сессии проекта (файлы pi), свежие сверху;
+  GET    /sessions?path=<папка>       — сессии проекта (файлы pi), свежие сверху; без `path` —
+                                        сессии всех проектов одним списком;
   GET    /models                      — модели, доступные pi (локальные и по API);
   GET    /providers                   — провайдеры и признак «ключ задан» (самих ключей нет);
   POST   /providers                   — создать или изменить своего провайдера (models.json);
@@ -2714,24 +2715,35 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _list_sessions(self, params):
-        """Сессии проекта из файлов истории: работают и когда процессы не подняты.
+        """Сессии из файлов истории: одной папки или сразу всех проектов.
 
-        Харнесс задаёт вызывающий (`harness=pi|claude`), а без него отдаются оба списка с
-        пометкой, чей это разговор: приложение показывает их вместе, различая по значку.
+        Работают и когда процессы не подняты: список читается прямо из файлов. Без `path`
+        отдаются сессии всех проектов — приложению нужен один общий список разговоров, и
+        обходить папки по одной снаружи значило бы делать десятки запросов на каждое
+        обновление. Харнесс задаёт вызывающий (`harness=pi|claude`), а без него отдаются оба
+        списка с пометкой, чей это разговор: приложение показывает их вместе, различая по значку.
         """
         raw = (params.get("path") or [""])[0]
-        path = allowed_path(raw) if raw else None
-        if path is None:
-            raise PiError("папка вне разрешённых корней: %s" % raw)
         asked = str((params.get("harness") or [""])[0]).strip()
 
+        if raw:
+            path = allowed_path(raw)
+            if path is None:
+                raise PiError("папка вне разрешённых корней: %s" % raw)
+            folders = [path]
+        else:
+            folders = [Path(str(p["path"])) for p in list_projects()]
+
         sessions = []
-        if asked in ("", HARNESS_PI):
-            for file in session_files(path):
-                sessions.append({**read_session_meta(file), "harness": HARNESS_PI})
-        if asked in ("", HARNESS_CLAUDE):
-            for file in claude_session_files(path):
-                sessions.append({**read_claude_meta(file), "harness": HARNESS_CLAUDE})
+        for folder in folders:
+            if asked in ("", HARNESS_PI):
+                for file in session_files(folder):
+                    # `path` — рабочая папка разговора: без неё строка общего списка не знает,
+                    # в каком проекте открывать сессию
+                    sessions.append({**read_session_meta(file), "harness": HARNESS_PI, "path": str(folder)})
+            if asked in ("", HARNESS_CLAUDE):
+                for file in claude_session_files(folder):
+                    sessions.append({**read_claude_meta(file), "harness": HARNESS_CLAUDE, "path": str(folder)})
         # свежие сверху: два списка складываются в один по времени последнего обращения
         sessions.sort(key=lambda s: s.get("updatedAt") or "", reverse=True)
         for session in sessions:
@@ -2740,7 +2752,7 @@ class Handler(BaseHTTPRequestHandler):
             # это видно значком, иначе кажется, что разговор стоит
             running = POOL.maybe(session["id"])
             session["busy"] = bool(running and running.busy)
-        self._json(200, {"path": str(path), "sessions": sessions})
+        self._json(200, {"path": str(folders[0]) if raw else "", "sessions": sessions})
 
     def _open_session(self, body):
         """Открывает сессию в выбранной папке (или продолжает существующую по id).

@@ -39,6 +39,15 @@ class AgentProject {
     sessions: json['sessions'] is num ? (json['sessions'] as num).toInt() : 0,
     lastUsed: DateTime.tryParse(json['lastUsed']?.toString() ?? ''),
   );
+
+  /// Проект по одному пути: имя — последняя папка.
+  ///
+  /// Нужен общему списку разговоров: там у сессии есть только её рабочая папка, а разобранного
+  /// проекта (с именем и счётчиком) нет — открывать сессию всё равно надо с путём.
+  factory AgentProject.fromPath(String path) {
+    final parts = path.split('/').where((p) => p.isNotEmpty).toList();
+    return AgentProject(path: path, name: parts.isEmpty ? path : parts.last);
+  }
 }
 
 /// Сессия pi в проекте — строка списка сессий (файл истории на маке).
@@ -63,6 +72,12 @@ class AgentSession {
   final String harness;
   final String harnessName;
 
+  /// Рабочая папка разговора — в каком проекте его открывать.
+  ///
+  /// Приходит только в общем списке (без папки): по ней строка показывает проект и по ней же
+  /// сессия открывается заново. В списке одной папки поле пустое — она и так известна.
+  final String path;
+
   /// Когда сессия начата и когда в ней последний раз что-то происходило.
   final DateTime? startedAt;
   final DateTime? updatedAt;
@@ -82,6 +97,7 @@ class AgentSession {
     this.model = '',
     this.harness = '',
     this.harnessName = '',
+    this.path = '',
     this.startedAt,
     this.updatedAt,
     this.busy = false,
@@ -96,6 +112,7 @@ class AgentSession {
     model: json['model']?.toString() ?? '',
     harness: json['harness']?.toString() ?? '',
     harnessName: json['harnessName']?.toString() ?? '',
+    path: json['path']?.toString() ?? '',
     startedAt: DateTime.tryParse(json['startedAt']?.toString() ?? ''),
     updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
     busy: json['busy'] == true,
@@ -103,6 +120,12 @@ class AgentSession {
 
   /// Подпись модели для строки списка: `провайдер/идентификатор` или пустая строка.
   String get modelLabel => model.isEmpty ? '' : '$provider/$model';
+
+  /// Имя проекта разговора — последняя папка его пути; пусто, если пути нет.
+  String get projectName {
+    final parts = path.split('/').where((p) => p.isNotEmpty).toList();
+    return parts.isEmpty ? '' : parts.last;
+  }
 }
 
 /// Открытая сессия: то, что мост шлёт в ответ на открытие и в конце каждого ответа.
