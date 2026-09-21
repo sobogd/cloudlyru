@@ -17,6 +17,11 @@ import 'agent_types.dart';
 /// и правит файлы, запускает команды, а модель считает токены — локальная llama.cpp или
 /// удалённый провайдер, если он выбран. Приложение показывает, что агент делает, сколько занято
 /// контекста и сколько это стоило, и отправляет то, что человек написал.
+///
+/// Экран годится на две роли, и различие только в шапке: отдельный экран поверх списка разговоров
+/// (телефон) и правая панель раздела «Проекты» на широком экране ([embedded]). Тело, поле ввода
+/// и работа с сессией в обеих ролях одни и те же — вторая копия переписки разошлась бы с первой
+/// при первой же правке.
 class AgentThreadScreen extends ConsumerStatefulWidget {
   /// Открытая сессия: её идентификатор и модель на момент открытия.
   final AgentSessionInfo session;
@@ -24,11 +29,32 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
   /// Проект, в чьей папке работает агент (нужен для заголовка и подписей).
   final AgentProject project;
 
-  /// Экран разговора с агентом.
+  /// Разговор открыт панелью рядом со списком, а не отдельным экраном.
+  ///
+  /// В этом виде шапку рисует сам экран ([_AgentThreadScreenState._paneHeader]) — по высоте и
+  /// цвету ту же, что у `AppBar`, — и в ней есть кнопка «к списку».
+  final bool embedded;
+
+  /// Ширина панели, в которой открыт разговор; `null` — экран занимает всё окно.
+  ///
+  /// Нужна только для предела ширины пузырей: `MediaQuery` в двухпанельном виде дал бы ширину
+  /// всего окна, и пузырь вылез бы за край панели.
+  final double? paneWidth;
+
+  /// Уход из панели: сброс выбранного разговора в списке.
+  ///
+  /// Назван отдельно от возврата назад, потому что панель — не маршрут: `Navigator.pop` здесь
+  /// закрыл бы весь раздел. На отдельном экране `null` — там работает именно `Navigator`.
+  final VoidCallback? onDismiss;
+
+  /// Экран (или панель) разговора с агентом.
   const AgentThreadScreen({
     super.key,
     required this.session,
     required this.project,
+    this.embedded = false,
+    this.paneWidth,
+    this.onDismiss,
   });
 
   @override
@@ -167,8 +193,14 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final result = await _thread.deleteSession();
     if (!mounted || result == null) return;
     if (result.anyDeleted) {
-      Navigator.of(context).pop();
+      // Сообщение показываем до ухода с экрана: после `pop` и сброса выбора это состояние
+      // может быть уже не смонтировано, а `ScaffoldMessenger` ищется по нему.
       snack(context, 'Сессия удалена');
+      if (widget.embedded) {
+        widget.onDismiss?.call();
+      } else {
+        Navigator.of(context).pop();
+      }
       return;
     }
     if (result.anyRestored) {
@@ -196,78 +228,112 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       if (_follow) _scrollToBottomSoon();
     });
 
-    return Scaffold(
-      appBar: AppBar(
-        // В шапке две строки: имя сессии сверху, под ним мелким шрифтом папка, в которой она
-        // запущена, и выбранная для неё модель. Сама панель снизу за это больше не отвечает.
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              (state.session?.name.isNotEmpty ?? false)
-                  ? state.session!.name
-                  : widget.project.name,
-              style: const TextStyle(color: C.fg, fontSize: 17),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            const SizedBox(height: 1),
-            Text(
-              [
-                widget.project.name,
-                state.session?.modelLabel ?? widget.session.modelLabel,
-              ].where((s) => s.isNotEmpty).join(' · '),
-              style: const TextStyle(color: C.fg3, fontSize: 11),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Сведения о сессии',
-            onPressed: () => setState(() => _details = !_details),
-            icon: Icon(_details ? Icons.info : Icons.info_outline),
-          ),
-          PopupMenuButton<String>(
-            tooltip: 'Ещё',
-            onSelected: (v) => switch (v) {
-              'model' => _pickModel(),
-              'compact' => _compact(),
-              'close' => _closeOnMac(),
-              _ => _delete(),
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(value: 'model', child: Text('Модель')),
-              PopupMenuItem(
-                value: 'compact',
-                enabled: !state.sending,
-                child: const Text('Сжать контекст'),
-              ),
-              const PopupMenuItem(
-                value: 'close',
-                child: Text('Закрыть на маке'),
-              ),
-              const PopupMenuItem(
-                value: 'delete',
-                child: Text('Удалить сессию'),
-              ),
-            ],
-          ),
-        ],
-      ),
-      body: Column(
+    // Тело одинаково в обеих ролях: разница только в том, кто рисует шапку.
+    final body = Column(
+      children: [
+        Expanded(child: _body(state)),
+        if (!_details) _jumpButton(state),
+        if (_details) _detailsPanel(state),
+        if (state.error != null) _errorBar(state),
+        _composer(state),
+      ],
+    );
+
+    if (widget.embedded) {
+      return Column(
         children: [
-          Expanded(child: _body(state)),
-          if (!_details) _jumpButton(state),
-          if (_details) _detailsPanel(state),
-          if (state.error != null) _errorBar(state),
-          _composer(state),
+          _paneHeader(state),
+          Expanded(child: body),
         ],
-      ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: _title(state), actions: _actions(state)),
+      body: body,
     );
   }
+
+  /// Заголовок разговора: имя сессии сверху, под ним мелким шрифтом папка, в которой она
+  /// запущена, и выбранная для неё модель.
+  ///
+  /// Одним и тем же виджетом и в `AppBar` отдельного экрана, и в шапке панели: строки не
+  /// должны разъехаться — по ним видно, что именно открыто.
+  Widget _title(AgentThreadState state) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Text(
+        (state.session?.name.isNotEmpty ?? false)
+            ? state.session!.name
+            : widget.project.name,
+        style: const TextStyle(color: C.fg, fontSize: 17),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      const SizedBox(height: 1),
+      Text(
+        [
+          widget.project.name,
+          state.session?.modelLabel ?? widget.session.modelLabel,
+        ].where((s) => s.isNotEmpty).join(' · '),
+        style: const TextStyle(color: C.fg3, fontSize: 11),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+    ],
+  );
+
+  /// Действия над разговором: сведения, модель, сжатие контекста, закрытие и удаление.
+  List<Widget> _actions(AgentThreadState state) => [
+    IconButton(
+      tooltip: 'Сведения о сессии',
+      onPressed: () => setState(() => _details = !_details),
+      icon: Icon(_details ? Icons.info : Icons.info_outline),
+    ),
+    PopupMenuButton<String>(
+      tooltip: 'Ещё',
+      onSelected: (v) => switch (v) {
+        'model' => _pickModel(),
+        'compact' => _compact(),
+        'close' => _closeOnMac(),
+        _ => _delete(),
+      },
+      itemBuilder: (context) => [
+        const PopupMenuItem(value: 'model', child: Text('Модель')),
+        PopupMenuItem(
+          value: 'compact',
+          enabled: !state.sending,
+          child: const Text('Сжать контекст'),
+        ),
+        const PopupMenuItem(value: 'close', child: Text('Закрыть на маке')),
+        const PopupMenuItem(value: 'delete', child: Text('Удалить сессию')),
+      ],
+    ),
+  ];
+
+  /// Шапка разговора в панели: тот же заголовок и те же действия, что в `AppBar`, плюс кнопка
+  /// «к списку».
+  ///
+  /// Высота и фон — как у `AppBar` (56, [C.canvas]): шапка списка разговоров и шапка самого
+  /// разговора стоят на одной линии и читаются одной полосой над двумя панелями.
+  Widget _paneHeader(AgentThreadState state) => Container(
+    height: 56,
+    color: C.canvas,
+    child: Row(
+      children: [
+        const SizedBox(width: 4),
+        IconButton(
+          tooltip: 'К списку разговоров',
+          onPressed: widget.onDismiss,
+          icon: const Icon(Icons.arrow_back),
+        ),
+        Expanded(child: _title(state)),
+        ..._actions(state),
+        const SizedBox(width: 4),
+      ],
+    ),
+  );
 
   /// Закрывает процесс pi на маке, оставляя разговор в истории.
   Future<void> _closeOnMac() async {
@@ -351,9 +417,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       child: Container(
         // ширину ограничиваем: пузырь во всю ширину на длинном ответе теряет границу между
         // вопросом и ответом
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.sizeOf(context).width * 0.92,
-        ),
+        constraints: BoxConstraints(maxWidth: _bubbleMax(context)),
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
@@ -411,6 +475,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       ),
     );
   }
+
+  /// Предельная ширина пузыря: почти вся панель, в которой открыт разговор.
+  ///
+  /// Считается от ширины панели, а не окна ([widget.paneWidth]): в двухпанельном виде пузырь
+  /// во всю ширину окна вылез бы за край правой панели и уехал под неё.
+  double _bubbleMax(BuildContext context) =>
+      (widget.paneWidth ?? MediaQuery.sizeOf(context).width) * 0.92;
 
   /// Один блок ответа: кусок текста, «размышления» или карточка вызова инструмента.
   ///

@@ -1,5 +1,8 @@
 import 'dart:async';
 
+// `CupertinoPageRoute` берём точечно: это маршрут с горизонтальным слайдом и пальцевым
+// возвратом от края на всех платформах, а из всего `cupertino.dart` в файле он один.
+import 'package:flutter/cupertino.dart' show CupertinoPageRoute;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -31,8 +34,21 @@ class ProjectsScreen extends ConsumerStatefulWidget {
   ConsumerState<ProjectsScreen> createState() => _ProjectsScreenState();
 }
 
-/// Состояние экрана: контроллеры, снимок работы и признак «открываю сессию».
+/// Состояние экрана: контроллеры, снимок работы, выбранный разговор и его панель.
 class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
+  /// Минимальная ширина раздела, с которой список разговоров и сам разговор показываются рядом.
+  ///
+  /// Порог только по ширине, без оглядки на высоту: короткий горизонтальный экран (телефон с
+  /// внешней клавиатурой) — тоже рабочий случай, и две панели там нужны так же, как на мониторе.
+  static const _twoPaneMin = 720.0;
+
+  /// Пределы ширины колонки со списком в двухпанельном виде.
+  ///
+  /// Ниже минимума колонка уже не читается, а выше максимума список забрал бы у переписки
+  /// больше трети экрана — на большом мониторе это заметно.
+  static const _sidebarMin = 300.0;
+  static const _sidebarMax = 380.0;
+
   /// Контроллер общего списка разговоров.
   late final AgentSessionsController _sessions;
 
@@ -47,6 +63,39 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
   /// Какие разговоры были «готовы» на прошлом проходе — чтобы показать про новые один раз.
   Set<String> _finishedBefore = const {};
+
+  /// Разговор, выбранный в двухпанельном виде (id строки списка); `null` — ничего не выбрано.
+  ///
+  /// Хранится именно id, а не сама строка: список раз в пять секунд перечитывается, и объекты
+  /// [AgentSession] заменяются новыми — выбранная строка иначе устарела бы в ту же секунду.
+  String? _selectedId;
+
+  /// Открытая сессия выбранного разговора; `null` — мост ещё поднимает процесс на маке.
+  AgentSessionInfo? _opened;
+
+  /// Проект выбранного разговора: из строки списка или из мастера новой сессии.
+  ///
+  /// Хранится вместе с сессией, а не выводится из её пути: у новой сессии проекта в строке нет,
+  /// а имя папки и имя проекта — не одно и то же.
+  AgentProject? _openProject;
+
+  /// Идёт открытие разговора в панели (включая новый — у него ещё нет id).
+  bool _starting = false;
+
+  /// Номер последнего открытия: ответ моста применяется, только если он всё ещё последний.
+  ///
+  /// Без него повторный тап по списку, пока открывался предыдущий разговор, показывал бы в панели
+  /// тот, на который человек уже не смотрит — а то и навсегда оставлял бы спиннер.
+  int _openSeq = 0;
+
+  /// Готовый виджет панели разговора и ключ, под который он собран.
+  ///
+  /// Экземпляр держится, чтобы отдавать из `build` тот же объект: `Element.updateChild`
+  /// пропускает перестройку поддерева для идентичного виджета. Иначе обновление списка раз в
+  /// пять секунд (и каждого снимка работы) перестраивало бы переписку целиком — то есть заново
+  /// разбирало markdown каждого видимого сообщения.
+  Widget? _thread;
+  String? _threadKey;
 
   @override
   void initState() {
@@ -95,7 +144,10 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// Если человек не дошёл до второго шага или закрыл мастер, ничего не открывается. Модель из
   /// выбора запоминается как модель по умолчанию харнесса — следующая новая сессия у этого
   /// агента начнётся с неё, если мастер снова закроют на этом шаге.
-  Future<void> _newSession() async {
+  ///
+  /// [wide] — открывать разговор в правой панели (широкий экран) или отдельным экраном поверх
+  /// списка (телефон): режим выбирает раскладка ([build]), а не сам мастер.
+  Future<void> _newSession({required bool wide}) async {
     final choice = await showNewSessionWizard(context, ref);
     if (choice == null || !mounted) return;
     if (choice.modelKey != null) {
@@ -108,22 +160,35 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       choice.project,
       harness: choice.harness,
       modelKey: choice.modelKey,
+      embedded: wide,
     );
   }
 
-  /// Открывает сессию (новую или существующую) и переходит в переписку.
+  /// Открывает сессию (новую или существующую) и показывает её разговор.
   ///
-  /// Открытие — это запуск процесса агента на маке: он занимает секунду-две, поэтому кнопка на
-  /// это время гаснет, а отказ показывается на экране, а не молчанием.
+  /// Открытие — это запуск процесса агента на маке: он занимает секунду-две. В двухпанельном
+  /// виде строка списка подсвечивается и панель показывает спиннер сразу — иначе отклика не
+  /// видно до самого ответа моста; на телефоне разговор открывается экраном поверх списка.
+  /// Отказ моста виден строкой над списком, а не молчанием.
   Future<void> _open(
     AgentProject project, {
     String harness = 'pi',
     String? sessionId,
     String? modelKey,
+    required bool embedded,
   }) async {
     // Разговор, который открывают, больше не «готов»: человек увидит его сам
     if (sessionId != null) {
       ref.read(agentActivityProvider.notifier).markSeen(sessionId);
+    }
+    final seq = ++_openSeq;
+    if (embedded) {
+      setState(() {
+        _starting = true;
+        _selectedId = sessionId;
+        _opened = null;
+        _openProject = project;
+      });
     }
     final session = await _sessions.open(
       project,
@@ -131,14 +196,54 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       sessionId: sessionId,
       modelKey: modelKey,
     );
-    if (session == null || !mounted) return;
+    // Пока ждали ответа, человек мог выбрать другой разговор или закрыть панель: тогда этот
+    // ответ уже никому не нужен, и показывать его нельзя
+    if (seq != _openSeq) return;
+    if (session == null) {
+      // Причина отказа уже лежит в состоянии списка, а выбранным при этом ничего не остаётся
+      if (embedded && mounted) _clearSelection();
+      return;
+    }
+    if (!mounted) return;
+    if (embedded) {
+      setState(() {
+        _starting = false;
+        _selectedId = session.id;
+        _opened = session;
+      });
+      await _sessions.load();
+      return;
+    }
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) =>
-            AgentThreadScreen(session: session, project: project),
+      // `CupertinoPageRoute`, а не `MaterialPageRoute`: у него переход — горизонтальный слайд,
+      // который можно потянуть назад пальцем от края, и он одинаков на Android и iOS. Переход
+      // идёт на композиторе и ничего не перестраивает: список остаётся жив под экраном вместе
+      // с прокруткой, поэтому возврат мгновенный.
+      CupertinoPageRoute<void>(
+        builder: (_) => AgentThreadScreen(session: session, project: project),
       ),
     );
     if (mounted) await _sessions.load();
+  }
+
+  /// Сбрасывает выбор в двухпанельном виде: правая панель возвращается к заглушке.
+  void _clearSelection() => setState(() {
+    _openSeq++;
+    _starting = false;
+    _selectedId = null;
+    _opened = null;
+    _openProject = null;
+  });
+
+  /// Снимает выбор, если выбранного разговора больше нет в списке.
+  ///
+  /// Нужно после удаления и уборки: без этого правая панель продолжала бы показывать разговор,
+  /// которого на маке уже нет.
+  void _pruneSelection() {
+    final id = _selectedId;
+    if (id == null) return;
+    if (ref.read(agentSessionsProvider).sessions.any((s) => s.id == id)) return;
+    _clearSelection();
   }
 
   /// Удаляет сессию на маке вместе с историей.
@@ -157,6 +262,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     if (!ok || !mounted) return;
     final result = await _sessions.remove(session.id);
     if (!mounted || result == null) return;
+    // Удалённый разговор закрывается и в правой панели, если был в ней открыт
+    _pruneSelection();
     if (result.anyRestored) {
       snack(
         context,
@@ -214,6 +321,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       keep: choice.keep,
     );
     if (!mounted || result == null) return;
+    _pruneSelection();
     final restored = result.anyRestored
         ? ', ${result.restored} вернулись: их ведут живые процессы Claude Code'
         : '';
@@ -228,64 +336,189 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(agentSessionsProvider);
-    final projects = ref.watch(agentProjectsProvider);
 
+    return LayoutBuilder(
+      builder: (context, c) {
+        // Раскладка — по ширине самого раздела: `LayoutBuilder` отдаёт уже урезанные границы,
+        // в которые не входят бар разделов и разделитель (`Shell`), поэтому порог один и тот же
+        // на всех платформах. `MediaQuery` дал бы ширину окна, и порог пришлось бы подгонять
+        // под чужие виджеты — а на маке и iPad окно меняется на лету.
+        final wide = c.maxWidth >= _twoPaneMin;
+        return wide ? _twoPaneBody(state, c.maxWidth) : _singlePane(state);
+      },
+    );
+  }
+
+  /// Однопанельный вид: список во всю ширину, разговор открывается экраном поверх (телефон).
+  Widget _singlePane(AgentSessionsState state) => Scaffold(
+    appBar: AppBar(
+      title: const Text(
+        'Проекты',
+        style: TextStyle(color: C.fg, fontSize: 18),
+      ),
+      actions: _actions(state, wide: false),
+    ),
+    floatingActionButton: FloatingActionButton(
+      tooltip: 'Новая сессия',
+      backgroundColor: C.accent,
+      foregroundColor: C.accentFg,
+      onPressed: state.loading ? null : () => _newSession(wide: false),
+      child: const Icon(Icons.add),
+    ),
+    body: _sidebar(state, wide: false),
+  );
+
+  /// Двухпанельный вид: список разговоров слева, выбранный разговор справа.
+  ///
+  /// Справа — тот же экран разговора, только встроенный ([AgentThreadScreen.embedded]): работа
+  /// с сессией, переписка и поле ввода у него одни и те же, а не вторая копия.
+  Widget _twoPaneBody(AgentSessionsState state, double width) {
+    final sidebar = (width * 0.34).clamp(_sidebarMin, _sidebarMax);
     return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'Проекты',
-          style: TextStyle(color: C.fg, fontSize: 18),
-        ),
-        actions: [
-          IconButton(
-            // Провайдеры и ключи — рядом с моделями, а не в «Настройках» приложения: это
-            // настройка харнесса на маке, и живёт она там же, где список разговоров
-            tooltip: 'Модели и ключи',
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => const AgentProvidersScreen(),
-              ),
-            ),
-            icon: const Icon(Icons.vpn_key_outlined),
-          ),
-          PopupMenuButton<String>(
-            tooltip: 'Ещё',
-            onSelected: (v) => v == 'purge' ? _purge() : null,
-            itemBuilder: (context) => const [
-              PopupMenuItem(
-                value: 'purge',
-                child: Text('Убрать старые…'),
-              ),
-            ],
-          ),
-          IconButton(
-            tooltip: 'Обновить список',
-            onPressed: state.loading ? null : () => _sessions.load(),
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton(
-        tooltip: 'Новая сессия',
-        backgroundColor: C.accent,
-        foregroundColor: C.accentFg,
-        onPressed: state.loading ? null : _newSession,
-        child: const Icon(Icons.add),
-      ),
-      body: Column(
+      body: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // чем отвечает харнесс: без этой строки непонятно, какая модель считает — а на маке
-          // она одна на чат и на агента
-          if (projects.health.label.isNotEmpty) _harnessLine(projects.health),
-          if (state.error != null) _errorBar(state.error!),
-          Expanded(child: _body(state)),
+          SizedBox(
+            width: sidebar,
+            child: Column(
+              children: [
+                _sidebarHeader(state),
+                Expanded(child: _sidebar(state, wide: true)),
+              ],
+            ),
+          ),
+          // Рамка вместо тени: на тёмной теме тень между двумя поверхностями почти не читается
+          const VerticalDivider(width: 1, thickness: 1, color: C.brd),
+          Expanded(child: _detail(width - sidebar - 1)),
         ],
       ),
     );
   }
 
-  /// Тело экрана: индикатор загрузки, пустой список или сами разговоры.
-  Widget _body(AgentSessionsState state) {
+  /// Заголовок колонки со списком в двухпанельном виде.
+  ///
+  /// «Плюс» стоит здесь, а не плавающей кнопкой: в правом нижнем углу экрана теперь поле ввода
+  /// разговора, и кнопка висела бы поверх него.
+  Widget _sidebarHeader(AgentSessionsState state) => SizedBox(
+    height: 56,
+    child: Row(
+      children: [
+        const SizedBox(width: 16),
+        const Expanded(
+          child: Text('Проекты', style: TextStyle(color: C.fg, fontSize: 18)),
+        ),
+        ..._actions(state, wide: true),
+        IconButton(
+          tooltip: 'Новая сессия',
+          onPressed: state.loading ? null : () => _newSession(wide: true),
+          icon: const Icon(Icons.add, color: C.accent),
+          visualDensity: VisualDensity.compact,
+        ),
+        const SizedBox(width: 4),
+      ],
+    ),
+  );
+
+  /// Действия над списком: модели и ключи, уборка старых разговоров, обновление.
+  ///
+  /// Одни и те же в шапке однопанельного вида и в заголовке колонки в двухпанельном — иначе
+  /// они разошлись бы поведением. В двухпанельном они плотнее: колонка узкая.
+  List<Widget> _actions(AgentSessionsState state, {required bool wide}) => [
+    IconButton(
+      // Провайдеры и ключи — рядом с моделями, а не в «Настройках» приложения: это настройка
+      // харнесса на маке, и живёт она там же, где список разговоров
+      tooltip: 'Модели и ключи',
+      onPressed: () => Navigator.of(context).push(
+        MaterialPageRoute<void>(builder: (_) => const AgentProvidersScreen()),
+      ),
+      icon: const Icon(Icons.vpn_key_outlined),
+      visualDensity: wide ? VisualDensity.compact : VisualDensity.standard,
+    ),
+    PopupMenuButton<String>(
+      tooltip: 'Ещё',
+      onSelected: (v) => v == 'purge' ? _purge() : null,
+      itemBuilder: (context) => const [
+        PopupMenuItem(value: 'purge', child: Text('Убрать старые…')),
+      ],
+    ),
+    IconButton(
+      tooltip: 'Обновить список',
+      onPressed: state.loading ? null : () => _sessions.load(),
+      icon: const Icon(Icons.refresh),
+      visualDensity: wide ? VisualDensity.compact : VisualDensity.standard,
+    ),
+  ];
+
+  /// Колонка со списком разговоров: строка о харнессе, ошибка и сам список.
+  ///
+  /// Заголовка здесь нет: в однопанельном виде его рисует `AppBar` ([_singlePane]), в
+  /// двухпанельном — [_sidebarHeader] над этой колонкой.
+  Widget _sidebar(AgentSessionsState state, {required bool wide}) {
+    final projects = ref.watch(agentProjectsProvider);
+    return Column(
+      children: [
+        // чем отвечает харнесс: без этой строки непонятно, какая модель считает — а на маке
+        // она одна на чат и на агента
+        if (projects.health.label.isNotEmpty) _harnessLine(projects.health),
+        if (state.error != null) _errorBar(state.error!),
+        Expanded(child: _body(state, wide: wide)),
+      ],
+    );
+  }
+
+  /// Правая панель: выбранный разговор, заглушка или спиннер, пока мост поднимает процесс.
+  ///
+  /// Спиннер — и при переходе на другой разговор, и при открытии нового (у него ещё нет id,
+  /// подсветить в списке нечего): мост отвечает через секунду-две, и пустая панель в это время
+  /// выглядела бы как «ничего не произошло».
+  Widget _detail(double width) {
+    final opened = _opened;
+    if (_starting || (opened != null && opened.id != _selectedId)) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final project = _openProject;
+    if (opened == null || project == null) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            'Разговор не выбран. Возьмите его из списка слева — переписка откроется здесь.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: C.fg3, fontSize: 13, height: 1.4),
+          ),
+        ),
+      );
+    }
+    return _threadView(opened, project, width);
+  }
+
+  /// Виджет панели разговора: один и тот же экземпляр, пока не сменился разговор или ширина.
+  ///
+  /// [AgentThreadScreen] держит поток ответа и таймер, а `Element.updateChild` пропускает
+  /// перестройку поддерева для идентичного виджета. Обновление списка (раз в пять секунд) и
+  /// снимка работы приходят сюда каждые несколько секунд: без этого переписка разбирала бы
+  /// markdown всех видимых сообщений столько же раз. Ширина меняется только при изменении
+  /// размера окна — тогда пересборка нужна: от неё зависит предел ширины пузыря.
+  Widget _threadView(AgentSessionInfo session, AgentProject project, double width) {
+    final key = '${session.id}@$width';
+    if (_threadKey != key || _thread == null) {
+      _threadKey = key;
+      _thread = AgentThreadScreen(
+        // Ключ по сессии: смена разговора обязана выбросить состояние прежнего — прокрутку,
+        // черновик в поле ввода и раскрытые карточки инструментов
+        key: ValueKey<String>(session.id),
+        session: session,
+        project: project,
+        embedded: true,
+        paneWidth: width,
+        onDismiss: _clearSelection,
+      );
+    }
+    return _thread!;
+  }
+
+  /// Тело списка: индикатор загрузки, пустой список или сами разговоры.
+  Widget _body(AgentSessionsState state, {required bool wide}) {
     if (state.loading && state.sessions.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -305,17 +538,24 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     return RefreshIndicator(
       onRefresh: () => _sessions.load(),
       child: ListView.builder(
-        padding: EdgeInsets.only(bottom: 88 + navBarInset(context)),
+        // в двухпанельном виде плавающей кнопки нет — низ списка нужно только отбить от края
+        padding: EdgeInsets.only(
+          bottom: navBarInset(context) + (wide ? 24 : 88),
+        ),
         itemCount: state.sessions.length,
-        itemBuilder: (context, i) => _sessionTile(state.sessions[i]),
+        itemBuilder: (context, i) => _sessionTile(state.sessions[i], wide: wide),
       ),
     );
   }
 
   /// Строка списка: имя разговора, проект, харнесс, модель, число сообщений и время.
-  Widget _sessionTile(AgentSession session) {
+  Widget _sessionTile(AgentSession session, {required bool wide}) {
     final activity = ref.watch(agentActivityProvider);
+    final selected = wide && session.id == _selectedId;
     return ListTile(
+      // Выбранный разговор подсвечен: в двухпанельном виде он же открыт справа, и по списку
+      // должно быть видно, какой именно
+      tileColor: selected ? C.accentSoft : null,
       leading: Icon(
         _harnessIcon(session.harness),
         // значок агента подсвечен, пока он работает или пока ответ ждёт просмотра: разговор
@@ -353,11 +593,17 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       ),
       onTap: session.path.isEmpty
           ? null
-          : () => _open(
-              AgentProject.fromPath(session.path),
-              harness: session.harness.isEmpty ? 'pi' : session.harness,
-              sessionId: session.id,
-            ),
+          : () {
+              // Повторное нажатие на уже открытый разговор ничего не делает: перезапускать
+              // процесс на маке ради того же самого незачем
+              if (wide && session.id == _selectedId) return;
+              _open(
+                AgentProject.fromPath(session.path),
+                harness: session.harness.isEmpty ? 'pi' : session.harness,
+                sessionId: session.id,
+                embedded: wide,
+              );
+            },
       trailing: PopupMenuButton<String>(
         tooltip: 'Действия',
         onSelected: (v) => v == 'close' ? _close(session) : _delete(session),
