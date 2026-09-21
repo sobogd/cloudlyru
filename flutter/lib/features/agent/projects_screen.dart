@@ -47,7 +47,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// Открывает список сессий выбранного проекта.
   Future<void> _openProject(AgentProject project) async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => AgentSessionsScreen(project: project)),
+      MaterialPageRoute<void>(
+        builder: (_) => AgentSessionsScreen(project: project),
+      ),
     );
     // после возврата перечитываем: в проекте могла появиться новая сессия
     if (mounted) await _projects.load();
@@ -59,14 +61,19 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Проекты', style: TextStyle(color: C.fg, fontSize: 18)),
+        title: const Text(
+          'Проекты',
+          style: TextStyle(color: C.fg, fontSize: 18),
+        ),
         actions: [
           IconButton(
             // Провайдеры и ключи — рядом с моделями, а не в «Настройках» приложения: это
             // настройка харнесса на маке, и живёт она там же, где список проектов
             tooltip: 'Модели и ключи',
             onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => const AgentProvidersScreen()),
+              MaterialPageRoute<void>(
+                builder: (_) => const AgentProvidersScreen(),
+              ),
             ),
             icon: const Icon(Icons.vpn_key_outlined),
           ),
@@ -131,7 +138,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         [
           project.path,
           if (project.sessions > 0) '${project.sessions} сессий',
-          if (project.lastUsed != null) listDate(project.lastUsed!, DateTime.now()),
+          if (project.lastUsed != null)
+            listDate(project.lastUsed!, DateTime.now()),
         ].join(' · '),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
@@ -143,36 +151,42 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
   /// Строка о харнессе и модели над списком.
   Widget _harnessLine(AgentHealth health) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: Text(
-            health.label,
-            style: const TextStyle(color: C.fg3, fontSize: 12),
-          ),
-        ),
-      );
+    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+    child: Align(
+      alignment: Alignment.centerLeft,
+      child: Text(
+        health.label,
+        style: const TextStyle(color: C.fg3, fontSize: 12),
+      ),
+    ),
+  );
 
   /// Сообщение об ошибке над списком: «мост недоступен» — состояние раздела, а не сбой строки.
   Widget _errorBar(String message) => Container(
-        width: double.infinity,
-        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: C.surface,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: C.danger),
+    width: double.infinity,
+    margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: C.surface,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: C.danger),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.error_outline, color: C.danger, size: 18),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            message,
+            style: const TextStyle(color: C.fg2, fontSize: 13, height: 1.3),
+          ),
         ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Icon(Icons.error_outline, color: C.danger, size: 18),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(message, style: const TextStyle(color: C.fg2, fontSize: 13, height: 1.3)),
-            ),
-            TextButton(onPressed: () => _projects.load(), child: const Text('Повторить')),
-          ],
+        TextButton(
+          onPressed: () => _projects.load(),
+          child: const Text('Повторить'),
         ),
-      );
+      ],
+    ),
+  );
 }

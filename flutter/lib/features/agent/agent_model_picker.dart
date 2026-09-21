@@ -21,25 +21,30 @@ import 'agent_types.dart';
 Future<AgentModel?> showModelPicker(
   BuildContext context,
   WidgetRef ref, {
+  String harness = 'pi',
   String? current,
 }) async {
   final controller = ref.read(agentModelsProvider.notifier);
-  // список читаем здесь, а не при входе в раздел: запрос к маку нужен только тому, кто
-  // действительно открывает выбор модели
-  unawaited(controller.load());
+  // Список читаем здесь, а не при входе в раздел: запрос к маку нужен только тому, кто
+  // действительно открывает выбор модели. Харнесс важен: у pi модели задаются провайдерами,
+  // у Claude Code — своим набором, и показывать одни вместо других нельзя.
+  unawaited(controller.load(harness: harness));
   return showDialog<AgentModel>(
     context: context,
-    builder: (_) => _ModelPickerDialog(current: current),
+    builder: (_) => _ModelPickerDialog(harness: harness, current: current),
   );
 }
 
 /// Диалог выбора модели.
 class _ModelPickerDialog extends ConsumerWidget {
+  /// Харнесс, чьи модели показываются.
+  final String harness;
+
   /// Ключ модели, которая используется сейчас (`провайдер/идентификатор`).
   final String? current;
 
   /// Диалог выбора модели.
-  const _ModelPickerDialog({this.current});
+  const _ModelPickerDialog({required this.harness, this.current});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -47,7 +52,10 @@ class _ModelPickerDialog extends ConsumerWidget {
 
     return AlertDialog(
       backgroundColor: C.surface,
-      title: const Text('Модель', style: TextStyle(color: C.fg, fontSize: 16)),
+      title: Text(
+        'Модель · ${ref.watch(agentHarnessesProvider).nameOf(harness)}',
+        style: const TextStyle(color: C.fg, fontSize: 16),
+      ),
       content: SizedBox(
         width: 420,
         child: state.loading && state.models.isEmpty
@@ -65,44 +73,74 @@ class _ModelPickerDialog extends ConsumerWidget {
                         padding: const EdgeInsets.only(bottom: 8),
                         child: Text(
                           state.error!,
-                          style: const TextStyle(color: C.danger, fontSize: 12.5, height: 1.3),
+                          style: const TextStyle(
+                            color: C.danger,
+                            fontSize: 12.5,
+                            height: 1.3,
+                          ),
                         ),
                       ),
                     if (state.models.isEmpty && state.error == null)
                       const Text(
                         'Моделей не видно. Проверьте на маке, что pi настроен: pi --list-models.',
-                        style: TextStyle(color: C.fg3, fontSize: 12.5, height: 1.3),
+                        style: TextStyle(
+                          color: C.fg3,
+                          fontSize: 12.5,
+                          height: 1.3,
+                        ),
                       ),
                     if (state.local.isNotEmpty) ...[
-                      _groupTitle('На этом маке'),
-                      for (final model in state.local) _row(context, ref, model),
+                      _groupTitle(
+                        harness == 'claude'
+                            ? 'Модели Claude Code'
+                            : 'На этом маке',
+                      ),
+                      for (final model in state.local)
+                        _row(context, ref, model),
                     ],
                     if (state.remote.isNotEmpty) ...[
-                      _groupTitle('По API (удалённые)'),
-                      for (final model in state.remote) _row(context, ref, model),
+                      _groupTitle(
+                        harness == 'claude'
+                            ? 'Остальные'
+                            : 'По API (удалённые)',
+                      ),
+                      for (final model in state.remote)
+                        _row(context, ref, model),
                     ],
                     const SizedBox(height: 8),
-                    const Text(
-                      'Удалённую модель добавляют кнопкой «Добавить провайдера»: адрес и ключ '
-                      'уедут на мак и останутся там — в приложении ключей нет.',
-                      style: TextStyle(color: C.fg3, fontSize: 11.5, height: 1.35),
+                    Text(
+                      harness == 'claude'
+                          ? 'Модели Claude Code задаются псевдонимами, а доступ у него свой — '
+                                'подписка или ключ на маке, и приложение в него не вмешивается.'
+                          : 'Удалённую модель добавляют кнопкой «Добавить провайдера»: адрес и '
+                                'ключ уедут на мак и останутся там — в приложении ключей нет.',
+                      style: const TextStyle(
+                        color: C.fg3,
+                        fontSize: 11.5,
+                        height: 1.35,
+                      ),
                     ),
                   ],
                 ),
               ),
       ),
       actions: [
-        TextButton(
-          // Добавить провайдера можно прямо отсюда: чаще всего выбор модели открывают именно
-          // для того, чтобы понять, чего в списке не хватает
-          onPressed: () {
-            Navigator.of(context).pop();
-            Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => const AgentProvidersScreen()),
-            );
-          },
-          child: const Text('Добавить провайдера'),
-        ),
+        // Провайдеры есть только у pi: Claude Code берёт модели из своей подписки или ключа,
+        // и добавлять там нечего
+        if (harness == 'pi')
+          TextButton(
+            // Добавить провайдера можно прямо отсюда: чаще всего выбор модели открывают именно
+            // для того, чтобы понять, чего в списке не хватает
+            onPressed: () {
+              Navigator.of(context).pop();
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const AgentProvidersScreen(),
+                ),
+              );
+            },
+            child: const Text('Добавить провайдера'),
+          ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Закрыть'),
@@ -113,13 +151,14 @@ class _ModelPickerDialog extends ConsumerWidget {
 
   /// Заголовок группы моделей: «на маке» и «по API».
   Widget _groupTitle(String text) => Padding(
-        padding: const EdgeInsets.only(top: 8, bottom: 2),
-        child: Text(text, style: const TextStyle(color: C.fg3, fontSize: 12)),
-      );
+    padding: const EdgeInsets.only(top: 8, bottom: 2),
+    child: Text(text, style: const TextStyle(color: C.fg3, fontSize: 12)),
+  );
 
   /// Строка модели: название, идентификатор, окно контекста и признак «нужен ключ».
   Widget _row(BuildContext context, WidgetRef ref, AgentModel model) {
-    final isCurrent = current != null && (current == model.key || current == model.id);
+    final isCurrent =
+        current != null && (current == model.key || current == model.id);
     final enabled = model.hasKey;
     return InkWell(
       onTap: enabled ? () => Navigator.of(context).pop(model) : null,
@@ -129,7 +168,9 @@ class _ModelPickerDialog extends ConsumerWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Icon(
-              isCurrent ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+              isCurrent
+                  ? Icons.radio_button_checked
+                  : Icons.radio_button_unchecked,
               size: 18,
               color: isCurrent ? C.accent : C.fg3,
             ),
@@ -149,7 +190,8 @@ class _ModelPickerDialog extends ConsumerWidget {
                   Text(
                     [
                       model.key,
-                      if (model.contextWindow != null) 'окно ${_tokens(model.contextWindow!)}',
+                      if (model.contextWindow != null)
+                        'окно ${_tokens(model.contextWindow!)}',
                       if (model.thinking) 'размышления',
                       if (!model.hasKey) 'нужен ключ на маке',
                     ].join(' · '),

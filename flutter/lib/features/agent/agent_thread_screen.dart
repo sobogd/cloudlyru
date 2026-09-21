@@ -25,7 +25,11 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
   final AgentProject project;
 
   /// Экран разговора с агентом.
-  const AgentThreadScreen({super.key, required this.session, required this.project});
+  const AgentThreadScreen({
+    super.key,
+    required this.session,
+    required this.project,
+  });
 
   @override
   ConsumerState<AgentThreadScreen> createState() => _AgentThreadScreenState();
@@ -123,7 +127,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
   /// Открывает выбор модели: локальная llama.cpp на маке или удалённый провайдер по API.
   Future<void> _pickModel() async {
-    final chosen = await showModelPicker(context, ref, current: ref.read(agentThreadProvider).session?.model);
+    final session = ref.read(agentThreadProvider).session;
+    final chosen = await showModelPicker(
+      context,
+      ref,
+      harness: session?.harness.isEmpty ?? true ? 'pi' : session!.harness,
+      current: session?.model,
+    );
     if (chosen == null || !mounted) return;
     await _thread.setModel(chosen);
     if (mounted) snack(context, 'Модель: ${chosen.label}');
@@ -177,7 +187,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          (state.session?.name.isNotEmpty ?? false) ? state.session!.name : widget.project.name,
+          (state.session?.name.isNotEmpty ?? false)
+              ? state.session!.name
+              : widget.project.name,
           style: const TextStyle(color: C.fg, fontSize: 18),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
@@ -203,8 +215,14 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 enabled: !state.sending,
                 child: const Text('Сжать контекст'),
               ),
-              const PopupMenuItem(value: 'close', child: Text('Закрыть на маке')),
-              const PopupMenuItem(value: 'delete', child: Text('Удалить сессию')),
+              const PopupMenuItem(
+                value: 'close',
+                child: Text('Закрыть на маке'),
+              ),
+              const PopupMenuItem(
+                value: 'delete',
+                child: Text('Удалить сессию'),
+              ),
             ],
           ),
         ],
@@ -281,7 +299,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 children: [
                   Icon(Icons.arrow_downward, size: 14, color: C.fg2),
                   SizedBox(width: 6),
-                  Text('К новому', style: TextStyle(color: C.fg2, fontSize: 12)),
+                  Text(
+                    'К новому',
+                    style: TextStyle(color: C.fg2, fontSize: 12),
+                  ),
                 ],
               ),
             ),
@@ -302,7 +323,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       child: Container(
         // ширину ограничиваем: пузырь во всю ширину на длинном ответе теряет границу между
         // вопросом и ответом
-        constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.92),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.sizeOf(context).width * 0.92,
+        ),
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
@@ -327,14 +350,19 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
               for (final block in item.blocks) _block(item, block)
             else ...[
               // ответ от моста без блоков (старая сборка) — рисуем как раньше
-              if (item.reasoning.isNotEmpty) _ReasoningBlock(text: item.reasoning),
+              if (item.reasoning.isNotEmpty)
+                _ReasoningBlock(text: item.reasoning),
               if (item.text.isNotEmpty) MarkdownText(item.text),
               for (final tool in item.tools) _toolCard(tool),
             ],
             if (item.isAssistant && item.isEmpty)
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 2),
-                child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+                child: SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
               ),
             // Ошибка прогона — часть ответа, а не отдельное сообщение: так видно, на каком шаге
             // разговор оборвался (например, «Request was aborted» после «Стоп»).
@@ -343,7 +371,11 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 padding: const EdgeInsets.only(top: 6),
                 child: Text(
                   item.error,
-                  style: const TextStyle(color: C.warn, fontSize: 12.5, height: 1.3),
+                  style: const TextStyle(
+                    color: C.warn,
+                    fontSize: 12.5,
+                    height: 1.3,
+                  ),
                 ),
               ),
           ],
@@ -370,47 +402,58 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Показывается именно в переписке, а не в логе: раздел работает без подтверждений, и
   /// единственный способ узнать, что агент сделал сам, — увидеть это рядом с ответом.
   Widget _note(String text) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Icon(Icons.info_outline, color: C.fg3, size: 14),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Text(text, style: const TextStyle(color: C.fg3, fontSize: 12, height: 1.3)),
-            ),
-          ],
+    padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.info_outline, color: C.fg3, size: 14),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            text,
+            style: const TextStyle(color: C.fg3, fontSize: 12, height: 1.3),
+          ),
         ),
-      );
+      ],
+    ),
+  );
 
   /// Карточка прямой команды оболочки (её выполнял не агент, а сам харнесс по просьбе клиента).
   Widget _bashCard(AgentItem item) => Container(
-        width: double.infinity,
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(
-          color: C.surface2,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: C.brd),
+    width: double.infinity,
+    margin: const EdgeInsets.symmetric(vertical: 4),
+    padding: const EdgeInsets.all(10),
+    decoration: BoxDecoration(
+      color: C.surface2,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: C.brd),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SelectableText(
+          '\$ ${item.command}',
+          style: const TextStyle(
+            color: C.fg2,
+            fontSize: 12.5,
+            fontFamily: 'monospace',
+          ),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SelectableText(
-              '\$ ${item.command}',
-              style: const TextStyle(color: C.fg2, fontSize: 12.5, fontFamily: 'monospace'),
-            ),
-            if (item.text.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: SelectableText(
-                  item.text,
-                  style: const TextStyle(color: C.fg3, fontSize: 12, fontFamily: 'monospace'),
-                ),
+        if (item.text.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: SelectableText(
+              item.text,
+              style: const TextStyle(
+                color: C.fg3,
+                fontSize: 12,
+                fontFamily: 'monospace',
               ),
-          ],
-        ),
-      );
+            ),
+          ),
+      ],
+    ),
+  );
 
   /// Карточка вызова инструмента: что агент сделал, с чем и что получил.
   ///
@@ -418,37 +461,40 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// действия — команду, правку файла, поиск по коду. Свёрнута по умолчанию: вывод бывает
   /// на сотни строк, а нужен редко.
   Widget _toolCard(AgentTool tool) => Padding(
-        padding: const EdgeInsets.only(top: 8),
-        child: _ToolCard(tool: tool),
-      );
+    padding: const EdgeInsets.only(top: 8),
+    child: _ToolCard(tool: tool),
+  );
 
   /// Ошибка над полем ввода: пока человек не повторит запрос, ответа нет, и причина должна
   /// быть видна, а не исчезнуть через пару секунд.
   Widget _errorBar(AgentThreadState state) => Container(
-        width: double.infinity,
-        margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: C.surface,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: C.danger),
+    width: double.infinity,
+    margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: C.surface,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: C.danger),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.error_outline, color: C.danger, size: 18),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            state.error!,
+            style: const TextStyle(color: C.fg2, fontSize: 13, height: 1.3),
+          ),
         ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Icon(Icons.error_outline, color: C.danger, size: 18),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                state.error!,
-                style: const TextStyle(color: C.fg2, fontSize: 13, height: 1.3),
-              ),
-            ),
-            if (!state.sending)
-              TextButton(onPressed: () => _thread.retry(), child: const Text('Повторить')),
-          ],
-        ),
-      );
+        if (!state.sending)
+          TextButton(
+            onPressed: () => _thread.retry(),
+            child: const Text('Повторить'),
+          ),
+      ],
+    ),
+  );
 
   /// Строка состояния: чем считает модель, где она живёт, сколько занято контекста и сколько
   /// уже идёт работа.
@@ -468,7 +514,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 4),
-      decoration: const BoxDecoration(border: Border(top: BorderSide(color: C.brd))),
+      decoration: const BoxDecoration(
+        border: Border(top: BorderSide(color: C.brd)),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -480,12 +528,19 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 minHeight: 5,
                 backgroundColor: C.surface2,
                 // цвет предупреждает заранее: на 85% окна следующий большой вывод уже не влезет
-                valueColor: AlwaysStoppedAnimation(percent >= 85 ? C.danger : (percent >= 65 ? C.warn : C.accent)),
+                valueColor: AlwaysStoppedAnimation(
+                  percent >= 85
+                      ? C.danger
+                      : (percent >= 65 ? C.warn : C.accent),
+                ),
               ),
             ),
             const SizedBox(height: 4),
             Text(
-              'контекст ${_num(used)} / ${_num(window)} · ${percent.toStringAsFixed(1)}% · '
+              // у Claude Code заполнение окна — оценка из расхода последнего хода, поэтому
+              // процент помечается знаком «≈», а не выдаётся за точное число, как у pi
+              'контекст ${_num(used)} / ${_num(window)} · '
+              '${session.contextEstimated ? '≈' : ''}${percent.toStringAsFixed(1)}% · '
               'свободно ${free == null ? '—' : _num(free)}',
               style: const TextStyle(color: C.fg3, fontSize: 11),
             ),
@@ -496,9 +551,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
               Expanded(
                 child: Text(
                   [
-                    session.modelLabel.isEmpty ? widget.session.modelLabel : session.modelLabel,
+                    session.harnessName.isEmpty ? 'pi' : session.harnessName,
+                    session.modelLabel.isEmpty
+                        ? widget.session.modelLabel
+                        : session.modelLabel,
                     session.whereLabel,
-                    if (state.sending) elapsed.isEmpty ? 'работает…' : 'идёт $elapsed',
+                    if (state.sending)
+                      elapsed.isEmpty ? 'работает…' : 'идёт $elapsed',
                     if (!state.sending && state.usage != null)
                       'токенов: ${state.usage!.input} → ${state.usage!.output}',
                   ].where((s) => s.isNotEmpty).join(' · '),
@@ -508,7 +567,11 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 ),
               ),
               if (state.sending)
-                const SizedBox(width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 2)),
+                const SizedBox(
+                  width: 10,
+                  height: 10,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
             ],
           ),
           if (state.sending && state.step.isNotEmpty)
@@ -531,19 +594,36 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final session = state.session!;
     final rows = <(String, String)>[
       ('Проект', session.path),
+      ('Харнесс', session.harnessName.isEmpty ? 'pi' : session.harnessName),
       ('Модель', session.modelLabel),
       ('Где считает', session.whereLabel),
-      if (session.thinkingLevel.isNotEmpty) ('Размышления', session.thinkingLevel),
-      ('Начата', session.startedAt == null ? '—' : fullDate(session.startedAt!.toLocal())),
-      ('Последняя активность',
-          session.updatedAt == null ? '—' : fullDate(session.updatedAt!.toLocal())),
+      if (session.thinkingLevel.isNotEmpty)
+        ('Размышления', session.thinkingLevel),
+      (
+        'Начата',
+        session.startedAt == null
+            ? '—'
+            : fullDate(session.startedAt!.toLocal()),
+      ),
+      (
+        'Последняя активность',
+        session.updatedAt == null
+            ? '—'
+            : fullDate(session.updatedAt!.toLocal()),
+      ),
       if (state.runStartedAt != null && state.sending)
         ('Текущий прогон', 'идёт ${_elapsed(state.runStartedAt)}'),
-      ('Сообщений', '${_num(session.messages)} (вопросов ${_num(session.userMessages)}, '
-          'ответов ${_num(session.assistantMessages)})'),
+      (
+        'Сообщений',
+        '${_num(session.messages)} (вопросов ${_num(session.userMessages)}, '
+            'ответов ${_num(session.assistantMessages)})',
+      ),
       ('Вызовов инструментов', _num(session.toolCalls)),
-      ('Токенов за сессию', 'вход ${_num(session.tokensInput)} · выход ${_num(session.tokensOutput)} · '
-          'из кэша ${_num(session.tokensCacheRead)}'),
+      (
+        'Токенов за сессию',
+        'вход ${_num(session.tokensInput)} · выход ${_num(session.tokensOutput)} · '
+            'из кэша ${_num(session.tokensCacheRead)}',
+      ),
       ('Токенов всего', _num(session.tokensTotal)),
       if (session.cost > 0) ('Стоимость', session.cost.toStringAsFixed(4)),
       if (session.sessionFile.isNotEmpty) ('Файл на маке', session.sessionFile),
@@ -556,7 +636,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Сведения о сессии', style: TextStyle(color: C.fg2, fontSize: 12)),
+          const Text(
+            'Сведения о сессии',
+            style: TextStyle(color: C.fg2, fontSize: 12),
+          ),
           const SizedBox(height: 6),
           for (final (label, value) in rows)
             Padding(
@@ -566,12 +649,19 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 children: [
                   SizedBox(
                     width: 130,
-                    child: Text(label, style: const TextStyle(color: C.fg3, fontSize: 11.5)),
+                    child: Text(
+                      label,
+                      style: const TextStyle(color: C.fg3, fontSize: 11.5),
+                    ),
                   ),
                   Expanded(
                     child: SelectableText(
                       value,
-                      style: const TextStyle(color: C.fg2, fontSize: 11.5, height: 1.3),
+                      style: const TextStyle(
+                        color: C.fg2,
+                        fontSize: 11.5,
+                        height: 1.3,
+                      ),
                     ),
                   ),
                 ],
@@ -587,60 +677,69 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Снизу прибавляем системный отступ ([navBarInset]): экран открыт отдельным маршрутом, а
   /// `Scaffold` без своей нижней панели не резервирует место под полосу навигации Android.
   Widget _composer(AgentThreadState state) => Container(
-        padding: EdgeInsets.fromLTRB(12, 8, 12, 12 + navBarInset(context)),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _input,
-                // во время работы агента поле закрыто: второй вопрос поверх первого дал бы
-                // две ветки в одном контексте
-                enabled: !state.sending,
-                minLines: 1,
-                maxLines: 5,
-                textInputAction: TextInputAction.newline,
-                keyboardType: TextInputType.multiline,
-                style: const TextStyle(color: C.fg, fontSize: 14),
-                decoration: InputDecoration(
-                  hintText: state.sending ? 'Агент работает…' : 'Что сделать в проекте?',
-                  hintStyle: const TextStyle(color: C.fg3, fontSize: 14),
-                  filled: true,
-                  fillColor: C.surface,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    borderSide: const BorderSide(color: C.brd),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    borderSide: const BorderSide(color: C.brd),
-                  ),
-                ),
-                onChanged: (_) => setState(() {}),
+    padding: EdgeInsets.fromLTRB(12, 8, 12, 12 + navBarInset(context)),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Expanded(
+          child: TextField(
+            controller: _input,
+            // во время работы агента поле закрыто: второй вопрос поверх первого дал бы
+            // две ветки в одном контексте
+            enabled: !state.sending,
+            minLines: 1,
+            maxLines: 5,
+            textInputAction: TextInputAction.newline,
+            keyboardType: TextInputType.multiline,
+            style: const TextStyle(color: C.fg, fontSize: 14),
+            decoration: InputDecoration(
+              hintText: state.sending
+                  ? 'Агент работает…'
+                  : 'Что сделать в проекте?',
+              hintStyle: const TextStyle(color: C.fg3, fontSize: 14),
+              filled: true,
+              fillColor: C.surface,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 14,
+                vertical: 10,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(20),
+                borderSide: const BorderSide(color: C.brd),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(20),
+                borderSide: const BorderSide(color: C.brd),
               ),
             ),
-            const SizedBox(width: 4),
-            state.sending
-                ? IconButton(
-                    tooltip: 'Стоп',
-                    onPressed: () => _thread.stop(),
-                    icon: const Icon(Icons.stop_circle_outlined, color: C.danger, size: 32),
-                  )
-                : IconButton(
-                    tooltip: 'Отправить',
-                    // кнопка активна только при непустом тексте: серая кнопка честнее кнопки,
-                    // которая молча ничего не делает
-                    onPressed: _input.text.trim().isEmpty ? null : _send,
-                    icon: Icon(
-                      Icons.send,
-                      size: 28,
-                      color: _input.text.trim().isEmpty ? C.fg3 : C.accent,
-                    ),
-                  ),
-          ],
+            onChanged: (_) => setState(() {}),
+          ),
         ),
-      );
+        const SizedBox(width: 4),
+        state.sending
+            ? IconButton(
+                tooltip: 'Стоп',
+                onPressed: () => _thread.stop(),
+                icon: const Icon(
+                  Icons.stop_circle_outlined,
+                  color: C.danger,
+                  size: 32,
+                ),
+              )
+            : IconButton(
+                tooltip: 'Отправить',
+                // кнопка активна только при непустом тексте: серая кнопка честнее кнопки,
+                // которая молча ничего не делает
+                onPressed: _input.text.trim().isEmpty ? null : _send,
+                icon: Icon(
+                  Icons.send,
+                  size: 28,
+                  color: _input.text.trim().isEmpty ? C.fg3 : C.accent,
+                ),
+              ),
+      ],
+    ),
+  );
 
   /// Дотягивает переписку до конца после перерисовки кадра.
   ///
@@ -715,14 +814,14 @@ class _ToolCardState extends State<_ToolCard> {
 
   /// Значок инструмента: по нему видно вид действия, не читая имя.
   IconData get _icon => switch (widget.tool.name) {
-        'bash' => Icons.terminal,
-        'read' => Icons.description_outlined,
-        'write' => Icons.note_add_outlined,
-        'edit' => Icons.edit_outlined,
-        'grep' => Icons.search,
-        'find' || 'ls' => Icons.folder_open_outlined,
-        _ => Icons.build_outlined,
-      };
+    'bash' => Icons.terminal,
+    'read' => Icons.description_outlined,
+    'write' => Icons.note_add_outlined,
+    'edit' => Icons.edit_outlined,
+    'grep' => Icons.search,
+    'find' || 'ls' => Icons.folder_open_outlined,
+    _ => Icons.build_outlined,
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -740,14 +839,20 @@ class _ToolCardState extends State<_ToolCard> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           InkWell(
-            onTap: tool.output.isEmpty ? null : () => setState(() => _open = !_open),
+            onTap: tool.output.isEmpty
+                ? null
+                : () => setState(() => _open = !_open),
             child: Row(
               children: [
                 Icon(_icon, size: 15, color: C.fg3),
                 const SizedBox(width: 6),
                 Text(
                   tool.name,
-                  style: const TextStyle(color: C.fg2, fontSize: 12.5, fontFamily: 'monospace'),
+                  style: const TextStyle(
+                    color: C.fg2,
+                    fontSize: 12.5,
+                    fontFamily: 'monospace',
+                  ),
                 ),
                 if (summary.isNotEmpty) ...[
                   const SizedBox(width: 8),
@@ -756,19 +861,31 @@ class _ToolCardState extends State<_ToolCard> {
                       summary,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: C.fg3, fontSize: 12, fontFamily: 'monospace'),
+                      style: const TextStyle(
+                        color: C.fg3,
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                      ),
                     ),
                   ),
                 ] else
                   const Spacer(),
                 if (tool.running)
-                  const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
+                  const SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
                 else if (tool.isError)
                   const Icon(Icons.error_outline, size: 15, color: C.danger)
                 else
                   const Icon(Icons.check, size: 15, color: C.ok),
                 if (tool.output.isNotEmpty)
-                  Icon(_open ? Icons.expand_less : Icons.expand_more, size: 16, color: C.fg3),
+                  Icon(
+                    _open ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: C.fg3,
+                  ),
               ],
             ),
           ),
@@ -777,7 +894,12 @@ class _ToolCardState extends State<_ToolCard> {
               padding: const EdgeInsets.only(top: 6),
               child: SelectableText(
                 tool.output,
-                style: const TextStyle(color: C.fg3, fontSize: 12, fontFamily: 'monospace', height: 1.3),
+                style: const TextStyle(
+                  color: C.fg3,
+                  fontSize: 12,
+                  fontFamily: 'monospace',
+                  height: 1.3,
+                ),
               ),
             ),
         ],
@@ -815,10 +937,16 @@ class _ReasoningBlockState extends State<_ReasoningBlock> {
           onTap: () => setState(() => _open = !_open),
           child: Row(
             children: [
-              Icon(_open ? Icons.expand_less : Icons.expand_more, size: 16, color: C.fg3),
+              Icon(
+                _open ? Icons.expand_less : Icons.expand_more,
+                size: 16,
+                color: C.fg3,
+              ),
               const SizedBox(width: 4),
               Text(
-                _open ? 'Размышления' : 'Размышления (${widget.text.length} симв.)',
+                _open
+                    ? 'Размышления'
+                    : 'Размышления (${widget.text.length} симв.)',
                 style: const TextStyle(color: C.fg3, fontSize: 12),
               ),
             ],
@@ -829,7 +957,11 @@ class _ReasoningBlockState extends State<_ReasoningBlock> {
             padding: const EdgeInsets.only(top: 6, bottom: 6),
             child: SelectableText(
               widget.text,
-              style: const TextStyle(color: C.fg3, fontSize: 12.5, height: 1.35),
+              style: const TextStyle(
+                color: C.fg3,
+                fontSize: 12.5,
+                height: 1.35,
+              ),
             ),
           ),
       ],

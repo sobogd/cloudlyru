@@ -34,11 +34,11 @@ class AgentProject {
 
   /// Разбор строки списка проектов.
   factory AgentProject.fromJson(Map<String, dynamic> json) => AgentProject(
-        path: json['path']?.toString() ?? '',
-        name: json['name']?.toString() ?? '',
-        sessions: json['sessions'] is num ? (json['sessions'] as num).toInt() : 0,
-        lastUsed: DateTime.tryParse(json['lastUsed']?.toString() ?? ''),
-      );
+    path: json['path']?.toString() ?? '',
+    name: json['name']?.toString() ?? '',
+    sessions: json['sessions'] is num ? (json['sessions'] as num).toInt() : 0,
+    lastUsed: DateTime.tryParse(json['lastUsed']?.toString() ?? ''),
+  );
 }
 
 /// Сессия pi в проекте — строка списка сессий (файл истории на маке).
@@ -59,6 +59,10 @@ class AgentSession {
   final String provider;
   final String model;
 
+  /// Харнесс разговора (`pi` или `claude`) и его название для значка в списке.
+  final String harness;
+  final String harnessName;
+
   /// Когда сессия начата и когда в ней последний раз что-то происходило.
   final DateTime? startedAt;
   final DateTime? updatedAt;
@@ -70,20 +74,24 @@ class AgentSession {
     this.messages = 0,
     this.provider = '',
     this.model = '',
+    this.harness = '',
+    this.harnessName = '',
     this.startedAt,
     this.updatedAt,
   });
 
   /// Разбор сессии из ответа моста.
   factory AgentSession.fromJson(Map<String, dynamic> json) => AgentSession(
-        id: json['id']?.toString() ?? '',
-        name: json['name']?.toString() ?? '',
-        messages: json['messages'] is num ? (json['messages'] as num).toInt() : 0,
-        provider: json['provider']?.toString() ?? '',
-        model: json['model']?.toString() ?? '',
-        startedAt: DateTime.tryParse(json['startedAt']?.toString() ?? ''),
-        updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
-      );
+    id: json['id']?.toString() ?? '',
+    name: json['name']?.toString() ?? '',
+    messages: json['messages'] is num ? (json['messages'] as num).toInt() : 0,
+    provider: json['provider']?.toString() ?? '',
+    model: json['model']?.toString() ?? '',
+    harness: json['harness']?.toString() ?? '',
+    harnessName: json['harnessName']?.toString() ?? '',
+    startedAt: DateTime.tryParse(json['startedAt']?.toString() ?? ''),
+    updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
+  );
 
   /// Подпись модели для строки списка: `провайдер/идентификатор` или пустая строка.
   String get modelLabel => model.isEmpty ? '' : '$provider/$model';
@@ -114,6 +122,14 @@ class AgentSessionInfo {
   /// Модель считает на домашнем маке, а не по API — по этому признаку сессия подписывается
   /// словами, чтобы удалённая модель не выглядела как локальная.
   final bool local;
+
+  /// Харнесс разговора (`pi` или `claude`).
+  final String harness;
+  final String harnessName;
+
+  /// Заполнение контекста — оценка, а не точное число (так у Claude Code: он не отдаёт
+  /// «занято токенов» одним полем, и процент считается из расхода последнего хода).
+  final bool contextEstimated;
 
   /// Сколько сообщений в сессии.
   final int messages;
@@ -161,6 +177,9 @@ class AgentSessionInfo {
     this.provider = '',
     this.modelName = '',
     this.local = false,
+    this.harness = '',
+    this.harnessName = '',
+    this.contextEstimated = false,
     this.messages = 0,
     this.busy = false,
     this.thinkingLevel = '',
@@ -182,7 +201,9 @@ class AgentSessionInfo {
 
   /// Разбор сессии из ответа моста.
   factory AgentSessionInfo.fromJson(Map<String, dynamic> json) {
-    final tokens = json['tokens'] is Map ? (json['tokens'] as Map).cast<String, dynamic>() : const {};
+    final tokens = json['tokens'] is Map
+        ? (json['tokens'] as Map).cast<String, dynamic>()
+        : const {};
     int? num_(Object? v) => v is num ? v.toInt() : null;
     return AgentSessionInfo(
       id: json['id']?.toString() ?? '',
@@ -192,12 +213,17 @@ class AgentSessionInfo {
       provider: json['provider']?.toString() ?? '',
       modelName: json['modelName']?.toString() ?? '',
       local: json['local'] == true,
+      harness: json['harness']?.toString() ?? '',
+      harnessName: json['harnessName']?.toString() ?? '',
+      contextEstimated: json['contextEstimated'] == true,
       messages: num_(json['messages']) ?? 0,
       busy: json['busy'] == true,
       thinkingLevel: json['thinkingLevel']?.toString() ?? '',
       contextTokens: num_(json['contextTokens']),
       contextWindow: num_(json['contextWindow']),
-      contextPercent: json['contextPercent'] is num ? (json['contextPercent'] as num).toDouble() : 0,
+      contextPercent: json['contextPercent'] is num
+          ? (json['contextPercent'] as num).toDouble()
+          : 0,
       tokensInput: num_(tokens['input']) ?? 0,
       tokensOutput: num_(tokens['output']) ?? 0,
       tokensCacheRead: num_(tokens['cacheRead']) ?? 0,
@@ -228,6 +254,44 @@ class AgentSessionInfo {
 
   /// Где считает модель — словами для экрана.
   String get whereLabel => local ? 'локальная (на маке)' : 'по API (удалённая)';
+}
+
+/// Харнесс — агент, который работает в папке проекта: pi или Claude Code.
+///
+/// Их может быть несколько, и разговоры у каждого свои: истории лежат в разных местах на маке,
+/// а модели задаются по-своему. Поэтому у сессии всегда есть харнесс, и приложение показывает
+/// его значком, чтобы не путать, чей это разговор.
+class AgentHarness {
+  /// Имя харнесса: `pi` или `claude`.
+  final String harness;
+
+  /// Человеческое название для экрана.
+  final String name;
+
+  /// Стоит ли он на маке (иначе предлагать его бессмысленно).
+  final bool available;
+
+  /// Версия, как её печатает сам харнесс.
+  final String version;
+
+  /// Харнесс из ответа моста.
+  const AgentHarness({
+    required this.harness,
+    this.name = '',
+    this.available = false,
+    this.version = '',
+  });
+
+  /// Разбор харнесса из ответа моста.
+  factory AgentHarness.fromJson(Map<String, dynamic> json) => AgentHarness(
+    harness: json['harness']?.toString() ?? '',
+    name: json['name']?.toString() ?? '',
+    available: json['available'] == true,
+    version: json['version']?.toString() ?? '',
+  );
+
+  /// Подпись для экрана: название, а если его нет — имя харнесса.
+  String get label => name.isNotEmpty ? name : harness;
 }
 
 /// Провайдер моделей, настроенный у pi на маке: свой (с адресом и ключом) или встроенный.
@@ -277,26 +341,28 @@ class AgentProvider {
 
   /// Разбор провайдера из ответа моста.
   factory AgentProvider.fromJson(Map<String, dynamic> json) => AgentProvider(
-        key: json['key']?.toString() ?? '',
-        name: json['name']?.toString() ?? '',
-        baseUrl: json['baseUrl']?.toString() ?? '',
-        api: json['api']?.toString() ?? '',
-        custom: json['custom'] == true,
-        hasKey: json['hasKey'] == true,
-        keyLength: json['keyLength'] is num ? (json['keyLength'] as num).toInt() : 0,
-        local: json['local'] == true,
-        models: <AgentModel>[
-          if (json['models'] is List)
-            for (final m in json['models'] as List)
-              if (m is Map)
-                AgentModel.fromJson({
-                  ...m.cast<String, dynamic>(),
-                  'provider': json['key']?.toString() ?? '',
-                  'local': json['local'] == true,
-                  'hasKey': json['hasKey'] == true,
-                }),
-        ],
-      );
+    key: json['key']?.toString() ?? '',
+    name: json['name']?.toString() ?? '',
+    baseUrl: json['baseUrl']?.toString() ?? '',
+    api: json['api']?.toString() ?? '',
+    custom: json['custom'] == true,
+    hasKey: json['hasKey'] == true,
+    keyLength: json['keyLength'] is num
+        ? (json['keyLength'] as num).toInt()
+        : 0,
+    local: json['local'] == true,
+    models: <AgentModel>[
+      if (json['models'] is List)
+        for (final m in json['models'] as List)
+          if (m is Map)
+            AgentModel.fromJson({
+              ...m.cast<String, dynamic>(),
+              'provider': json['key']?.toString() ?? '',
+              'local': json['local'] == true,
+              'hasKey': json['hasKey'] == true,
+            }),
+    ],
+  );
 
   /// Подпись для экрана: название, а если его нет — идентификатор.
   String get label => name.isNotEmpty ? name : key;
@@ -342,15 +408,19 @@ class AgentModel {
 
   /// Разбор модели из ответа моста.
   factory AgentModel.fromJson(Map<String, dynamic> json) => AgentModel(
-        provider: json['provider']?.toString() ?? '',
-        id: json['id']?.toString() ?? '',
-        name: json['name']?.toString() ?? '',
-        contextWindow: json['contextWindow'] is num ? (json['contextWindow'] as num).toInt() : null,
-        maxTokens: json['maxTokens'] is num ? (json['maxTokens'] as num).toInt() : null,
-        thinking: json['thinking'] == true,
-        local: json['local'] == true,
-        hasKey: json['hasKey'] != false,
-      );
+    provider: json['provider']?.toString() ?? '',
+    id: json['id']?.toString() ?? '',
+    name: json['name']?.toString() ?? '',
+    contextWindow: json['contextWindow'] is num
+        ? (json['contextWindow'] as num).toInt()
+        : null,
+    maxTokens: json['maxTokens'] is num
+        ? (json['maxTokens'] as num).toInt()
+        : null,
+    thinking: json['thinking'] == true,
+    local: json['local'] == true,
+    hasKey: json['hasKey'] != false,
+  );
 
   /// Строка для хранения выбора в настройках и для сравнения с текущей моделью сессии.
   String get key => '$provider/$id';
@@ -394,30 +464,43 @@ class AgentTool {
 
   /// Разбор вызова из ответа моста (в истории приходит готовым объектом).
   factory AgentTool.fromJson(Map<String, dynamic> json) => AgentTool(
-        id: json['id']?.toString() ?? '',
-        name: json['name']?.toString() ?? '',
-        args: json['args'] is Map ? (json['args'] as Map).cast<String, dynamic>() : const {},
-        output: json['output']?.toString() ?? '',
-        isError: json['isError'] == true,
-      );
+    id: json['id']?.toString() ?? '',
+    name: json['name']?.toString() ?? '',
+    args: json['args'] is Map
+        ? (json['args'] as Map).cast<String, dynamic>()
+        : const {},
+    output: json['output']?.toString() ?? '',
+    isError: json['isError'] == true,
+  );
 
   /// Копия с заменёнными полями; `null` означает «оставить как было».
-  AgentTool copyWith({Map<String, dynamic>? args, String? output, bool? isError, bool? running}) =>
-      AgentTool(
-        id: id,
-        name: name,
-        args: args ?? this.args,
-        output: output ?? this.output,
-        isError: isError ?? this.isError,
-        running: running ?? this.running,
-      );
+  AgentTool copyWith({
+    Map<String, dynamic>? args,
+    String? output,
+    bool? isError,
+    bool? running,
+  }) => AgentTool(
+    id: id,
+    name: name,
+    args: args ?? this.args,
+    output: output ?? this.output,
+    isError: isError ?? this.isError,
+    running: running ?? this.running,
+  );
 
   /// Подпись вызова одной строкой: команда у оболочки, путь у файловых инструментов.
   ///
   /// Нужна строке карточки, пока она свёрнута: по ней видно, что агент делает, не разворачивая
   /// вывод целиком.
   String get summary {
-    for (final key in ['command', 'path', 'file_path', 'pattern', 'query', 'url']) {
+    for (final key in [
+      'command',
+      'path',
+      'file_path',
+      'pattern',
+      'query',
+      'url',
+    ]) {
       final value = args[key];
       if (value is String && value.isNotEmpty) return value;
     }
@@ -450,17 +533,18 @@ class AgentBlock {
   const AgentBlock.text(String value) : this(type: 'text', text: value);
 
   /// Кусок «размышлений» модели.
-  const AgentBlock.reasoning(String value) : this(type: 'reasoning', text: value);
+  const AgentBlock.reasoning(String value)
+    : this(type: 'reasoning', text: value);
 
   /// Ссылка на карточку вызова инструмента.
   const AgentBlock.tool(String id) : this(type: 'tool', toolId: id);
 
   /// Разбор блока из ответа моста.
   factory AgentBlock.fromJson(Map<String, dynamic> json) => AgentBlock(
-        type: json['type']?.toString() ?? 'text',
-        text: json['text']?.toString() ?? '',
-        toolId: json['id']?.toString() ?? '',
-      );
+    type: json['type']?.toString() ?? 'text',
+    text: json['text']?.toString() ?? '',
+    toolId: json['id']?.toString() ?? '',
+  );
 
   /// Это кусок текста.
   bool get isText => type == 'text';
@@ -472,7 +556,8 @@ class AgentBlock {
   bool get isTool => type == 'tool';
 
   /// Копия с дописанным текстом.
-  AgentBlock plus(String extra) => AgentBlock(type: type, text: text + extra, toolId: toolId);
+  AgentBlock plus(String extra) =>
+      AgentBlock(type: type, text: text + extra, toolId: toolId);
 }
 
 /// Элемент переписки: вопрос человека, ответ агента или прямая команда оболочки.
@@ -517,22 +602,22 @@ class AgentItem {
 
   /// Разбор элемента из ответа моста.
   factory AgentItem.fromJson(Map<String, dynamic> json) => AgentItem(
-        kind: json['kind']?.toString() ?? 'assistant',
-        text: json['text']?.toString() ?? '',
-        reasoning: json['reasoning']?.toString() ?? '',
-        error: json['error']?.toString() ?? '',
-        command: json['command']?.toString() ?? '',
-        blocks: <AgentBlock>[
-          if (json['blocks'] is List)
-            for (final b in json['blocks'] as List)
-              if (b is Map) AgentBlock.fromJson(b.cast<String, dynamic>()),
-        ],
-        tools: <AgentTool>[
-          if (json['tools'] is List)
-            for (final t in json['tools'] as List)
-              if (t is Map) AgentTool.fromJson(t.cast<String, dynamic>()),
-        ],
-      );
+    kind: json['kind']?.toString() ?? 'assistant',
+    text: json['text']?.toString() ?? '',
+    reasoning: json['reasoning']?.toString() ?? '',
+    error: json['error']?.toString() ?? '',
+    command: json['command']?.toString() ?? '',
+    blocks: <AgentBlock>[
+      if (json['blocks'] is List)
+        for (final b in json['blocks'] as List)
+          if (b is Map) AgentBlock.fromJson(b.cast<String, dynamic>()),
+    ],
+    tools: <AgentTool>[
+      if (json['tools'] is List)
+        for (final t in json['tools'] as List)
+          if (t is Map) AgentTool.fromJson(t.cast<String, dynamic>()),
+    ],
+  );
 
   /// Это вопрос человека.
   bool get isUser => kind == 'user';
@@ -547,16 +632,15 @@ class AgentItem {
     List<AgentBlock>? blocks,
     List<AgentTool>? tools,
     String? error,
-  }) =>
-      AgentItem(
-        kind: kind,
-        text: text ?? this.text,
-        reasoning: reasoning ?? this.reasoning,
-        blocks: blocks ?? this.blocks,
-        tools: tools ?? this.tools,
-        error: error ?? this.error,
-        command: command,
-      );
+  }) => AgentItem(
+    kind: kind,
+    text: text ?? this.text,
+    reasoning: reasoning ?? this.reasoning,
+    blocks: blocks ?? this.blocks,
+    tools: tools ?? this.tools,
+    error: error ?? this.error,
+    command: command,
+  );
 
   /// Ответ пуст: ни текста, ни карточек — на экране это ожидание первого куска ответа.
   bool get isEmpty =>
@@ -598,20 +682,18 @@ class AgentHealth {
 
   /// Разбор ответа `/health`.
   factory AgentHealth.fromJson(Map<String, dynamic> json) => AgentHealth(
-        pi: json['pi']?.toString() ?? '',
-        provider: json['provider']?.toString() ?? '',
-        model: json['model']?.toString() ?? '',
-        roots: <String>[
-          if (json['roots'] is List)
-            for (final r in json['roots'] as List) r.toString(),
-        ],
-      );
+    pi: json['pi']?.toString() ?? '',
+    provider: json['provider']?.toString() ?? '',
+    model: json['model']?.toString() ?? '',
+    roots: <String>[
+      if (json['roots'] is List)
+        for (final r in json['roots'] as List) r.toString(),
+    ],
+  );
 
   /// Подпись «харнесс и модель» для шапки раздела.
-  String get label => [
-        if (pi.isNotEmpty) 'pi $pi',
-        if (model.isNotEmpty) model,
-      ].join(' · ');
+  String get label =>
+      [if (pi.isNotEmpty) 'pi $pi', if (model.isNotEmpty) model].join(' · ');
 }
 
 /// Одно событие потока ответа.

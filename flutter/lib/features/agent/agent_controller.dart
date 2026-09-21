@@ -11,12 +11,77 @@ import 'agent_types.dart';
 /// Провайдером, а не полем состояния: адрес сервера и сессия меняются в рантайме (вход, выход,
 /// смена сервера в настройках), и каждый следующий запрос должен уходить с текущими — поэтому
 /// клиент читается заново, а не хранится. Так же устроен чат.
-final agentApiProvider = Provider<AgentApi>((ref) => AgentApi(ref.read(appStateProvider).api));
+final agentApiProvider = Provider<AgentApi>(
+  (ref) => AgentApi(ref.read(appStateProvider).api),
+);
+
+// --- харнессы ---
+
+/// Состояние списка харнессов: кто вообще есть на маке.
+class AgentHarnessesState {
+  /// Харнессы с признаком «стоит на маке».
+  final List<AgentHarness> harnesses;
+
+  /// Идёт загрузка.
+  final bool loading;
+
+  /// Причина последней неудачи или `null`.
+  final String? error;
+
+  /// Состояние списка харнессов.
+  const AgentHarnessesState({
+    this.harnesses = const [],
+    this.loading = false,
+    this.error,
+  });
+
+  /// Доступные на маке.
+  List<AgentHarness> get available => [
+    for (final h in harnesses)
+      if (h.available) h,
+  ];
+
+  /// Название харнесса по имени (`pi`, `claude`); пусто — если такого нет в списке.
+  String nameOf(String harness) {
+    for (final h in harnesses) {
+      if (h.harness == harness) return h.label;
+    }
+    return harness;
+  }
+}
+
+/// Провайдер списка харнессов.
+final agentHarnessesProvider =
+    NotifierProvider<AgentHarnessesController, AgentHarnessesState>(
+      AgentHarnessesController.new,
+    );
+
+/// Харнессы на маке: читаются один раз при входе в раздел.
+class AgentHarnessesController extends Notifier<AgentHarnessesState> {
+  /// Клиент раздела.
+  AgentApi get _api => ref.read(agentApiProvider);
+
+  @override
+  AgentHarnessesState build() => const AgentHarnessesState();
+
+  /// Читает список харнессов.
+  Future<void> load() async {
+    state = AgentHarnessesState(harnesses: state.harnesses, loading: true);
+    try {
+      state = AgentHarnessesState(harnesses: await _api.harnesses());
+    } on AgentApiException catch (e) {
+      state = AgentHarnessesState(harnesses: state.harnesses, error: e.message);
+    }
+  }
+}
 
 // --- модели ---
 
-/// Состояние списка моделей: что pi на маке может запустить.
+/// Состояние списка моделей: что выбранный харнесс может запустить.
 class AgentModelsState {
+  /// Чей это список: модели у pi и Claude Code разные.
+  final String harness;
+
   /// Локальные и удалённые модели.
   final List<AgentModel> models;
 
@@ -27,13 +92,24 @@ class AgentModelsState {
   final String? error;
 
   /// Состояние списка моделей.
-  const AgentModelsState({this.models = const [], this.loading = false, this.error});
+  const AgentModelsState({
+    this.harness = 'pi',
+    this.models = const [],
+    this.loading = false,
+    this.error,
+  });
 
   /// Только локальные (считают на маке) и только удалённые — для группировки в выборе.
-  List<AgentModel> get local => [for (final m in models) if (m.local) m];
+  List<AgentModel> get local => [
+    for (final m in models)
+      if (m.local) m,
+  ];
 
   /// Модели по API.
-  List<AgentModel> get remote => [for (final m in models) if (!m.local) m];
+  List<AgentModel> get remote => [
+    for (final m in models)
+      if (!m.local) m,
+  ];
 
   /// Модель по ключу `провайдер/идентификатор`, если она есть в списке.
   AgentModel? byKey(String? key) {
@@ -47,7 +123,9 @@ class AgentModelsState {
 
 /// Провайдер списка моделей.
 final agentModelsProvider =
-    NotifierProvider<AgentModelsController, AgentModelsState>(AgentModelsController.new);
+    NotifierProvider<AgentModelsController, AgentModelsState>(
+      AgentModelsController.new,
+    );
 
 /// Список моделей харнесса: читается один раз при первом открытии выбора и обновляется кнопкой.
 class AgentModelsController extends Notifier<AgentModelsState> {
@@ -57,14 +135,23 @@ class AgentModelsController extends Notifier<AgentModelsState> {
   @override
   AgentModelsState build() => const AgentModelsState();
 
-  /// Читает список моделей у моста.
-  Future<void> load() async {
-    state = AgentModelsState(models: state.models, loading: true);
+  /// Читает список моделей харнесса у моста.
+  ///
+  /// Список для другого харнесса всегда перечитывается: у pi модели задаются провайдерами, у
+  /// Claude Code — его собственным набором, и держать их в одном кэше значило бы показывать
+  /// модели не того агента.
+  Future<void> load({String harness = 'pi'}) async {
+    final keep = state.harness == harness ? state.models : const <AgentModel>[];
+    state = AgentModelsState(harness: harness, models: keep, loading: true);
     try {
-      final models = await _api.models();
-      state = AgentModelsState(models: models);
+      final models = await _api.models(harness: harness);
+      state = AgentModelsState(harness: harness, models: models);
     } on AgentApiException catch (e) {
-      state = AgentModelsState(models: state.models, error: e.message);
+      state = AgentModelsState(
+        harness: harness,
+        models: keep,
+        error: e.message,
+      );
     }
   }
 }
@@ -83,18 +170,30 @@ class AgentProvidersState {
   final String? error;
 
   /// Состояние списка провайдеров.
-  const AgentProvidersState({this.providers = const [], this.loading = false, this.error});
+  const AgentProvidersState({
+    this.providers = const [],
+    this.loading = false,
+    this.error,
+  });
 
   /// Свои провайдеры: их можно править и удалять.
-  List<AgentProvider> get custom => [for (final p in providers) if (p.custom) p];
+  List<AgentProvider> get custom => [
+    for (final p in providers)
+      if (p.custom) p,
+  ];
 
   /// Встроенные провайдеры pi: у них задаётся только ключ.
-  List<AgentProvider> get builtin => [for (final p in providers) if (!p.custom) p];
+  List<AgentProvider> get builtin => [
+    for (final p in providers)
+      if (!p.custom) p,
+  ];
 }
 
 /// Провайдер списка провайдеров.
 final agentProvidersProvider =
-    NotifierProvider<AgentProvidersController, AgentProvidersState>(AgentProvidersController.new);
+    NotifierProvider<AgentProvidersController, AgentProvidersState>(
+      AgentProvidersController.new,
+    );
 
 /// Провайдеры на маке: чтение, сохранение, удаление и ключи.
 ///
@@ -223,37 +322,37 @@ class AgentProjectsState {
     List<AgentProject>? projects,
     AgentHealth? health,
     bool? loading,
-  }) =>
-      AgentProjectsState(
-        projects: projects ?? this.projects,
-        health: health ?? this.health,
-        loading: loading ?? this.loading,
-        error: error,
-      );
+  }) => AgentProjectsState(
+    projects: projects ?? this.projects,
+    health: health ?? this.health,
+    loading: loading ?? this.loading,
+    error: error,
+  );
 
   /// Копия без ошибки.
   AgentProjectsState ready({
     List<AgentProject>? projects,
     AgentHealth? health,
-  }) =>
-      AgentProjectsState(
-        projects: projects ?? this.projects,
-        health: health ?? this.health,
-        loading: false,
-      );
+  }) => AgentProjectsState(
+    projects: projects ?? this.projects,
+    health: health ?? this.health,
+    loading: false,
+  );
 
   /// Копия с проставленной ошибкой.
   AgentProjectsState withError(String message) => AgentProjectsState(
-        projects: projects,
-        health: health,
-        loading: false,
-        error: message,
-      );
+    projects: projects,
+    health: health,
+    loading: false,
+    error: message,
+  );
 }
 
 /// Провайдер списка проектов.
 final agentProjectsProvider =
-    NotifierProvider<AgentProjectsController, AgentProjectsState>(AgentProjectsController.new);
+    NotifierProvider<AgentProjectsController, AgentProjectsState>(
+      AgentProjectsController.new,
+    );
 
 /// Список проектов: загрузка с моста, состояние моста и текст ошибки для экрана.
 class AgentProjectsController extends Notifier<AgentProjectsState> {
@@ -307,7 +406,9 @@ class AgentSessionsState {
 
 /// Провайдер сессий проекта.
 final agentSessionsProvider =
-    NotifierProvider<AgentSessionsController, AgentSessionsState>(AgentSessionsController.new);
+    NotifierProvider<AgentSessionsController, AgentSessionsState>(
+      AgentSessionsController.new,
+    );
 
 /// Сессии проекта: список из файлов pi и открытие новой сессии.
 class AgentSessionsController extends Notifier<AgentSessionsState> {
@@ -319,14 +420,22 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
 
   /// Читает сессии проекта.
   Future<void> load(AgentProject project) async {
-    state = AgentSessionsState(project: project, sessions: state.sessions, loading: true);
+    state = AgentSessionsState(
+      project: project,
+      sessions: state.sessions,
+      loading: true,
+    );
     try {
       final sessions = await _api.sessions(project.path);
       // проект могли сменить, пока шёл ответ: тогда список относится уже не к тому экрану
       if (state.project?.path != project.path) return;
       state = AgentSessionsState(project: project, sessions: sessions);
     } on AgentApiException catch (e) {
-      state = AgentSessionsState(project: project, sessions: state.sessions, error: e.message);
+      state = AgentSessionsState(
+        project: project,
+        sessions: state.sessions,
+        error: e.message,
+      );
     }
   }
 
@@ -336,6 +445,7 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
   /// отказал: причина при этом уже лежит в состоянии и показывается на экране.
   Future<AgentSessionInfo?> open(
     AgentProject project, {
+    String harness = 'pi',
     String? sessionId,
     String? modelKey,
   }) async {
@@ -349,6 +459,7 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
       // модель передаём только для новой сессии: у существующей она уже записана в её файле
       final session = await _api.openSession(
         project.path,
+        harness: harness,
         sessionId: sessionId,
         modelKey: sessionId == null ? modelKey : null,
       );
@@ -373,7 +484,10 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
       await _api.deleteSession(sessionId);
       state = AgentSessionsState(
         project: state.project,
-        sessions: [for (final s in state.sessions) if (s.id != sessionId) s],
+        sessions: [
+          for (final s in state.sessions)
+            if (s.id != sessionId) s,
+        ],
       );
     } on AgentApiException catch (e) {
       showError(e.message);
@@ -449,40 +563,39 @@ class AgentThreadState {
     String? step,
     AgentUsage? usage,
     DateTime? runStartedAt,
-  }) =>
-      AgentThreadState(
-        session: session ?? this.session,
-        items: items ?? this.items,
-        loading: loading ?? this.loading,
-        sending: sending ?? this.sending,
-        step: step ?? this.step,
-        usage: usage ?? this.usage,
-        error: error,
-        runStartedAt: runStartedAt ?? this.runStartedAt,
-      );
+  }) => AgentThreadState(
+    session: session ?? this.session,
+    items: items ?? this.items,
+    loading: loading ?? this.loading,
+    sending: sending ?? this.sending,
+    step: step ?? this.step,
+    usage: usage ?? this.usage,
+    error: error,
+    runStartedAt: runStartedAt ?? this.runStartedAt,
+  );
 
   /// Копия с проставленной ошибкой.
   AgentThreadState withError(String message) => AgentThreadState(
-        session: session,
-        items: items,
-        loading: loading,
-        sending: sending,
-        step: step,
-        usage: usage,
-        error: message,
-        runStartedAt: runStartedAt,
-      );
+    session: session,
+    items: items,
+    loading: loading,
+    sending: sending,
+    step: step,
+    usage: usage,
+    error: message,
+    runStartedAt: runStartedAt,
+  );
 
   /// Копия без ошибки.
   AgentThreadState clearError() => AgentThreadState(
-        session: session,
-        items: items,
-        loading: loading,
-        sending: sending,
-        step: step,
-        usage: usage,
-        runStartedAt: runStartedAt,
-      );
+    session: session,
+    items: items,
+    loading: loading,
+    sending: sending,
+    step: step,
+    usage: usage,
+    runStartedAt: runStartedAt,
+  );
 
   /// Последний элемент переписки (в него дописывается текущий ответ), либо `null`.
   AgentItem? get last => items.isEmpty ? null : items.last;
@@ -490,7 +603,9 @@ class AgentThreadState {
 
 /// Провайдер открытого разговора.
 final agentThreadProvider =
-    NotifierProvider<AgentThreadController, AgentThreadState>(AgentThreadController.new);
+    NotifierProvider<AgentThreadController, AgentThreadState>(
+      AgentThreadController.new,
+    );
 
 /// Разговор с агентом: история сессии, отправка сообщения и дописывание ответа потоком.
 ///
@@ -526,7 +641,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     state = AgentThreadState(session: session, loading: true);
     try {
       final items = await _api.messages(session.id);
-      if (state.session?.id != session.id) return; // сессию успели сменить, пока шёл ответ
+      if (state.session?.id != session.id) {
+        return; // сессию успели сменить, пока шёл ответ
+      }
       state = state.copyWith(items: items, loading: false);
     } on AgentApiException catch (e) {
       state = state.copyWith(loading: false).withError(e.message);
@@ -539,7 +656,12 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final session = state.session;
     if (prompt.isEmpty || session == null || state.sending) return;
     state = state
-        .copyWith(items: [...state.items, AgentItem(kind: 'user', text: prompt)])
+        .copyWith(
+          items: [
+            ...state.items,
+            AgentItem(kind: 'user', text: prompt),
+          ],
+        )
         .clearError();
     await _run(session.id, prompt);
   }
@@ -621,7 +743,10 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     try {
       final updated = await _api.setModel(session.id, model.key);
       state = state.copyWith(session: updated).clearError();
-      await ref.read(settingsProvider).ui.setAgentModel(model.key);
+      await ref
+          .read(settingsProvider)
+          .ui
+          .setAgentModel(updated.harness, model.key);
     } on AgentApiException catch (e) {
       state = state.withError(e.message);
     }
@@ -656,12 +781,18 @@ class AgentThreadController extends Notifier<AgentThreadState> {
 
   /// Запускает поток ответа на [prompt], который уже лежит в состоянии последним вопросом.
   Future<void> _run(String sessionId, String prompt) async {
-    state = state.copyWith(sending: true, step: '', runStartedAt: DateTime.now());
+    state = state.copyWith(
+      sending: true,
+      step: '',
+      runStartedAt: DateTime.now(),
+    );
     _cancelledByUser = false;
     final done = Completer<void>();
     _done = done;
 
-    _sub = _api.prompt(sessionId, prompt).listen(
+    _sub = _api
+        .prompt(sessionId, prompt)
+        .listen(
           _applyEvent,
           onError: (Object e) {
             if (!_cancelledByUser) _fail(e);
@@ -687,7 +818,12 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     if (event.usage != null) state = state.copyWith(usage: event.usage);
     if (event.session != null) state = state.copyWith(session: event.session);
     if (event.note != null) {
-      state = state.copyWith(items: [...state.items, AgentItem(kind: 'note', text: event.note!)]);
+      state = state.copyWith(
+        items: [
+          ...state.items,
+          AgentItem(kind: 'note', text: event.note!),
+        ],
+      );
       return;
     }
     if (event.toolCall != null) {
@@ -718,7 +854,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final last = items.last;
     items[items.length - 1] = last.copyWith(
       text: event.text == null ? null : last.text + event.text!,
-      reasoning: event.reasoning == null ? null : last.reasoning + event.reasoning!,
+      reasoning: event.reasoning == null
+          ? null
+          : last.reasoning + event.reasoning!,
       blocks: _appendText(last.blocks, event.text, event.reasoning),
     );
     state = state.copyWith(items: items);
@@ -729,9 +867,15 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// Кусок продолжает последний блок своего вида, только если тот идёт последним. Как только
   /// между текстом и текстом встала карточка инструмента, начинается новый блок — иначе новый
   /// текст после команды оказался бы выше её карточки, и разговор читался бы не по порядку.
-  List<AgentBlock> _appendText(List<AgentBlock> blocks, String? text, String? reasoning) {
+  List<AgentBlock> _appendText(
+    List<AgentBlock> blocks,
+    String? text,
+    String? reasoning,
+  ) {
     var result = blocks;
-    if (text != null && text.isNotEmpty) result = _appendBlock(result, const AgentBlock.text(''), text);
+    if (text != null && text.isNotEmpty) {
+      result = _appendBlock(result, const AgentBlock.text(''), text);
+    }
     if (reasoning != null && reasoning.isNotEmpty) {
       result = _appendBlock(result, const AgentBlock.reasoning(''), reasoning);
     }
@@ -739,7 +883,11 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   }
 
   /// Дописывает [extra] в последний блок того же вида, а если его нет — добавляет новый.
-  List<AgentBlock> _appendBlock(List<AgentBlock> blocks, AgentBlock blank, String extra) {
+  List<AgentBlock> _appendBlock(
+    List<AgentBlock> blocks,
+    AgentBlock blank,
+    String extra,
+  ) {
     final next = [...blocks];
     if (next.isNotEmpty && next.last.type == blank.type) {
       next[next.length - 1] = next.last.plus(extra);
@@ -752,7 +900,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// Подпись текущего действия по вызову инструмента: «выполняю команду: npm test».
   String _toolStep(AgentTool tool) {
     final summary = tool.summary;
-    return summary.isEmpty ? 'выполняю: ${tool.name}' : '${tool.name}: $summary';
+    return summary.isEmpty
+        ? 'выполняю: ${tool.name}'
+        : '${tool.name}: $summary';
   }
 
   /// Добавляет или обновляет карточку инструмента в последнем ответе агента.
@@ -761,7 +911,11 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// результат — часть одного ответа, и разрывать их на два пузыря значит показывать
   /// переписку не такой, какой её видит модель. [keepArgs] оставлен для событий прогресса и
   /// завершения: они приходят без аргументов, и затирать ими уже известные нельзя.
-  void _upsertTool(AgentTool tool, {bool keepArgs = false, bool finished = false}) {
+  void _upsertTool(
+    AgentTool tool, {
+    bool keepArgs = false,
+    bool finished = false,
+  }) {
     final items = [...state.items];
     if (items.isEmpty || !items.last.isAssistant) {
       items.add(const AgentItem(kind: 'assistant'));
@@ -769,7 +923,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final last = items.last;
     final tools = [...last.tools];
     var blocks = last.blocks;
-    final index = tools.indexWhere((t) => t.id == tool.id && tool.id.isNotEmpty);
+    final index = tools.indexWhere(
+      (t) => t.id == tool.id && tool.id.isNotEmpty,
+    );
     if (index < 0) {
       tools.add(tool);
       // Карточка встаёт в блоки на своё место — там, где инструмент вызван по ходу ответа.
@@ -797,7 +953,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// Пустой каркас после ошибки — это пузырь без текста, который ничего не объясняет: причину
   /// показывает сообщение об ошибке, а вопрос остаётся на месте, чтобы его повторить.
   void _fail(Object e) {
-    final message = e is AgentApiException ? e.message : 'Не удалось получить ответ агента.';
+    final message = e is AgentApiException
+        ? e.message
+        : 'Не удалось получить ответ агента.';
     final items = [...state.items];
     if (items.isNotEmpty && items.last.isAssistant && items.last.isEmpty) {
       items.removeLast();

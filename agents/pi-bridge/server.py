@@ -57,6 +57,7 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -362,8 +363,321 @@ def normalize_messages(messages):
     return items
 
 
+# Харнессы, которые умеет мост. Имя идёт в идентификатор сессии: `pi--<id>`, `claude--<id>`.
+# Так два хранилища истории (у pi и у Claude Code они свои) не путаются, а приложение видит
+# идентификатор как одну непрозрачную строку и не думает о том, чей это разговор.
+HARNESS_PI = "pi"
+HARNESS_CLAUDE = "claude"
+HARNESS_NAMES = {HARNESS_PI: "pi", HARNESS_CLAUDE: "Claude Code"}
+
+# Модели Claude Code задаются псевдонимами: так их понимает и он сам, и они не устаревают с
+# выходом новых версий. Окно контекста у них одно и то же (длинные варианты — отдельные модели).
+CLAUDE_MODELS = [
+    {"id": "default", "name": "Как настроено в Claude Code", "contextWindow": 200_000},
+    {"id": "opus", "name": "Opus — самый сильный", "contextWindow": 200_000},
+    {"id": "sonnet", "name": "Sonnet — баланс", "contextWindow": 200_000},
+    {"id": "haiku", "name": "Haiku — самый быстрый", "contextWindow": 200_000},
+]
+
+
+def session_key(harness, session_id):
+    """Идентификатор сессии наружу: `харнесс--id` (или просто id, если харнесс не задан).
+
+    Разделитель — двойной дефис, а не слэш: идентификатор ходит в пути ручек, и со слэшем
+    пришлось бы разбирать URL-кодирование на обеих сторонах.
+    """
+    if not session_id:
+        return ""
+    if not harness:
+        return str(session_id)
+    return "%s--%s" % (harness, session_id)
+
+
+def split_key(key):
+    """Разбирает идентификатор сессии на харнесс и его собственный id.
+
+    Идентификатор без имени харнесса считается сессией pi: так продолжает работать сборка
+    приложения, которая про второй харнесс ещё не знает.
+    """
+    text = str(key or "")
+    for harness in (HARNESS_PI, HARNESS_CLAUDE):
+        prefix = harness + "--"
+        if text.startswith(prefix):
+            return harness, text[len(prefix):]
+    return HARNESS_PI, text
+
+
+def claude_profile():
+    """Профиль Claude Code, из которого он залогинен на этом маке.
+
+    У Claude Code профилей может быть несколько, и различаются они переменной
+    `CLAUDE_CONFIG_DIR`: в одном человек работает, другой остаётся пустым — и тогда он отвечает
+    «Not logged in», хотя в терминале всё работает. Мост запускает Claude Code от себя (в
+    окружении launchd, где переменных оболочки нет), поэтому профиль задаётся настройкой моста
+    `claude_config_dir`, а если она пуста — берётся из окружения самого моста.
+    """
+    value = str(CONFIG.get("claude_config_dir") or "").strip() or str(os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if value:
+        return str(Path(value).expanduser())
+    return ""
+
+
+def claude_projects_dir():
+    """Где Claude Code держит проекты: внутри профиля, из которого он залогинен.
+
+    Профиль задаётся `CLAUDE_CONFIG_DIR` и заменяет собой `~/.claude` целиком, вместе с
+    каталогом `projects`. Искать сессии в `~/.claude` при другом профиле бессмысленно: там их
+    просто нет, и список разговоров выглядел бы пустым при живых файлах на диске.
+    """
+    return Path(claude_profile() or (Path.home() / ".claude")) / "projects"
+
+
+def claude_sessions_dir(cwd):
+    """Папка сессий Claude Code для рабочей директории проекта.
+
+    Схема имени задана им самим: путь с заменёнными на дефис разделителями. Повторяем её
+    дословно — иначе список сессий проекта окажется пустым.
+    """
+    encoded = str(cwd).lstrip(os.sep).replace("/", "-").replace("\\", "-").replace(":", "-")
+    return claude_projects_dir() / ("-" + encoded)
+
+
+def find_session_file(harness, session_id):
+    """Файл сессии по идентификатору, если он есть на диске; иначе `None`.
+
+    Ищем по имени файла, а не по папке проекта: удалить или показать разговор нужно и тогда,
+    когда сессия не открыта, а идентификатор в имени уникален. У pi файл называется
+    `<время>_<id>.jsonl`, у Claude Code — просто `<id>.jsonl`.
+    """
+    if not session_id:
+        return None
+    if harness == HARNESS_CLAUDE:
+        found = sorted(claude_projects_dir().glob("*/%s.jsonl" % session_id))
+    else:
+        found = sorted(PI_SESSIONS.glob("*/**%s.jsonl" % session_id))
+    return found[0] if found else None
+
+
+def claude_result_text(content):
+    """Текст результата инструмента Claude Code: он бывает строкой и списком блоков."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+        elif isinstance(block, str):
+            parts.append(block)
+    return "".join(parts)
+
+
+def claude_context_window(model):
+    """Окно контекста модели Claude Code по псевдониму; неизвестная — стандартные 200k."""
+    for entry in CLAUDE_MODELS:
+        if entry["id"] == model:
+            return entry["contextWindow"]
+    return 200_000
+
+
+def claude_model_label(model):
+    """Человеческое название модели Claude Code по псевдониму."""
+    for entry in CLAUDE_MODELS:
+        if entry["id"] == model:
+            return entry["name"]
+    return model
+
+
+def read_claude_meta(file):
+    """Читает из файла сессии Claude Code то, что нужно строке списка.
+
+    Файл читается целиком одним куском, но разбирается только начало: у Claude Code история
+    измеряется десятками мегабайт, и разбор каждой строки в JSON на список из двадцати сессий
+    занял бы секунды. Счётчики берутся подсчётом подстрок — этого достаточно для строки списка,
+    а точную переписку разбирает `messages()` уже у открытой сессии.
+    """
+    meta = {
+        "id": file.stem,
+        "cwd": "",
+        "startedAt": None,
+        "name": "",
+        "title": "",
+        "messages": 0,
+        "provider": HARNESS_CLAUDE,
+        "model": "",
+        "userMessages": 0,
+        "assistantMessages": 0,
+        "toolCalls": 0,
+    }
+    try:
+        data = file.read_bytes()
+    except OSError as e:
+        log("не смог прочитать сессию %s: %s" % (file, e))
+        return meta
+
+    meta["userMessages"] = data.count(b'"type":"user"')
+    meta["assistantMessages"] = data.count(b'"type":"assistant"')
+    meta["toolCalls"] = data.count(b'"type":"tool_use"')
+    meta["messages"] = meta["userMessages"] + meta["assistantMessages"]
+
+    for line in data[:400_000].decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("isSidechain") is True:
+            continue
+        if not meta["startedAt"] and entry.get("timestamp"):
+            meta["startedAt"] = entry["timestamp"]
+        if not meta["cwd"] and entry.get("cwd"):
+            meta["cwd"] = str(entry["cwd"])
+        message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+        if entry.get("type") == "user" and not meta["title"]:
+            content = message.get("content")
+            text = content if isinstance(content, str) else content_text(content)
+            text = str(text or "").strip().replace("\n", " ")
+            if text and not text.startswith("<"):
+                # служебные вставки самого Claude Code начинаются с разметки — их в заголовок не берём
+                meta["title"] = text[:80]
+        elif entry.get("type") == "assistant" and not meta["model"]:
+            meta["model"] = str(message.get("model") or "")
+
+    if not meta["name"]:
+        meta["name"] = meta["title"]
+    if not meta["startedAt"]:
+        meta["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
+    meta["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
+    return meta
+
+
+def normalize_claude_messages(entries):
+    """Переписка Claude Code в том же виде, что и у pi: элементы с блоками по порядку.
+
+    У Claude Code история — плоский список записей: вопрос, ответ, результат инструмента
+    отдельной записью. Приводим её к той же форме, что и у pi (элемент на вопрос, блоки по
+    порядку, результат подклеен к своему вызову), иначе один и тот же разговор выглядел бы в
+    приложении по-разному в зависимости от харнесса.
+    """
+    items = []
+    by_call = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("isSidechain") is True:
+            continue
+        kind = entry.get("type")
+        message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+        content = message.get("content")
+
+        if kind == "user":
+            blocks = []
+            calls = []
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        text += str(block.get("text") or "")
+                    elif block.get("type") == "tool_result":
+                        call = by_call.get(str(block.get("tool_use_id") or ""))
+                        if call is not None:
+                            call["output"] = claude_result_text(block.get("content"))
+                            call["isError"] = bool(block.get("is_error"))
+            if text.strip() and not text.lstrip().startswith("<"):
+                items.append({"kind": "user", "text": text})
+            continue
+
+        if kind != "assistant":
+            continue
+
+        blocks = []
+        calls = []
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text" and str(block.get("text") or "").strip():
+                    blocks.append({"type": "text", "text": str(block["text"])})
+                elif block_type == "thinking" and str(block.get("thinking") or "").strip():
+                    blocks.append({"type": "reasoning", "text": str(block["thinking"])})
+                elif block_type == "tool_use":
+                    call = {
+                        "id": str(block.get("id") or ""),
+                        "name": str(block.get("name") or "").lower(),
+                        "args": block.get("input") if isinstance(block.get("input"), dict) else {},
+                        "output": "",
+                        "isError": False,
+                    }
+                    calls.append(call)
+                    by_call[call["id"]] = call
+                    blocks.append({"type": "tool", "id": call["id"]})
+        if not blocks:
+            continue
+        if items and items[-1].get("kind") == "assistant":
+            items[-1]["blocks"].extend(blocks)
+            items[-1]["tools"].extend(calls)
+        else:
+            items.append({
+                "kind": "assistant",
+                "blocks": blocks,
+                "tools": calls,
+                "text": "",
+                "reasoning": "",
+                "error": "",
+            })
+
+    for item in items:
+        if item.get("kind") != "assistant":
+            continue
+        item["text"] = "".join(b["text"] for b in item["blocks"] if b["type"] == "text")
+        item["reasoning"] = "".join(b["text"] for b in item["blocks"] if b["type"] == "reasoning")
+    return items
+
+
+def harness_status():
+    """Что из харнессов стоит на этом маке: имя, версия и путь к бинарю.
+
+    Приложение показывает этот список при создании сессии: предлагать Claude Code там, где его
+    нет, значило бы обещать то, чего не будет.
+    """
+    result = []
+    for harness, binary in ((HARNESS_PI, CONFIG.get("pi") or "pi"),
+                            (HARNESS_CLAUDE, CONFIG.get("claude") or "claude")):
+        path = shutil.which(str(binary)) or ""
+        version = ""
+        if path:
+            try:
+                out = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=15)
+                version = (out.stdout or out.stderr or "").strip().splitlines()[0] if (out.stdout or out.stderr or "").strip() else ""
+            except (OSError, subprocess.SubprocessError) as e:
+                log("%s --version не ответил: %s" % (harness, e))
+        result.append({
+            "harness": harness,
+            "name": HARNESS_NAMES.get(harness, harness),
+            "available": bool(path),
+            "version": version,
+        })
+    return result
+
+
+def claude_session_files(path):
+    """Файлы сессий Claude Code в папке проекта, свежие сверху."""
+    folder = claude_sessions_dir(path)
+    if not folder.is_dir():
+        return []
+    files = [p for p in folder.glob("*.jsonl") if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+
 def session_files(path):
-    """Файлы сессий проекта, свежие сверху."""
+    """Файлы сессий pi в папке проекта, свежие сверху."""
     folder = sessions_dir_for(path)
     if not folder.is_dir():
         return []
@@ -517,11 +831,11 @@ def allowed_path(path):
 
 
 def session_file(session):
-    """Файл сессии pi для живого процесса: путь из `get_state`, иначе поиск по идентификатору.
+    """Файл сессии живого процесса: путь из снимка состояния, иначе поиск по идентификатору.
 
     Искать приходится потому, что у только что открытой сессии файл может появиться позже
-    первого вопроса, а удалять и показывать время старта нужно и до него. Имя файла всегда
-    оканчивается идентификатором сессии (`<время>_<id>.jsonl`), поэтому поиск однозначный.
+    первого вопроса, а удалять и показывать время старта нужно и до него. Харнесс берётся из
+    самой сессии: у pi и Claude Code свои хранилища истории.
     """
     if session.file_cache:
         return session.file_cache
@@ -529,11 +843,12 @@ def session_file(session):
     if isinstance(state_file, str) and state_file and Path(state_file).exists():
         session.file_cache = Path(state_file)
     elif session.id:
-        found = sorted(PI_SESSIONS.glob("*/**%s.jsonl" % session.id))
+        found = find_session_file(session.harness, session.id)
         if found:
-            session.file_cache = found[0]
+            session.file_cache = found
     if session.file_cache and session.start_meta is None:
-        session.start_meta = read_session_meta(session.file_cache)
+        reader = read_claude_meta if session.harness == HARNESS_CLAUDE else read_session_meta
+        session.start_meta = reader(session.file_cache)
     return session.file_cache
 
 
@@ -567,7 +882,34 @@ def is_local_model(model):
     return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 
-def list_models():
+def list_models(harness=HARNESS_PI):
+    """Список моделей харнесса для выбора в приложении.
+
+    У pi он собирается из его собственного каталога (см. ниже), у Claude Code — фиксированный:
+    модели задаются псевдонимами (`opus`, `sonnet`, `haiku`), и придумывать им список из
+    документации значило бы показывать то, чего в этой версии может уже не быть.
+    """
+    if harness == HARNESS_CLAUDE:
+        return [
+            {
+                "provider": HARNESS_CLAUDE,
+                "id": entry["id"],
+                "name": entry["name"],
+                "contextWindow": entry["contextWindow"],
+                "maxTokens": None,
+                "thinking": True,
+                "baseUrl": "",
+                "local": False,
+                # ключи Claude Code — его собственные (подписка или ANTHROPIC_API_KEY на маке):
+                # приложение их не знает и не показывает
+                "hasKey": True,
+            }
+            for entry in CLAUDE_MODELS
+        ]
+    return list_pi_models()
+
+
+def list_pi_models():
     """Список моделей, доступных pi на этом маке, для выбора в приложении.
 
     Источник — сам pi (`pi --list-models`): он знает и локальные провайдеры из `models.json`,
@@ -696,22 +1038,22 @@ def parse_size(raw):
     return int(value)
 
 
-def purge_session(session_id):
-    """Удаляет файл сессии pi с диска: разговор исчезает совсем, а не только из приложения.
+def purge_session(key):
+    """Удаляет файл сессии с диска: разговор исчезает совсем, а не только из приложения.
 
-    Ищем по имени файла, а не по папке проекта: сессию можно удалить и когда она не открыта, а
-    идентификатор в имени файла уникален. Возвращаем число удалённых файлов — приложение по нему
-    понимает, было ли что удалять.
+    Харнесс берётся из идентификатора, потому что хранилищ два. Возвращаем число удалённых
+    файлов — приложение по нему понимает, было ли что удалять.
     """
-    removed = 0
-    for file in PI_SESSIONS.glob("*/**%s.jsonl" % session_id):
-        try:
-            file.unlink()
-            removed += 1
-            log("удалил файл сессии %s" % file)
-        except OSError as e:
-            raise PiError("не смог удалить файл сессии %s: %s" % (file, e))
-    return removed
+    harness, session_id = split_key(key)
+    file = find_session_file(harness, session_id)
+    if file is None:
+        return 0
+    try:
+        file.unlink()
+        log("удалил файл сессии %s (%s)" % (file, harness))
+    except OSError as e:
+        raise PiError("не смог удалить файл сессии %s: %s" % (file, e))
+    return 1
 
 
 def read_json_file(path):
@@ -965,7 +1307,126 @@ class PiError(Exception):
     """Ошибка работы с харнессом: текст пригоден и для лога, и для показа в приложении."""
 
 
-class PiSession:
+class AgentSession:
+    """Общая часть сессии любого харнесса: один процесс, одна папка проекта, один разговор.
+
+    Харнессы (pi и Claude Code) говорят на разных протоколах, но всё остальное у них совпадает:
+    пул процессов, подписчики потока, признак «занята», остановка по простою, отправка команды
+    строкой JSON в stdin. Это и живёт здесь, а наследник добавляет своё: как запустить процесс,
+    как отправить сообщение, как прервать работу, как прочитать переписку и снимок состояния.
+    """
+
+    #: Имя харнесса: уходит в идентификатор сессии (`pi--<id>`, `claude--<id>`), потому что
+    #: хранилищ истории два и по имени видно, к какому относится разговор.
+    harness = ""
+
+    def __init__(self, cwd, model=None):
+        """Заводит общие поля сессии; процесс поднимает наследник."""
+        self.cwd = str(cwd)
+        self.id = ""                # идентификатор сессии внутри харнесса
+        self.model = model or ""    # выбранная модель (у pi — `провайдер/модель`)
+        self.proc = None
+        self.reader = None
+        self.lock = threading.Lock()
+        self.pending = {}           # id команды -> очередь ответа (у pi; у Claude не нужен)
+        self.subscribers = []       # очереди SSE-потоков, слушающих эту сессию
+        self.busy = False           # идёт генерация: второй запрос в ту же сессию не пускаем
+        self.touched = time.time()  # время последнего обращения (для остановки по простою)
+        self.state = {}             # снимок состояния в общем для обоих виде (см. _session_brief)
+        self.start_meta = None      # заголовок файла сессии (время старта) — читается один раз
+        self.file_cache = None      # путь к файлу сессии: ищем один раз по идентификатору
+        self.stderr_tail = []       # хвост stderr процесса — попадает в текст ошибки
+        self.counters = {"userMessages": 0, "assistantMessages": 0, "toolCalls": 0}
+        self.partial_seen = False   # пришли ли частичные куски текущего ответа (у Claude)
+
+    @property
+    def key(self):
+        """Идентификатор сессии наружу: с именем харнесса, потому что хранилищ два."""
+        return session_key(self.harness, self.id)
+
+    def subscribe(self):
+        """Подписывает поток SSE на события сессии и отдаёт очередь этих событий.
+
+        Подписка ставится ДО отправки сообщения: события первого шага иначе можно потерять.
+        """
+        events = queue.Queue()
+        self.subscribers.append(events)
+        return events
+
+    def unsubscribe(self, events):
+        """Снимает подписку: клиент ушёл или ответ закончился."""
+        if events in self.subscribers:
+            self.subscribers.remove(events)
+
+    def _publish(self, event):
+        """Рассылает событие всем открытым потокам SSE этой сессии."""
+        for q in list(self.subscribers):
+            q.put(event)
+
+    def _write(self, payload):
+        """Отправляет одну команду процессу; сбой записи означает смерть процесса."""
+        self.touched = time.time()
+        try:
+            self.proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            raise PiError("процесс %s не принимает команды: %s" % (self.harness, e))
+
+    def stop(self):
+        """Закрывает процесс: приложению сессия больше не нужна."""
+        proc = self.proc
+        if proc is None:
+            return
+        self.proc = None
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError, AttributeError):
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log("закрыл процесс %s сессии %s" % (self.harness, self.id))
+
+    def _fail_waiters(self, reason):
+        """Будит всех ожидающих после смерти процесса, чтобы запросы не висели вечно."""
+        for key, q in list(self.pending.items()):
+            q.put({"type": "response", "id": key, "success": False, "error": reason})
+        self.pending.clear()
+        for q in list(self.subscribers):
+            q.put({"type": "fatal", "message": reason})
+
+    def alive(self):
+        """Жив ли процесс."""
+        return self.proc is not None and self.proc.poll() is None
+
+    def _restart(self):
+        """Поднимает процесс заново, продолжая ту же сессию (он мог умереть или быть погашен).
+
+        Продолжение идёт по идентификатору сессии: у pi это `--session-id`, у Claude Code —
+        `--resume`, и оба берут историю из своего файла, так что разговор не теряется.
+        """
+        self._start(self.id)
+
+    def prompt(self, text):
+        """Отправляет сообщение агенту; реализует наследник (у каждого свой протокол)."""
+        raise NotImplementedError
+
+    def abort(self):
+        """Прерывает работу агента; реализует наследник."""
+        raise NotImplementedError
+
+    def refresh_state(self):
+        """Обновляет снимок состояния; реализует наследник."""
+        raise NotImplementedError
+
+    def messages(self):
+        """Переписка в нормализованном виде; реализует наследник."""
+        raise NotImplementedError
+
+
+class PiSession(AgentSession):
     """Один процесс pi в режиме RPC, привязанный к рабочей папке проекта.
 
     Почему процесс на сессию, а не один на всех: `pi --mode rpc` — это одна сессия с
@@ -974,6 +1435,8 @@ class PiSession:
     промпта в llama.cpp.
     """
 
+    harness = "pi"
+
     def __init__(self, cwd, session_id=None, provider=None, model=None):
         """Поднимает процесс pi в папке [cwd], при необходимости продолжая сессию [session_id].
 
@@ -981,21 +1444,9 @@ class PiSession:
         моделей может быть несколько (локальная и удалённая по API), и выбор делается в момент
         открытия сессии; пустые значения означают «модель по умолчанию из настроек моста».
         """
-        self.cwd = str(cwd)
+        super().__init__(cwd, model=model)
         self.id = session_id or ""
         self.provider = provider or ""
-        self.model = model or ""
-        self.proc = None
-        self.reader = None
-        self.lock = threading.Lock()
-        self.pending = {}          # id команды -> очередь ответа
-        self.subscribers = []      # очереди SSE-потоков, слушающих эту сессию
-        self.busy = False          # идёт генерация: второй запрос в ту же сессию не пускаем
-        self.touched = time.time()  # время последнего обращения (для остановки по простою)
-        self.state = {}            # последнее get_state: модель, контекст, число сообщений
-        self.start_meta = None      # заголовок файла сессии (время старта) — читается один раз
-        self.file_cache = None      # путь к файлу сессии: ищем один раз по идентификатору
-        self.stderr_tail = []      # хвост stderr pi — попадает в текст ошибки, если процесс умер
         self._start(session_id)
 
     def _start(self, session_id):
@@ -1113,28 +1564,6 @@ class PiSession:
         self._write(response)
         self._publish({"type": "ui", "method": method, "title": title, "auto": shown})
 
-    def _publish(self, event):
-        """Рассылает событие pi всем открытым потокам SSE этой сессии."""
-        for q in list(self.subscribers):
-            q.put(event)
-
-    def _fail_waiters(self, reason):
-        """Будит всех ожидающих после смерти процесса, чтобы запросы не висели вечно."""
-        for key, q in list(self.pending.items()):
-            q.put({"type": "response", "id": key, "success": False, "error": reason})
-        self.pending.clear()
-        for q in list(self.subscribers):
-            q.put({"type": "fatal", "message": reason})
-
-    def _write(self, payload):
-        """Отправляет одну команду pi; сбой записи означает смерть процесса."""
-        self.touched = time.time()
-        try:
-            self.proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            self.proc.stdin.flush()
-        except (OSError, ValueError) as e:
-            raise PiError("процесс pi не принимает команды: %s" % e)
-
     def command(self, kind, timeout=COMMAND_TIMEOUT, **fields):
         """Отправляет команду и ждёт её ответ; возвращает `data` ответа.
 
@@ -1157,6 +1586,18 @@ class PiSession:
             raise PiError(str(response.get("error") or "pi отклонил команду %s" % kind))
         data = response.get("data")
         return data if isinstance(data, dict) else {}
+
+    def prompt(self, text):
+        """Отправляет сообщение агенту: у pi это команда RPC, ответ на неё приходит сразу."""
+        self.command("prompt", message=text)
+
+    def abort(self):
+        """Прерывает работу агента: pi подтверждает отмену и ждёт, пока сессия станет свободной."""
+        self.command("abort")
+
+    def set_model(self, provider, model):
+        """Меняет модель у открытой сессии: разговор продолжается, меняется считающий."""
+        self.command("set_model", provider=provider, modelId=model)
 
     def messages(self):
         """Переписка сессии в нормализованном виде."""
@@ -1192,30 +1633,426 @@ class PiSession:
         }
         return self.state
 
-    def stop(self):
-        """Закрывает процесс pi: приложению сессия больше не нужна."""
-        proc = self.proc
-        if proc is None:
-            return
-        self.proc = None
-        try:
-            proc.stdin.close()
-        except (OSError, ValueError, AttributeError):
-            pass
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        log("закрыл процесс pi сессии %s" % self.id)
 
-    def alive(self):
-        """Жив ли процесс."""
-        return self.proc is not None and self.proc.poll() is None
+
+class ClaudeSession(AgentSession):
+    """Один процесс Claude Code в потоковом режиме, привязанный к рабочей папке проекта.
+
+    Claude Code — второй харнесс в этом разделе, и говорит он не JSON-RPC, как pi, а потоком
+    событий со своим набором полей (`system/init`, `assistant`, `user`, `result`). Протокол
+    задаёт флагами: `--input-format stream-json` (сообщения строками JSON в stdin) и
+    `--output-format stream-json` (события строками JSON в stdout). Один процесс живёт столько
+    же, сколько разговор: продолжение не поднимает его заново и не теряет прогрев промпта.
+
+    Разрешения: подтверждать в headless-режиме некому, поэтому сессия запускается с
+    `--permission-mode bypassPermissions` — тем же «разрешать всё», что и у pi. Какой режим
+    использовать, решает настройка моста (`claude_permission_mode`), но по умолчанию он такой
+    же, иначе часть работы агент молча не смог бы выполнить.
+
+    Учётные данные Claude Code — его собственные (подписка или ключ в `ANTHROPIC_API_KEY`) и
+    живут на этом маке. Если он не залогинен, ответом придёт строка «Not logged in · Please run
+    /login» — мост покажет её как обычный ответ, а не сломает раздел.
+    """
+
+    harness = "claude"
+
+    def __init__(self, cwd, session_id=None, model=None):
+        """Поднимает процесс Claude Code в папке [cwd], продолжая сессию [session_id].
+
+        Идентификатор новой сессии задаём сами (`--session-id`): свой Claude Code сообщает
+        только вместе с первым ответом, а он нужен сразу — иначе приложение не смогло бы ни
+        запомнить разговор, ни показать его в списке сессий. Продолжение идёт через `--resume`
+        с тем же идентификатором.
+        """
+        super().__init__(cwd, model=model)
+        self.id = session_id or str(uuid.uuid4())
+        self.last_usage = {}   # расход последнего хода: из него считается занятое окно
+        self._start(session_id)
+
+    def _start(self, session_id):
+        """Собирает команду запуска Claude Code и заводит потоки чтения."""
+        cmd = [
+            str(CONFIG.get("claude") or "claude"),
+            "--print",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            # без частичных кусков текст приходит целиком в конце ответа: на экране это выглядело
+            # бы как «молчит минуту, потом вывалил всё»
+            "--include-partial-messages",
+            "--verbose",
+            "--permission-mode", str(CONFIG.get("claude_permission_mode") or "bypassPermissions"),
+        ]
+        if session_id:
+            cmd += ["--resume", session_id]
+        else:
+            cmd += ["--session-id", self.id]
+        model = self.model.split("/", 1)[1] if "/" in self.model else self.model
+        if model and model != "default":
+            cmd += ["--model", model]
+
+        env = dict(os.environ)
+        profile = claude_profile()
+        if profile:
+            # Профилей у Claude Code может быть несколько (`CLAUDE_CONFIG_DIR`), и залогинен
+            # обычно один: без нужного профиля он отвечает «Not logged in», хотя в терминале
+            # у человека всё работает. Берём профиль из настроек моста, а если там пусто — из
+            # окружения самого моста.
+            env["CLAUDE_CONFIG_DIR"] = profile
+
+        log("запускаю claude в %s (профиль %s): %s" % (self.cwd, profile or "по умолчанию", " ".join(cmd)))
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                cwd=self.cwd,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,  # построчно: протокол Claude Code — тоже JSON-строки
+            )
+        except OSError as e:
+            raise PiError("не удалось запустить claude (%s): %s" % (CONFIG.get("claude"), e))
+
+        self.reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self.reader.start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+        # Служебные события Claude Code присылает не сразу, а вместе с первым ответом, поэтому
+        # запуск проверяем коротким ожиданием: если процесс умер (не тот профиль, сломан
+        # конфиг), об этом лучше сказать сразу, чем показывать пустую сессию.
+        time.sleep(0.6)
+        if not self.alive():
+            detail = self.stderr_tail[-1] if self.stderr_tail else "без вывода"
+            raise PiError("Claude Code не запустился: %s" % detail)
+
+    def _read_stdout(self):
+        """Читает поток событий Claude Code и раздаёт их подписчикам.
+
+        Разбирать здесь нечего: перевод событий харнесса в события экрана делает
+        `translate_claude_event`, потому что тому же переводу нужен доступ к снимку состояния
+        сессии (расход токенов, модель, счётчики).
+        """
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                log("не разобрал строку claude: %s" % line[:200])
+                continue
+            if not isinstance(event, dict):
+                continue
+            # Идентификатор сессии и модель — это состояние сессии, а не то, что показывается
+            # на экране, поэтому забираем их себе, если харнесс прислал своё: при `--resume`
+            # он может вернуть другой идентификатор, и продолжать разговор нужно уже по нему.
+            session_id = str(event.get("session_id") or "")
+            if session_id:
+                self.id = session_id
+                self.file_cache = None  # файл сессии мог смениться вместе с идентификатором
+            model = str(event.get("model") or "")
+            if model and (not self.model or self.model == "default"):
+                self.model = model
+            self._publish(event)
+
+        # процесс закончился — будим всех, кто ждал событий
+        self._fail_waiters("процесс claude завершился")
+
+    def _read_stderr(self):
+        """Держит хвост stderr: по нему понятно, почему процесс умер."""
+        for line in self.proc.stderr:
+            line = line.rstrip()
+            if not line:
+                continue
+            self.stderr_tail.append(line)
+            del self.stderr_tail[:-20]
+            log("claude: %s" % line[:300])
+
+    def prompt(self, text):
+        """Отправляет сообщение в том виде, в каком его ждёт потоковый режим Claude Code."""
+        self.counters["userMessages"] += 1
+        self._write({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        })
+
+    def abort(self):
+        """Прерывает работу: у Claude Code для этого отдельный кадр управления."""
+        self._write({"type": "control_request", "request": {"subtype": "interrupt"}})
+
+    def set_model(self, provider, model):
+        """Меняет модель: у Claude Code она задаётся при запуске, поэтому процесс перезапускается.
+
+        Разговор при этом не теряется: новый процесс поднимается с `--resume` и продолжает ту же
+        сессию из её файла. Другого способа у него нет — модель в живом процессе не меняется.
+        """
+        self.model = model
+        self.stop()
+        self._start(self.id)
+
+    def refresh_state(self):
+        """Собирает снимок состояния в том же виде, что у pi: экран общий для обоих.
+
+        Часть чисел у Claude Code приходится считать самим: он не отдаёт «занято токенов в
+        окне» одним полем, зато присылает расход последнего хода — из него занятое окно и
+        получается (вход + прочитанное из кэша + записанное в кэш). Поэтому процент здесь
+        оценка, и наружу это уходит флагом `contextEstimated`: приложение помечает такое число
+        знаком «≈», а не выдаёт за точное, как у pi.
+        """
+        usage = self.last_usage if isinstance(self.last_usage, dict) else {}
+        used = sum(int(usage.get(k) or 0) for k in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+        ))
+        model = self.model.split("/", 1)[1] if "/" in self.model else (self.model or CONFIG.get("claude_model") or "default")
+        window = claude_context_window(model)
+        tokens = self.state.get("tokens") if isinstance(self.state.get("tokens"), dict) else {}
+        file = session_file(self)
+        meta = self.start_meta or {}
+        self.state = {
+            **self.state,
+            "model": {"id": model, "name": claude_model_label(model), "provider": "claude"},
+            "thinkingLevel": "on",
+            "messageCount": (self.counters["userMessages"] + self.counters["assistantMessages"]) or meta.get("messages") or 0,
+            "tokens": tokens,
+            "cost": self.state.get("cost") or 0,
+            "userMessages": self.counters["userMessages"] or meta.get("userMessages") or 0,
+            "assistantMessages": self.counters["assistantMessages"] or meta.get("assistantMessages") or 0,
+            "toolCalls": self.counters["toolCalls"] or meta.get("toolCalls") or 0,
+            "contextUsage": {
+                "tokens": used,
+                "contextWindow": window,
+                "percent": round(used / window * 100, 1) if window else 0,
+                "estimated": True,
+            } if used else None,
+            "sessionFile": str(file) if file else "",
+        }
+        return self.state
+
+    def messages(self):
+        """Переписка сессии из её файла: у Claude Code история лежит готовыми сообщениями."""
+        file = session_file(self)
+        if not file or not file.exists():
+            return []
+        entries = []
+        with file.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+        return normalize_claude_messages(entries)
+
+
+def translate_pi_event(session, event):
+    """Переводит событие pi в события экрана; второй элемент ответа — «прогон закончился».
+
+    Перевод живёт здесь, а не в самой сессии, по одной причине: у обоих харнессов он разный, а
+    ручка потока — одна. Так HTTP-слой не знает, с кем он говорит, и второй харнесс не требует
+    второй ручки.
+    """
+    kind = event.get("type")
+    out = []
+
+    if kind == "message_update":
+        delta = event.get("assistantMessageEvent")
+        if isinstance(delta, dict):
+            delta_kind = delta.get("type")
+            if delta_kind == "text_delta" and delta.get("delta"):
+                out.append({"type": "delta", "text": str(delta["delta"])})
+            elif delta_kind == "thinking_delta" and delta.get("delta"):
+                out.append({"type": "reasoning", "text": str(delta["delta"])})
+            elif delta_kind == "toolcall_start":
+                out.append({
+                    "type": "tool_call",
+                    "id": str(delta.get("id") or ""),
+                    "name": str(delta.get("toolName") or ""),
+                })
+        usage = event.get("usage")
+        if isinstance(usage, dict) and (usage.get("totalTokens") or usage.get("input")):
+            out.append({
+                "type": "usage",
+                "input": usage.get("input"),
+                "output": usage.get("output"),
+                "totalTokens": usage.get("totalTokens"),
+            })
+        return out, False
+
+    if kind == "tool_execution_start":
+        out.append({
+            "type": "tool_start",
+            "id": str(event.get("toolCallId") or ""),
+            "name": str(event.get("toolName") or ""),
+            "args": event.get("args") if isinstance(event.get("args"), dict) else {},
+        })
+        return out, False
+
+    if kind == "tool_execution_update":
+        partial = event.get("partialResult")
+        text = content_text(partial.get("content")) if isinstance(partial, dict) else ""
+        out.append({"type": "tool_update", "id": str(event.get("toolCallId") or ""), "text": text})
+        return out, False
+
+    if kind == "tool_execution_end":
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        out.append({
+            "type": "tool_end",
+            "id": str(event.get("toolCallId") or ""),
+            "name": str(event.get("toolName") or ""),
+            "text": content_text(result.get("content")),
+            "isError": bool(event.get("isError")),
+        })
+        return out, False
+
+    if kind == "compaction_start":
+        return [{"type": "status", "step": "сжимаю контекст"}], False
+
+    if kind == "compaction_end":
+        return [{"type": "compacted"}], False
+
+    if kind == "agent_settled":
+        # полностью устоявшийся прогон: ни ретраев, ни очереди продолжений
+        session.busy = False
+        session.touched = time.time()
+        return out, True
+
+    if kind == "fatal":
+        return [{"type": "error", "message": str(event.get("message") or "сбой харнесса")}], True
+
+    if kind in ("auto_retry_start", "auto_retry_end", "extension_error", "queue_update"):
+        return [{**event, "type": kind}], False
+
+    return out, False
+
+
+def translate_claude_event(session, event):
+    """Переводит событие Claude Code в события экрана; второй элемент — «ход закончился».
+
+    События Claude Code богаче наших: он присылает и частичные куски текста, и целые сообщения,
+    и служебные кадры. Наружу уходит только то, что видно на экране, а из служебного берётся
+    важное: идентификатор сессии, модель, расход токенов и стоимость.
+
+    Отдельная тонкость — частичные куски. С `--include-partial-messages` текст приходит дважды:
+    кусками по мере генерации и целиком в готовом сообщении. Поэтому готовое сообщение отдаёт
+    текст только тогда, когда частичных кусков не было: иначе в ответе всё напечаталось бы
+    второй раз.
+    """
+    kind = event.get("type")
+    subtype = event.get("subtype")
+    out = []
+
+    if kind == "system":
+        if subtype == "init":
+            # идентификатор и модель сессии забирает себе читатель потока (см. ClaudeSession);
+            # на экран отсюда уходит только подпись «что происходит»
+            out.append({"type": "status", "step": "готовлю ответ"})
+        return out, False
+
+    if kind == "stream_event":
+        inner = event.get("event") if isinstance(event.get("event"), dict) else {}
+        inner_kind = inner.get("type")
+        if inner_kind == "content_block_start":
+            block = inner.get("content_block") if isinstance(inner.get("content_block"), dict) else {}
+            if block.get("type") == "tool_use":
+                out.append({
+                    "type": "tool_call",
+                    "id": str(block.get("id") or ""),
+                    "name": str(block.get("name") or "").lower(),
+                })
+        elif inner_kind == "content_block_delta":
+            delta = inner.get("delta") if isinstance(inner.get("delta"), dict) else {}
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                session.partial_seen = True
+                out.append({"type": "delta", "text": str(delta["text"])})
+            elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                session.partial_seen = True
+                out.append({"type": "reasoning", "text": str(delta["thinking"])})
+        return out, False
+
+    if kind == "assistant":
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_kind = block.get("type")
+                if block_kind == "tool_use":
+                    out.append({
+                        "type": "tool_start",
+                        "id": str(block.get("id") or ""),
+                        "name": str(block.get("name") or "").lower(),
+                        "args": block.get("input") if isinstance(block.get("input"), dict) else {},
+                    })
+                    session.counters["toolCalls"] += 1
+                elif block_kind == "text" and not session.partial_seen and str(block.get("text") or ""):
+                    out.append({"type": "delta", "text": str(block["text"])})
+                elif block_kind == "thinking" and not session.partial_seen and str(block.get("thinking") or ""):
+                    out.append({"type": "reasoning", "text": str(block["thinking"])})
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            session.last_usage = usage
+        session.counters["assistantMessages"] += 1
+        return out, False
+
+    if kind == "user":
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    out.append({
+                        "type": "tool_end",
+                        "id": str(block.get("tool_use_id") or ""),
+                        "text": claude_result_text(block.get("content")),
+                        "isError": bool(block.get("is_error")),
+                    })
+        return out, False
+
+    if kind == "result":
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        if usage:
+            session.last_usage = usage
+            tokens = session.state.get("tokens") if isinstance(session.state.get("tokens"), dict) else {}
+            session.state["tokens"] = {
+                "input": int(tokens.get("input") or 0) + int(usage.get("input_tokens") or 0),
+                "output": int(tokens.get("output") or 0) + int(usage.get("output_tokens") or 0),
+                "cacheRead": int(tokens.get("cacheRead") or 0) + int(usage.get("cache_read_input_tokens") or 0),
+                "total": int(tokens.get("total") or 0) + sum(int(usage.get(k) or 0) for k in (
+                    "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                )),
+            }
+        cost = event.get("total_cost_usd")
+        if isinstance(cost, (int, float)):
+            session.state["cost"] = float(session.state.get("cost") or 0) + float(cost)
+        session.partial_seen = False
+        session.busy = False
+        session.touched = time.time()
+        # Ход закончился ошибкой (например, «Not logged in» или отказ провайдера) — показываем
+        # это ошибкой, а не пустым ответом: человеку нужно понять, что чинить.
+        if event.get("is_error") or (subtype and subtype != "success"):
+            return [{"type": "error", "message": str(event.get("result") or "Claude Code вернул ошибку")}], True
+        return out, True
+
+    return out, False
+
+
+def translate(session, event):
+    """Переводит событие харнесса в события экрана (см. переводы выше)."""
+    if session.harness == HARNESS_CLAUDE:
+        return translate_claude_event(session, event)
+    return translate_pi_event(session, event)
 
 
 class Pool:
-    """Пул процессов pi: по одному на сессию, с остановкой по простою."""
+    """Пул процессов харнессов: по одному на сессию, с остановкой по простою."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -1223,49 +2060,59 @@ class Pool:
         self.reaper = threading.Thread(target=self._reap, daemon=True)
         self.reaper.start()
 
-    def open(self, cwd, session_id=None, provider=None, model=None):
-        """Отдаёт сессию в папке [cwd], поднимая процесс, если его ещё нет.
+    def open(self, cwd, harness=HARNESS_PI, session_id=None, provider=None, model=None):
+        """Отдаёт сессию в папке [cwd], поднимая процесс нужного харнесса, если его ещё нет.
 
-        Занятая сессия не переоткрывается: два клиента в одной сессии — это два писателя в
-        один JSONL-файл pi, и разговор бы разъехался. Проверка «занято» живёт в ручке prompt,
-        здесь же важно не потерять уже поднятый процесс.
+        Занятая сессия не переоткрывается: два клиента в одной сессии — это два писателя в один
+        файл истории, и разговор бы разъехался. Проверка «занято» живёт в ручке prompt, здесь же
+        важно не потерять уже поднятый процесс.
         """
+        key = session_key(harness, session_id) if session_id else ""
         with self.lock:
-            if session_id and session_id in self.sessions:
-                session = self.sessions[session_id]
+            if key and key in self.sessions:
+                session = self.sessions[key]
                 if not session.alive():
-                    session._start(session_id)
+                    session._restart()
                 session.touched = time.time()
                 return session
 
-            session = PiSession(cwd, session_id, provider=provider, model=model)
+            session = (ClaudeSession if harness == HARNESS_CLAUDE else PiSession)(
+                cwd, session_id, model=model, **({"provider": provider} if harness != HARNESS_CLAUDE else {}),
+            )
             if not session.id:
+                detail = session.stderr_tail[-1] if session.stderr_tail else "без вывода"
                 session.stop()
-                raise PiError("pi не сообщил идентификатор сессии")
+                raise PiError("%s не сообщил идентификатор сессии (%s)" % (harness, detail))
             # если такой процесс уже был под другим ключом — закрываем дубль
-            existing = self.sessions.get(session.id)
+            existing = self.sessions.get(session.key)
             if existing is not None and existing is not session:
                 session.stop()
                 existing.touched = time.time()
                 return existing
-            self.sessions[session.id] = session
+            self.sessions[session.key] = session
             return session
 
-    def find(self, session_id):
-        """Находит живую сессию по id или бросает понятную ошибку."""
+    def find(self, key):
+        """Находит живую сессию по ключу (`харнесс--id`) или бросает понятную ошибку."""
         with self.lock:
-            session = self.sessions.get(session_id)
+            session = self.sessions.get(key)
         if session is None:
             raise PiError("сессия не открыта: сначала откройте её в приложении")
         if not session.alive():
-            session._start(session.id)
+            session._restart()
         return session
 
     def list(self):
         """Снимок пула для /health."""
         with self.lock:
             return [
-                {"id": s.id, "cwd": s.cwd, "busy": s.busy, "idle": round(time.time() - s.touched)}
+                {
+                    "id": s.key,
+                    "harness": s.harness,
+                    "cwd": s.cwd,
+                    "busy": s.busy,
+                    "idle": round(time.time() - s.touched),
+                }
                 for s in self.sessions.values()
             ]
 
@@ -1300,7 +2147,7 @@ class Pool:
                     if not s.busy and now - s.touched > IDLE_STOP_SECONDS
                 ]
                 for session in stale:
-                    self.sessions.pop(session.id, None)
+                    self.sessions.pop(session.key, None)
             for session in stale:
                 session.stop()
 
@@ -1386,8 +2233,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, self._health())
             elif path == "/projects":
                 self._json(200, {"projects": list_projects()})
+            elif path == "/harnesses":
+                self._json(200, {"harnesses": harness_status()})
             elif path == "/models":
-                self._json(200, {"models": list_models()})
+                harness = str((params.get("harness") or [HARNESS_PI])[0]).strip().lower() or HARNESS_PI
+                self._json(200, {"models": list_models(harness), "harness": harness})
             elif path == "/providers":
                 self._json(200, {"providers": provider_list()})
             elif path == "/sessions":
@@ -1449,9 +2299,11 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "prompt":
                     self._prompt(session, body)
                 elif action == "abort":
-                    session.command("abort")
+                    session.abort()
                     self._json(200, {"ok": True})
                 elif action == "compact":
+                    if session.harness != HARNESS_PI:
+                        raise PiError("сжатие контекста есть только у pi: Claude Code сжимает его сам")
                     instructions = body.get("instructions")
                     data = session.command(
                         "compact",
@@ -1464,9 +2316,9 @@ class Handler(BaseHTTPRequestHandler):
                     model = str(body.get("modelId") or "").strip()
                     if not provider or not model:
                         raise PiError("нужны provider и modelId")
-                    session.command("set_model", provider=provider, modelId=model)
+                    session.set_model(provider, model)
                     # наружу отдаём описание сессии в том же виде, что и везде: приложение
-                    # показывает им шапку и сведения, и сырое состояние pi тут не подходит
+                    # показывает им шапку и сведения, и сырое состояние харнесса тут не подходит
                     session.refresh_state()
                     self._json(200, {"session": self._session_brief(session)})
                 elif action == "ui":
@@ -1506,20 +2358,15 @@ class Handler(BaseHTTPRequestHandler):
     # --- что делают ручки ---
 
     def _health(self):
-        """Сводка для приложения: работает ли мост, виден ли pi, что в пуле."""
-        version = ""
-        try:
-            out = subprocess.run(
-                [str(CONFIG.get("pi") or "pi"), "--version"],
-                capture_output=True, text=True, timeout=10,
-            )
-            version = (out.stdout or out.stderr or "").strip().splitlines()[0] if (out.stdout or out.stderr or "").strip() else ""
-        except (OSError, subprocess.SubprocessError) as e:
-            log("pi --version не ответил: %s" % e)
+        """Сводка для приложения: работает ли мост, какие харнессы стоят, что в пуле."""
         provider, model = default_model()
+        harnesses = harness_status()
+        pi_version = next((h["version"] for h in harnesses if h["harness"] == HARNESS_PI), "")
         return {
             "ok": True,
-            "pi": version,
+            # `pi` оставлен для сборок приложения, которые про харнессы ещё не знают
+            "pi": pi_version,
+            "harnesses": harnesses,
             "provider": provider,
             "model": model,
             "roots": CONFIG.get("roots") or [],
@@ -1527,13 +2374,29 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _list_sessions(self, params):
-        """Сессии проекта из файлов pi: работает и когда процесс pi не поднят."""
+        """Сессии проекта из файлов истории: работают и когда процессы не подняты.
+
+        Харнесс задаёт вызывающий (`harness=pi|claude`), а без него отдаются оба списка с
+        пометкой, чей это разговор: приложение показывает их вместе, различая по значку.
+        """
         raw = (params.get("path") or [""])[0]
         path = allowed_path(raw) if raw else None
         if path is None:
             raise PiError("папка вне разрешённых корней: %s" % raw)
-        meta = [read_session_meta(f) for f in session_files(path)]
-        self._json(200, {"path": str(path), "sessions": meta})
+        asked = str((params.get("harness") or [""])[0]).strip()
+
+        sessions = []
+        if asked in ("", HARNESS_PI):
+            for file in session_files(path):
+                sessions.append({**read_session_meta(file), "harness": HARNESS_PI})
+        if asked in ("", HARNESS_CLAUDE):
+            for file in claude_session_files(path):
+                sessions.append({**read_claude_meta(file), "harness": HARNESS_CLAUDE})
+        # свежие сверху: два списка складываются в один по времени последнего обращения
+        sessions.sort(key=lambda s: s.get("updatedAt") or "", reverse=True)
+        for session in sessions:
+            session["id"] = session_key(session["harness"], session["id"])
+        self._json(200, {"path": str(path), "sessions": sessions})
 
     def _open_session(self, body):
         """Открывает сессию в выбранной папке (или продолжает существующую по id).
@@ -1546,10 +2409,20 @@ class Handler(BaseHTTPRequestHandler):
         path = allowed_path(raw) if raw else None
         if path is None:
             raise PiError("папка вне разрешённых корней: %s" % raw)
-        session_id = str(body.get("sessionId") or "").strip() or None
+        # Харнесс можно задать явно, а можно прийти вместе с идентификатором сессии
+        # (`claude--<id>`): приложение открывает существующий разговор по строке из списка.
+        raw_id = str(body.get("sessionId") or "").strip()
+        harness = str(body.get("harness") or "").strip().lower()
+        if not harness and raw_id:
+            harness = split_key(raw_id)[0]
+        if not harness:
+            harness = HARNESS_PI
+        if harness not in HARNESS_NAMES:
+            raise PiError("неизвестный харнесс: %s" % harness)
+        session_id = split_key(raw_id)[1] if raw_id else None
         provider = str(body.get("provider") or "").strip() or None
         model = str(body.get("model") or "").strip() or None
-        session = POOL.open(path, session_id, provider=provider, model=model)
+        session = POOL.open(path, harness, session_id, provider=provider, model=model)
         session.refresh_state()
         self._json(200, {"session": self._session_brief(session)})
 
@@ -1581,8 +2454,12 @@ class Handler(BaseHTTPRequestHandler):
         tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else {}
         file = session_file(session)
         meta = session.start_meta or {}
+        context_estimated = bool(context.get("estimated")) if isinstance(context, dict) else False
         return {
-            "id": session.id,
+            "id": session.key,
+            "harness": session.harness,
+            "harnessName": HARNESS_NAMES.get(session.harness, session.harness),
+            "contextEstimated": context_estimated,
             "path": session.cwd,
             "name": str(state.get("sessionName") or ""),
             "model": str(model.get("id") or ""),
@@ -1671,13 +2548,13 @@ class Handler(BaseHTTPRequestHandler):
 
         aborted = False
         try:
-            # подписка стоит ДО отправки prompt: события первого шага иначе можно потерять
+            # подписка стоит ДО отправки сообщения: события первого шага иначе можно потерять
             try:
-                session.command("prompt", message=text)
+                session.prompt(text)
             except PiError as e:
                 # Заголовки потока уже отправлены, поэтому ответить кодом нельзя — отказ
-                # уходит событием. Так приходит, например, отказ pi принять второй вопрос в
-                # занятую сессию, если её занял кто-то помимо моста.
+                # уходит событием. Так приходит, например, отказ харнесса принять второй вопрос
+                # в занятую сессию, если её занял кто-то помимо моста.
                 self._event({"type": "error", "message": str(e)})
                 return
             self._event({"type": "accepted"})
@@ -1687,51 +2564,17 @@ class Handler(BaseHTTPRequestHandler):
                 except queue.Empty:
                     # пустой такт — проверка, жив ли ещё клиент и не оборвался ли процесс
                     if not session.alive():
-                        self._event({"type": "error", "message": "процесс pi завершился"})
+                        self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
                         break
                     continue
-                kind = event.get("type")
-                if kind == "message_update":
-                    self._message_update(event)
-                elif kind == "tool_execution_start":
-                    self._event({
-                        "type": "tool_start",
-                        "id": str(event.get("toolCallId") or ""),
-                        "name": str(event.get("toolName") or ""),
-                        "args": event.get("args") if isinstance(event.get("args"), dict) else {},
-                    })
-                elif kind == "tool_execution_update":
-                    self._event({
-                        "type": "tool_update",
-                        "id": str(event.get("toolCallId") or ""),
-                        "text": self._partial_text(event),
-                    })
-                elif kind == "tool_execution_end":
-                    result = event.get("result") if isinstance(event.get("result"), dict) else {}
-                    self._event({
-                        "type": "tool_end",
-                        "id": str(event.get("toolCallId") or ""),
-                        "name": str(event.get("toolName") or ""),
-                        "text": content_text(result.get("content")),
-                        "isError": bool(event.get("isError")),
-                    })
-                elif kind == "compaction_start":
-                    self._event({"type": "status", "step": "сжимаю контекст"})
-                elif kind == "compaction_end":
-                    self._event({"type": "compacted"})
-                elif kind == "agent_settled":
-                    # полностью устоявшийся прогон: ни ретраев, ни очереди продолжений.
-                    # Занятость снимаем ДО события: иначе в нём ушло бы `busy: true`, и
-                    # приложение решило бы, что сессия всё ещё работает.
-                    session.busy = False
-                    session.touched = time.time()
+                translated, done = translate(session, event)
+                for ours in translated:
+                    self._event(ours)
+                if done:
+                    # описание сессии собираем только теперь: расход и контекст обновляются
+                    # ровно в конце прогона, и раньше этих чисел просто нет
                     self._event({"type": "done", "session": self._settled_brief(session)})
                     break
-                elif kind == "fatal":
-                    self._event({"type": "error", "message": str(event.get("message") or "сбой pi")})
-                    break
-                elif kind in ("auto_retry_start", "auto_retry_end", "extension_error", "queue_update"):
-                    self._event({**event, "type": kind})
         except (BrokenPipeError, ConnectionResetError):
             # клиент ушёл (уход с экрана, кнопка «Стоп», потеря сети): гасим и работу агента,
             # иначе мак продолжит считать ответ, которого никто не ждёт
@@ -1750,38 +2593,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._event({"type": "closed"})
             except (BrokenPipeError, ConnectionResetError, ValueError):
                 pass
-
-    def _partial_text(self, event):
-        """Вытаскивает накопленный текст из события прогресса инструмента."""
-        partial = event.get("partialResult")
-        if isinstance(partial, dict):
-            return content_text(partial.get("content"))
-        return ""
-
-    def _message_update(self, event):
-        """Превращает дельту сообщения pi в события экрана: текст, размышления, вызов."""
-        delta = event.get("assistantMessageEvent")
-        if not isinstance(delta, dict):
-            return
-        kind = delta.get("type")
-        if kind == "text_delta":
-            self._event({"type": "delta", "text": str(delta.get("delta") or "")})
-        elif kind == "thinking_delta":
-            self._event({"type": "reasoning", "text": str(delta.get("delta") or "")})
-        elif kind == "toolcall_start":
-            self._event({
-                "type": "tool_call",
-                "id": str(delta.get("id") or ""),
-                "name": str(delta.get("toolName") or ""),
-            })
-        usage = event.get("usage")
-        if isinstance(usage, dict):
-            self._event({
-                "type": "usage",
-                "input": usage.get("input"),
-                "output": usage.get("output"),
-                "totalTokens": usage.get("totalTokens"),
-            })
 
     def _event(self, payload):
         """Пишет одно событие в поток SSE."""

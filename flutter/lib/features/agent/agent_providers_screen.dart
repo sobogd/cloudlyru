@@ -23,7 +23,8 @@ class AgentProvidersScreen extends ConsumerStatefulWidget {
   const AgentProvidersScreen({super.key});
 
   @override
-  ConsumerState<AgentProvidersScreen> createState() => _AgentProvidersScreenState();
+  ConsumerState<AgentProvidersScreen> createState() =>
+      _AgentProvidersScreenState();
 }
 
 /// Состояние экрана: контроллер списка, взятый один раз.
@@ -43,7 +44,9 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
   /// Открывает форму своего провайдера: новую или для правки существующего.
   Future<void> _edit([AgentProvider? provider]) async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => AgentProviderFormScreen(provider: provider)),
+      MaterialPageRoute<void>(
+        builder: (_) => AgentProviderFormScreen(provider: provider),
+      ),
     );
     if (mounted) await _providers.load();
   }
@@ -75,7 +78,10 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     if (value == null || !mounted) return;
     final error = await _providers.setKey(provider.key, value);
     if (!mounted) return;
-    snack(context, error ?? (value.trim().isEmpty ? 'Ключ убран' : 'Ключ сохранён на маке'));
+    snack(
+      context,
+      error ?? (value.trim().isEmpty ? 'Ключ убран' : 'Ключ сохранён на маке'),
+    );
   }
 
   @override
@@ -84,7 +90,10 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Модели и ключи', style: TextStyle(color: C.fg, fontSize: 18)),
+        title: const Text(
+          'Модели и ключи',
+          style: TextStyle(color: C.fg, fontSize: 18),
+        ),
         actions: [
           IconButton(
             tooltip: 'Обновить',
@@ -107,19 +116,28 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
             child: state.loading && state.providers.isEmpty
                 ? const Center(child: CircularProgressIndicator())
                 : ListView(
-                    padding: EdgeInsets.only(top: 8, bottom: 88 + navBarInset(context)),
+                    padding: EdgeInsets.only(
+                      top: 8,
+                      bottom: 88 + navBarInset(context),
+                    ),
                     children: [
                       _sectionTitle('Настроены на маке'),
-                      for (final provider in state.custom) _customTile(provider),
+                      for (final provider in state.custom)
+                        _customTile(provider),
                       _sectionTitle('По API: встроены в pi'),
-                      for (final provider in state.builtin) _builtinTile(provider),
+                      for (final provider in state.builtin)
+                        _builtinTile(provider),
                       const Padding(
                         padding: EdgeInsets.fromLTRB(16, 12, 16, 0),
                         child: Text(
                           'Ключ по API уезжает на мак и остаётся там: в приложении и на сервере он '
                           'не хранится. Свои провайдеры — это любой OpenAI-совместимый сервис: '
                           'адрес, ключ и модели задаются здесь.',
-                          style: TextStyle(color: C.fg3, fontSize: 12, height: 1.4),
+                          style: TextStyle(
+                            color: C.fg3,
+                            fontSize: 12,
+                            height: 1.4,
+                          ),
                         ),
                       ),
                     ],
@@ -132,87 +150,100 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
 
   /// Заголовок раздела списка.
   Widget _sectionTitle(String text) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
-        child: Text(
-          text,
-          style: const TextStyle(color: C.fg3, fontSize: 12, letterSpacing: 0.3),
-        ),
-      );
+    padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+    child: Text(
+      text,
+      style: const TextStyle(color: C.fg3, fontSize: 12, letterSpacing: 0.3),
+    ),
+  );
 
   /// Строка своего провайдера: адрес, модели, правка и удаление.
   Widget _customTile(AgentProvider provider) => ListTile(
-        leading: Icon(
-          provider.local ? Icons.memory : Icons.cloud_outlined,
-          color: provider.local ? C.ok : C.fg2,
-        ),
-        title: Text(provider.label, style: const TextStyle(color: C.fg, fontSize: 15)),
-        subtitle: Text(
-          [
-            provider.key,
-            provider.baseUrl,
-            provider.models.isEmpty ? 'моделей нет' : 'моделей: ${provider.models.length}',
-            if (!provider.hasKey) 'ключ не задан',
-          ].join(' · '),
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(color: C.fg3, fontSize: 12),
-        ),
-        onTap: provider.local ? null : () => _edit(provider),
-        trailing: provider.local
-            ? const Icon(Icons.lock_outline, size: 18, color: C.fg3)
-            : PopupMenuButton<String>(
-                tooltip: 'Действия',
-                onSelected: (v) => v == 'edit'
-                    ? _edit(provider)
-                    : v == 'key'
-                        ? _key(provider)
-                        : _delete(provider),
-                itemBuilder: (context) => const [
-                  PopupMenuItem(value: 'edit', child: Text('Изменить')),
-                  PopupMenuItem(value: 'key', child: Text('Ключ')),
-                  PopupMenuItem(value: 'delete', child: Text('Удалить')),
-                ],
-              ),
-      );
+    leading: Icon(
+      provider.local ? Icons.memory : Icons.cloud_outlined,
+      color: provider.local ? C.ok : C.fg2,
+    ),
+    title: Text(
+      provider.label,
+      style: const TextStyle(color: C.fg, fontSize: 15),
+    ),
+    subtitle: Text(
+      [
+        provider.key,
+        provider.baseUrl,
+        provider.models.isEmpty
+            ? 'моделей нет'
+            : 'моделей: ${provider.models.length}',
+        if (!provider.hasKey) 'ключ не задан',
+      ].join(' · '),
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(color: C.fg3, fontSize: 12),
+    ),
+    onTap: provider.local ? null : () => _edit(provider),
+    trailing: provider.local
+        ? const Icon(Icons.lock_outline, size: 18, color: C.fg3)
+        : PopupMenuButton<String>(
+            tooltip: 'Действия',
+            onSelected: (v) => v == 'edit'
+                ? _edit(provider)
+                : v == 'key'
+                ? _key(provider)
+                : _delete(provider),
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'edit', child: Text('Изменить')),
+              PopupMenuItem(value: 'key', child: Text('Ключ')),
+              PopupMenuItem(value: 'delete', child: Text('Удалить')),
+            ],
+          ),
+  );
 
   /// Строка встроенного провайдера: задан ли ключ и кнопка его замены.
   Widget _builtinTile(AgentProvider provider) => ListTile(
-        leading: Icon(
-          provider.hasKey ? Icons.key : Icons.key_off_outlined,
-          color: provider.hasKey ? C.ok : C.fg3,
-        ),
-        title: Text(provider.label, style: const TextStyle(color: C.fg, fontSize: 15)),
-        subtitle: Text(
-          provider.hasKey ? 'ключ задан (${provider.keyLength} симв.)' : 'ключ не задан',
-          style: const TextStyle(color: C.fg3, fontSize: 12),
-        ),
-        trailing: TextButton(
-          onPressed: () => _key(provider),
-          child: Text(provider.hasKey ? 'Заменить' : 'Задать'),
-        ),
-      );
+    leading: Icon(
+      provider.hasKey ? Icons.key : Icons.key_off_outlined,
+      color: provider.hasKey ? C.ok : C.fg3,
+    ),
+    title: Text(
+      provider.label,
+      style: const TextStyle(color: C.fg, fontSize: 15),
+    ),
+    subtitle: Text(
+      provider.hasKey
+          ? 'ключ задан (${provider.keyLength} симв.)'
+          : 'ключ не задан',
+      style: const TextStyle(color: C.fg3, fontSize: 12),
+    ),
+    trailing: TextButton(
+      onPressed: () => _key(provider),
+      child: Text(provider.hasKey ? 'Заменить' : 'Задать'),
+    ),
+  );
 
   /// Сообщение об ошибке над списком.
   Widget _errorBar(String message) => Container(
-        width: double.infinity,
-        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: C.surface,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: C.danger),
+    width: double.infinity,
+    margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: C.surface,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: C.danger),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.error_outline, color: C.danger, size: 18),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            message,
+            style: const TextStyle(color: C.fg2, fontSize: 13, height: 1.3),
+          ),
         ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Icon(Icons.error_outline, color: C.danger, size: 18),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(message, style: const TextStyle(color: C.fg2, fontSize: 13, height: 1.3)),
-            ),
-          ],
-        ),
-      );
+      ],
+    ),
+  );
 }
 
 /// Диалог ввода ключа встроенного провайдера.
@@ -248,7 +279,9 @@ class _KeyDialogState extends State<_KeyDialog> {
     return AlertDialog(
       backgroundColor: C.surface,
       title: Text(
-        provider.hasKey ? 'Заменить ключ: ${provider.label}' : 'Ключ: ${provider.label}',
+        provider.hasKey
+            ? 'Заменить ключ: ${provider.label}'
+            : 'Ключ: ${provider.label}',
         style: const TextStyle(color: C.fg, fontSize: 16),
       ),
       content: Column(
@@ -258,7 +291,7 @@ class _KeyDialogState extends State<_KeyDialog> {
           Text(
             provider.hasKey
                 ? 'Сейчас ключ задан (${provider.keyLength} симв.). Новый заменит его; пустое '
-                    'поле уберёт ключ совсем.'
+                      'поле уберёт ключ совсем.'
                 : 'Ключ уедет на мак и останется там: в приложении и на сервере он не хранится.',
             style: const TextStyle(color: C.fg3, fontSize: 12, height: 1.35),
           ),
@@ -306,20 +339,27 @@ class AgentProviderFormScreen extends ConsumerStatefulWidget {
   const AgentProviderFormScreen({super.key, this.provider});
 
   @override
-  ConsumerState<AgentProviderFormScreen> createState() => _AgentProviderFormScreenState();
+  ConsumerState<AgentProviderFormScreen> createState() =>
+      _AgentProviderFormScreenState();
 }
 
 /// Состояние формы: поля, черновики моделей и признак «идёт проверка».
-class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScreen> {
+class _AgentProviderFormScreenState
+    extends ConsumerState<AgentProviderFormScreen> {
   /// Поля формы: идентификатор, название, адрес, тип API и ключ.
-  late final TextEditingController _key =
-      TextEditingController(text: widget.provider?.key ?? '');
-  late final TextEditingController _name =
-      TextEditingController(text: widget.provider?.name ?? '');
-  late final TextEditingController _baseUrl =
-      TextEditingController(text: widget.provider?.baseUrl ?? '');
+  late final TextEditingController _key = TextEditingController(
+    text: widget.provider?.key ?? '',
+  );
+  late final TextEditingController _name = TextEditingController(
+    text: widget.provider?.name ?? '',
+  );
+  late final TextEditingController _baseUrl = TextEditingController(
+    text: widget.provider?.baseUrl ?? '',
+  );
   late final TextEditingController _api = TextEditingController(
-    text: (widget.provider?.api.isNotEmpty ?? false) ? widget.provider!.api : 'openai-completions',
+    text: (widget.provider?.api.isNotEmpty ?? false)
+        ? widget.provider!.api
+        : 'openai-completions',
   );
   final _apiKey = TextEditingController();
   final _manualModel = TextEditingController();
@@ -379,7 +419,9 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
       _saving = true;
       _error = null;
     });
-    final error = await ref.read(agentProvidersProvider.notifier).save(
+    final error = await ref
+        .read(agentProvidersProvider.notifier)
+        .save(
           key: _key.text.trim(),
           name: _name.text.trim(),
           baseUrl: _baseUrl.text.trim(),
@@ -410,7 +452,12 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
       body: ListView(
         padding: EdgeInsets.fromLTRB(16, 12, 16, 24 + navBarInset(context)),
         children: [
-          _field(_key, 'Идентификатор', 'например deepseek — латиницей', enabled: !editing),
+          _field(
+            _key,
+            'Идентификатор',
+            'например deepseek — латиницей',
+            enabled: !editing,
+          ),
           _field(_name, 'Название', 'как показывать в выборе модели'),
           _field(_baseUrl, 'Адрес API', 'https://api.deepseek.com/v1'),
           _field(_api, 'Тип API', 'openai-completions'),
@@ -428,9 +475,15 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
               OutlinedButton.icon(
                 onPressed: _probing ? null : _probe,
                 icon: _probing
-                    ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
                     : const Icon(Icons.wifi_tethering, size: 18),
-                label: Text(_probing ? 'Проверяю…' : 'Проверить и подтянуть модели'),
+                label: Text(
+                  _probing ? 'Проверяю…' : 'Проверить и подтянуть модели',
+                ),
               ),
             ],
           ),
@@ -439,7 +492,11 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
               padding: const EdgeInsets.only(top: 10),
               child: Text(
                 _error!,
-                style: const TextStyle(color: C.danger, fontSize: 12.5, height: 1.35),
+                style: const TextStyle(
+                  color: C.danger,
+                  fontSize: 12.5,
+                  height: 1.35,
+                ),
               ),
             ),
           if (_found.isNotEmpty) ...[
@@ -496,7 +553,13 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
                   if (id.isEmpty) return;
                   setState(() {
                     if (!_models.any((m) => m.id == id)) {
-                      _models.add(AgentModel(provider: _key.text.trim(), id: id, name: id));
+                      _models.add(
+                        AgentModel(
+                          provider: _key.text.trim(),
+                          id: id,
+                          name: id,
+                        ),
+                      );
                     }
                     _manualModel.clear();
                   });
@@ -506,15 +569,22 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
             ],
           ),
           const SizedBox(height: 8),
-          const Text('Модели провайдера', style: TextStyle(color: C.fg3, fontSize: 12)),
+          const Text(
+            'Модели провайдера',
+            style: TextStyle(color: C.fg3, fontSize: 12),
+          ),
           for (final model in _models)
             ListTile(
               dense: true,
               contentPadding: EdgeInsets.zero,
-              title: Text(model.id, style: const TextStyle(color: C.fg, fontSize: 13.5)),
+              title: Text(
+                model.id,
+                style: const TextStyle(color: C.fg, fontSize: 13.5),
+              ),
               subtitle: Text(
                 [
-                  if (model.contextWindow != null) 'окно ${model.contextWindow}',
+                  if (model.contextWindow != null)
+                    'окно ${model.contextWindow}',
                   if (model.maxTokens != null) 'потолок ${model.maxTokens}',
                   if (model.thinking) 'размышления',
                 ].join(' · '),
@@ -522,7 +592,9 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
               ),
               trailing: IconButton(
                 tooltip: 'Убрать',
-                onPressed: () => setState(() => _models.removeWhere((m) => m.id == model.id)),
+                onPressed: () => setState(
+                  () => _models.removeWhere((m) => m.id == model.id),
+                ),
                 icon: const Icon(Icons.close, size: 18, color: C.fg3),
               ),
             ),
@@ -550,24 +622,23 @@ class _AgentProviderFormScreenState extends ConsumerState<AgentProviderFormScree
     String hint, {
     bool enabled = true,
     bool obscure = false,
-  }) =>
-      Padding(
-        padding: const EdgeInsets.only(bottom: 10),
-        child: TextField(
-          controller: controller,
-          enabled: enabled,
-          obscureText: obscure,
-          style: const TextStyle(color: C.fg, fontSize: 13),
-          decoration: InputDecoration(
-            labelText: label,
-            labelStyle: const TextStyle(color: C.fg3, fontSize: 12),
-            hintText: hint,
-            hintStyle: const TextStyle(color: C.fg3, fontSize: 12),
-            filled: true,
-            fillColor: C.canvas,
-            border: const OutlineInputBorder(),
-            isDense: true,
-          ),
-        ),
-      );
+  }) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: TextField(
+      controller: controller,
+      enabled: enabled,
+      obscureText: obscure,
+      style: const TextStyle(color: C.fg, fontSize: 13),
+      decoration: InputDecoration(
+        labelText: label,
+        labelStyle: const TextStyle(color: C.fg3, fontSize: 12),
+        hintText: hint,
+        hintStyle: const TextStyle(color: C.fg3, fontSize: 12),
+        filled: true,
+        fillColor: C.canvas,
+        border: const OutlineInputBorder(),
+        isDense: true,
+      ),
+    ),
+  );
 }

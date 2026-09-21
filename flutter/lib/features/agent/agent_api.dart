@@ -25,7 +25,8 @@ class AgentApiException implements Exception {
   final String? code;
 
   /// Мост не отвечает: мак спит или туннель отключился. Повторять бессмысленно.
-  bool get bridgeUnavailable => code == 'bridge_unavailable' || status == 502 || status == 503;
+  bool get bridgeUnavailable =>
+      code == 'bridge_unavailable' || status == 502 || status == 503;
 
   /// Сессия занята: в ней уже идёт генерация.
   bool get busy => code == 'busy' || status == 409;
@@ -45,21 +46,25 @@ class AgentApiException implements Exception {
 class AgentApi {
   /// Клиент раздела поверх облачного: адрес и сессия — из него.
   AgentApi(this.cloudly) {
-    _http = Dio(BaseOptions(
-      baseUrl: cloudly.baseUrl,
-      connectTimeout: const Duration(seconds: 20),
-      // Ответ приходит потоком, и между порциями бывают минуты: агент читает файлы, выполняет
-      // команды, а локальная модель думает молча. Таймаут на чтение поэтому не задаём —
-      // прерывает ответ кнопка «Стоп» или уход с экрана.
-      receiveTimeout: Duration.zero,
-    ));
-    _http.interceptors.add(InterceptorsWrapper(
-      onRequest: (o, h) {
-        o.headers.addAll(cloudly.authHeaders);
-        o.headers['Accept'] = 'application/json';
-        h.next(o);
-      },
-    ));
+    _http = Dio(
+      BaseOptions(
+        baseUrl: cloudly.baseUrl,
+        connectTimeout: const Duration(seconds: 20),
+        // Ответ приходит потоком, и между порциями бывают минуты: агент читает файлы, выполняет
+        // команды, а локальная модель думает молча. Таймаут на чтение поэтому не задаём —
+        // прерывает ответ кнопка «Стоп» или уход с экрана.
+        receiveTimeout: Duration.zero,
+      ),
+    );
+    _http.interceptors.add(
+      InterceptorsWrapper(
+        onRequest: (o, h) {
+          o.headers.addAll(cloudly.authHeaders);
+          o.headers['Accept'] = 'application/json';
+          h.next(o);
+        },
+      ),
+    );
   }
 
   /// Облачный клиент, у которого взяты адрес и сессия.
@@ -70,15 +75,35 @@ class AgentApi {
 
   /// Состояние моста: версия pi, выбранная модель, разрешённые корни.
   Future<AgentHealth> health() async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/health'));
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get('/projects/health'),
+    );
     return AgentHealth.fromJson(data ?? const {});
   }
 
-  /// Модели, доступные харнессу на маке: локальная и, если настроены, удалённые по API.
+  /// Харнессы, стоящие на маке: pi и Claude Code — с версиями и признаком «есть».
+  Future<List<AgentHarness>> harnesses() async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get('/projects/harnesses'),
+    );
+    final raw = data?['harnesses'];
+    return <AgentHarness>[
+      if (raw is List)
+        for (final h in raw)
+          if (h is Map) AgentHarness.fromJson(h.cast<String, dynamic>()),
+    ];
+  }
+
+  /// Модели харнесса: у pi — локальная и удалённые по API, у Claude Code — его собственные.
   ///
   /// Ключей от API в ответе нет — они остаются на маке; приходит только признак «ключ задан».
-  Future<List<AgentModel>> models() async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/models'));
+  Future<List<AgentModel>> models({String harness = 'pi'}) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get(
+        '/projects/models',
+        queryParameters: <String, dynamic>{'harness': harness},
+      ),
+    );
     final raw = data?['models'];
     return <AgentModel>[
       if (raw is List)
@@ -91,7 +116,9 @@ class AgentApi {
   ///
   /// Ключи сюда не приходят: только признак «задан» и длина. Сам ключ лежит на маке.
   Future<List<AgentProvider>> providers() async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/providers'));
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get('/projects/providers'),
+    );
     final raw = data?['providers'];
     return <AgentProvider>[
       if (raw is List)
@@ -113,23 +140,26 @@ class AgentApi {
     required List<AgentModel> models,
   }) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/providers', data: <String, dynamic>{
-        'key': key,
-        'name': name,
-        'baseUrl': baseUrl,
-        'api': api,
-        'apiKey': apiKey,
-        'models': <Map<String, dynamic>>[
-          for (final m in models)
-            <String, dynamic>{
-              'id': m.id,
-              'name': m.name,
-              if (m.contextWindow != null) 'contextWindow': m.contextWindow,
-              if (m.maxTokens != null) 'maxTokens': m.maxTokens,
-              'thinking': m.thinking,
-            },
-        ],
-      }),
+      () => _http.post(
+        '/projects/providers',
+        data: <String, dynamic>{
+          'key': key,
+          'name': name,
+          'baseUrl': baseUrl,
+          'api': api,
+          'apiKey': apiKey,
+          'models': <Map<String, dynamic>>[
+            for (final m in models)
+              <String, dynamic>{
+                'id': m.id,
+                'name': m.name,
+                if (m.contextWindow != null) 'contextWindow': m.contextWindow,
+                if (m.maxTokens != null) 'maxTokens': m.maxTokens,
+                'thinking': m.thinking,
+              },
+          ],
+        },
+      ),
     );
     return _providersOf(data);
   }
@@ -152,11 +182,14 @@ class AgentApi {
     String apiKey = '',
   }) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/providers/probe', data: <String, dynamic>{
-        'baseUrl': baseUrl,
-        if (provider.isNotEmpty) 'provider': provider,
-        if (apiKey.isNotEmpty) 'apiKey': apiKey,
-      }),
+      () => _http.post(
+        '/projects/providers/probe',
+        data: <String, dynamic>{
+          'baseUrl': baseUrl,
+          if (provider.isNotEmpty) 'provider': provider,
+          if (apiKey.isNotEmpty) 'apiKey': apiKey,
+        },
+      ),
     );
     final raw = data?['models'];
     return <AgentModel>[
@@ -167,12 +200,15 @@ class AgentApi {
   }
 
   /// Задаёт или убирает ключ встроенного провайдера (пустая строка — убрать).
-  Future<List<AgentProvider>> saveProviderKey(String provider, String apiKey) async {
+  Future<List<AgentProvider>> saveProviderKey(
+    String provider,
+    String apiKey,
+  ) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/providers/key', data: <String, dynamic>{
-        'provider': provider,
-        'apiKey': apiKey,
-      }),
+      () => _http.post(
+        '/projects/providers/key',
+        data: <String, dynamic>{'provider': provider, 'apiKey': apiKey},
+      ),
     );
     return _providersOf(data);
   }
@@ -189,7 +225,9 @@ class AgentApi {
 
   /// Проекты: папки внутри разрешённых корней, в которых можно работать.
   Future<List<AgentProject>> projects() async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects'));
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get('/projects'),
+    );
     final raw = data?['projects'];
     return <AgentProject>[
       if (raw is List)
@@ -201,7 +239,10 @@ class AgentApi {
   /// Сессии проекта, свежие сверху: их сервер берёт у моста, а мост — из файлов pi.
   Future<List<AgentSession>> sessions(String path) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects/sessions', queryParameters: <String, dynamic>{'path': path}),
+      () => _http.get(
+        '/projects/sessions',
+        queryParameters: <String, dynamic>{'path': path},
+      ),
     );
     final raw = data?['sessions'];
     return <AgentSession>[
@@ -216,15 +257,24 @@ class AgentApi {
   ///
   /// [modelKey] задаёт модель для новой сессии в виде `провайдер/идентификатор`: у pi моделей
   /// может быть несколько (локальная и удалённая по API), и выбрать её можно до начала разговора.
-  Future<AgentSessionInfo> openSession(String path, {String? sessionId, String? modelKey}) async {
+  Future<AgentSessionInfo> openSession(
+    String path, {
+    String harness = 'pi',
+    String? sessionId,
+    String? modelKey,
+  }) async {
     final split = _splitModel(modelKey);
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/sessions', data: <String, dynamic>{
-        'path': path,
-        if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
-        if (split != null) 'provider': split.$1,
-        if (split != null) 'model': split.$2,
-      }),
+      () => _http.post(
+        '/projects/sessions',
+        data: <String, dynamic>{
+          'path': path,
+          'harness': harness,
+          if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+          if (split != null) 'provider': split.$1,
+          if (split != null) 'model': split.$2,
+        },
+      ),
     );
     return _sessionOf(data);
   }
@@ -234,10 +284,10 @@ class AgentApi {
     final split = _splitModel(modelKey);
     if (split == null) throw const AgentApiException(0, 'модель не выбрана');
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/sessions/$id/model', data: <String, dynamic>{
-        'provider': split.$1,
-        'modelId': split.$2,
-      }),
+      () => _http.post(
+        '/projects/sessions/$id/model',
+        data: <String, dynamic>{'provider': split.$1, 'modelId': split.$2},
+      ),
     );
     return _sessionOf(data);
   }
@@ -259,7 +309,9 @@ class AgentApi {
   /// Нужно после сжатия контекста и смены модели: числа в шапке экрана должны быть свежими, а
   /// из потока ответа они приходят только к концу прогона.
   Future<AgentSessionInfo> session(String id) async {
-    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/sessions/$id'));
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get('/projects/sessions/$id'),
+    );
     return _sessionOf(data);
   }
 
@@ -295,14 +347,21 @@ class AgentApi {
     }
 
     final body = res.data;
-    if (body == null) throw const AgentApiException(0, 'Сервер закрыл соединение, не прислав ответ');
+    if (body == null) {
+      throw const AgentApiException(
+        0,
+        'Сервер закрыл соединение, не прислав ответ',
+      );
+    }
 
     // `cast<List<int>>()` обязателен, а не косметика: `body.stream` — поток `Uint8List`, а
     // `utf8.decoder` объявлен над `List<int>`; без приведения код собирается, но падает в рантайме.
     // Декодер потоковый: русский текст занимает два байта на символ, и сетевой чанк может
     // разрезать символ или строку JSON посередине — склейку держит `LineSplitter`.
-    final lines =
-        body.stream.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter());
+    final lines = body.stream
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
     await for (final line in lines) {
       if (!line.startsWith('data:')) continue;
       final payload = line.substring('data:'.length).trim();
@@ -322,7 +381,9 @@ class AgentApi {
 
   /// Останавливает генерацию: сервер просит мост прервать работу агента.
   Future<void> abort(String id) async {
-    await _send<Map<String, dynamic>>(() => _http.post('/projects/sessions/$id/abort'));
+    await _send<Map<String, dynamic>>(
+      () => _http.post('/projects/sessions/$id/abort'),
+    );
   }
 
   /// Сжимает контекст сессии: длинная работа иначе перестанет влезать в окно модели.
@@ -338,7 +399,9 @@ class AgentApi {
   /// Нужно, когда человек уходит из раздела, а также по явной кнопке: живой процесс держит
   /// контекст модели в памяти мака, и продолжение разговора потом поднимает его заново из файла.
   Future<void> closeSession(String id) async {
-    await _send<Map<String, dynamic>>(() => _http.post('/projects/sessions/$id/close'));
+    await _send<Map<String, dynamic>>(
+      () => _http.post('/projects/sessions/$id/close'),
+    );
   }
 
   /// Удаляет сессию на маке: процесс гасится, файл истории стирается.
@@ -355,7 +418,9 @@ class AgentApi {
   /// Описание сессии из ответа сервера (`{"session": {...}}`).
   AgentSessionInfo _sessionOf(Map<String, dynamic>? data) {
     final raw = data?['session'];
-    return AgentSessionInfo.fromJson(raw is Map ? raw.cast<String, dynamic>() : const {});
+    return AgentSessionInfo.fromJson(
+      raw is Map ? raw.cast<String, dynamic>() : const {},
+    );
   }
 
   /// Разбор одного события потока; `null` — событие не про экран.
@@ -364,13 +429,19 @@ class AgentApi {
     switch (kind) {
       case 'delta':
         final text = json['text'];
-        return text is String && text.isNotEmpty ? AgentEvent(text: text) : null;
+        return text is String && text.isNotEmpty
+            ? AgentEvent(text: text)
+            : null;
       case 'reasoning':
         final text = json['text'];
-        return text is String && text.isNotEmpty ? AgentEvent(reasoning: text) : null;
+        return text is String && text.isNotEmpty
+            ? AgentEvent(reasoning: text)
+            : null;
       case 'status':
         final step = json['step'];
-        return step is String && step.isNotEmpty ? AgentEvent(status: step) : null;
+        return step is String && step.isNotEmpty
+            ? AgentEvent(status: step)
+            : null;
       case 'tool_call':
         return AgentEvent(
           toolCall: AgentTool(
@@ -384,7 +455,9 @@ class AgentApi {
           toolStart: AgentTool(
             id: json['id']?.toString() ?? '',
             name: json['name']?.toString() ?? '',
-            args: json['args'] is Map ? (json['args'] as Map).cast<String, dynamic>() : const {},
+            args: json['args'] is Map
+                ? (json['args'] as Map).cast<String, dynamic>()
+                : const {},
             running: true,
           ),
         );
@@ -411,25 +484,35 @@ class AgentApi {
         // переписке отдельной служебной строкой — иначе агент «что-то сделал сам» без следа.
         final title = json['title']?.toString() ?? '';
         final auto = json['auto']?.toString() ?? '';
-        final text =
-            ['Подтверждение', if (title.isNotEmpty) '«$title»', auto].where((s) => s.isNotEmpty).join(': ');
+        final text = [
+          'Подтверждение',
+          if (title.isNotEmpty) '«$title»',
+          auto,
+        ].where((s) => s.isNotEmpty).join(': ');
         return text.isEmpty ? null : AgentEvent(note: text);
       case 'usage':
         return AgentEvent(
           usage: AgentUsage(
             input: json['input'] is num ? (json['input'] as num).toInt() : 0,
             output: json['output'] is num ? (json['output'] as num).toInt() : 0,
-            total: json['totalTokens'] is num ? (json['totalTokens'] as num).toInt() : 0,
+            total: json['totalTokens'] is num
+                ? (json['totalTokens'] as num).toInt()
+                : 0,
           ),
         );
       case 'done':
         final raw = json['session'];
         return AgentEvent(
           done: true,
-          session: raw is Map ? AgentSessionInfo.fromJson(raw.cast<String, dynamic>()) : null,
+          session: raw is Map
+              ? AgentSessionInfo.fromJson(raw.cast<String, dynamic>())
+              : null,
         );
       case 'error':
-        return AgentEvent(done: true, error: json['message']?.toString() ?? 'агент не ответил');
+        return AgentEvent(
+          done: true,
+          error: json['message']?.toString() ?? 'агент не ответил',
+        );
       default:
         // `accepted`, `closed`, `compacted` и прочее состояние экрана не меняют: незнакомые
         // события пропускаем, чтобы новый мост не ломал старую сборку приложения.
@@ -470,7 +553,10 @@ class AgentApi {
       DioExceptionType.sendTimeout =>
         'Нет связи с сервером. Проверьте интернет и повторите.',
       DioExceptionType.cancel => 'Запрос отменён.',
-      _ => status == 0 ? 'Не удалось обратиться к серверу.' : 'Сервер ответил ошибкой $status.',
+      _ =>
+        status == 0
+            ? 'Не удалось обратиться к серверу.'
+            : 'Сервер ответил ошибкой $status.',
     };
     return AgentApiException(status, message, code: code);
   }
