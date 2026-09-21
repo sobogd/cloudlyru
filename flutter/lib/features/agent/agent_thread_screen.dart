@@ -236,8 +236,8 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       return;
     }
     if (result.anyRestored) {
-      // Файл вернул живой процесс: разговор ведёт remote-control или открытый терминал Claude
-      // Code, и удалить его из приложения нельзя. Говорим это прямо, а не показываем успех.
+      // Файл вернул живой процесс: разговор открыт в терминале Claude Code, и удалить его из
+      // приложения нельзя. Говорим это прямо, а не показываем успех.
       snack(
         context,
         'Этот разговор ведёт живой процесс Claude Code: файл восстановлен, удалить его отсюда '
@@ -268,6 +268,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       if (next.items.isEmpty) return;
       if (_follow || !_initialJumpDone) _scrollToBottomSoon();
     });
+
+    // Страховка на случай, если слушатель не сработал (например, история оказалась в состоянии
+    // раньше, чем он подписался): пока первый показ не закончен, прыжок в конец ставится из
+    // самой сборки. После него условие перестаёт выполняться.
+    if (!_initialJumpDone && !state.loading && state.items.isNotEmpty) {
+      _scrollToBottomSoon();
+    }
 
     // Тело одинаково в обеих ролях: разница только в том, кто рисует шапку.
     final body = Column(
@@ -894,41 +901,67 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Отложенно: длина списка в момент вызова ещё не учитывает новый текст, и прыжок к прежнему
   /// максимуму не дотянул бы до конца ответа.
   ///
-  /// Пока идёт первый прыжок ([_initialJumpDone]), он повторяется, пока растёт предел прокрутки:
-  /// история приходит и раскладывается несколькими кадрами, и максимум растёт уже после прыжка —
-  /// с одного раза длинный разговор открывался бы не в конце. Дальше следование проверяется в
-  /// сам момент прыжка, а не в момент постановки в очередь: между ними человек успевает
-  /// отлистать вверх — и раньше список всё равно прыгал вниз, после чего снова считал себя
-  /// «внизу» и залипал там навсегда. Пока человек держит палец на экране, не прыгаем вовсе.
+  /// Пока идёт первый показ ([_initialJumpDone]), прыжок повторяется, пока не окажемся в самом
+  /// конце и предел прокрутки перестанет меняться (см. [_retryInitialJump]). Дальше следование
+  /// проверяется в сам момент прыжка, а не в момент постановки в очередь: между ними человек
+  /// успевает отлистать вверх — и раньше список всё равно прыгал вниз, после чего снова считал
+  /// себя «внизу» и залипал там навсегда. Пока человек держит палец на экране, не прыгаем вовсе.
   void _scrollToBottomSoon() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scroll.hasClients) return;
-      // Пока грузится история, в списке ещё прошлый разговор (или он пуст): прыгать по чужому
-      // содержимому нельзя, а тем более считать по нему, что первый показ закончен.
-      if (ref.read(agentThreadProvider).loading) return;
+      if (!mounted) return;
       final initial = !_initialJumpDone;
-      // до первого прыжка ни отлист, ни признак прокрутки не учитываем: открываем с конца
       if (!initial && !_follow) return;
-      if (!initial && _scroll.position.isScrollingNotifier.value) return;
+      if (initial) {
+        // Пока грузится история, прыгать некуда: в списке ещё прошлый разговор (или он пуст).
+        // Ждать здесь нечего — приход истории сам поменяет состояние, и слушатель позовёт
+        // нас заново, с уже свежим счётом попыток.
+        if (ref.read(agentThreadProvider).loading) return;
+        // Список может быть ещё не построен: пробуем на следующем кадре, но не бесконечно.
+        if (!_scroll.hasClients) {
+          _retryInitialJump();
+          return;
+        }
+      } else {
+        if (!_scroll.hasClients) return;
+        if (_scroll.position.isScrollingNotifier.value) return;
+      }
       final bottom = _scroll.position.maxScrollExtent;
       _selfScroll = true;
       _scroll.jumpTo(bottom);
       _selfScroll = false;
       if (!initial) return;
-      // список доехал не целиком — прыгаем ещё раз; потолок, чтобы не зациклиться на вечно
-      // доезжающем содержимом
-      final grew = bottom > _initialJumpExtent;
-      _initialJumpExtent = bottom;
-      _initialJumpTries++;
-      if (grew && _initialJumpTries < 30) {
-        _scrollToBottomSoon();
-      } else {
-        _initialJumpDone = true;
-        // В первом показе истории вниз мог оттянуть сам список, а не человек: раз мы в конце,
-        // считаем, что смотрим конец разговора, иначе ответ агента писался бы без автопрокрутки.
-        _follow = true;
-      }
+      _retryInitialJump(
+        atBottom: _scroll.position.pixels >= bottom - 1,
+        stable: bottom == _initialJumpExtent,
+        extent: bottom,
+      );
     });
+  }
+
+  /// Считает попытку первого прыжка и решает, повторять ли её.
+  ///
+  /// Повтор нужен, пока не окажемся в самом конце и предел прокрутки перестанет меняться: у
+  /// ленивого списка он сначала оценка, и настоящая высота хвоста появляется только после того,
+  /// как хвост построен (а разметка и картинки добавляют высоты и позже). Потолок попыток —
+  /// чтобы вечно доезжающее содержимое не держало экран в прыжках.
+  ///
+  /// Побочно: обновляет [_initialJumpExtent] и закрывает первый показ — [_initialJumpDone] и
+  /// [_follow], после чего список ведёт себя как обычно.
+  void _retryInitialJump({
+    bool atBottom = false,
+    bool stable = false,
+    double? extent,
+  }) {
+    _initialJumpExtent = extent ?? _initialJumpExtent;
+    _initialJumpTries++;
+    if (_initialJumpTries < _maxInitialJumpTries && (!atBottom || !stable)) {
+      _scrollToBottomSoon();
+      return;
+    }
+    _initialJumpDone = true;
+    // В первом показе истории вниз мог оттянуть сам список, а не человек: раз мы в конце,
+    // считаем, что смотрим конец разговора, — иначе ответ агента писался бы без автопрокрутки.
+    _follow = true;
   }
 
   /// Сколько идёт текущая работа словами: «12 с», «1 мин 20 с», «5 мин 3 с».
@@ -1094,6 +1127,13 @@ Future<void> copyMessage(BuildContext context, String text) async {
   await Clipboard.setData(ClipboardData(text: text));
   if (context.mounted) snack(context, 'Скопировано');
 }
+
+/// Предел попыток доехать до конца переписки при её открытии.
+///
+/// Кадров, а не миллисекунд: до этого предела список продолжает строиться, и прыжок в конец
+/// повторяется. Больше сорока кадров — это уже дольше, чем человек готов ждать молчащей
+/// прокрутки; если разметка доезжает позже, это видно, но список уже показывает конец.
+const _maxInitialJumpTries = 40;
 
 /// Убирает пустые строки из служебного текста: вывода команды и «размышлений».
 ///
