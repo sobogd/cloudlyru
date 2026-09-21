@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -41,6 +42,12 @@ const int _searchLimit = 500;
 /// выбирается папка устройства для связки (см. `features/settings/sync_links_screen.dart`):
 /// связка — это ровно одна пара папок, поэтому отметка тут одиночная и в настройки раздела
 /// не пишется вовсе.
+///
+/// Третий случай — iOS. Там дерева файловой системы нет вовсе: приложение заперто в своей
+/// песочнице, и папку можно только выбрать в системном «Файлах» (см. `device/ios_folders.dart`).
+/// Поэтому корнями становятся выбранные папки, а вместо блуждания по диску на экране есть
+/// кнопка «Добавить» — и та же галочка, что и везде: выбранное поддерево внутри папки
+/// отмечается как обычно, потому что внутри неё обычный Dart уже всё видит.
 class FolderTreeScreen extends ConsumerStatefulWidget {
   /// [section] — какой раздел настраивается: у «Файлов» и «Фото» свои наборы папок, и один
   /// экран обслуживает оба, потому что поведение у них одинаковое.
@@ -113,6 +120,68 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
   /// Контроллер синхронизации: у него берутся чтение диска ([DeviceFiles]), текущий выбор папок
   /// и единственный вызов, который пересобирает очередь.
   SyncController get _sync => ref.read(syncControllerProvider);
+
+  /// iOS: папки не обходятся, а выбираются в системном «Файлах» — у экрана другой вход
+  /// (кнопка «Добавить»), другое пустое состояние и своя подсказка.
+  bool get _ios => Platform.isIOS;
+
+  /// Добавить папку через системный выбор «Файлов» (iOS).
+  ///
+  /// После выбора корни перечитываются: нативная часть (см. `ios/Runner/FolderAccess.swift`)
+  /// уже открыла доступ к папке, и она появляется в дереве — с подпапками, которые читаются
+  /// обычными средствами Dart, как и всё остальное в дереве.
+  Future<void> _addFolder() async {
+    final picked = await _sync.files.pickFolder();
+    if (!mounted || picked == null) return;
+    await _loadRoots();
+  }
+
+  /// Забыть папку (iOS): доступ к ней закрывается, и она исчезает из списка навсегда.
+  ///
+  /// Подтверждение обязательно: вместе с папкой уходит право на доступ, а вернуть его можно
+  /// только выбором заново — то есть человеком, а не приложением.
+  ///
+  /// Если внутри забытой папки лежал выбор раздела, он снимается. Это не педантизм: зеркало
+  /// считает исчезнувшую папку удалением и убрало бы её содержимое из облака — ровно то,
+  /// чего от «забыть папку» никто не ждёт (см. `MirrorEngine`).
+  Future<void> _forgetFolder(String path) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Забыть папку?'),
+        content: Text(
+          '$path\n\nДоступ к ней закроется, и вернуть его можно только выбором заново. '
+          'Папка исчезнет из списка, а её содержимое — из выбранных для синхронизации.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Отмена'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Забыть'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await _sync.files.forgetFolder(path);
+    if (!mounted) return;
+    final selection = _sync.selection;
+    final covered = _chosen.any(
+      (chosen) => chosen == path || p.isWithin(path, chosen),
+    );
+    if (!widget.pick && covered && selection != null) {
+      final next = await selection.clear(widget.section);
+      if (!mounted) return;
+      setState(() {
+        _chosen = next;
+        _dirty = true;
+      });
+    }
+    await _loadRoots();
+  }
 
   /// Первый кадр: подставляем уже сделанный выбор и читаем корни томов.
   ///
@@ -441,6 +510,13 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
             ],
           ),
           actions: [
+            // iOS: папку негде искать обходом диска — её выбирают в системном «Файлах»,
+            // поэтому вход в выбор здесь кнопкой, а не деревом
+            if (_ios)
+              TextButton(
+                onPressed: () => unawaited(_addFolder()),
+                child: const Text('Добавить'),
+              ),
             // В режиме выбора одной папки кнопка одна: закрыть экран с выбранным путём.
             // «Снять всё» и «Готово» здесь не нужны — выбор не набор, а одна пара папок
             if (widget.pick)
@@ -469,6 +545,9 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
                 widget.pick
                     ? 'Отметьте папку, содержимое которой поедет в выбранную папку облака. '
                           'Отмеченная папка включает все вложенные.'
+                    : _ios
+                    ? 'Содержимое отмеченных папок появится в разделе $_sectionHint. Папки '
+                          'выбираются в системном «Файлах»: обойти диск на iPad нельзя.'
                     : 'Отмеченная папка включает все вложенные. Содержимое этих папок '
                           'появится в разделе $_sectionHint.',
                 style: const TextStyle(color: C.fg3, fontSize: 11),
@@ -524,6 +603,12 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
                           unreadable: _unreadable.contains(node.path),
                           onToggle: () => unawaited(_toggle(node)),
                           onExpand: () => unawaited(_toggleExpand(node)),
+                          // Забыть папку можно только у корня, и только на iOS: там корень —
+                          // это выбранная в «Файлах» папка, и без этой кнопки убрать её
+                          // из списка было бы нечем
+                          onForget: _ios && node.depth == 0
+                              ? () => unawaited(_forgetFolder(node.path))
+                              : null,
                         );
                       },
                     ),
@@ -549,7 +634,9 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
         controller: _search,
         decoration: InputDecoration(
           isDense: true,
-          hintText: 'поиск папки по всему телефону',
+          // на iOS обходить нечего: поиск идёт по выбранным папкам, и обещать «по всему
+          // телефону» там было бы неправдой
+          hintText: _ios ? 'поиск по выбранным папкам' : 'поиск папки по всему телефону',
           prefixIcon: const Icon(Icons.search, size: 20, color: C.fg3),
           suffixIcon: value.text.isEmpty
               ? null
@@ -565,23 +652,36 @@ class _FolderTreeScreenState extends ConsumerState<FolderTreeScreen> {
 
   /// Пустой список строк. Кнопка «Открыть настройки» показывается только при известном отказе
   /// в доступе: если доступ есть, а папок нет — значит их правда нет, и звать в настройки незачем.
+  ///
+  /// На iOS пусто всегда означает одно и то же — папки ещё не выбраны, — и кнопка тут ведёт
+  /// не в системные настройки, а в системный выбор папки.
   Widget _empty(SyncAccess access) {
     return Padding(
       padding: const EdgeInsets.all(24),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Text(
-            'Папок не найдено',
-            style: TextStyle(color: C.fg, fontWeight: FontWeight.w600),
+          Text(
+            _ios ? 'Папки не выбраны' : 'Папок не найдено',
+            style: const TextStyle(color: C.fg, fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 6),
-          const Text(
-            'Скорее всего у приложения нет доступа ко всем файлам.',
+          Text(
+            _ios
+                ? 'Выберите папку в «Файлах» — её содержимое появится в разделе '
+                      '$_sectionHint. Обойти диск на iPad нельзя: система не выпускает '
+                      'приложение за пределы его хранилища.'
+                : 'Скорее всего у приложения нет доступа ко всем файлам.',
             textAlign: TextAlign.center,
-            style: TextStyle(color: C.fg3, fontSize: 12),
+            style: const TextStyle(color: C.fg3, fontSize: 12),
           ),
-          if (access == SyncAccess.denied) ...[
+          if (_ios) ...[
+            const SizedBox(height: 12),
+            FilledButton(
+              onPressed: () => unawaited(_addFolder()),
+              child: const Text('Выбрать папку'),
+            ),
+          ] else if (access == SyncAccess.denied) ...[
             const SizedBox(height: 12),
             FilledButton(
               onPressed: () => _sync.requestAccess(),
@@ -616,6 +716,7 @@ class _FolderRow extends StatelessWidget {
     required this.unreadable,
     required this.onToggle,
     required this.onExpand,
+    this.onForget,
   });
 
   final FolderNode node;
@@ -628,6 +729,9 @@ class _FolderRow extends StatelessWidget {
   final bool unreadable;
   final VoidCallback onToggle;
   final VoidCallback onExpand;
+
+  /// Убрать папку из списка (iOS): `null` — у этой строки такого действия нет.
+  final VoidCallback? onForget;
 
   @override
   Widget build(BuildContext context) {
@@ -701,6 +805,13 @@ class _FolderRow extends StatelessWidget {
                 ],
               ),
             ),
+            if (onForget != null)
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Забыть папку',
+                onPressed: onForget,
+                icon: const Icon(Icons.close, size: 18, color: C.fg3),
+              ),
           ],
         ),
       ),
