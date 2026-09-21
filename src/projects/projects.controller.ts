@@ -380,6 +380,33 @@ export class ProjectsController {
   }
 
   /**
+   * Убирает старые сессии проекта: разговоры старше N дней и/или всё, кроме K самых свежих.
+   *
+   * Необратимо, поэтому условия обязательны и проверяются на мосте: без хотя бы одного из них
+   * ручка откажет, чтобы «убрать старое» не превратилось в «удалить всё». Приложение показывает
+   * число удаляемых разговоров до нажатия.
+   */
+  @Post('sessions/purge')
+  async purgeSessions(@Body() body: Record<string, unknown> = {}) {
+    const path = str(body.path);
+    if (!path) throw badRequest('path обязателен');
+    const olderThanDays = num(body.olderThanDays);
+    const keep = num(body.keep);
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>('POST', '/sessions/purge', {
+        body: {
+          path,
+          harness: str(body.harness) || 'pi',
+          ...(olderThanDays === undefined ? {} : { olderThanDays }),
+          ...(keep === undefined ? {} : { keep }),
+        },
+        // удаление сотен файлов на маке: секунды, но не мгновение
+        timeoutMs: 120_000,
+      }),
+    );
+  }
+
+  /**
    * Удаляет сессию: процесс гасится, файл истории стирается с мака.
    *
    * Необратимо, поэтому в приложении это отдельное действие с подтверждением.
@@ -412,6 +439,15 @@ export class ProjectsController {
       throw new ApiError(status, e.message, codeFor(status));
     }
   }
+}
+
+/** Число из тела запроса; не число и не задано — `undefined`. */
+function num(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  return undefined;
 }
 
 /** Строка из тела запроса: у необязательных полей пустая строка вместо `undefined`. */

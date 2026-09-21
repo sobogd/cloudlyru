@@ -33,7 +33,8 @@ stdio и умеет ровно то, что нужно разделу «Прое
   POST   /sessions/<id>/model         — сменить модель;
   POST   /sessions/<id>/close         — закрыть процесс (файл сессии остаётся);
   POST   /sessions/<id>/ui            — ответ на диалог расширения (по умолчанию не нужен);
-  DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается.
+  DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается;
+  POST   /sessions/purge              — убрать старые сессии проекта (старше N дней / кроме K свежих).
 
 Кто сюда ходит: только сервер приложения, и только через reverse-SSH туннель мака — порт
 18820 слушает loopback на обоих концах (см. jevel.ai/agents/run-dsh-tunnel.sh), ровно как
@@ -1129,10 +1130,12 @@ def parse_size(raw):
 
 
 def purge_session(key):
-    """Удаляет файл сессии с диска: разговор исчезает совсем, а не только из приложения.
+    """Удаляет сессию с диска: файл истории и папку, которую агент завёл под этот разговор.
 
-    Харнесс берётся из идентификатора, потому что хранилищ два. Возвращаем число удалённых
-    файлов — приложение по нему понимает, было ли что удалять.
+    Харнесс берётся из идентификатора, потому что хранилищ два. У Claude Code рядом с файлом
+    истории лежит папка с тем же именем (результаты инструментов, служебные пометки) — без неё
+    удаление оставляло мусор, который копился сотнями. Возвращаем число удалённых файлов —
+    приложение по нему понимает, было ли что удалять.
     """
     harness, session_id = split_key(key)
     file = find_session_file(harness, session_id)
@@ -1141,9 +1144,41 @@ def purge_session(key):
     try:
         file.unlink()
         log("удалил файл сессии %s (%s)" % (file, harness))
+        workdir = file.parent / session_id
+        if workdir.is_dir():
+            shutil.rmtree(workdir, ignore_errors=True)
+            log("удалил папку сессии %s" % workdir)
     except OSError as e:
         raise PiError("не смог удалить файл сессии %s: %s" % (file, e))
     return 1
+
+
+def purge_old_sessions(path, harness, older_days, keep):
+    """Удаляет старые сессии проекта, оставляя свежие: уборка, а не удаление по одной.
+
+    Условия складываются: удаляем то, что старше [older_days] дней И при этом не входит в
+    [keep] самых свежих. Второе условие нужно, чтобы «удалить старше недели» не снесло
+    разговор, который человек только что оставил открытым на паузе: свежие сессии неприкосновенны
+    независимо от порога. Хотя бы одно условие обязательно — иначе ручка снесла бы всё подряд.
+    """
+    if older_days is None and keep is None:
+        raise PiError("нужно условие: старше скольких дней удалять или сколько свежих оставить")
+    files = (claude_session_files(path) if harness == HARNESS_CLAUDE else session_files(path))
+    newest_first = sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+    protected = set(str(f) for f in newest_first[: max(0, keep or 0)])
+    threshold = time.time() - (older_days * 86400) if older_days is not None else None
+
+    deleted = []
+    for file in newest_first:
+        if str(file) in protected:
+            continue
+        if threshold is not None and file.stat().st_mtime >= threshold:
+            continue
+        session_id = file.stem.split("_")[-1] if harness != HARNESS_CLAUDE else file.stem
+        if purge_session(session_key(harness, session_id)):
+            deleted.append(session_key(harness, session_id))
+    log("уборка сессий в %s (%s): удалено %d" % (path, harness, len(deleted)))
+    return deleted
 
 
 def read_json_file(path):
@@ -2393,6 +2428,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/sessions":
                 self._open_session(body)
                 return
+            if path == "/sessions/purge":
+                self._json(200, self._purge_sessions(body))
+                return
             if path == "/providers":
                 self._json(200, {"providers": save_provider(body)})
                 return
@@ -2557,6 +2595,33 @@ class Handler(BaseHTTPRequestHandler):
         session = POOL.open(path, harness, session_id, provider=provider, model=model)
         session.refresh_state()
         self._json(200, {"session": self._session_brief(session)})
+
+    def _purge_sessions(self, body):
+        """Убирает старые сессии проекта: разговор, который закрыли, чтобы освободить список.
+
+        Разрушительно и необратимо, поэтому условия приходят от человека явно (`olderThanDays`
+        и/или `keep`) и проверяются в `purge_old_sessions`: без хотя бы одного ручка откажет,
+        а не снесёт всё подряд.
+        """
+        raw = str(body.get("path") or "").strip()
+        path = allowed_path(raw) if raw else None
+        if path is None:
+            raise PiError("папка вне разрешённых корней: %s" % raw)
+        harness = str(body.get("harness") or HARNESS_PI).strip().lower()
+        if harness not in HARNESS_NAMES:
+            raise PiError("неизвестный харнесс: %s" % harness)
+        older = body.get("olderThanDays")
+        keep = body.get("keep")
+        if older is not None:
+            older = int(older)
+            if older < 0:
+                raise PiError("olderThanDays не может быть отрицательным")
+        if keep is not None:
+            keep = int(keep)
+            if keep < 0:
+                raise PiError("keep не может быть отрицательным")
+        deleted = purge_old_sessions(path, harness, older, keep)
+        return {"deleted": len(deleted), "sessions": deleted}
 
     def _close(self, session_id):
         """Закрывает процесс pi, оставляя историю: освобождает память на маке.

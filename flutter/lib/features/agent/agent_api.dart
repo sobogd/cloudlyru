@@ -81,6 +81,29 @@ class AgentApi {
     return AgentHealth.fromJson(data ?? const {});
   }
 
+  /// Убирает старые сессии проекта, оставляя свежие.
+  ///
+  /// Условия складываются: `olderThanDays` — что считать старым, `keep` — сколько самых свежих
+  /// не трогать вовсе. Хотя бы одно нужно: без него мост откажет, чтобы «убрать старое» не
+  /// превратилось в «удалить всё». Возвращает, сколько сессий удалено.
+  Future<int> purgeSessions({
+    required String path,
+    required String harness,
+    int? olderThanDays,
+    int? keep,
+  }) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post('/projects/sessions/purge', data: <String, dynamic>{
+        'path': path,
+        'harness': harness,
+        // null-aware элементы: условие писать не нужно, поле просто не попадёт в тело
+        'olderThanDays': ?olderThanDays,
+        'keep': ?keep,
+      }),
+    );
+    return data?['deleted'] is num ? (data!['deleted'] as num).toInt() : 0;
+  }
+
   /// Харнессы, стоящие на маке: pi и Claude Code — с версиями и признаком «есть».
   Future<List<AgentHarness>> harnesses() async {
     final data = await _send<Map<String, dynamic>>(

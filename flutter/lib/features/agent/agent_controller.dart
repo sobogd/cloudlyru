@@ -392,6 +392,9 @@ class AgentSessionsState {
   /// Идёт загрузка списка или открытие сессии.
   final bool loading;
 
+  /// Какой харнесс убирать при уборке старых сессий (его выбирает экран).
+  final String purgeHarness;
+
   /// Причина последней неудачи или `null`.
   final String? error;
 
@@ -400,8 +403,18 @@ class AgentSessionsState {
     this.project,
     this.sessions = const [],
     this.loading = false,
+    this.purgeHarness = 'pi',
     this.error,
   });
+
+  /// Копия состояния с выбранным для уборки харнессом.
+  AgentSessionsState withHarness(String harness) => AgentSessionsState(
+    project: project,
+    sessions: sessions,
+    loading: loading,
+    purgeHarness: harness,
+    error: error,
+  );
 }
 
 /// Провайдер сессий проекта.
@@ -494,6 +507,31 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     }
   }
 
+  /// Убирает старые сессии проекта и перечитывает список с мака.
+  ///
+  /// Возвращает число удалённых разговоров или `null`, если мост отказал (причина при этом уже
+  /// лежит в состоянии и показывается на экране).
+  Future<int?> purgeOld({int? olderThanDays, int? keep}) async {
+    final project = state.project;
+    if (project == null) return null;
+    final harness = state.purgeHarness;
+    try {
+      final deleted = await _api.purgeSessions(
+        path: project.path,
+        harness: harness,
+        olderThanDays: olderThanDays,
+        keep: keep,
+      );
+      // Список перечитываем с мака: удаление идёт по файлам, и показывать список, собранный
+      // до него, значит однажды снова увидеть удалённый разговор в списке.
+      await load(project);
+      return deleted;
+    } on AgentApiException catch (e) {
+      showError(e.message);
+      return null;
+    }
+  }
+
   /// Закрывает процесс сессии на маке, оставляя историю (освобождает память под контекст).
   Future<void> close(String sessionId) async {
     try {
@@ -501,6 +539,14 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     } on AgentApiException catch (e) {
       showError(e.message);
     }
+  }
+
+  /// Запоминает, какой харнесс выбран на экране: им убираются старые сессии.
+  ///
+  /// Уборка идёт по файлам на маке, а список приходит сразу по обоим харнессам — поэтому
+  /// разбирать, чьи разговоры удалять, должен экран, а контроллеру нужно только знать ответ.
+  void selectHarness(String harness) {
+    state = state.withHarness(harness);
   }
 
   /// Показывает ошибку, полученную не от списка (например, отказ моста на открытии).

@@ -46,7 +46,9 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
       if (!mounted) return;
       // харнессы читаем сразу: от них зависит и список, и то, что предложить новой сессии
       ref.read(agentHarnessesProvider.notifier).load();
-      _sessions.load(widget.project);
+      _sessions.load(widget.project).then((_) {
+        if (mounted) _sessions.selectHarness(_harness);
+      });
     });
   }
 
@@ -117,6 +119,13 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
         ),
         actions: [
           IconButton(
+            // Уборка старых разговоров: у Claude Code их копятся сотни (в ~/work/tangem их было
+            // 246), и по одному они не удаляются — нужна разовая чистка с понятным правилом
+            tooltip: 'Убрать старые',
+            onPressed: state.loading ? null : _purge,
+            icon: const Icon(Icons.cleaning_services_outlined),
+          ),
+          IconButton(
             tooltip: 'Обновить список',
             onPressed: state.loading
                 ? null
@@ -176,9 +185,51 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
         ],
         selected: <String>{_harness},
         showSelectedIcon: false,
-        onSelectionChanged: (value) => setState(() => _harness = value.first),
+        onSelectionChanged: (value) {
+          setState(() => _harness = value.first);
+          _sessions.selectHarness(_harness);
+        },
       ),
     );
+  }
+
+  /// Убирает старые сессии выбранного харнесса по выбранному правилу.
+  ///
+  /// Правило выбирает человек, и числа он видит до нажатия: диалог считает, сколько разговоров
+  /// уйдёт по каждому варианту. Удаление необратимо, поэтому подтверждение отдельное и с числом.
+  Future<void> _purge() async {
+    final state = ref.read(agentSessionsProvider);
+    final sessions = [
+      for (final s in state.sessions)
+        if (s.harness == _harness) s,
+    ];
+    if (sessions.isEmpty) {
+      snack(context, 'Убирать нечего: разговоров у этого агента нет');
+      return;
+    }
+    final rule = await showDialog<_PurgeRule>(
+      context: context,
+      builder: (_) => _PurgeDialog(
+        sessions: sessions,
+        harnessName: ref.read(agentHarnessesProvider).nameOf(_harness),
+      ),
+    );
+    if (rule == null || !mounted) return;
+
+    final ok = await confirmDialog(
+      context,
+      'Убрать старые сессии',
+      '${rule.count} разговоров будут удалены на маке вместе с историей. Восстановить их нечем.',
+      danger: true,
+      confirmLabel: 'Удалить',
+    );
+    if (!ok || !mounted) return;
+    final deleted = await _sessions.purgeOld(
+      olderThanDays: rule.olderThanDays,
+      keep: rule.keep,
+    );
+    if (!mounted || deleted == null) return;
+    snack(context, 'Удалено разговоров: $deleted');
   }
 
   /// Значок харнесса: у pi терминал, у Claude Code — звёздочка его бренда.
@@ -283,4 +334,151 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
       ],
     ),
   );
+}
+
+/// Правило уборки: что именно удалять и сколько разговоров под него попадает.
+class _PurgeRule {
+  /// Удалять старше стольких дней; `null` — по возрасту не ограничиваем.
+  final int? olderThanDays;
+
+  /// Сколько самых свежих разговоров не трогать; `null` — не защищаем ничего.
+  final int? keep;
+
+  /// Сколько разговоров уйдёт по этому правилу (посчитано заранее, для подтверждения).
+  final int count;
+
+  /// Правило уборки.
+  const _PurgeRule({this.olderThanDays, this.keep, required this.count});
+}
+
+/// Диалог уборки: два правила с готовыми числами.
+///
+/// Числа считаются здесь же, из уже загруженного списка: человек должен видеть «удалится 192»
+/// до нажатия, а не узнавать это по факту.
+class _PurgeDialog extends StatefulWidget {
+  /// Сессии выбранного харнесса в этом проекте.
+  final List<AgentSession> sessions;
+
+  /// Название харнесса для подписи.
+  final String harnessName;
+
+  /// Диалог уборки.
+  const _PurgeDialog({required this.sessions, required this.harnessName});
+
+  @override
+  State<_PurgeDialog> createState() => _PurgeDialogState();
+}
+
+/// Состояние диалога: выбранное правило.
+class _PurgeDialogState extends State<_PurgeDialog> {
+  /// Выбрано правило «оставить только свежие».
+  bool _keepFresh = false;
+
+  /// Сколько свежих разговоров оставляем во втором правиле.
+  static const _keepFreshCount = 5;
+
+  /// Сколько удалится, если оставить [_keepFreshCount] самых свежих.
+  int get _countKeepFresh => _countFor(keep: _keepFreshCount);
+
+  /// Сколько удалится, если убрать старше недели.
+  int get _countByAge => _countFor(olderThanDays: 7);
+
+  /// Считает, сколько сессий попадёт под правило.
+  ///
+  /// Повторяет арифметику моста: свежие защищены, остальное удаляется по возрасту. Нужно, чтобы
+  /// число в диалоге совпадало с тем, что произойдёт на маке.
+  int _countFor({int? olderThanDays, int? keep}) {
+    final sorted = [...widget.sessions]
+      ..sort(
+        (a, b) =>
+            (b.updatedAt ?? DateTime(0)).compareTo(a.updatedAt ?? DateTime(0)),
+      );
+    final protected = <String>{
+      if (keep != null)
+        for (final s in sorted.take(keep)) s.id,
+    };
+    final threshold = olderThanDays == null
+        ? null
+        : DateTime.now().subtract(Duration(days: olderThanDays));
+    return widget.sessions
+        .where(
+          (s) =>
+              !protected.contains(s.id) &&
+              (threshold == null || (s.updatedAt?.isBefore(threshold) ?? true)),
+        )
+        .length;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final keepCount = _countKeepFresh;
+    final weekCount = _countByAge;
+    return AlertDialog(
+      backgroundColor: C.surface,
+      title: Text(
+        'Убрать старые · ${widget.harnessName}',
+        style: const TextStyle(color: C.fg, fontSize: 16),
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Всего разговоров: ${widget.sessions.length}. Удаление необратимо.',
+            style: const TextStyle(color: C.fg3, fontSize: 12, height: 1.35),
+          ),
+          const SizedBox(height: 8),
+          RadioGroup<bool>(
+            groupValue: _keepFresh,
+            onChanged: (v) => setState(() => _keepFresh = v ?? false),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                RadioListTile<bool>(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  value: false,
+                  title: Text(
+                    'Удалить старше 7 дней — $weekCount',
+                    style: const TextStyle(color: C.fg, fontSize: 14),
+                  ),
+                  subtitle: const Text(
+                    'Разговоры за последнюю неделю остаются все',
+                    style: TextStyle(color: C.fg3, fontSize: 11.5),
+                  ),
+                ),
+                RadioListTile<bool>(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  value: true,
+                  title: Text(
+                    'Оставить только $_keepFreshCount свежих — $keepCount',
+                    style: const TextStyle(color: C.fg, fontSize: 14),
+                  ),
+                  subtitle: const Text(
+                    'Всё остальное, включая вчерашнее, удаляется',
+                    style: TextStyle(color: C.fg3, fontSize: 11.5),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Отмена'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(
+            _keepFresh
+                ? _PurgeRule(keep: _keepFreshCount, count: keepCount)
+                : _PurgeRule(olderThanDays: 7, count: weekCount),
+          ),
+          child: const Text('Дальше'),
+        ),
+      ],
+    );
+  }
 }
