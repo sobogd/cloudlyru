@@ -39,6 +39,7 @@ model User {
   clipboardAt   DateTime?
   chats         Chat[]
   chatSettings  ChatSettings?
+  notes         Note[]
 }
 
 model Session {
@@ -1318,4 +1319,30 @@ model ChatSource {
 
   @@unique([messageId, position])
   @@map("chat_sources")
+}
+
+// ===== Заметки =====
+
+/// Заметка раздела «Заметки»: просто текст, приоритет и время последней правки.
+///
+/// Отдельного заголовка нет намеренно: в списке видно начало текста, а придумывать имя каждой
+/// заметке — лишняя работа. Хранится на сервере (как чаты и память), поэтому заметки одни на
+/// все устройства и переживают переустановку приложения.
+///
+/// `priority` — строка, а не enum: в схеме проекта enums не заводятся, значения проверяются
+/// в сервисе перед записью. Сортировка списка (высокий → низкий, внутри — свежие правки сверху)
+/// делается сервером, чтобы порядок был одинаков на всех клиентах.
+model Note {
+  id        String   @id @default(uuid())
+  userId    String
+  text      String
+  priority  String   @default("low") // 'high' | 'medium' | 'low'
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Список всегда читается одним запросом «все заметки пользователя», поэтому индекс покрывает
+  // именно его: без него выборка идёт сканом всей таблицы заметок всех пользователей.
+  @@index([userId, priority, updatedAt])
+  @@map("notes")
 }

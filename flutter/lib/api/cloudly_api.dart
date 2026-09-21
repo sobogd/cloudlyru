@@ -654,6 +654,33 @@ class CloudlyApi {
   /// единственную точку восстановления одним запросом.
   Future<void> purgeTrash() async => _req('/trash/purge', method: 'POST', body: {});
 
+  // ---------- заметки ----------
+
+  /// Список заметок в порядке показа: приоритет (высокий → низкий), затем свежие правки.
+  ///
+  /// Порядок считает сервер — так он одинаков на всех устройствах, а клиенту остаётся только
+  /// показать список как есть.
+  Future<List<Note>> notes() async {
+    final body = _m(await _req('/notes'));
+    return body.lm('notes').map(Note.fromJson).toList();
+  }
+
+  /// Новая заметка. Возвращает вид, под которым её сохранил сервер: `id` нужен, чтобы редактор
+  /// дальше правил именно её, а не создавал копию при каждом сохранении.
+  Future<Note> createNote({required String text, required String priority}) async {
+    final body = _m(await _req('/notes', method: 'POST', body: {'text': text, 'priority': priority}));
+    return Note.fromJson(_m(body['note']));
+  }
+
+  /// Правка текста и/или приоритета заметки; сервер сам обновляет время последней правки.
+  Future<Note> updateNote(String id, {required String text, required String priority}) async {
+    final body = _m(await _req('/notes/$id', method: 'PATCH', body: {'text': text, 'priority': priority}));
+    return Note.fromJson(_m(body['note']));
+  }
+
+  /// Удаление заметки — насовсем, без корзины.
+  Future<void> deleteNote(String id) async => _req('/notes/$id', method: 'DELETE');
+
   // ---------- медиа ----------
 
   /// Сколько кадров в медиатеке. Галерея им не пользуется: её список курсорный, и полной

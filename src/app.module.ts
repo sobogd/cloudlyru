@@ -25,6 +25,7 @@ import { MailModule } from './mail/mail.module';
 import { FacturaModule } from './factura/factura.module';
 import { ChatModule } from './chat/chat.module';
 import { ProjectsModule } from './projects/projects.module';
+import { NotesModule } from './notes/notes.module';
 
 /**
  * Корневой модуль: собирает функциональные модули и вешает на каждый запрос три глобальные
@@ -70,6 +71,7 @@ import { ProjectsModule } from './projects/projects.module';
     FacturaModule,
     ChatModule,
     ProjectsModule,
+    NotesModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },

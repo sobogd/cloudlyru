@@ -515,6 +515,32 @@ class TrashView {
       );
 }
 
+// ===== заметки =====
+
+/// Заметка раздела «Заметки»: текст, приоритет и время последней правки.
+///
+/// Отдельного заголовка нет намеренно: в списке видно начало текста, а придумывать имя каждой
+/// заметке — лишняя работа. [priority] — строка сервера (`high` | `medium` | `low`); неизвестное
+/// значение показывается нейтрально, а порядок всё равно расставляет сервер, поэтому разбору
+/// модели доверять этому полю целиком не нужно.
+class Note {
+  final String id;
+  final String text;
+  final String priority;
+  // Момент последней правки, ISO с `Z` (UTC): показывается через listDate в поясе устройства.
+  final String updatedAt;
+
+  Note({required this.id, required this.text, required this.priority, required this.updatedAt});
+
+  /// Разбор заметки из ответа `/notes`.
+  factory Note.fromJson(Map<String, dynamic> j) => Note(
+        id: j.s('id'),
+        text: j.s('text'),
+        priority: j.s('priority'),
+        updatedAt: j.s('updatedAt'),
+      );
+}
+
 // ===== app-токены =====
 
 /// Строка списка app-токенов (device-токенов) в настройках.

@@ -10,6 +10,7 @@ import '../features/chat/chat_screen.dart';
 import '../features/files/files_screen.dart';
 import '../features/mail/mail_screen.dart';
 import '../features/map/map_screen.dart';
+import '../features/notes/notes_screen.dart';
 import '../features/gallery/gallery_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../factura/invoices_screen.dart';
@@ -23,8 +24,9 @@ import '../theme.dart';
 /// (`settings.ui`, поле `tab`), поэтому переименование значений сломало бы восстановление
 /// последнего раздела: [_ShellState.initState] ищет сохранённое имя по `name` и при промахе
 /// молча остаётся на «Файлах». Список открытый: новый раздел — новое значение здесь и строка
-/// в [_tabLook], больше менять нечего.
-enum AppTab { files, mail, media, map, invoices, chat, projects, trash, settings }
+/// в [_tabLook], больше менять нечего. Порядок значений = порядок разделов в баре, поэтому
+/// новый раздел вставляется в нужное место, а не в конец списка: «Заметки» стоят после «Карты».
+enum AppTab { files, mail, media, map, notes, invoices, chat, projects, trash, settings }
 
 /// Название раздела для человека и его иконка.
 ///
@@ -45,6 +47,11 @@ const Map<AppTab, _TabLook> _tabLook = {
     activeIcon: Icons.photo_library,
   ),
   AppTab.map: (label: 'Карта', icon: Icons.map_outlined, activeIcon: Icons.map),
+  AppTab.notes: (
+    label: 'Заметки',
+    icon: Icons.sticky_note_2_outlined,
+    activeIcon: Icons.sticky_note_2,
+  ),
   AppTab.invoices: (
     label: 'Инвойсы',
     icon: Icons.receipt_long_outlined,
@@ -153,6 +160,7 @@ class _ShellState extends ConsumerState<Shell> {
         AppTab.mail => const MailScreen(),
         AppTab.media => const GalleryScreen(),
         AppTab.map => const MapScreen(),
+        AppTab.notes => const NotesScreen(),
         AppTab.invoices => const InvoicesScreen(),
         AppTab.chat => const ChatScreen(),
         AppTab.projects => const ProjectsScreen(),
