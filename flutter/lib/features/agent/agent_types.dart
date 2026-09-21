@@ -286,6 +286,45 @@ class AgentDeleteResult {
   bool get anyRestored => restored > 0;
 }
 
+/// Работа на маке: что считается прямо сейчас и что закончилось, пока приложения не было.
+///
+/// Снимок держит сервер (он опрашивает мост сам), поэтому «готово» видно и после того, как
+/// приложение закрывалось. Настоящих уведомлений в фоне нет — это отдельная работа с push-каналом.
+class AgentActivity {
+  /// Идентификаторы сессий, которые считаются прямо сейчас.
+  final Set<String> running;
+
+  /// Сессии, которые закончились недавно: им показывается «готово».
+  final Set<String> finished;
+
+  /// Когда снимок обновлялся на сервере; `null` — ещё ни разу.
+  final DateTime? updatedAt;
+
+  /// Снимок работы.
+  const AgentActivity({
+    this.running = const {},
+    this.finished = const {},
+    this.updatedAt,
+  });
+
+  /// Пустой снимок: ничего не известно.
+  static const empty = AgentActivity();
+
+  /// Разбор снимка из ответа сервера.
+  factory AgentActivity.fromJson(Map<String, dynamic> json) {
+    Set<String> ids(Object? raw) => <String>{
+      if (raw is List)
+        for (final item in raw)
+          if (item is Map && item['id'] is String) item['id'] as String,
+    };
+    return AgentActivity(
+      running: ids(json['running']),
+      finished: ids(json['finished']),
+      updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
+    );
+  }
+}
+
 /// Харнесс — агент, который работает в папке проекта: pi или Claude Code.
 ///
 /// Их может быть несколько, и разговоры у каждого свои: истории лежат в разных местах на маке,
@@ -755,6 +794,12 @@ class AgentEvent {
   /// Служебная строка для переписки: например, автоответ на подтверждение.
   final String? note;
 
+  /// Сообщение принято в очередь занятой сессии; число — его место в очереди.
+  final int? queued;
+
+  /// Сообщение из очереди ушло агенту: подпись очереди можно снимать.
+  final bool queuedStarted;
+
   /// Расход токенов.
   final AgentUsage? usage;
 
@@ -772,6 +817,8 @@ class AgentEvent {
     this.text,
     this.reasoning,
     this.status,
+    this.queued,
+    this.queuedStarted = false,
     this.toolStart,
     this.toolProgress,
     this.toolEnd,

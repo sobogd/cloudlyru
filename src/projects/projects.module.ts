@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ProjectsController } from './projects.controller';
+import { ProjectsActivityService } from './projects-activity.service';
 import { ProjectsService } from './projects.service';
 
 /**
@@ -14,6 +15,6 @@ import { ProjectsService } from './projects.service';
  */
 @Module({
   controllers: [ProjectsController],
-  providers: [ProjectsService],
+  providers: [ProjectsService, ProjectsActivityService],
 })
 export class ProjectsModule {}

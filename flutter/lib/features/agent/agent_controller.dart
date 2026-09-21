@@ -156,6 +156,68 @@ class AgentModelsController extends Notifier<AgentModelsState> {
   }
 }
 
+// --- работа на маке ---
+
+/// Состояние работы на маке: что считается и что закончилось без нас.
+class AgentActivityState {
+  /// Снимок с сервера.
+  final AgentActivity activity;
+
+  /// Причина последней неудачи или `null`.
+  final String? error;
+
+  /// Состояние работы.
+  const AgentActivityState({this.activity = AgentActivity.empty, this.error});
+
+  /// Сессия считается прямо сейчас.
+  bool isRunning(String id) => activity.running.contains(id);
+
+  /// Разговор закончился, пока мы на него не смотрели.
+  bool isFinished(String id) => activity.finished.contains(id);
+}
+
+/// Провайдер снимка работы.
+final agentActivityProvider =
+    NotifierProvider<AgentActivityController, AgentActivityState>(
+      AgentActivityController.new,
+    );
+
+/// Снимок работы на маке: приложение спрашивает его, пока открыт список разговоров.
+///
+/// Это и есть «уведомление» без push-канала: сервер опрашивает мост всегда, а приложение,
+/// оказавшись на экране, узнаёт, что разговор дописался без него, и помечает строку «готово».
+class AgentActivityController extends Notifier<AgentActivityState> {
+  /// Клиент раздела.
+  AgentApi get _api => ref.read(agentApiProvider);
+
+  @override
+  AgentActivityState build() => const AgentActivityState();
+
+  /// Читает снимок работы.
+  Future<void> load() async {
+    try {
+      state = AgentActivityState(activity: await _api.activity());
+    } on AgentApiException catch (e) {
+      state = AgentActivityState(activity: state.activity, error: e.message);
+    }
+  }
+
+  /// Снимает пометку «готово» с разговора, который человек открыл.
+  void markSeen(String sessionId) {
+    if (!state.activity.finished.contains(sessionId)) return;
+    state = AgentActivityState(
+      activity: AgentActivity(
+        running: state.activity.running,
+        finished: {
+          for (final id in state.activity.finished)
+            if (id != sessionId) id,
+        },
+        updatedAt: state.activity.updatedAt,
+      ),
+    );
+  }
+}
+
 // --- провайдеры ---
 
 /// Состояние списка провайдеров: свои (models.json) и встроенные (auth.json) на маке.
@@ -432,11 +494,13 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
   AgentSessionsState build() => const AgentSessionsState();
 
   /// Читает сессии проекта.
-  Future<void> load(AgentProject project) async {
+  Future<void> load(AgentProject project, {bool silent = false}) async {
     state = AgentSessionsState(
       project: project,
       sessions: state.sessions,
-      loading: true,
+      // Тихий режим для периодического обновления: список перечитывается, но спиннер не мигает,
+      // иначе экран дёргался бы каждые несколько секунд
+      loading: !silent,
     );
     try {
       final sessions = await _api.sessions(project.path);
@@ -593,6 +657,12 @@ class AgentThreadState {
   /// Причина последней неудачи или `null`.
   final String? error;
 
+  /// Сколько сообщений человека ждут своей очереди: агент занят предыдущим.
+  ///
+  /// Показывается на экране: иначе отправленное в занятую сессию сообщение выглядит потерянным —
+  /// ответа на него ещё нет, а очередь и есть доказательство, что оно живое.
+  final int queued;
+
   /// Когда человек отправил текущее сообщение: по этому времени экран считает, сколько уже
   /// идёт работа. Живёт в состоянии, а не в виджете, потому что перерисовок за прогон много.
   final DateTime? runStartedAt;
@@ -606,6 +676,7 @@ class AgentThreadState {
     this.step = '',
     this.usage,
     this.error,
+    this.queued = 0,
     this.runStartedAt,
   });
 
@@ -617,6 +688,7 @@ class AgentThreadState {
     bool? sending,
     String? step,
     AgentUsage? usage,
+    int? queued,
     DateTime? runStartedAt,
   }) => AgentThreadState(
     session: session ?? this.session,
@@ -638,6 +710,7 @@ class AgentThreadState {
     step: step,
     usage: usage,
     error: message,
+    queued: queued,
     runStartedAt: runStartedAt,
   );
 
@@ -649,6 +722,7 @@ class AgentThreadState {
     sending: sending,
     step: step,
     usage: usage,
+    queued: queued,
     runStartedAt: runStartedAt,
   );
 
@@ -739,7 +813,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   Future<void> send(String text) async {
     final prompt = text.trim();
     final session = state.session;
-    if (prompt.isEmpty || session == null || state.sending) return;
+    if (prompt.isEmpty || session == null) return;
     state = state
         .copyWith(
           items: [
@@ -748,7 +822,30 @@ class AgentThreadController extends Notifier<AgentThreadState> {
           ],
         )
         .clearError();
+    if (state.sending) {
+      // Агент занят — сообщение встаёт в очередь на маке и уедет, как только он освободится.
+      // Отказывать нельзя: человек дописывает уточнение, пока агент ещё работает.
+      await _queue(session.id, prompt);
+      return;
+    }
     await _run(session.id, prompt);
+  }
+
+  /// Ставит сообщение в очередь занятой сессии.
+  ///
+  /// Если сессия успела освободиться (мост отвечает «очередь не нужна»), отправляем вопрос
+  /// обычным путём: иначе он остался бы висеть в очереди, которой уже нет.
+  Future<void> _queue(String sessionId, String prompt) async {
+    try {
+      final position = await _api.queueMessage(sessionId, prompt);
+      if (position == 0) {
+        await _run(sessionId, prompt);
+        return;
+      }
+      state = state.copyWith(queued: position);
+    } on AgentApiException catch (e) {
+      state = state.withError(e.message);
+    }
   }
 
   /// Повторяет последний вопрос после ошибки.
@@ -914,6 +1011,8 @@ class AgentThreadController extends Notifier<AgentThreadState> {
       return;
     }
     if (event.status != null) state = state.copyWith(step: event.status!);
+    if (event.queued != null) state = state.copyWith(queued: event.queued);
+    if (event.queuedStarted) state = state.copyWith(queued: 0);
     if (event.usage != null) state = state.copyWith(usage: event.usage);
     if (event.session != null) state = state.copyWith(session: event.session);
     if (event.note != null) {

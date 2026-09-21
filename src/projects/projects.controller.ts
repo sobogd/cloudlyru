@@ -16,6 +16,10 @@ import { Readable } from 'node:stream';
 import { ApiError, badRequest } from '../common/errors';
 import { RateLimit } from '../common/decorators';
 import { ProjectsError, ProjectsService } from './projects.service';
+import {
+  ActivitySnapshot,
+  ProjectsActivityService,
+} from './projects-activity.service';
 
 /** Потолок длины сообщения агенту: его принимает и мост, но отказ лучше дать здесь, с текстом. */
 const MAX_PROMPT_CHARS = 20_000;
@@ -40,7 +44,10 @@ const MAX_PROMPT_CHARS = 20_000;
 export class ProjectsController {
   private readonly logger = new Logger(ProjectsController.name);
 
-  constructor(private readonly projects: ProjectsService) {}
+  constructor(
+    private readonly projects: ProjectsService,
+    private readonly activity: ProjectsActivityService,
+  ) {}
 
   /**
    * Состояние моста: версия харнесса, выбранная модель, разрешённые корни.
@@ -89,6 +96,18 @@ export class ProjectsController {
     return this.wrap(() =>
       this.projects.call<Record<string, unknown>>('GET', `/models${query}`),
     );
+  }
+
+  /**
+   * Что считается на маке прямо сейчас и что закончилось, пока приложения не было.
+   *
+   * Сервер опрашивает мост сам (раз в пять секунд), поэтому снимок живёт независимо от того,
+   * открыто ли приложение: вернувшись, оно видит «готово» у разговоров, которые дописались без
+   * него. Настоящих уведомлений в фоне пока нет — это отдельная работа (push-канал).
+   */
+  @Get('activity')
+  activitySnapshot(): ActivitySnapshot {
+    return this.activity.snapshot();
   }
 
   /**

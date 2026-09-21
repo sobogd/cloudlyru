@@ -572,6 +572,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                       elapsed.isEmpty ? 'работает…' : 'идёт $elapsed',
                     if (!state.sending && state.usage != null)
                       'токенов: ${state.usage!.input} → ${state.usage!.output}',
+                    // Очередь — доказательство, что дописанное сообщение живое: ответа на него
+                    // ещё нет, и без этой подписи оно выглядит потерянным
+                    if (state.queued > 0) 'в очереди: ${state.queued}',
                   ].where((s) => s.isNotEmpty).join(' · '),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -696,9 +699,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         Expanded(
           child: TextField(
             controller: _input,
-            // во время работы агента поле закрыто: второй вопрос поверх первого дал бы
-            // две ветки в одном контексте
-            enabled: !state.sending,
+            // Поле доступно и во время работы: дописанное сообщение уходит в очередь и доезжает
+            // до агента, как только он освободится, — ждать с пустым полем незачем
+            enabled: true,
             minLines: 1,
             maxLines: 5,
             textInputAction: TextInputAction.newline,
@@ -706,7 +709,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
             style: const TextStyle(color: C.fg, fontSize: 14),
             decoration: InputDecoration(
               hintText: state.sending
-                  ? 'Агент работает…'
+                  ? 'Дописать — уйдёт в очередь'
                   : 'Что сделать в проекте?',
               hintStyle: const TextStyle(color: C.fg3, fontSize: 14),
               filled: true,
@@ -728,27 +731,29 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           ),
         ),
         const SizedBox(width: 4),
-        state.sending
-            ? IconButton(
-                tooltip: 'Стоп',
-                onPressed: () => _thread.stop(),
-                icon: const Icon(
-                  Icons.stop_circle_outlined,
-                  color: C.danger,
-                  size: 32,
-                ),
-              )
-            : IconButton(
-                tooltip: 'Отправить',
-                // кнопка активна только при непустом тексте: серая кнопка честнее кнопки,
-                // которая молча ничего не делает
-                onPressed: _input.text.trim().isEmpty ? null : _send,
-                icon: Icon(
-                  Icons.send,
-                  size: 28,
-                  color: _input.text.trim().isEmpty ? C.fg3 : C.accent,
-                ),
-              ),
+        // Кнопка отправки остаётся и во время работы агента: сообщение встанет в очередь. Рядом
+        // «Стоп» — потому что остановить прогон и дописать сообщение это разные действия.
+        IconButton(
+          tooltip: state.sending ? 'Отправить в очередь' : 'Отправить',
+          // кнопка активна только при непустом тексте: серая кнопка честнее кнопки,
+          // которая молча ничего не делает
+          onPressed: _input.text.trim().isEmpty ? null : _send,
+          icon: Icon(
+            state.sending ? Icons.playlist_add : Icons.send,
+            size: 28,
+            color: _input.text.trim().isEmpty ? C.fg3 : C.accent,
+          ),
+        ),
+        if (state.sending)
+          IconButton(
+            tooltip: 'Стоп',
+            onPressed: () => _thread.stop(),
+            icon: const Icon(
+              Icons.stop_circle_outlined,
+              color: C.danger,
+              size: 32,
+            ),
+          ),
       ],
     ),
   );

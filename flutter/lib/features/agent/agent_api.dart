@@ -112,6 +112,14 @@ class AgentApi {
     );
   }
 
+  /// Что считается на маке и что закончилось, пока приложения не было.
+  Future<AgentActivity> activity() async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.get('/projects/activity'),
+    );
+    return AgentActivity.fromJson(data ?? const {});
+  }
+
   /// Харнессы, стоящие на маке: pi и Claude Code — с версиями и признаком «есть».
   Future<List<AgentHarness>> harnesses() async {
     final data = await _send<Map<String, dynamic>>(
@@ -379,6 +387,20 @@ class AgentApi {
     yield* _eventsFrom(res.data);
   }
 
+  /// Ставит сообщение в очередь занятой сессии.
+  ///
+  /// Возвращает номер в очереди; `0` означает, что сессия успела освободиться — тогда сообщение
+  /// надо отправить обычным вопросом ([prompt]), иначе оно потерялось бы.
+  Future<int> queueMessage(String id, String text) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post(
+        '/projects/sessions/$id/queue',
+        data: <String, dynamic>{'text': text},
+      ),
+    );
+    return data?['position'] is num ? (data!['position'] as num).toInt() : 0;
+  }
+
   /// Подключается к уже идущему прогону агента и отдаёт его события.
   ///
   /// Так экран показывает ответ, который пишется прямо сейчас (его начали с другого устройства
@@ -547,6 +569,13 @@ class AgentApi {
           auto,
         ].where((s) => s.isNotEmpty).join(': ');
         return text.isEmpty ? null : AgentEvent(note: text);
+      case 'queued':
+        final position = json['position'];
+        return position is num ? AgentEvent(queued: position.toInt()) : null;
+      case 'queued_started':
+        // Сообщение из очереди ушло агенту: подпись «в очереди» снимается, текст ответа
+        // приходит следом обычными delta
+        return const AgentEvent(queuedStarted: true);
       case 'usage':
         return AgentEvent(
           usage: AgentUsage(

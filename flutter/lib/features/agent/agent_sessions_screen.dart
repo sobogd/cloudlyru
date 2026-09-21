@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -32,6 +34,15 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
   /// Контроллер списка сессий.
   late final AgentSessionsController _sessions;
 
+  /// Обновление списка и снимка работы, пока экран открыт.
+  ///
+  /// Раз в пять секунд: этого хватает, чтобы увидеть чужой прогон (с телефона или из терминала)
+  /// и что разговор дописался, а лишних запросов к маку не плодит.
+  Timer? _ticker;
+
+  /// Какие разговоры были «готовы» на прошлом проходе — чтобы показать про новые один раз.
+  Set<String> _finishedBefore = const {};
+
   /// Выбранный харнесс: им же фильтруется список, и он же пойдёт новой сессии.
   ///
   /// Харнессы держат истории в разных местах на маке, и разговоры у них разные — показывать их
@@ -49,7 +60,38 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
       _sessions.load(widget.project).then((_) {
         if (mounted) _sessions.selectHarness(_harness);
       });
+      ref.read(agentActivityProvider.notifier).load();
+      _ticker = Timer.periodic(const Duration(seconds: 5), (_) => _refresh());
+      // О новых готовых ответах сообщаем один раз: сравниваем с прошлым снимком
+      ref.listen(agentActivityProvider, (_, next) {
+        final fresh = next.activity.finished.difference(_finishedBefore);
+        _finishedBefore = next.activity.finished;
+        if (fresh.isNotEmpty && mounted) {
+          snack(
+            context,
+            fresh.length == 1
+                ? 'Агент закончил: ответ готов'
+                : 'Агент закончил: готовых ответов ${fresh.length}',
+          );
+        }
+      });
     });
+  }
+
+  /// Перечитывает список и снимок работы, не мигая спиннером.
+  ///
+  /// Вызывается таймером: чужой прогон виден только так — мост не присылает событий тому, кто
+  /// на него не подписан.
+  void _refresh() {
+    if (!mounted) return;
+    _sessions.load(widget.project, silent: true);
+    ref.read(agentActivityProvider.notifier).load();
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
   }
 
   /// Открывает сессию (новую или существующую) и переходит в переписку.
@@ -58,6 +100,10 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
   /// время гаснет, а отказ показывается на экране, а не молчанием. У новой сессии модель берётся
   /// из выбранной ранее (`ui.agentModel`), у существующей — та, что записана в её файле.
   Future<void> _open({String? sessionId, String? harness}) async {
+    // Разговор, который открывают, больше не «готов»: человек увидит его сам
+    if (sessionId != null) {
+      ref.read(agentActivityProvider.notifier).markSeen(sessionId);
+    }
     final target = harness ?? _harness;
     final modelKey = ref.read(settingsProvider).ui.agentModel(target);
     final session = await _sessions.open(
@@ -289,9 +335,14 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
     return ListTile(
       leading: Icon(
         _harnessIcon(session.harness),
-        // значок агента подсвечен, пока он работает: разговор может считаться и без открытого
-        // экрана, и это должно быть видно из списка
-        color: session.busy ? C.ok : C.fg2,
+        // значок агента подсвечен, пока он работает или пока ответ ждёт просмотра: разговор
+        // может считаться и без открытого экрана, и это должно быть видно из списка
+        color:
+            session.busy ||
+                ref.watch(agentActivityProvider).isRunning(session.id) ||
+                ref.watch(agentActivityProvider).isFinished(session.id)
+            ? C.ok
+            : C.fg2,
       ),
       title: Text(
         _title(session),
@@ -301,7 +352,13 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
       ),
       subtitle: Text(
         [
-          if (session.busy) '● работает',
+          // «Работает» — агент считает прямо сейчас (даже если экран разговора закрыт);
+          // «готово» — он закончил, пока на него не смотрели
+          if (session.busy ||
+              ref.watch(agentActivityProvider).isRunning(session.id))
+            '● работает'
+          else if (ref.watch(agentActivityProvider).isFinished(session.id))
+            '✓ готово',
           ref.read(agentHarnessesProvider).nameOf(session.harness),
           if (session.modelLabel.isNotEmpty) session.modelLabel,
           '${session.messages} сообщ.',
