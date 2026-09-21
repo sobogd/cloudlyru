@@ -28,6 +28,7 @@ stdio и умеет ровно то, что нужно разделу «Прое
   GET    /sessions/<id>/messages      — переписка в нормализованном виде;
   GET    /sessions/<id>/events        — подключиться к уже идущему прогону (SSE);
   POST   /sessions/<id>/prompt        — отправить сообщение, ответ потоком SSE;
+  POST   /sessions/<id>/queue         — дописать сообщение в занятую сессию (уйдёт по очереди);
   POST   /sessions/<id>/abort         — остановить генерацию;
   POST   /sessions/<id>/compact       — сжать контекст;
   POST   /sessions/<id>/model         — сменить модель;
@@ -117,6 +118,9 @@ MAX_MESSAGE_CHARS = 20_000  # потолок сообщения, чтобы од
 # Claude Code — `result`. По ним сессия снимает занятость, и это единственное место, где она
 # снимается: пока прогон идёт, сессия занята по-настоящему.
 RUN_END_EVENTS = {"agent_settled", "result"}
+
+# Наши собственные события в общем потоке с событиями харнесса: очередь и простой сессии.
+OWN_EVENTS = {"queued", "queued_started", "idle"}
 
 FORWARDED_EVENTS = {
     "message_update",
@@ -1515,6 +1519,10 @@ class AgentSession:
         self.stderr_tail = []       # хвост stderr процесса — попадает в текст ошибки
         self.counters = {"userMessages": 0, "assistantMessages": 0, "toolCalls": 0}
         self.partial_seen = False   # пришли ли частичные куски текущего ответа (у Claude)
+        # Сообщения, присланные пока агент работал: их не отклоняем, а ставим в очередь и
+        # отправляем по завершении текущего прогона. Это и есть «общая сессия» между
+        # устройствами: телефон дописывает «и поправь тесты», пока мак считает, и это доезжает.
+        self.queue = []
 
     @property
     def key(self):
@@ -1535,6 +1543,49 @@ class AgentSession:
         if events in self.subscribers:
             self.subscribers.remove(events)
 
+    def enqueue(self, text):
+        """Ставит сообщение в очередь сессии и возвращает его номер в очереди.
+
+        Номер нужен приложению, чтобы показать «в очереди: 2», а не молчать: человек должен
+        видеть, что его сообщение принято и ждёт своей очереди.
+        """
+        self.queue.append({"text": text, "at": time.time()})
+        self.touched = time.time()
+        log("сессия %s: сообщение поставлено в очередь (%d-е)" % (self.id, len(self.queue)))
+        return len(self.queue)
+
+    def _deliver_queued(self):
+        """Отправляет следующее сообщение из очереди, если агент уже свободен.
+
+        Вызывается из читателя потока на завершающем событии прогона. Саму отправку делает
+        отдельный поток: читатель обязан вернуться к чтению stdout, иначе ответ модели (в том
+        числе подтверждение команды) некому будет разобрать и всё встанет.
+        """
+        if not self.queue:
+            return
+        item = self.queue.pop(0)
+        log("сессия %s: отдаю из очереди (%d осталось)" % (self.id, len(self.queue)))
+        # Занятость выставляем здесь же, до запуска потока: иначе наблюдатель успел бы решить,
+        # что прогон закончился и новых не будет, и отключился бы ровно перед ответом.
+        self.busy = True
+        threading.Thread(target=self._send_queued, args=(item,), daemon=True).start()
+
+    def _send_queued(self, item):
+        """Отправляет сообщение из очереди агенту; сбой снимает занятость и виден на экране."""
+        try:
+            self.prompt(item["text"])
+            self._publish({
+                "type": "queued_started",
+                "text": item["text"],
+                "queue": len(self.queue),
+            })
+        except PiError as e:
+            self.busy = False
+            self._publish({
+                "type": "error",
+                "message": "не смог отправить сообщение из очереди: %s" % e,
+            })
+
     def _watch_run_state(self, event):
         """Отмечает конец прогона, даже когда за ним никто не смотрит.
 
@@ -1546,6 +1597,10 @@ class AgentSession:
         if event.get("type") in RUN_END_EVENTS:
             self.busy = False
             self.touched = time.time()
+            log("сессия %s: прогон завершён (%s), в очереди %d" % (
+                self.id, event.get("type"), len(self.queue)))
+            # Прогон закончился — отдаём агенту то, что прислали, пока он считал
+            self._deliver_queued()
 
     def _publish(self, event):
         """Рассылает событие всем открытым потокам SSE этой сессии."""
@@ -2120,9 +2175,6 @@ def translate_pi_event(session, event):
         session.touched = time.time()
         return out, True
 
-    if kind == "fatal":
-        return [{"type": "error", "message": str(event.get("message") or "сбой харнесса")}], True
-
     if kind in ("auto_retry_start", "auto_retry_end", "extension_error", "queue_update"):
         return [{**event, "type": kind}], False
 
@@ -2242,7 +2294,18 @@ def translate_claude_event(session, event):
 
 
 def translate(session, event):
-    """Переводит событие харнесса в события экрана (см. переводы выше)."""
+    """Переводит событие харнесса в события экрана (см. переводы выше).
+
+    В том же потоке идут и наши собственные сообщения — о очереди, о простое, о сбое процесса.
+    Их пропускаем насквозь: переводить там нечего, а потерять их нельзя — приложение по ним
+    показывает «в очереди: 2» и снимает эту подпись, когда сообщение ушло агенту.
+    """
+    kind = event.get("type")
+    if kind in OWN_EVENTS:
+        return [event], False
+    if kind == "fatal":
+        # Процесс харнесса умер: для экрана это ошибка и конец прогона, чем бы он ни был занят
+        return [{"type": "error", "message": str(event.get("message") or "сбой харнесса")}], True
     if session.harness == HARNESS_CLAUDE:
         return translate_claude_event(session, event)
     return translate_pi_event(session, event)
@@ -2531,6 +2594,26 @@ class Handler(BaseHTTPRequestHandler):
                 # такой сессии отвечал 400, и человек видел ошибку там, где всё в порядке.
                 if action == "close":
                     self._close(parts[2])
+                    return
+                if action == "queue":
+                    # Сообщение в занятую сессию: не отказ, а очередь. Приложение шлёт сюда, когда
+                    # у него уже открыт поток текущего прогона: второй поток дал бы двойной текст.
+                    text = str(body.get("text") or "").strip()
+                    if not text:
+                        raise PiError("пустое сообщение")
+                    if len(text) > MAX_MESSAGE_CHARS:
+                        raise PiError("сообщение длиннее %d символов" % MAX_MESSAGE_CHARS)
+                    session = POOL.maybe(parts[2]) or self._reopen(parts[2])
+                    if session is None:
+                        raise PiError("сессия не открыта: сначала откройте её в приложении")
+                    if not session.busy and not session.queue:
+                        # Сессия успела освободиться, пока приложение решало, куда слать: очередь
+                        # не нужна. Отвечаем именно так, а не принимаем молча — иначе сообщение
+                        # потерялось бы: приложение по этому ответу отправляет его обычным
+                        # вопросом (ручка prompt), и там оно уходит агенту.
+                        self._json(200, {"queued": False, "position": 0})
+                        return
+                    self._json(200, {"queued": True, "position": session.enqueue(text)})
                     return
                 if action == "abort":
                     session = POOL.maybe(parts[2])
@@ -2845,16 +2928,20 @@ class Handler(BaseHTTPRequestHandler):
             log("не смог обновить состояние сессии %s: %s" % (session.id, e))
         return self._session_brief(session)
 
-    def _events(self, session):
-        """Отдаёт поток событий уже идущего прогона, ничего агенту не отправляя.
+    def _events(self, session, queued=0):
+        """Отдаёт поток событий идущего прогона, ничего агенту не отправляя.
 
-        Зачем: приложение подключается к разговору, который идёт (его начали с другого
-        устройства, или экран открыли заново во время работы). Без этой ручки оставался только
-        отказ «сессия занята», и человек видел ошибку вместо ответа, который в этот момент
-        писался. Здесь мы просто смотрим со стороны: разрыв соединения работу НЕ прерывает —
-        за это отвечает ручка `prompt`, у которой своя семантика.
+        [queued] — номер в очереди, если этим же запросом человек дописал сообщение в занятую
+        сессию: приложение показывает «в очереди: N», а дальше видит и текущий ответ, и ответ
+        на своё сообщение — поток не закрывается между прогонами, пока очередь не опустеет.
+
+        Зачем ручка нужна и без очереди: приложение подключается к разговору, который идёт (его
+        начали с другого устройства, или экран открыли заново во время работы). Без неё оставался
+        только отказ «сессия занята», и человек видел ошибку вместо ответа, который в этот момент
+        писался. Здесь мы просто смотрим со стороны: разрыв соединения работу НЕ прерывает — за
+        это отвечает ручка `prompt`, у которой своя семантика.
         """
-        if not session.busy:
+        if not session.busy and not queued:
             # Свободна: говорить нечего, и держать поток открытым значило бы показывать вечную
             # загрузку. Приложение по этому событию остаётся в обычном состоянии.
             self.send_response(200)
@@ -2875,6 +2962,8 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         try:
             self._event({"type": "accepted"})
+            if queued:
+                self._event({"type": "queued", "position": queued})
             while True:
                 try:
                     event = events.get(timeout=1.0)
@@ -2888,7 +2977,14 @@ class Handler(BaseHTTPRequestHandler):
                     self._event(ours)
                 if done:
                     self._event({"type": "done", "session": self._settled_brief(session)})
-                    break
+                    # Есть очередь — прогон начнётся сразу после этого: закрывать поток значило бы
+                    # заставить приложение переподключаться к следующему ответу
+                    # Та же секунда запаса, что и в ручке prompt: см. пояснение там
+                    if not (session.busy or session.queue):
+                        time.sleep(1.0)
+                    if not (session.busy or session.queue):
+                        log("наблюдатель сессии %s отключён: прогон завершён, очередь пуста" % session.id)
+                        break
         except (BrokenPipeError, ConnectionResetError):
             pass  # смотрящий ушёл: прогон продолжается, это его дело
         finally:
@@ -2922,7 +3018,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(text) > MAX_MESSAGE_CHARS:
             raise PiError("сообщение длиннее %d символов" % MAX_MESSAGE_CHARS)
         if session.busy:
-            self._json(409, {"error": "сессия занята: дождитесь конца ответа или нажмите «Стоп»"})
+            # Занятую сессию больше не отклоняем: сообщение встаёт в очередь, а этот поток
+            # показывает, что происходит сейчас, и продолжается, когда дойдёт до очереди.
+            self._events(session, queued=session.enqueue(text))
             return
 
         events = queue.Queue()
@@ -2967,7 +3065,18 @@ class Handler(BaseHTTPRequestHandler):
                     # описание сессии собираем только теперь: расход и контекст обновляются
                     # ровно в конце прогона, и раньше этих чисел просто нет
                     self._event({"type": "done", "session": self._settled_brief(session)})
-                    break
+                    # Есть очередь — прогон начнётся сразу после этого, и поток продолжается:
+                    # закрывать его значило бы заставить приложение переподключаться к ответу
+                    # Секунда запаса перед закрытием: следующее сообщение уходит из очереди в
+                    # тот же миг, когда прогон завершается, и без этой паузы поток закрывался бы
+                    # ровно перед началом следующего ответа. Пауза дешевле, чем заставить
+                    # приложение переподключаться к работе, которую оно уже начало смотреть.
+                    if not (session.busy or session.queue):
+                        time.sleep(1.0)
+                    if not (session.busy or session.queue):
+                        log("поток сессии %s закрыт: прогон завершён (занята=%s, очередь=%d)" % (
+                            session.id, session.busy, len(session.queue)))
+                        break
         except (BrokenPipeError, ConnectionResetError):
             # Клиент ушёл: экран закрыли, приложение свернули, связь пропала. Работу НЕ гасим —
             # человек вернётся и продолжит смотреть ответ (для этого есть ручка /events), а
