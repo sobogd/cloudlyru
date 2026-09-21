@@ -55,6 +55,15 @@ jobs:
       - name: CocoaPods
         run: pod --version || brew install cocoapods
 
+      # Node и зависимости нужны только для публикации: сам сборщик — скрипт на bash,
+      # а в S3 сборку кладёт `scripts/publish-ios.mjs` (ему нужен только @aws-sdk/client-s3).
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Зависимости для публикации (только @aws-sdk/client-s3)
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
       # Ключ приходит секретом в base64: так его можно положить в секреты одной командой,
       # не копируя содержимое файла в интерфейс. Файл живёт до конца задания во временном
       # каталоге раннера — в репозиторий и в артефакты он не попадает.
