@@ -594,8 +594,34 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     items[items.length - 1] = last.copyWith(
       text: event.text == null ? null : last.text + event.text!,
       reasoning: event.reasoning == null ? null : last.reasoning + event.reasoning!,
+      blocks: _appendText(last.blocks, event.text, event.reasoning),
     );
     state = state.copyWith(items: items);
+  }
+
+  /// Дописывает кусок текста (или «размышлений») в блоки ответа, сохраняя порядок.
+  ///
+  /// Кусок продолжает последний блок своего вида, только если тот идёт последним. Как только
+  /// между текстом и текстом встала карточка инструмента, начинается новый блок — иначе новый
+  /// текст после команды оказался бы выше её карточки, и разговор читался бы не по порядку.
+  List<AgentBlock> _appendText(List<AgentBlock> blocks, String? text, String? reasoning) {
+    var result = blocks;
+    if (text != null && text.isNotEmpty) result = _appendBlock(result, const AgentBlock.text(''), text);
+    if (reasoning != null && reasoning.isNotEmpty) {
+      result = _appendBlock(result, const AgentBlock.reasoning(''), reasoning);
+    }
+    return result;
+  }
+
+  /// Дописывает [extra] в последний блок того же вида, а если его нет — добавляет новый.
+  List<AgentBlock> _appendBlock(List<AgentBlock> blocks, AgentBlock blank, String extra) {
+    final next = [...blocks];
+    if (next.isNotEmpty && next.last.type == blank.type) {
+      next[next.length - 1] = next.last.plus(extra);
+    } else {
+      next.add(AgentBlock(type: blank.type, text: extra));
+    }
+    return next;
   }
 
   /// Подпись текущего действия по вызову инструмента: «выполняю команду: npm test».
@@ -617,9 +643,14 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     }
     final last = items.last;
     final tools = [...last.tools];
+    var blocks = last.blocks;
     final index = tools.indexWhere((t) => t.id == tool.id && tool.id.isNotEmpty);
     if (index < 0) {
       tools.add(tool);
+      // Карточка встаёт в блоки на своё место — там, где инструмент вызван по ходу ответа.
+      // Дальнейшие события того же вызова (аргументы, прогресс, результат) только обновляют
+      // карточку: порядок уже зафиксирован.
+      blocks = [...blocks, AgentBlock.tool(tool.id)];
     } else {
       final old = tools[index];
       tools[index] = AgentTool(
@@ -632,7 +663,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
         running: finished ? false : (old.running || tool.running),
       );
     }
-    items[items.length - 1] = last.copyWith(tools: tools);
+    items[items.length - 1] = last.copyWith(tools: tools, blocks: blocks);
     state = state.copyWith(items: items);
   }
 
@@ -643,7 +674,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   void _fail(Object e) {
     final message = e is AgentApiException ? e.message : 'Не удалось получить ответ агента.';
     final items = [...state.items];
-    if (items.isNotEmpty && items.last.isAssistant && items.last.text.isEmpty && items.last.tools.isEmpty) {
+    if (items.isNotEmpty && items.last.isAssistant && items.last.isEmpty) {
       items.removeLast();
     }
     state = state.copyWith(items: items).withError(message);
@@ -659,10 +690,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     _sub = null;
     if (state.sending) {
       final items = [...state.items];
-      if (items.isNotEmpty &&
-          items.last.isAssistant &&
-          items.last.text.isEmpty &&
-          items.last.tools.isEmpty) {
+      if (items.isNotEmpty && items.last.isAssistant && items.last.isEmpty) {
         items.removeLast();
       }
       // строку «что делает сейчас» снимаем вместе с работой: иначе она осталась бы висеть

@@ -353,6 +353,56 @@ class AgentTool {
   }
 }
 
+/// Блок ответа агента в том порядке, в каком он появился: кусок текста, «размышления» или
+/// ссылка на карточку вызова инструмента.
+///
+/// Нужен именно порядок. Модель отвечает так: пишет текст, просит выполнить команду, получает
+/// результат, пишет текст дальше — и всё это один ответ на один вопрос. Если рисовать текст
+/// отдельно от карточек, новый текст оказывается над карточками, и разговор читается не в том
+/// порядке, в каком шёл. Карточки адресуются идентификатором: сам вывод инструмента лежит в
+/// [AgentItem.tools] и в блоках не дублируется.
+class AgentBlock {
+  /// Вид блока: `text`, `reasoning` или `tool`.
+  final String type;
+
+  /// Текст блока (для `text` и `reasoning`); у блока-инструмента пусто.
+  final String text;
+
+  /// Идентификатор вызова инструмента (для `tool`).
+  final String toolId;
+
+  /// Блок ответа.
+  const AgentBlock({required this.type, this.text = '', this.toolId = ''});
+
+  /// Кусок текста ответа.
+  const AgentBlock.text(String value) : this(type: 'text', text: value);
+
+  /// Кусок «размышлений» модели.
+  const AgentBlock.reasoning(String value) : this(type: 'reasoning', text: value);
+
+  /// Ссылка на карточку вызова инструмента.
+  const AgentBlock.tool(String id) : this(type: 'tool', toolId: id);
+
+  /// Разбор блока из ответа моста.
+  factory AgentBlock.fromJson(Map<String, dynamic> json) => AgentBlock(
+        type: json['type']?.toString() ?? 'text',
+        text: json['text']?.toString() ?? '',
+        toolId: json['id']?.toString() ?? '',
+      );
+
+  /// Это кусок текста.
+  bool get isText => type == 'text';
+
+  /// Это «размышления».
+  bool get isReasoning => type == 'reasoning';
+
+  /// Это карточка вызова инструмента.
+  bool get isTool => type == 'tool';
+
+  /// Копия с дописанным текстом.
+  AgentBlock plus(String extra) => AgentBlock(type: type, text: text + extra, toolId: toolId);
+}
+
 /// Элемент переписки: вопрос человека, ответ агента или прямая команда оболочки.
 ///
 /// Одним типом, а не тремя, потому что экран рисует их одним списком и различает по [kind].
@@ -367,7 +417,13 @@ class AgentItem {
   /// «Размышления» модели, если она их отдаёт (у локальной qwen они выключены).
   final String reasoning;
 
-  /// Вызовы инструментов этого ответа.
+  /// Блоки ответа в порядке появления: текст, «размышления» и карточки инструментов.
+  ///
+  /// Пустой список означает ответ от старого моста, который блоков ещё не присылал: тогда
+  /// экран рисует текст, размышления и карточки по отдельным полям.
+  final List<AgentBlock> blocks;
+
+  /// Вызовы инструментов этого ответа (в том числе те, на которые ссылаются блоки).
   final List<AgentTool> tools;
 
   /// Ошибка ответа (например, «Request was aborted»), если прогон не удался.
@@ -381,6 +437,7 @@ class AgentItem {
     required this.kind,
     this.text = '',
     this.reasoning = '',
+    this.blocks = const [],
     this.tools = const [],
     this.error = '',
     this.command = '',
@@ -393,6 +450,11 @@ class AgentItem {
         reasoning: json['reasoning']?.toString() ?? '',
         error: json['error']?.toString() ?? '',
         command: json['command']?.toString() ?? '',
+        blocks: <AgentBlock>[
+          if (json['blocks'] is List)
+            for (final b in json['blocks'] as List)
+              if (b is Map) AgentBlock.fromJson(b.cast<String, dynamic>()),
+        ],
         tools: <AgentTool>[
           if (json['tools'] is List)
             for (final t in json['tools'] as List)
@@ -407,15 +469,26 @@ class AgentItem {
   bool get isAssistant => kind == 'assistant';
 
   /// Копия с заменёнными полями.
-  AgentItem copyWith({String? text, String? reasoning, List<AgentTool>? tools, String? error}) =>
+  AgentItem copyWith({
+    String? text,
+    String? reasoning,
+    List<AgentBlock>? blocks,
+    List<AgentTool>? tools,
+    String? error,
+  }) =>
       AgentItem(
         kind: kind,
         text: text ?? this.text,
         reasoning: reasoning ?? this.reasoning,
+        blocks: blocks ?? this.blocks,
         tools: tools ?? this.tools,
         error: error ?? this.error,
         command: command,
       );
+
+  /// Ответ пуст: ни текста, ни карточек — на экране это ожидание первого куска ответа.
+  bool get isEmpty =>
+      text.isEmpty && reasoning.isEmpty && tools.isEmpty && blocks.isEmpty;
 }
 
 /// Расход токенов на ответ: приходит от провайдера по ходу генерации.

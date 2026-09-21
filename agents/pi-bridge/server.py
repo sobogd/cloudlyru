@@ -228,13 +228,25 @@ def thinking_text(content):
 
 
 def normalize_messages(messages):
-    """Приводит переписку pi к плоскому списку строк для экрана.
+    """Приводит переписку pi к списку элементов для экрана.
 
-    У pi история — дерево записей, где вызов инструмента и его результат лежат в разных
-    сообщениях. Экрану нужно другое: последовательность «вопрос — ответ — что агент
-    сделал». Поэтому результат инструмента не становится отдельной строкой, а
-    подклеивается к своему вызову по `toolCallId` — так в приложении вызов и его вывод
-    показываются одной карточкой.
+    У pi история — дерево записей: ответ агента, результат инструмента и следующий ответ лежат
+    отдельными сообщениями. Экрану нужно другое — «вопрос и всё, что агент по нему сделал»,
+    поэтому:
+
+    * несколько ответов подряд (модель ответила, получила результаты инструментов, ответила
+      снова) склеиваются в один элемент: в приложении это один ответ на один вопрос, и живой
+      поток выглядит так же — значит открытая заново сессия обязана выглядеть одинаково;
+    * внутри ответа блоки идут в том порядке, в каком их выдала модель: текст, вызов
+      инструмента, снова текст. Без этого новый текст после команды оказывался бы над её
+      карточкой, и разговор читался бы не в том порядке, в каком он шёл;
+    * результат инструмента не становится отдельной строкой, а подклеивается к своему вызову
+      по `toolCallId` — вызов и его вывод показываются одной карточкой. Ссылки на карточки в
+      `blocks` идут по идентификатору, поэтому вывод не дублируется в ответе.
+
+    Поля `text`, `reasoning` и `tools` остаются рядом с `blocks` для совместимости: сборка
+    приложения, которая ещё не знает про блоки, покажет ответ как раньше — текстом и списком
+    карточек под ним.
     """
     items = []
     by_call = {}
@@ -247,11 +259,23 @@ def normalize_messages(messages):
             if text.strip():
                 items.append({"kind": "user", "text": text})
         elif role == "assistant":
-            tools = []
+            blocks = []
+            calls = []
             content = message.get("content")
             if isinstance(content, list):
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "toolCall":
+                    if not isinstance(block, dict):
+                        continue
+                    kind = block.get("type")
+                    if kind == "text":
+                        text = str(block.get("text") or "")
+                        if text:
+                            blocks.append({"type": "text", "text": text})
+                    elif kind == "thinking":
+                        thinking = str(block.get("thinking") or "")
+                        if thinking:
+                            blocks.append({"type": "reasoning", "text": thinking})
+                    elif kind == "toolCall":
                         call = {
                             "id": str(block.get("id") or ""),
                             "name": str(block.get("name") or ""),
@@ -259,19 +283,30 @@ def normalize_messages(messages):
                             "output": "",
                             "isError": False,
                         }
-                        tools.append(call)
+                        calls.append(call)
                         by_call[call["id"]] = call
-            text = content_text(content)
-            thinking = thinking_text(content)
+                        blocks.append({"type": "tool", "id": call["id"]})
+            elif isinstance(content, str) and content.strip():
+                blocks.append({"type": "text", "text": content})
+
             # Пустой ответ без вызовов — это сообщение с одним лишь текстом ошибки провайдера;
             # показываем его, иначе прогон выглядел бы как «агент молча ничего не сделал».
             error = message.get("errorMessage")
-            if text.strip() or thinking or tools or error:
+            if not blocks and not error:
+                continue
+            if items and items[-1].get("kind") == "assistant":
+                # продолжаем тот же ответ: модель ответила ещё раз в рамках одного вопроса
+                items[-1]["blocks"].extend(blocks)
+                items[-1]["tools"].extend(calls)
+                if error:
+                    items[-1]["error"] = str(error)
+            else:
                 items.append({
                     "kind": "assistant",
-                    "text": text,
-                    "reasoning": thinking,
-                    "tools": tools,
+                    "blocks": blocks,
+                    "tools": calls,
+                    "text": "",
+                    "reasoning": "",
                     "error": str(error) if error else "",
                 })
         elif role == "toolResult":
@@ -287,6 +322,14 @@ def normalize_messages(messages):
                 "exitCode": message.get("exitCode"),
             })
         # system и прочие роли на экран не попадают: это внутренняя механика харнесса
+
+    for item in items:
+        if item.get("kind") != "assistant":
+            continue
+        # Сводные строки собираем из блоков в том же порядке: старые сборки приложения читают
+        # именно их, и по ним же экран решает, пустой ли это ответ.
+        item["text"] = "".join(b["text"] for b in item["blocks"] if b["type"] == "text")
+        item["reasoning"] = "".join(b["text"] for b in item["blocks"] if b["type"] == "reasoning")
     return items
 
 

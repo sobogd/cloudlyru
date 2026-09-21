@@ -39,11 +39,19 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Прокрутка переписки — ею управляет автопрокрутка при работе агента.
   final _scroll = ScrollController();
 
-  /// Стоит ли прокрутка внизу переписки.
+  /// Идём ли за новым содержимым.
   ///
-  /// Нужен, чтобы растущий ответ тянул экран за собой только тогда, когда человек и так смотрит
-  /// конец разговора: иначе автопрокрутка выдёргивала бы его из середины.
-  bool _atBottom = true;
+  /// Включается, когда человек у нижнего края, и выключается, как только он отлистал вверх:
+  /// иначе растущий ответ выдёргивал бы его из середины разговора. Обратно включается у
+  /// нижнего края или кнопкой «вниз».
+  bool _follow = true;
+
+  /// Идёт наша собственная прокрутка.
+  ///
+  /// Нужна, чтобы наш же прыжок вниз не выглядел как «человек прокрутил»: слушатель прокрутки
+  /// иначе считал бы позицию и мог бы снова включить следование, из-за чего список залипал бы
+  /// у нижнего края и отлистать вверх было невозможно.
+  bool _selfScroll = false;
 
   /// Показаны ли подробные сведения о сессии (токены, счётчики, время, путь к файлу).
   bool _details = false;
@@ -80,13 +88,14 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     super.dispose();
   }
 
-  /// Обновляет признак «прокрутка внизу» по каждому движению списка.
+  /// Обновляет признак «идём за новым» по каждому движению списка.
   ///
   /// Порог в 80 пикселей, а не строгое равенство: при работе агента список растёт между кадрами,
-  /// и точное сравнение с максимумом почти всегда давало бы «не внизу».
+  /// и точное сравнение с максимумом почти всегда давало бы «не внизу». Свои прыжки пропускаем
+  /// ([_selfScroll]) — иначе они же и включали бы следование обратно.
   void _trackScroll() {
-    if (!_scroll.hasClients) return;
-    _atBottom = _scroll.position.maxScrollExtent - _scroll.position.pixels < 80;
+    if (!_scroll.hasClients || _selfScroll) return;
+    _follow = _scroll.position.maxScrollExtent - _scroll.position.pixels < 80;
   }
 
   /// Отправляет набранный текст и очищает поле.
@@ -94,7 +103,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final text = _input.text;
     if (text.trim().isEmpty) return;
     _input.clear();
-    _atBottom = true;
+    // после отправки человек смотрит на свой вопрос и начало ответа — возвращаемся вниз
+    // принудительно, даже если он перед этим читал середину переписки
+    _follow = true;
     await _thread.send(text);
   }
 
@@ -160,7 +171,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     // карточка инструмента одинаково требуют дотянуть список до конца.
     ref.listen(agentThreadProvider, (_, next) {
       if (next.items.isEmpty) return;
-      if (_atBottom) _scrollToBottomSoon();
+      if (_follow) _scrollToBottomSoon();
     });
 
     return Scaffold(
@@ -201,6 +212,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       body: Column(
         children: [
           Expanded(child: _body(state)),
+          if (!_details) _jumpButton(state),
           if (_details) _detailsPanel(state),
           if (state.error != null) _errorBar(state),
           if (state.session != null) _infoBar(state),
@@ -246,6 +258,39 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     );
   }
 
+  /// Кнопка «вниз»: показывается, только когда человек отлистал от конца разговора.
+  ///
+  /// Нужна потому, что автопрокрутка после этого молчит: без кнопки вернуться к новому тексту
+  /// можно было бы лишь вручную до самого низа, а ответ пишется минутами.
+  Widget _jumpButton(AgentThreadState state) {
+    if (_follow || state.items.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: Material(
+          color: C.surface2,
+          shape: const StadiumBorder(side: BorderSide(color: C.brd)),
+          child: InkWell(
+            customBorder: const StadiumBorder(),
+            onTap: _jumpToBottom,
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.arrow_downward, size: 14, color: C.fg2),
+                  SizedBox(width: 6),
+                  Text('К новому', style: TextStyle(color: C.fg2, fontSize: 12)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   /// Один элемент переписки: вопрос, ответ агента, команда оболочки или служебная строка.
   Widget _item(AgentItem item) {
     if (item.kind == 'note') return _note(item.text);
@@ -268,23 +313,29 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Размышления показываем до ответа и свёрнутыми: они длиннее самого ответа и нужны
-            // редко, но полностью скрывать их — значит врать о том, что модель сделала.
-            if (item.reasoning.isNotEmpty) _ReasoningBlock(text: item.reasoning),
+            // Размышления приходят блоком в общем порядке (в старом ответе без блоков —
+            // отдельным полем выше текста): они длиннее ответа и нужны редко, но полностью
+            // скрывать их — значит врать о том, что модель сделала.
             if (isUser)
               SelectableText(
                 item.text,
                 style: const TextStyle(color: C.fg, fontSize: 14, height: 1.35),
               )
+            else if (item.blocks.isNotEmpty)
+              // Блоки идут в том порядке, в каком агент работал: текст, карточка команды,
+              // снова текст. Так новый текст оказывается под тем, что было до него.
+              for (final block in item.blocks) _block(item, block)
             else ...[
+              // ответ от моста без блоков (старая сборка) — рисуем как раньше
+              if (item.reasoning.isNotEmpty) _ReasoningBlock(text: item.reasoning),
               if (item.text.isNotEmpty) MarkdownText(item.text),
-              if (item.text.isEmpty && item.tools.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 2),
-                  child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
-                ),
+              for (final tool in item.tools) _toolCard(tool),
             ],
-            for (final tool in item.tools) _toolCard(tool),
+            if (item.isAssistant && item.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 2),
+                child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+              ),
             // Ошибка прогона — часть ответа, а не отдельное сообщение: так видно, на каком шаге
             // разговор оборвался (например, «Request was aborted» после «Стоп»).
             if (item.error.isNotEmpty)
@@ -299,6 +350,19 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         ),
       ),
     );
+  }
+
+  /// Один блок ответа: кусок текста, «размышления» или карточка вызова инструмента.
+  ///
+  /// Карточка ищется по идентификатору в [AgentItem.tools]: сам вывод инструмента живёт там
+  /// одним экземпляром, а блок задаёт только место карточки в ответе.
+  Widget _block(AgentItem item, AgentBlock block) {
+    if (block.isTool) {
+      final tool = item.tools.where((t) => t.id == block.toolId).firstOrNull;
+      return tool == null ? const SizedBox.shrink() : _toolCard(tool);
+    }
+    if (block.isReasoning) return _ReasoningBlock(text: block.text);
+    return MarkdownText(block.text);
   }
 
   /// Служебная строка: автоответ на подтверждение, которого человек не давал.
@@ -582,11 +646,25 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   ///
   /// Отложенно: длина списка в момент вызова ещё не учитывает новый текст, и прыжок к прежнему
   /// максимуму не дотянул бы до конца ответа.
+  ///
+  /// Следование проверяется здесь, а не там, где прыжок поставлен в очередь: между этими двумя
+  /// моментами человек успевает отлистать вверх — и раньше список всё равно прыгал вниз, после
+  /// чего снова считал себя «внизу» и залипал там навсегда. Пока человек держит палец на экране,
+  /// не прыгаем вовсе.
   void _scrollToBottomSoon() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scroll.hasClients) return;
+      if (!mounted || !_follow || !_scroll.hasClients) return;
+      if (_scroll.position.isScrollingNotifier.value) return;
+      _selfScroll = true;
       _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      _selfScroll = false;
     });
+  }
+
+  /// Возвращает список к концу разговора по кнопке и снова включает следование.
+  void _jumpToBottom() {
+    setState(() => _follow = true);
+    _scrollToBottomSoon();
   }
 
   /// Сколько идёт текущая работа словами: «12 с», «1 мин 20 с», «5 мин 3 с».
