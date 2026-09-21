@@ -595,19 +595,30 @@ def last_jsonl_field(data, kind, field):
     Ищем по сырым байтам, а не разбором всех строк: журнал Claude Code измеряется десятками
     мегабайт, а имя, поставленное `/rename`, лежит в самом конце — разбирать ради него весь
     файл при каждом обновлении списка нельзя. `None` — записи такого типа нет.
+
+    Между `"type":` и значением бывает пробел: сам Claude Code пишет компактно, а наш
+    `json.dumps` — с пробелами, и строгий поиск `"type":"custom-title"` пропускал бы записи,
+    записанные мостом или руками. Поэтому значение ищется как отдельная строка и первое
+    совпадение берётся не «где угодно», а слева от последней такой записи в файле.
     """
-    marker = b'"type":"' + kind.encode("utf-8") + b'"'
-    index = data.rfind(marker)
+    quoted = b'"' + kind.encode("utf-8") + b'"'
+    index = data.rfind(quoted)
     if index < 0:
         return None
-    start = data.rfind(b"\n", 0, index) + 1
-    end = data.find(b"\n", index)
+    # имя, встречающееся в тексте сообщений, не путать с типом записи: значение стоит после
+    # `"type":` и закрывается переводом строки — иначе строка без поля `type` притворилась бы
+    # записью имени
+    typed = data.rfind(b'"type"', 0, index)
+    if typed < 0:
+        return None
+    start = data.rfind(b"\n", 0, typed) + 1
+    end = data.find(b"\n", typed)
     line = data[start:end if end >= 0 else len(data)]
     try:
         entry = json.loads(line.decode("utf-8", "replace"))
     except ValueError:
         return None
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or entry.get("type") != kind:
         return None
     value = entry.get(field)
     return value.strip() if isinstance(value, str) else None
