@@ -299,8 +299,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       appBar: AppBar(
         title: _title(state),
         actions: [_actions(state)],
-        // фон — как у шапки панели в двухпанельном виде и как у поля ввода
-        backgroundColor: C.surface3,
+        // фон — как у левого бара разделов ([C.island]): шапка разговора и колонка списка
+        // читаются одной поверхностью, а не двумя разными полосами
+        backgroundColor: C.island,
       ),
       body: body,
     );
@@ -376,12 +377,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Шапка разговора в панели: тот же заголовок и те же действия, что в `AppBar`, плюс кнопка
   /// «к списку».
   ///
-  /// Высота и фон — как у `AppBar` (56, [C.canvas]): шапка списка разговоров и шапка самого
+  /// Высота и фон — как у `AppBar` (56, [C.island]): шапка списка разговоров и шапка самого
   /// разговора стоят на одной линии и читаются одной полосой над двумя панелями.
   Widget _paneHeader(AgentThreadState state) => Container(
     height: 56,
-    // фон — как у поля ввода ([C.surface3]): шапка панели и поле под ней читаются одним блоком
-    color: C.surface3,
+    // фон — как у левого бара разделов ([C.island]): панель со списком слева и шапка панели
+    // справа — одна поверхность, границу задаёт рамка между панелями
+    color: C.island,
     child: Row(
       children: [
         const SizedBox(width: 4),

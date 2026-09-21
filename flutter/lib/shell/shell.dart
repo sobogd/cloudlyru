@@ -34,8 +34,9 @@ enum AppTab { files, mail, media, map, notes, invoices, chat, projects, trash, s
 /// Ключом для настроек остаётся `AppTab.name` (см. комментарий к нему), поэтому менять эти
 /// подписи можно свободно — сохранённый раздел от них не зависит.
 ///
-/// Подписи — и подсказка при наведении, и имя для экранного диктора: на экране их не видно
-/// (бар только с иконками на всех платформах), но без них иконку пришлось бы угадывать.
+/// Подписи — и то, что видно в баре на широком экране, и подсказка при наведении, и имя для
+/// экранного диктора: в узком баре (телефон) на экране их нет, и без них иконку пришлось бы
+/// угадывать.
 typedef _TabLook = ({String label, IconData icon, IconData activeIcon});
 
 const Map<AppTab, _TabLook> _tabLook = {
@@ -66,6 +67,15 @@ const Map<AppTab, _TabLook> _tabLook = {
     activeIcon: Icons.settings,
   ),
 };
+
+/// Порог ширины окна, с которого левый бар показывает подписи разделов, а не одни иконки.
+///
+/// Считается по ширине всего окна: бар — первое, что занимает место слева, поэтому своей
+/// ширины у него ещё нет. 900 выбрано вместе с порогом двухпанельного вида раздела «Проекты»
+/// (720 на содержимое): 900 − 176 (бар с подписями) − 1 (рамка) ≈ 723, то есть на той же
+/// ширине, где появляются подписи разделов, список разговоров и сам разговор уже помещаются
+/// рядом — раскладка меняется целиком, а не в два приёма.
+const double _navLabelsMin = 900.0;
 
 /// Оболочка после входа: держит выбранный раздел и левый бар с разделами.
 ///
@@ -177,29 +187,37 @@ class _ShellState extends ConsumerState<Shell> {
       body: SafeArea(
         left: true,
         right: false,
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _NavBar(current: _tab, onSelect: _selectTab),
-            // Рамка вместо тени: на тёмной теме тень между двумя поверхностями почти не
-            // читается, а линия отделяет бар от содержимого в любом месте одинаково.
-            const VerticalDivider(width: 1, thickness: 1, color: C.brd),
-            // Разделы не пересоздаются: `IndexedStack` держит построенные экраны в дереве,
-            // поэтому возврат на раздел не повторяет его загрузку и не сбрасывает прокрутку.
-            // Ещё не открытые разделы остаются пустыми заглушками — их экраны создаются при
-            // первом показе.
-            Expanded(
-              child: IndexedStack(
-                index: _tab.index,
-                children: [
-                  for (final tab in AppTab.values)
-                    (tab == _tab || _screens.containsKey(tab))
-                        ? _screenFor(tab)
-                        : const SizedBox.shrink(),
-                ],
+        child: LayoutBuilder(
+          // ширина бара и содержимого считается от окна: `LayoutBuilder` здесь один на всё
+          // тело, чтобы подписи в баре и двухпанельные разделы появлялись на одной ширине
+          builder: (context, c) => Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _NavBar(
+                current: _tab,
+                onSelect: _selectTab,
+                wide: c.maxWidth >= _navLabelsMin,
               ),
-            ),
-          ],
+              // Рамка вместо тени: на тёмной теме тень между двумя поверхностями почти не
+              // читается, а линия отделяет бар от содержимого в любом месте одинаково.
+              const VerticalDivider(width: 1, thickness: 1, color: C.brd),
+              // Разделы не пересоздаются: `IndexedStack` держит построенные экраны в дереве,
+              // поэтому возврат на раздел не повторяет его загрузку и не сбрасывает прокрутку.
+              // Ещё не открытые разделы остаются пустыми заглушками — их экраны создаются при
+              // первом показе.
+              Expanded(
+                child: IndexedStack(
+                  index: _tab.index,
+                  children: [
+                    for (final tab in AppTab.values)
+                      (tab == _tab || _screens.containsKey(tab))
+                          ? _screenFor(tab)
+                          : const SizedBox.shrink(),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -219,21 +237,29 @@ class _ShellState extends ConsumerState<Shell> {
 
 /// Левый бар с разделами: полоса во всю высоту экрана.
 ///
-/// Только иконки, без подписей — одинаково на всех платформах: список короткий и узнаваемый, а
-/// подписи отняли бы у содержимого ширину, которая нужнее спискам файлов и писем. Название
-/// раздела остаётся в подсказке при наведении и в подписи для экранного диктора (`Tooltip`),
-/// так что иконку не приходится угадывать.
+/// На телефоне — одни иконки: список короткий и узнаваемый, а подписи отняли бы у содержимого
+/// ширину, которая нужнее спискам файлов и писем. На широком экране ([wide]) рядом с иконкой
+/// идёт название раздела: там место есть, и по названию раздел видно сразу, а не только по
+/// подсказке при наведении. Подсказка (`Tooltip`) остаётся в обоих случаях — она же имя для
+/// экранного диктора.
 ///
 /// Содержимое бара прокручивается, чтобы новые разделы не упирались в нижний край, когда их
 /// станет больше, чем помещается на экран.
 class _NavBar extends StatelessWidget {
-  const _NavBar({required this.current, required this.onSelect});
+  const _NavBar({
+    required this.current,
+    required this.onSelect,
+    required this.wide,
+  });
 
   /// Открытый сейчас раздел — его строка подсвечена.
   final AppTab current;
 
   /// Что делать при выборе раздела.
   final ValueChanged<AppTab> onSelect;
+
+  /// Показывать ли рядом с иконкой название раздела (широкий экран).
+  final bool wide;
 
   /// Размер иконки и отступ вокруг неё.
   ///
@@ -243,13 +269,23 @@ class _NavBar extends StatelessWidget {
   static const _iconSize = 22.0;
   static const _tapPad = 11.0;
 
-  /// Ширина полосы: иконка и отступы вокруг кнопки.
+  /// Ширина полосы в узком виде: иконка и отступы вокруг кнопки.
   static const _width = _iconSize + 2 * _tapPad;
+
+  /// Отступ между иконкой и подписью раздела в широком виде.
+  static const _labelGap = 12.0;
+
+  /// Ширина полосы с подписями.
+  ///
+  /// Число, а не «по самой длинной подписи»: ширина бара менялась бы от набора разделов, и
+  /// содержимое прыгало бы при добавлении нового пункта. Подписи, которым места не хватит,
+  /// обрезаются — раздел при этом всё равно виден целиком в подсказке.
+  static const _wideWidth = 176.0;
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: _width,
+      width: wide ? _wideWidth : _width,
       // `Material` — не для красоты: без него `InkWell` в строках не рисует отклик на нажатие.
       // Цвет бара — `island` (тот же, что у карточек), а не фон приложения: бар отделяется от
       // содержимого цветом, и разделитель (см. `body`) тогда только подчёркивает границу.
@@ -267,16 +303,16 @@ class _NavBar extends StatelessWidget {
     );
   }
 
-  /// Кнопка раздела: иконка и подсветка выбранного.
+  /// Кнопка раздела: иконка, подпись (в широком виде) и подсветка выбранного.
   ///
-  /// Вместо `ListTile` — свой квадрат с равными отступами: `ListTile` держит минимум 56 px и
+  /// Вместо `ListTile` — свой ряд с равными отступами: `ListTile` держит минимум 56 px и
   /// собственные боковые поля, из-за которых кнопка вышла бы шире, чем полоса.
   Widget _item(AppTab tab) {
     final look = _tabLook[tab]!;
     final selected = tab == current;
     return Tooltip(
-      // подпись раздела — единственное место, где он назван словами: видна при наведении
-      // (на маке — курсором) и читается экранным диктором
+      // подпись раздела — в узком баре единственное место, где он назван словами: видна при
+      // наведении (на маке — курсором) и читается экранным диктором
       message: look.label,
       child: InkWell(
         onTap: () => onSelect(tab),
@@ -284,10 +320,30 @@ class _NavBar extends StatelessWidget {
           // подсветка выбранного — мягкая заливка акцентом, как у нижней панели разделов раньше
           color: selected ? C.accentSoft : null,
           padding: const EdgeInsets.all(_tapPad),
-          child: Icon(
-            selected ? look.activeIcon : look.icon,
-            size: _iconSize,
-            color: selected ? C.accent : C.fg3,
+          child: Row(
+            children: [
+              Icon(
+                selected ? look.activeIcon : look.icon,
+                size: _iconSize,
+                color: selected ? C.accent : C.fg3,
+              ),
+              // подпись только там, где для неё есть место: в узком баре ширину строки задаёт
+              // иконка, и текст влез бы поверх соседних элементов
+              if (wide) ...[
+                const SizedBox(width: _labelGap),
+                Expanded(
+                  child: Text(
+                    look.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: selected ? C.accent : C.fg3,
+                      fontSize: 14,
+                    ),
+                  ),
+                ),
+              ],
+            ],
           ),
         ),
       ),

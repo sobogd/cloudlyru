@@ -325,22 +325,21 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     );
   }
 
-  /// Колонка со списком разговоров: строка о харнессе, ошибка и сам список.
+  /// Колонка со списком разговоров: ошибка моста и сам список.
   ///
   /// Шапки с названием раздела нет ни здесь, ни в однопанельном виде: раздел уже назван
   /// подсветкой в левом баре, а строка «Проекты» только отнимала бы высоту у списка.
-  Widget _sidebar(AgentSessionsState state, {required bool wide}) {
-    final projects = ref.watch(agentProjectsProvider);
-    return Column(
+  Widget _sidebar(AgentSessionsState state, {required bool wide}) => Material(
+    // фон колонки со списком — как у левого бара разделов ([C.island]): список и бар читаются
+    // одной поверхностью, а разговор справа отделяет только рамка и его собственный фон
+    color: C.island,
+    child: Column(
       children: [
-        // чем отвечает харнесс: без этой строки непонятно, какая модель считает — а на маке
-        // она одна на чат и на агента
-        if (projects.health.label.isNotEmpty) _harnessLine(projects.health),
         if (state.error != null) _errorBar(state.error!),
         Expanded(child: _body(state, wide: wide)),
       ],
-    );
-  }
+    ),
+  );
 
   /// Правая панель: выбранный разговор, заглушка или спиннер, пока мост поднимает процесс.
   ///
@@ -420,13 +419,19 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     );
   }
 
-  /// Кнопка новой сессии: первая строка списка во всю ширину.
+  /// Кнопка новой сессии: первая строка списка во всю ширину колонки.
   ///
   /// Раньше это была плавающая кнопка в углу, но она перекрывала последние строки списка и
   /// спорила с полем ввода разговора. Строкой во всю ширину её видно всегда, и открывать
   /// мастер приходится не через поиск кнопки в углу.
+  ///
+  /// Заливка — не ярким акцентом, а мягкой подложкой ([C.accentSoft]) от края до края колонки:
+  /// на фоне списка ([C.island]) яркая кнопка перетягивала бы взгляд с разговоров на себя.
+  /// Текст и значок при этом остаются акцентными — что это кнопка и что она делает, видно.
   Widget _addTile(AgentSessionsState state, {required bool wide}) => Padding(
-    padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+    // поля только сверху и снизу: подложка должна упираться в края колонки, иначе она
+    // выглядит плавающей кнопкой, а не первой строкой списка
+    padding: const EdgeInsets.fromLTRB(0, 8, 0, 4),
     child: SizedBox(
       height: 46,
       width: double.infinity,
@@ -435,9 +440,11 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         icon: const Icon(Icons.add, size: 20),
         label: const Text('Новая сессия'),
         style: FilledButton.styleFrom(
-          backgroundColor: C.accent,
-          foregroundColor: C.accentFg,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          backgroundColor: C.accentSoft,
+          foregroundColor: C.accent,
+          // без скругления: подложка идёт от края до края, и радиус на такой полосе смотрелся
+          // бы случайным пятном
+          shape: const RoundedRectangleBorder(),
         ),
       ),
     ),
@@ -520,18 +527,6 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       ),
     );
   }
-
-  /// Строка о харнессе и модели над списком.
-  Widget _harnessLine(AgentHealth health) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-    child: Align(
-      alignment: Alignment.centerLeft,
-      child: Text(
-        health.label,
-        style: const TextStyle(color: C.fg3, fontSize: 12),
-      ),
-    ),
-  );
 
   /// Сообщение об ошибке над списком: «мост недоступен» — состояние раздела, а не сбой строки.
   Widget _errorBar(String message) => Container(
