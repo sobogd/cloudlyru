@@ -90,8 +90,20 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
       confirmLabel: 'Удалить',
     );
     if (!ok || !mounted) return;
-    await _sessions.remove(session.id);
-    if (mounted) snack(context, 'Сессия удалена');
+    final result = await _sessions.remove(session.id);
+    if (!mounted || result == null) return;
+    if (result.anyRestored) {
+      snack(
+        context,
+        'Этот разговор ведёт живой процесс Claude Code: файл восстановлен, удалить его отсюда '
+        'нельзя — только в самом Claude',
+      );
+      return;
+    }
+    snack(
+      context,
+      result.anyDeleted ? 'Сессия удалена' : 'Удалять было нечего',
+    );
   }
 
   /// Закрывает процесс сессии на маке: история остаётся, память под контекст освобождается.
@@ -224,12 +236,15 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
       confirmLabel: 'Удалить',
     );
     if (!ok || !mounted) return;
-    final deleted = await _sessions.purgeOld(
+    final result = await _sessions.purgeOld(
       olderThanDays: rule.olderThanDays,
       keep: rule.keep,
     );
-    if (!mounted || deleted == null) return;
-    snack(context, 'Удалено разговоров: $deleted');
+    if (!mounted || result == null) return;
+    final restored = result.anyRestored
+        ? ', ${result.restored} вернулись: их ведут живые процессы Claude Code'
+        : '';
+    snack(context, 'Удалено разговоров: ${result.deleted}$restored');
   }
 
   /// Значок харнесса: у pi терминал, у Claude Code — звёздочка его бренда.

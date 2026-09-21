@@ -1129,18 +1129,20 @@ def parse_size(raw):
     return int(value)
 
 
-def purge_session(key):
-    """Удаляет сессию с диска: файл истории и папку, которую агент завёл под этот разговор.
+def remove_session_files(key):
+    """Удаляет файлы сессии с диска и возвращает путь файла истории (или `None`).
 
     Харнесс берётся из идентификатора, потому что хранилищ два. У Claude Code рядом с файлом
     истории лежит папка с тем же именем (результаты инструментов, служебные пометки) — без неё
-    удаление оставляло мусор, который копился сотнями. Возвращаем число удалённых файлов —
-    приложение по нему понимает, было ли что удалять.
+    удаление оставляло мусор, который копился сотнями.
+
+    Проверки «файл вернулся» здесь нет намеренно: она стоит 0.4 секунды ожидания, а уборка
+    удаляет сотни сессий. Разбирается с этим вызывающий — один раз, после всей пачки.
     """
     harness, session_id = split_key(key)
     file = find_session_file(harness, session_id)
     if file is None:
-        return 0
+        return None
     try:
         file.unlink()
         log("удалил файл сессии %s (%s)" % (file, harness))
@@ -1150,7 +1152,25 @@ def purge_session(key):
             log("удалил папку сессии %s" % workdir)
     except OSError as e:
         raise PiError("не смог удалить файл сессии %s: %s" % (file, e))
-    return 1
+    return file
+
+
+def purge_session(key):
+    """Удаляет одну сессию и проверяет, не вернул ли файл живой процесс.
+
+    Проверка нужна из-за сессий, которые ведёт кто-то снаружи: у Claude Code так работают
+    разговоры из `remote-control` и из открытого терминала — процесс держит разговор и пишет
+    его журнал заново сразу после удаления. Приложение по этому признаку честно говорит
+    «удалить отсюда нельзя», вместо того чтобы показывать успех и оставлять разговор в списке.
+    """
+    file = remove_session_files(key)
+    if file is None:
+        return {"deleted": False, "restored": False}
+    time.sleep(0.4)
+    restored = file.exists()
+    if restored:
+        log("файл %s восстановлен живым процессом: разговор ведётся снаружи" % file)
+    return {"deleted": not restored, "restored": restored}
 
 
 def purge_old_sessions(path, harness, older_days, keep):
@@ -1169,16 +1189,27 @@ def purge_old_sessions(path, harness, older_days, keep):
     threshold = time.time() - (older_days * 86400) if older_days is not None else None
 
     deleted = []
+    removed_files = []
     for file in newest_first:
         if str(file) in protected:
             continue
         if threshold is not None and file.stat().st_mtime >= threshold:
             continue
         session_id = file.stem.split("_")[-1] if harness != HARNESS_CLAUDE else file.stem
-        if purge_session(session_key(harness, session_id)):
+        gone = remove_session_files(session_key(harness, session_id))
+        if gone is not None:
             deleted.append(session_key(harness, session_id))
-    log("уборка сессий в %s (%s): удалено %d" % (path, harness, len(deleted)))
-    return deleted
+            removed_files.append(gone)
+
+    # Одна проверка на всю пачку: сколько файлов вернули себе живые процессы (разговоры,
+    # которые ведёт remote-control или открытый терминал). Их считать удалёнными нельзя.
+    restored = []
+    if removed_files:
+        time.sleep(0.4)
+        restored = [session_key(harness, f.stem.split("_")[-1] if harness != HARNESS_CLAUDE else f.stem)
+                    for f in removed_files if f.exists()]
+    log("уборка сессий в %s (%s): удалено %d, вернулось %d" % (path, harness, len(deleted) - len(restored), len(restored)))
+    return {"deleted": [k for k in deleted if k not in restored], "restored": restored}
 
 
 def read_json_file(path):
@@ -2518,8 +2549,16 @@ class Handler(BaseHTTPRequestHandler):
                 if session is not None:
                     session.stop()
                 # файл ищем всегда: удалить разговор можно и у закрытой сессии
-                removed = purge_session(parts[2])
-                self._json(200, {"ok": True, "deleted": removed})
+                outcome = purge_session(parts[2])
+                self._json(200, {
+                    "ok": True,
+                    # счётчики, а не флаги: у уборки их тоже два, и приложению проще читать
+                    # одинаковый ответ у обеих ручек
+                    "deleted": 1 if outcome["deleted"] else 0,
+                    # 1 — файл вернул живой процесс: разговор ведётся снаружи
+                    # (`remote-control` или открытый терминал), и удалить его отсюда нельзя
+                    "restored": 1 if outcome["restored"] else 0,
+                })
             else:
                 self._json(404, {"error": "неизвестная ручка: %s" % path})
 
@@ -2620,8 +2659,13 @@ class Handler(BaseHTTPRequestHandler):
             keep = int(keep)
             if keep < 0:
                 raise PiError("keep не может быть отрицательным")
-        deleted = purge_old_sessions(path, harness, older, keep)
-        return {"deleted": len(deleted), "sessions": deleted}
+        result = purge_old_sessions(path, harness, older, keep)
+        return {
+            "deleted": len(result["deleted"]),
+            "restored": len(result["restored"]),
+            "sessions": result["deleted"],
+            "restoredSessions": result["restored"],
+        }
 
     def _close(self, session_id):
         """Закрывает процесс pi, оставляя историю: освобождает память на маке.

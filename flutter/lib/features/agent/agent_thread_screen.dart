@@ -164,12 +164,24 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       confirmLabel: 'Удалить',
     );
     if (!ok || !mounted) return;
-    final deleted = await _thread.deleteSession();
-    if (!mounted) return;
-    if (deleted) {
+    final result = await _thread.deleteSession();
+    if (!mounted || result == null) return;
+    if (result.anyDeleted) {
       Navigator.of(context).pop();
       snack(context, 'Сессия удалена');
+      return;
     }
+    if (result.anyRestored) {
+      // Файл вернул живой процесс: разговор ведёт remote-control или открытый терминал Claude
+      // Code, и удалить его из приложения нельзя. Говорим это прямо, а не показываем успех.
+      snack(
+        context,
+        'Этот разговор ведёт живой процесс Claude Code: файл восстановлен, удалить его отсюда '
+        'нельзя — только в самом Claude',
+      );
+      return;
+    }
+    snack(context, 'Удалять было нечего: файл сессии не найден');
   }
 
   @override

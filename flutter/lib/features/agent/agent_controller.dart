@@ -488,35 +488,16 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     }
   }
 
-  /// Удаляет сессию на маке вместе с историей.
-  ///
-  /// Необратимо, поэтому вызывающий сначала спрашивает подтверждение. Список обновляется
-  /// локально: сервер уже удалил файл, и перечитывать его ради одной строки незачем.
-  Future<void> remove(String sessionId) async {
-    try {
-      await _api.deleteSession(sessionId);
-      state = AgentSessionsState(
-        project: state.project,
-        sessions: [
-          for (final s in state.sessions)
-            if (s.id != sessionId) s,
-        ],
-      );
-    } on AgentApiException catch (e) {
-      showError(e.message);
-    }
-  }
-
   /// Убирает старые сессии проекта и перечитывает список с мака.
   ///
-  /// Возвращает число удалённых разговоров или `null`, если мост отказал (причина при этом уже
-  /// лежит в состоянии и показывается на экране).
-  Future<int?> purgeOld({int? olderThanDays, int? keep}) async {
+  /// Возвращает итог (сколько удалилось и сколько вернулось) или `null`, если мост отказал:
+  /// причина при этом уже лежит в состоянии и показывается на экране.
+  Future<AgentDeleteResult?> purgeOld({int? olderThanDays, int? keep}) async {
     final project = state.project;
     if (project == null) return null;
     final harness = state.purgeHarness;
     try {
-      final deleted = await _api.purgeSessions(
+      final result = await _api.purgeSessions(
         path: project.path,
         harness: harness,
         olderThanDays: olderThanDays,
@@ -525,7 +506,35 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
       // Список перечитываем с мака: удаление идёт по файлам, и показывать список, собранный
       // до него, значит однажды снова увидеть удалённый разговор в списке.
       await load(project);
-      return deleted;
+      return result;
+    } on AgentApiException catch (e) {
+      showError(e.message);
+      return null;
+    }
+  }
+
+  /// Удаляет сессию на маке вместе с историей и возвращает итог (что удалилось, что вернулось).
+  ///
+  /// Необратимо, поэтому вызывающий сначала спрашивает подтверждение. Строка убирается сразу, а
+  /// затем список перечитывается с мака: если файл вернул живой процесс, разговор останется в
+  /// списке — и это правильнее, чем показать его удалённым.
+  Future<AgentDeleteResult?> remove(String sessionId) async {
+    try {
+      final result = await _api.deleteSession(sessionId);
+      // Строку убираем сразу (ответ уже есть), потом перечитываем список с мака: если файл
+      // вернул живой процесс, разговор останется в списке — и это честнее, чем показать
+      // его удалённым.
+      state = AgentSessionsState(
+        project: state.project,
+        sessions: [
+          for (final s in state.sessions)
+            if (s.id != sessionId) s,
+        ],
+        purgeHarness: state.purgeHarness,
+      );
+      final project = state.project;
+      if (project != null) await load(project);
+      return result;
     } on AgentApiException catch (e) {
       showError(e.message);
       return null;
@@ -799,16 +808,15 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   ///
   /// Занятость снимаем до удаления: работающий процесс держит файл открытым, и стирать его
   /// из-под агента — верный способ получить обрывок сессии на диске.
-  Future<bool> deleteSession() async {
+  Future<AgentDeleteResult?> deleteSession() async {
     final session = state.session;
-    if (session == null) return false;
+    if (session == null) return null;
     if (state.sending) await stop();
     try {
-      await _api.deleteSession(session.id);
-      return true;
+      return await _api.deleteSession(session.id);
     } on AgentApiException catch (e) {
       state = state.withError(e.message);
-      return false;
+      return null;
     }
   }
 
