@@ -1,0 +1,95 @@
+name: iOS app (build + publish)
+
+# Ручной прогон: собирает сборку для iPad и iPhone (Flutter-клиент из flutter/, каталог ios/)
+# и публикует .ipa в релизный артефакт S3, откуда её всегда отдаёт
+# https://files.iq-factura.com/ios, а страница https://files.iq-factura.com/ios/install
+# ставит сборку на устройство по воздуху (itms-services).
+#
+# Автоматического запуска по push нет: релиз — осознанное действие, перед ним нужно поднять
+# номер сборки в flutter/pubspec.yaml. Номер общий с Android и macOS, и скрипт публикации
+# не даёт положить сборку с тем же или меньшим номером.
+# Ручной запуск: gh workflow run ios.yml --repo sobogd/cloudlyru
+#
+# Про сборку. Она Ad Hoc: подписана distribution-профилем, в который вписаны конкретные
+# устройства по UDID. Поэтому установить её можно только на них, зато режим разработчика
+# на устройстве не нужен, а срок жизни профиля — год. Устройства регистрируются через
+# App Store Connect API (POST /v1/devices) или руками в кабинете разработчика.
+#
+# Сам сборщик живёт в scripts/build-ios.sh: там же объяснено, почему `flutter build ipa`
+# здесь не подходит и зачем xcodebuild-у ключ передаётся флагами. Шаги воркфлоу только
+# готовят ключ и переменные, чтобы локальная сборка и CI шли одним и тем же путём.
+#
+# Секреты:
+#   ASC_KEY_ID, ASC_ISSUER_ID, APPLE_TEAM_ID — из кабинета разработчика (ключ App Store Connect);
+#   ASC_KEY_P8 — сам файл .p8 в base64 (`base64 -i AuthKey_XXXX.p8 | gh secret set ASC_KEY_P8`);
+#   S3_FILES_ACCESS_KEY / S3_FILES_SECRET_KEY — те же, что у автодеплоя.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cloudlyru-ios
+  cancel-in-progress: false
+
+env:
+  # Тот же Flutter, что у нас локально: новая stable может поменять Xcode-шаблон и сломать
+  # сборку в самый неподходящий момент, а релиз должен собираться воспроизводимо.
+  FLUTTER_VERSION: 3.47.4
+
+jobs:
+  ios:
+    # Только мак: нужен Xcode. macos-latest — Apple Silicon, то есть сборка под arm64 (все
+    # актуальные iPad и iPhone), для старых armv7 нужен был бы отдельный раннер.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # CocoaPods на образах раннера обычно уже стоит, но от него зависит вся сборка iOS
+      # (у части плагинов нет поддержки Swift Package Manager), поэтому проверяем явно.
+      - name: CocoaPods
+        run: pod --version || brew install cocoapods
+
+      # Ключ приходит секретом в base64: так его можно положить в секреты одной командой,
+      # не копируя содержимое файла в интерфейс. Файл живёт до конца задания во временном
+      # каталоге раннера — в репозиторий и в артефакты он не попадает.
+      - name: Ключ App Store Connect
+        env:
+          KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          test -n "$KEY_P8" || { echo "нет секрета ASC_KEY_P8"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s' "$KEY_P8" | base64 -d > "$RUNNER_TEMP/asc/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/asc/AuthKey.p8"
+          echo "ASC_KEY_FILE=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Сборка, подпись и публикация в /ios
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
+          S3_FILES_SECRET_KEY: ${{ secrets.S3_FILES_SECRET_KEY }}
+          S3_FILES_ENDPOINT: https://nbg1.your-objectstorage.com
+          S3_FILES_REGION: nbg1
+          S3_FILES_BUCKET: cloudlyru
+          S3_FILES_FORCE_PATH_STYLE: 'true'
+          S3_FILES_PREFIX: ''
+          CLOUDLY_BASE_URL: https://files.iq-factura.com
+        run: ./scripts/build-ios.sh
+
+      - name: Итог в summary
+        if: always()
+        run: |
+          {
+            echo "### Приложение для iPad и iPhone"
+            echo "- установка на устройстве: https://files.iq-factura.com/ios/install"
+            echo "- сам архив: https://files.iq-factura.com/ios"
+            echo "- сборка Ad Hoc: ставится только на устройства из профиля;"
+            echo "  режим разработчика не нужен, профиль живёт год"
+          } >> "$GITHUB_STEP_SUMMARY"
