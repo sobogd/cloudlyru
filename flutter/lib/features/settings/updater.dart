@@ -32,12 +32,21 @@ import 'macos_update.dart';
 ///
 /// Панель сама себя не обновляет по таймеру: проверка версии — действие по кнопке, а не
 /// фоновый процесс. При открытии настроек она проверяет версию один раз.
+///
+/// На iOS обновлять себя нечем: система не даёт приложению ни запустить установщик, ни
+/// заменить собственную сборку, поэтому панель там только показывает версию (см. [_selfUpdate]).
 class UpdaterPanel extends ConsumerStatefulWidget {
   const UpdaterPanel({super.key});
 
   @override
   ConsumerState<UpdaterPanel> createState() => _UpdaterPanelState();
 }
+
+/// Умеет ли приложение обновлять себя на этой платформе: Android ставит APK системным
+/// установщиком, macOS подменяет свой бандл помощником (`macos_update.dart`). На iOS нет
+/// ни того, ни другого — приложению запрещено и запускать установщик, и переписывать
+/// собственную сборку, поэтому там панель версии ничего не проверяет и ничего не обещает.
+final bool _selfUpdate = Platform.isAndroid || Platform.isMacOS;
 
 /// Состояние панели: своя версия, версия на сервере и ход скачивания.
 class _UpdaterPanelState extends ConsumerState<UpdaterPanel> {
@@ -97,6 +106,8 @@ class _UpdaterPanelState extends ConsumerState<UpdaterPanel> {
   Future<void> _bootstrap() async {
     await _init();
     if (!mounted) return;
+    // На iOS свою версию показываем, а к серверу не ходим: поставить оттуда всё равно нечего.
+    if (!_selfUpdate) return;
     await _check();
   }
 
@@ -304,18 +315,26 @@ class _UpdaterPanelState extends ConsumerState<UpdaterPanel> {
           Row(children: [
             const Text('Обновление', style: TextStyle(color: C.fg, fontWeight: FontWeight.w600)),
             const Spacer(),
-            TextButton(
-              // Во время проверки или скачивания кнопка выключена: две параллельные загрузки
-              // писали бы в один и тот же файл. До чтения своей версии — тоже: сравнивать
-              // в этот момент нечего.
-              onPressed: (_checking || _downloading || !_ready) ? null : _check,
-              child: (_checking || !_ready) ? const Text('…') : const Text('Проверить'),
-            ),
+            // Кнопки «Проверить» на iOS нет: спрашивать сервер о сборке, которую приложение
+            // не сможет поставить, — это обещание, которого оно не выполнит.
+            if (_selfUpdate)
+              TextButton(
+                // Во время проверки или скачивания кнопка выключена: две параллельные загрузки
+                // писали бы в один и тот же файл. До чтения своей версии — тоже: сравнивать
+                // в этот момент нечего.
+                onPressed: (_checking || _downloading || !_ready) ? null : _check,
+                child: (_checking || !_ready) ? const Text('…') : const Text('Проверить'),
+              ),
           ]),
           // Свою версию показываем всегда, версию с сервера — только когда она известна:
           // строка «на сервере: …» без ответа сервера смысла не имеет.
           Text('текущая версия: $_currentName ($_currentCode)',
               style: const TextStyle(color: C.fg3, fontSize: 13)),
+          // На iOS обновляет не приложение, а тот, кто ставил сборку: TestFlight или новая
+          // сборка поверх руками. Молчать об этом нельзя — иначе непонятно, где искать новую.
+          if (!_selfUpdate)
+            const Text('приложение на iOS не обновляет себя: новая сборка ставится снаружи',
+                style: TextStyle(color: C.fg3, fontSize: 12)),
           if (latest != null) ...[
             const SizedBox(height: 2),
             Text('на сервере: ${latest.versionName} (${latest.versionCode})',

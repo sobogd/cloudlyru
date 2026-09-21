@@ -14,6 +14,7 @@ import '../features/settings/settings_screen.dart';
 import '../factura/invoices_screen.dart';
 import '../features/trash/trash_screen.dart';
 import '../providers.dart';
+import '../theme.dart';
 
 /// Разделы приложения — ровно те, что стоят в нижней панели, в том же порядке.
 ///
@@ -27,6 +28,19 @@ import '../providers.dart';
 /// [_ShellState.build] обязан совпадать с порядком значений здесь, иначе подсветится и
 /// откроется не тот раздел. Число `destinations` — тоже ровно по числу значений.
 enum AppTab { files, mail, media, map, invoices, chat, trash, settings }
+
+/// Иконки для каждого раздела. Имена соответствуют `AppTab.name`, чтобы можно было
+/// восстанавливать последнюю вкладку из настроек, даже если иконка изменится.
+final Map<AppTab, IconData> _tabIcons = {
+  AppTab.files: Icons.folder_outlined,
+  AppTab.mail: Icons.mail_outline,
+  AppTab.media: Icons.photo_library_outlined,
+  AppTab.map: Icons.map_outlined,
+  AppTab.invoices: Icons.receipt_long_outlined,
+  AppTab.chat: Icons.chat_bubble_outline,
+  AppTab.trash: Icons.delete_outline,
+  AppTab.settings: Icons.settings_outlined,
+};
 
 /// Оболочка после входа: держит выбранный раздел и нижнюю панель навигации.
 ///
@@ -45,6 +59,7 @@ class Shell extends ConsumerStatefulWidget {
 /// Состояние оболочки: выбранный раздел и уже построенные экраны разделов.
 class _ShellState extends ConsumerState<Shell> {
   AppTab _tab = AppTab.files;
+  bool _drawerOpen = false;
 
   /// Построенные экраны разделов: `IndexedStack` держит их живыми, поэтому на экран,
   /// в который человек уже заходил, он возвращается с той же открытой папкой и прокруткой.
@@ -131,38 +146,68 @@ class _ShellState extends ConsumerState<Shell> {
             (tab == _tab || _screens.containsKey(tab)) ? _screenFor(tab) : const SizedBox.shrink(),
         ],
       ),
-      // Панель разделов: только иконки, подписи скрыты (см. theme.dart, navigationBarTheme).
-      // Подписи всё равно остаются в NavigationDestination — из них берутся подсказка при
-      // долгом нажатии и текст для экранного диктора, поэтому удалять их нельзя.
-      // Сама панель настроена в theme.dart: высота урезана с 80 до 56, подписи выключены
-      // (labelBehavior: alwaysHide), иконки 24 — отсюда и «иконки без подписей» в коде.
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab.index,
-        onDestinationSelected: (i) {
-          // индекс приходит от панели и совпадает с порядком AppTab — по нему же берём имя
-          // для настроек, чтобы после перезапуска открылась та же вкладка
-          setState(() => _tab = AppTab.values[i]);
-          // запись не ждём: вкладка — мелочь, ради которой нельзя задерживать перерисовку
-          unawaited(ref.read(appStateProvider).settings.ui.patch({'tab': AppTab.values[i].name}));
-        },
-        // Подписи обязательны, хотя на экране их не видно: NavigationDestination берёт из них
-        // и всплывающую подсказку при долгом нажатии, и подпись для экранного диктора.
-        // Пустой label или его удаление — это не «иконки без подписей», а панель, у которой
-        // навигация перестаёт объясняться словами.
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.folder_outlined), selectedIcon: Icon(Icons.folder), label: 'Файлы'),
-          NavigationDestination(icon: Icon(Icons.mail_outline), selectedIcon: Icon(Icons.mail), label: 'Почта'),
-          NavigationDestination(icon: Icon(Icons.photo_library_outlined), selectedIcon: Icon(Icons.photo_library), label: 'Медиа'),
-          NavigationDestination(icon: Icon(Icons.map_outlined), selectedIcon: Icon(Icons.map), label: 'Карта'),
-          // «Фактуры» — раздел, перенесённый из отдельного сервиса iq-factura: выставление
-          // инвойсов, расходы и квартальные декларации. Стоит рядом с «Картой», потому что
-          // это такая же отдельная зона приложения, а не часть файлов.
-          NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: 'Фактуры'),
-          // «Чат» — разговор с локальной моделью владельца (LM Studio на его маке). Отдельный раздел, а не
-          // кнопка внутри другого: это такая же самостоятельная зона приложения, как «Файлы».
-          NavigationDestination(icon: Icon(Icons.chat_bubble_outline), selectedIcon: Icon(Icons.chat_bubble), label: 'Чат'),
-          NavigationDestination(icon: Icon(Icons.delete_outline), selectedIcon: Icon(Icons.delete), label: 'Корзина'),
-          NavigationDestination(icon: Icon(Icons.settings_outlined), selectedIcon: Icon(Icons.settings), label: 'Настройки'),
+      // Боковая панель вместо нижней: открывается по кнопке в AppBar.
+      // На мобильном — только по кнопке, на десктопе — можно оставить открытым или тоже по кнопке.
+      drawer: _buildDrawer(),
+      // Кнопка меню в AppBar для открытия/закрытия Drawer.
+      appBar: AppBar(
+        title: Text(_tab.name),
+        // Кнопка гамбургер: иконка меняется в зависимости от состояния Drawer.
+        actions: [
+          IconButton(
+            icon: Icon(_drawerOpen ? Icons.close : Icons.menu),
+            onPressed: () => setState(() => _drawerOpen = !_drawerOpen),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Строит боковую панель навигации.
+  Widget _buildDrawer() {
+    return Drawer(
+      child: ListView(
+        // Отступ сверху, чтобы не наезжать на AppBar.
+        padding: const EdgeInsets.only(top: 16, left: 8, right: 8, bottom: 8),
+        children: [
+          // Заголовок Drawer — просто название приложения или логотип.
+          Container(
+            height: 120,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [C.accent, C.accent2],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+            ),
+            child: Center(
+              child: Text(
+                'Cloudly',
+                style: TextStyle(
+                  color: C.accentFg,
+                  fontSize: 32,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+          // Список разделов навигации.
+          ...AppTab.values.map((tab) {
+            final selectedIcon = _tabIcons[tab];
+            final icon = tab == _tab ? Icon(selectedIcon) : Icon(selectedIcon);
+            return ListTile(
+              leading: icon,
+              title: Text(tab.name),
+              onTap: () {
+                setState(() {
+                  _tab = tab;
+                  _drawerOpen = false; // Закрыть Drawer после выбора.
+                });
+                // Запись в настройки — не ждём, вкладка — мелочь.
+                unawaited(ref.read(appStateProvider).settings.ui.patch({'tab': tab.name}));
+              },
+            );
+          }),
         ],
       ),
     );

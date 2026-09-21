@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11,6 +12,14 @@ import '../../sync/ui/queue_screen.dart';
 import '../../theme.dart';
 import '../../util/widgets.dart';
 import 'sync_links_screen.dart';
+
+/// Доступна ли синхронизация папок устройства на этой платформе.
+///
+/// На iOS её нет: приложение заперто в собственной песочнице и чужих папок не видит вовсе —
+/// `NativeFs.storageRoots` отдаёт там пустой список (см. `sync/device/native_fs.dart`).
+/// Поэтому панель не показывает неработающие строки, а объясняет, почему их нет: пустое
+/// дерево папок читалось бы как сбой приложения, а не как ограничение системы.
+final bool _deviceSyncSupported = !Platform.isIOS;
 
 /// Группа «Синхронизация»: доступ к файлам, связки «устройство ↔ облако», папки «Фото»,
 /// очередь и зеркало.
@@ -34,8 +43,9 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
   void initState() {
     super.initState();
     // Проверка «не встала ли синхронизация» и отсюда: настройки могут открыть первыми,
-    // а кнопок «сверить»/«включить» больше нет — возобновить работу может только ядро
-    unawaited(_sync.checkAndResume());
+    // а кнопок «сверить»/«включить» больше нет — возобновить работу может только ядро.
+    // На iOS проверять нечего: синхронизации там нет, и токен устройства выпускать незачем.
+    if (_deviceSyncSupported) unawaited(_sync.checkAndResume());
   }
 
   /// Открывает вложенный экран и перерисовывается по возвращении.
@@ -74,6 +84,26 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
 
   @override
   Widget build(BuildContext context) {
+    // На iOS синхронизировать нечего: строки панели вели бы в дерево без корней. Вместо
+    // неработающих кнопок — объяснение, что именно не даёт система.
+    if (!_deviceSyncSupported) {
+      return const Panel(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Синхронизация',
+                style: TextStyle(color: C.fg, fontWeight: FontWeight.w600)),
+            SizedBox(height: 6),
+            Text(
+              'На iPad синхронизация папок не работает: система не выпускает приложение за '
+              'пределы его собственного хранилища, и папки устройства ему недоступны. '
+              'Файлы, медиа, карта, чат и почта работают как обычно.',
+              style: TextStyle(color: C.fg3, fontSize: 12),
+            ),
+          ],
+        ),
+      );
+    }
     final sync = ref.watch(syncControllerProvider);
     // у «Файлов» не выбор папок, а связки: папку в облаке человек выбирает сам
     final fileLinks = sync.links?.all().length ?? 0;

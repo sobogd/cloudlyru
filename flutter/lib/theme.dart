@@ -86,7 +86,7 @@ ThemeData buildTheme() {
     // Шапка раздела — того же цвета, что фон приложения: экран выглядит цельным, а границу
     // с содержимым задают только карточки. Раньше этот цвет стоял в каждом `AppBar` по
     // экрану — теперь он один на всё приложение, и менять его нужно здесь.
-    appBarTheme: const AppBarTheme(
+    appBarTheme: AppBarTheme(
       backgroundColor: C.canvas,
       // M3 подкрашивает шапку тоном primary при прокрутке содержимого под ней; подложка
       // должна остаться ровно цвета палитры.
@@ -94,6 +94,8 @@ ThemeData buildTheme() {
       foregroundColor: C.fg,
       elevation: 0,
       scrolledUnderElevation: 0,
+      // Иконки в AppBar — тот же цвет, что и текст.
+      iconTheme: IconThemeData(color: C.fg, size: 24),
     ),
     cardTheme: CardThemeData(
       color: C.surface,
@@ -137,10 +139,13 @@ ThemeData buildTheme() {
         borderSide: const BorderSide(color: C.accent),
       ),
     ),
-    // Панель разделов — узкая полоса только с иконками: подписи скрыты, высота урезана
+    // Боковая панель — узкая полоса слева только с иконками: подписи скрыты, высота урезана
     // с 80 (значение Material 3 по умолчанию) до [_navBarHeight]. Высота считается без
     // системного отступа снизу — Flutter добавляет его сам, поэтому на жестовой навигации
     // панель будет выше ровно на высоту полосы жеста.
+    drawerTheme: DrawerThemeData(
+      backgroundColor: C.surface,
+    ),
     navigationBarTheme: NavigationBarThemeData(
       backgroundColor: C.island,
       indicatorColor: C.accentSoft,
