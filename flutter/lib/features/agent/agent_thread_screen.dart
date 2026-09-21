@@ -94,12 +94,15 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// открывался бы с самого начала.
   bool _initialJumpDone = false;
 
-  /// Сколько кадров подряд ждём укладки истории при первом прыжке вниз.
+  /// Сколько кадров подряд уже пытаемся доехать до конца при открытии разговора.
   ///
-  /// История приходит и раскладывается несколькими кадрами, и максимум прокрутки растёт уже
-  /// после прыжка. Потолок нужен, чтобы содержимое, доезжающее бесконечно (например, картинки),
-  /// не оставило экран в вечных прыжках.
+  /// История приходит и раскладывается не одним кадром, и максимум прокрутки растёт уже после
+  /// прыжка. Потолок нужен, чтобы содержимое, доезжающее бесконечно (например, картинки), не
+  /// оставило экран в вечных прыжках.
   int _initialJumpTries = 0;
+
+  /// Предел прокрутки в прошлой попытке: пока он растёт, мы ещё не в конце истории.
+  double _initialJumpExtent = -1;
 
   /// Тикер времени работы: пока агент работает, экран раз в секунду пересчитывает «идёт 1:20».
   ///
@@ -118,8 +121,16 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     // историю запрашиваем после первого кадра: провайдеры трогать в initState нельзя
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      // Первый показ начинается заново на каждый открытый разговор: признак снят с прошлой
+      // истории (или его не было вовсе).
+      //
+      // `attach` не ждём: у занятой сессии он дожидается конца текущего прогона (подключается к
+      // нему), и ожидание здесь отложило бы прыжок в конец до конца работы агента. Историю
+      // прихода состояния мы и так поймаем слушателем провайдера.
+      _initialJumpDone = false;
+      _initialJumpTries = 0;
+      _initialJumpExtent = -1;
       _thread.attach(widget.session);
-      // разговор открывается с конца: последнее сообщение в нём важнее начала истории
       _scrollToBottomSoon();
     });
   }
@@ -140,9 +151,12 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   ///
   /// Порог в 80 пикселей, а не строгое равенство: при работе агента список растёт между кадрами,
   /// и точное сравнение с максимумом почти всегда давало бы «не внизу». Свои прыжки пропускаем
-  /// ([_selfScroll]) — иначе они же и включали бы следование обратно.
+  /// ([_selfScroll]) — иначе они же и включали бы следование обратно. Пока идёт первый прыжок в
+  /// конец ([_initialJumpDone]), движение списка не наше дело: его сдвигает сама укладывающаяся
+  /// история, и считать это отлистом человека нельзя.
   void _trackScroll() {
     if (!_scroll.hasClients || _selfScroll) return;
+    if (!_initialJumpDone) return;
     _follow = _scroll.position.maxScrollExtent - _scroll.position.pixels < 80;
   }
 
@@ -242,8 +256,17 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     // Автопрокрутка подпиской на состояние, а не счётчиком дельт: растущий ответ и новая
     // карточка инструмента одинаково требуют дотянуть список до конца.
     ref.listen(agentThreadProvider, (_, next) {
+      // Пока грузится история, прыгать некуда: список в это время пуст и предел прокрутки
+      // нулевой — прыжок «до конца» снял бы признак первого показа раньше срока, и приход
+      // истории уже не отмотал бы переписку в конец.
+      if (next.loading) {
+        _initialJumpDone = false;
+        _initialJumpTries = 0;
+        _initialJumpExtent = -1;
+        return;
+      }
       if (next.items.isEmpty) return;
-      if (_follow) _scrollToBottomSoon();
+      if (_follow || !_initialJumpDone) _scrollToBottomSoon();
     });
 
     // Тело одинаково в обеих ролях: разница только в том, кто рисует шапку.
@@ -266,7 +289,12 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: _title(state), actions: [_actions(state)]),
+      appBar: AppBar(
+        title: _title(state),
+        actions: [_actions(state)],
+        // фон — как у шапки панели в двухпанельном виде и как у поля ввода
+        backgroundColor: C.surface3,
+      ),
       body: body,
     );
   }
@@ -366,7 +394,8 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// разговора стоят на одной линии и читаются одной полосой над двумя панелями.
   Widget _paneHeader(AgentThreadState state) => Container(
     height: 56,
-    color: C.canvas,
+    // фон — как у поля ввода ([C.surface3]): шапка панели и поле под ней читаются одним блоком
+    color: C.surface3,
     child: Row(
       children: [
         const SizedBox(width: 4),
@@ -685,7 +714,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     return LinearProgressIndicator(
       value: (percent / 100).clamp(0.0, 1.0),
       minHeight: 3,
-      backgroundColor: C.canvas,
+      // фон — как у самого поля ввода (`fillColor` в `inputDecorationTheme`), а не как у фона
+      // экрана: полоса должна читаться границей поля, а не отдельной плашкой над ним
+      backgroundColor: C.surface3,
       // M3 дорисовывает точку-стоп у конца полосы; здесь она была бы мусором
       stopIndicatorRadius: 0,
       valueColor: AlwaysStoppedAnimation(
@@ -863,31 +894,39 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Отложенно: длина списка в момент вызова ещё не учитывает новый текст, и прыжок к прежнему
   /// максимуму не дотянул бы до конца ответа.
   ///
-  /// Пока идёт первый прыжок ([_initialJumpDone]), он повторяется: история приходит и
-  /// раскладывается несколькими кадрами, и максимум прокрутки растёт уже после прыжка — с
-  /// одного раза длинный разговор открывался бы с начала. Дальше следование проверяется в сам
-  /// момент прыжка, а не в момент постановки в очередь: между ними человек успевает отлистать
-  /// вверх — и раньше список всё равно прыгал вниз, после чего снова считал себя «внизу» и
-  /// залипал там навсегда. Пока человек держит палец на экране, не прыгаем вовсе.
+  /// Пока идёт первый прыжок ([_initialJumpDone]), он повторяется, пока растёт предел прокрутки:
+  /// история приходит и раскладывается несколькими кадрами, и максимум растёт уже после прыжка —
+  /// с одного раза длинный разговор открывался бы не в конце. Дальше следование проверяется в
+  /// сам момент прыжка, а не в момент постановки в очередь: между ними человек успевает
+  /// отлистать вверх — и раньше список всё равно прыгал вниз, после чего снова считал себя
+  /// «внизу» и залипал там навсегда. Пока человек держит палец на экране, не прыгаем вовсе.
   void _scrollToBottomSoon() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scroll.hasClients) return;
+      // Пока грузится история, в списке ещё прошлый разговор (или он пуст): прыгать по чужому
+      // содержимому нельзя, а тем более считать по нему, что первый показ закончен.
+      if (ref.read(agentThreadProvider).loading) return;
       final initial = !_initialJumpDone;
       // до первого прыжка ни отлист, ни признак прокрутки не учитываем: открываем с конца
       if (!initial && !_follow) return;
       if (!initial && _scroll.position.isScrollingNotifier.value) return;
-      final before = _scroll.position.maxScrollExtent;
+      final bottom = _scroll.position.maxScrollExtent;
       _selfScroll = true;
-      _scroll.jumpTo(before);
+      _scroll.jumpTo(bottom);
       _selfScroll = false;
       if (!initial) return;
-      // список доехал не целиком (разметка и картинки считаются не в первом кадре) —
-      // прыгаем ещё раз; потолок, чтобы не зациклиться на вечно доезжающем содержимом
+      // список доехал не целиком — прыгаем ещё раз; потолок, чтобы не зациклиться на вечно
+      // доезжающем содержимом
+      final grew = bottom > _initialJumpExtent;
+      _initialJumpExtent = bottom;
       _initialJumpTries++;
-      if (_scroll.position.maxScrollExtent > before && _initialJumpTries < 8) {
+      if (grew && _initialJumpTries < 30) {
         _scrollToBottomSoon();
       } else {
         _initialJumpDone = true;
+        // В первом показе истории вниз мог оттянуть сам список, а не человек: раз мы в конце,
+        // считаем, что смотрим конец разговора, иначе ответ агента писался бы без автопрокрутки.
+        _follow = true;
       }
     });
   }
@@ -918,11 +957,12 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   }
 }
 
-/// Карточка одного вызова инструмента: имя, подпись действия, свёрнутый вывод.
+/// Карточка вызова инструмента: подпись вызова и его вывод целиком.
 ///
-/// Развёрнутость живёт здесь, а не в состоянии разговора: это оформление одной карточки, и
-/// ему незачем переживать перерисовку всей переписки.
-class _ToolCard extends StatefulWidget {
+/// Прятать вывод за нажатием не нужно: в переписке важно, что агент сделал, и лишний тап
+/// за каждой командой только мешал бы. Имени инструмента и значка вида тоже нет — по подписи
+/// (команда, путь, шаблон) и так видно, что произошло.
+class _ToolCard extends StatelessWidget {
   /// Вызов инструмента со всем, что о нём известно.
   final AgentTool tool;
 
@@ -930,93 +970,45 @@ class _ToolCard extends StatefulWidget {
   const _ToolCard({required this.tool});
 
   @override
-  State<_ToolCard> createState() => _ToolCardState();
-}
-
-/// Состояние карточки: развёрнута ли она.
-class _ToolCardState extends State<_ToolCard> {
-  /// Показан ли вывод целиком.
-  bool _open = false;
-
-  /// Значок инструмента: по нему видно вид действия, не читая имя.
-  IconData get _icon => switch (widget.tool.name) {
-    'bash' => Icons.terminal,
-    'read' => Icons.description_outlined,
-    'write' => Icons.note_add_outlined,
-    'edit' => Icons.edit_outlined,
-    'grep' => Icons.search,
-    'find' || 'ls' => Icons.folder_open_outlined,
-    _ => Icons.build_outlined,
-  };
-
-  @override
   Widget build(BuildContext context) {
-    final tool = widget.tool;
     final summary = tool.summary;
-    // пустые строки вывода убираем один раз на построение: они съедают высоту сообщения,
-    // ничего не сообщая (см. [_compactLines])
+    // пустые строки вывода убираем: они съедают высоту сообщения, ничего не сообщая
     final output = _compactLines(tool.output);
-    final hasOutput = output.isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        InkWell(
-          onTap: hasOutput ? () => setState(() => _open = !_open) : null,
-          child: Row(
-            // минимум по содержимому: короткая команда — узкий пузырь, а длина строки задаётся
-            // пределом ширины пузыря, на котором текст переносится
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // имя инструмента не пишем: вид действия видно по значку
-              Icon(_icon, size: 16, color: C.fg3),
-              if (summary.isNotEmpty) ...[
-                const SizedBox(width: 8),
-                Flexible(
-                  child: Text(
-                    summary,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: C.fg2,
-                      fontSize: _textSize,
-                      fontFamily: 'monospace',
-                    ),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (summary.isNotEmpty)
+              Flexible(
+                child: SelectableText(
+                  summary,
+                  style: const TextStyle(
+                    color: C.fg2,
+                    fontSize: _textSize,
+                    fontFamily: 'monospace',
                   ),
                 ),
-              ] else
-                const Spacer(),
-              if (tool.running)
-                const Padding(
-                  padding: EdgeInsets.only(left: 8),
-                  child: SizedBox(
-                    width: 12,
-                    height: 12,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                )
-              else if (tool.isError)
-                const Padding(
-                  padding: EdgeInsets.only(left: 8),
-                  child: Icon(Icons.error_outline, size: 16, color: C.danger),
-                )
-              else
-                const Padding(
-                  padding: EdgeInsets.only(left: 8),
-                  child: Icon(Icons.check, size: 16, color: C.ok),
+              ),
+            // Значок состояния оставляем: без него не видно, вызов ещё идёт или упал.
+            if (tool.running)
+              const Padding(
+                padding: EdgeInsets.only(left: 8),
+                child: SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(strokeWidth: 2),
                 ),
-              if (hasOutput)
-                Padding(
-                  padding: const EdgeInsets.only(left: 4),
-                  child: Icon(
-                    _open ? Icons.expand_less : Icons.expand_more,
-                    size: 16,
-                    color: C.fg3,
-                  ),
-                ),
-            ],
-          ),
+              )
+            else if (tool.isError)
+              const Padding(
+                padding: EdgeInsets.only(left: 8),
+                child: Icon(Icons.error_outline, size: 16, color: C.danger),
+              ),
+          ],
         ),
-        if (_open && hasOutput)
+        if (output.isNotEmpty)
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: SelectableText(
@@ -1123,7 +1115,7 @@ const _textSize = 14.0;
 
 /// Ширина кнопки «скопировать» вместе с её полями: на неё уменьшается предел ширины пузыря,
 /// потому что кнопка стоит вне пузыря и пара должна целиком влезать в отведённое место.
-const _copyButtonWidth = 34.0;
+const _copyButtonWidth = 30.0;
 
 /// Кнопка «скопировать сообщение» — одна и та же у пузырей и у карточек команд.
 ///
@@ -1145,20 +1137,20 @@ class _CopyButton extends StatelessWidget {
     // с содержимым сообщения — оттенок берём от fg3, своего цвета для неё в палитре нет.
     icon: Icon(
       Icons.content_copy,
-      size: 16,
-      color: C.fg3.withValues(alpha: 0.6),
+      size: 14,
+      color: C.fg3.withValues(alpha: 0.45),
     ),
     visualDensity: VisualDensity.compact,
     padding: EdgeInsets.zero,
-    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
   );
 }
 
-/// Карточка прямой команды оболочки: строка команды и свёрнутый вывод.
+/// Карточка прямой команды оболочки: строка команды и её вывод целиком.
 ///
-/// Свёрнута по умолчанию: такую команду запускал не агент, а харнесс по просьбе клиента, и в
-/// переписке важен сам факт запуска; вывод нужен только когда за ним зачем-то полезли.
-class _BashCard extends StatefulWidget {
+/// Такую команду запускал не агент, а харнесс по просьбе клиента; прятать её вывод за
+/// нажатием не нужно — раскрывать его пришлось бы каждый раз, чтобы просто прочитать ответ.
+class _BashCard extends StatelessWidget {
   /// Команда целиком, как её запускали.
   final String command;
 
@@ -1169,55 +1161,25 @@ class _BashCard extends StatefulWidget {
   const _BashCard({required this.command, required this.output});
 
   @override
-  State<_BashCard> createState() => _BashCardState();
-}
-
-/// Состояние карточки команды: показан ли вывод.
-class _BashCardState extends State<_BashCard> {
-  /// Показан ли вывод команды.
-  bool _open = false;
-
-  @override
   Widget build(BuildContext context) {
     // пустые строки вывода убираем: команда печатает их пачками, а несут они только высоту
-    final output = _compactLines(widget.output);
-    final hasOutput = output.isNotEmpty;
+    final text = _compactLines(output);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        InkWell(
-          // сворачивать нечего, если команда ничего не напечатала
-          onTap: hasOutput ? () => setState(() => _open = !_open) : null,
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Flexible(
-                child: SelectableText(
-                  '\$ ${widget.command}',
-                  style: const TextStyle(
-                    color: C.fg2,
-                    fontSize: _textSize,
-                    fontFamily: 'monospace',
-                  ),
-                ),
-              ),
-              if (hasOutput)
-                Padding(
-                  padding: const EdgeInsets.only(left: 4),
-                  child: Icon(
-                    _open ? Icons.expand_less : Icons.expand_more,
-                    size: 16,
-                    color: C.fg3,
-                  ),
-                ),
-            ],
+        SelectableText(
+          '\$ $command',
+          style: const TextStyle(
+            color: C.fg2,
+            fontSize: _textSize,
+            fontFamily: 'monospace',
           ),
         ),
-        if (_open)
+        if (text.isNotEmpty)
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: SelectableText(
-              output,
+              text,
               style: const TextStyle(
                 color: C.fg3,
                 fontSize: _textSize,
@@ -1231,11 +1193,12 @@ class _BashCardState extends State<_BashCard> {
   }
 }
 
-/// Свёрнутый блок «размышлений» модели над ответом.
+/// «Размышления» модели: полный текст, приглушённый и без раскрытия.
 ///
-/// Свёрнут по умолчанию: у локальной модели размышления выключены, но если их включат, они
-/// будут длиннее ответа — показывать их надо, а мешать чтению не должны.
-class _ReasoningBlock extends StatefulWidget {
+/// Мешать чтению они не будут и так: они идут отдельным сообщением, приглушённым фоном и
+/// цветом. Прятать их за нажатием значило бы заставлять человека лезть за ними каждый раз —
+/// а это часть того, что модель на самом деле сделала.
+class _ReasoningBlock extends StatelessWidget {
   /// Текст размышлений целиком; дописывается по мере генерации.
   final String text;
 
@@ -1243,61 +1206,13 @@ class _ReasoningBlock extends StatefulWidget {
   const _ReasoningBlock({required this.text});
 
   @override
-  State<_ReasoningBlock> createState() => _ReasoningBlockState();
-}
-
-/// Состояние блока: раскрыт он или нет.
-class _ReasoningBlockState extends State<_ReasoningBlock> {
-  /// Раскрыт ли блок.
-  bool _open = false;
-
-  @override
-  Widget build(BuildContext context) {
-    // пустые строки в размышлениях убираем: модель ставит их пачками, и они занимают высоту
-    // у сообщения, которое в свёрнутом виде и так одна строка
-    final text = _compactLines(widget.text);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        InkWell(
-          onTap: () => setState(() => _open = !_open),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                _open ? Icons.expand_less : Icons.expand_more,
-                size: 16,
-                color: C.fg3,
-              ),
-              const SizedBox(width: 4),
-              // Свёрнуто — одна обрезанная строка: по ней видно, о чём модель думала, и она не
-              // отнимает высоту у ответа; полностью текст показывается по нажатию.
-              Flexible(
-                child: Text(
-                  _open || text.isEmpty
-                      ? 'Размышления'
-                      : text.split('\n').first,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: C.fg3, fontSize: _textSize),
-                ),
-              ),
-            ],
-          ),
-        ),
-        if (_open)
-          Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: SelectableText(
-              text,
-              style: const TextStyle(
-                color: C.fg2,
-                fontSize: _textSize,
-                height: 1.35,
-              ),
-            ),
-          ),
-      ],
-    );
-  }
+  Widget build(BuildContext context) => SelectableText(
+    // пустые строки в размышлениях убираем: модель ставит их пачками, а несут они только высоту
+    _compactLines(text),
+    style: const TextStyle(
+      color: C.fg2,
+      fontSize: _textSize,
+      height: 1.35,
+    ),
+  );
 }
