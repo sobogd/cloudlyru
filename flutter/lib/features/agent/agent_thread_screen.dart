@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../theme.dart';
@@ -86,6 +87,20 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Показаны ли подробные сведения о сессии (токены, счётчики, время, путь к файлу).
   bool _details = false;
 
+  /// Показан ли разговор с конца.
+  ///
+  /// Первый прыжок вниз — не «следование за новым текстом», а показ истории с конца: до него
+  /// ни отлист человека, ни признак прокрутки во внимание не берутся, иначе длинный разговор
+  /// открывался бы с самого начала.
+  bool _initialJumpDone = false;
+
+  /// Сколько кадров подряд ждём укладки истории при первом прыжке вниз.
+  ///
+  /// История приходит и раскладывается несколькими кадрами, и максимум прокрутки растёт уже
+  /// после прыжка. Потолок нужен, чтобы содержимое, доезжающее бесконечно (например, картинки),
+  /// не оставило экран в вечных прыжках.
+  int _initialJumpTries = 0;
+
   /// Тикер времени работы: пока агент работает, экран раз в секунду пересчитывает «идёт 1:20».
   ///
   /// Без него строка «агент работает…» не отвечает на главный вопрос — сколько уже ждать, а
@@ -102,7 +117,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     _scroll.addListener(_trackScroll);
     // историю запрашиваем после первого кадра: провайдеры трогать в initState нельзя
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _thread.attach(widget.session);
+      if (!mounted) return;
+      _thread.attach(widget.session);
+      // разговор открывается с конца: последнее сообщение в нём важнее начала истории
+      _scrollToBottomSoon();
     });
   }
 
@@ -232,7 +250,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final body = Column(
       children: [
         Expanded(child: _body(state)),
-        if (!_details) _jumpButton(state),
         if (_details) _detailsPanel(state),
         if (state.error != null) _errorBar(state),
         _composer(state),
@@ -249,7 +266,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: _title(state), actions: _actions(state)),
+      appBar: AppBar(title: _title(state), actions: [_actions(state)]),
       body: body,
     );
   }
@@ -284,33 +301,63 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ],
   );
 
-  /// Действия над разговором: сведения, модель, сжатие контекста, закрытие и удаление.
-  List<Widget> _actions(AgentThreadState state) => [
-    IconButton(
-      tooltip: 'Сведения о сессии',
-      onPressed: () => setState(() => _details = !_details),
-      icon: Icon(_details ? Icons.info : Icons.info_outline),
+  /// Действия над разговором одним меню «троеточие»: сведения, модель, сжатие контекста,
+  /// завершение процесса на маке и удаление.
+  ///
+  /// Всё в меню, а не отдельными кнопками: в шапке их должно быть ровно две — стрелка назад и
+  /// троеточие — иначе на телефоне кнопки отъедают место у названия разговора. «Сведения»
+  /// открывают ту же панель, что раньше показывала отдельная кнопка с «i».
+  Widget _actions(AgentThreadState state) => PopupMenuButton<String>(
+    tooltip: 'Ещё',
+    onSelected: (v) => switch (v) {
+      'details' => setState(() => _details = !_details),
+      'model' => _pickModel(),
+      'compact' => _compact(),
+      'close' => _closeOnMac(),
+      _ => _delete(),
+    },
+    // плотнее и без внутренних отступов: кнопка стоит рядом со стрелкой и не должна занимать
+    // под себя 48 пикселей со всех сторон
+    style: IconButton.styleFrom(
+      padding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
     ),
-    PopupMenuButton<String>(
-      tooltip: 'Ещё',
-      onSelected: (v) => switch (v) {
-        'model' => _pickModel(),
-        'compact' => _compact(),
-        'close' => _closeOnMac(),
-        _ => _delete(),
-      },
-      itemBuilder: (context) => [
-        const PopupMenuItem(value: 'model', child: Text('Модель')),
-        PopupMenuItem(
-          value: 'compact',
-          enabled: !state.sending,
-          child: const Text('Сжать контекст'),
+    iconSize: 22,
+    itemBuilder: (context) => [
+      PopupMenuItem(
+        value: 'details',
+        child: Text(_details ? 'Скрыть сведения' : 'Сведения о сессии'),
+      ),
+      const PopupMenuItem(value: 'model', child: Text('Модель')),
+      PopupMenuItem(
+        value: 'compact',
+        enabled: !state.sending,
+        child: const Text('Сжать контекст'),
+      ),
+      PopupMenuItem(
+        value: 'close',
+        // сер, пока процесс на маке не работает: завершать нечего, и делать вид, что что-то
+        // закрылось, хуже, чем честно показать, что действие сейчас неприменимо
+        enabled: state.sending || (state.session?.busy ?? false),
+        // подпись под названием — ответ на «а что это вообще значит»: процесс умрёт,
+        // а история разговора останется
+        child: const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Завершить процесс на маке'),
+            SizedBox(height: 2),
+            Text(
+              'Процесс агента завершится и освободит память; история разговора останется.',
+              style: TextStyle(color: C.fg3, fontSize: 11.5, height: 1.25),
+            ),
+          ],
         ),
-        const PopupMenuItem(value: 'close', child: Text('Закрыть на маке')),
-        const PopupMenuItem(value: 'delete', child: Text('Удалить сессию')),
-      ],
-    ),
-  ];
+      ),
+      const PopupMenuItem(value: 'delete', child: Text('Удалить сессию')),
+    ],
+  );
 
   /// Шапка разговора в панели: тот же заголовок и те же действия, что в `AppBar`, плюс кнопка
   /// «к списку».
@@ -327,10 +374,15 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           tooltip: 'К списку разговоров',
           onPressed: widget.onDismiss,
           icon: const Icon(Icons.arrow_back),
+          // плотнее и без внутренних отступов: в шапке всего две кнопки, и место нужно
+          // названию разговора, а не пустому полю вокруг стрелки
+          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
         ),
         Expanded(child: _title(state)),
-        ..._actions(state),
-        const SizedBox(width: 4),
+        _actions(state),
+        const SizedBox(width: 6),
       ],
     ),
   );
@@ -340,7 +392,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final session = ref.read(agentThreadProvider).session;
     if (session == null) return;
     await _thread.closeSession();
-    if (mounted) snack(context, 'Сессия закрыта на маке, история сохранена');
+    if (mounted) snack(context, 'Процесс завершён на маке, история сохранена');
   }
 
   /// Тело экрана: загрузка истории или переписка.
@@ -362,116 +414,146 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         ),
       );
     }
+    // элементы разворачиваются в сообщения один раз на сборку: от них же зависит и их число
+    final entries = _entries(state.items);
     return ListView.builder(
       controller: _scroll,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-      itemCount: state.items.length,
-      itemBuilder: (context, i) => _item(state.items[i]),
+      // ответ агента показывается несколькими сообщениями: команда и текст — разные шаги
+      // работы, и в одном пузыре они читаются как одна реплика модели
+      itemCount: entries.length,
+      itemBuilder: (context, i) => _entry(entries[i]),
     );
   }
 
-  /// Кнопка «вниз»: показывается, только когда человек отлистал от конца разговора.
+  /// Разворачивает элементы разговора в плоский список сообщений.
   ///
-  /// Нужна потому, что автопрокрутка после этого молчит: без кнопки вернуться к новому тексту
-  /// можно было бы лишь вручную до самого низа, а ответ пишется минутами.
-  Widget _jumpButton(AgentThreadState state) {
-    if (_follow || state.items.isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Align(
-        alignment: Alignment.centerRight,
-        child: Material(
-          color: C.surface2,
-          shape: const StadiumBorder(side: BorderSide(color: C.brd)),
-          child: InkWell(
-            customBorder: const StadiumBorder(),
-            onTap: _jumpToBottom,
-            child: const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.arrow_downward, size: 14, color: C.fg2),
-                  SizedBox(width: 6),
-                  Text(
-                    'К новому',
-                    style: TextStyle(color: C.fg2, fontSize: 12),
-                  ),
-                ],
+  /// Один ответ агента приходит одним [AgentItem] с блоками внутри (текст, карточка команды,
+  /// снова текст), и порядок этих блоков — это порядок работы агента. Рисовать их одним
+  /// пузырём значит перемешивать команды и текст в одном сообщении, поэтому блок становится
+  /// отдельным сообщением, а порядок блоков задаёт порядок списка.
+  List<_Entry> _entries(List<AgentItem> items) {
+    final entries = <_Entry>[];
+    for (final item in items) {
+      // блоки разбираем в свой список: ошибку прогона надо привязать к последнему сообщению
+      // именно этого ответа, а не к предыдущему в разговоре
+      final mine = <_Entry>[];
+      if (item.kind == 'note') {
+        mine.add(_Entry(_EntryKind.note, text: item.text));
+      } else if (item.kind == 'bash') {
+        mine.add(
+          _Entry(_EntryKind.bash, text: item.text, command: item.command),
+        );
+      } else if (item.isUser) {
+        mine.add(_Entry(_EntryKind.user, text: item.text));
+      } else if (item.blocks.isEmpty) {
+        // Ответ от старого моста, который блоков ещё не присылал: тот же порядок, что
+        // задавали раньше — размышления, текст, затем карточки команд.
+        if (item.reasoning.isNotEmpty) {
+          mine.add(_Entry(_EntryKind.reasoning, text: item.reasoning));
+        }
+        if (item.text.isNotEmpty) {
+          mine.add(_Entry(_EntryKind.text, text: item.text));
+        }
+        for (final tool in item.tools) {
+          mine.add(_Entry(_EntryKind.tool, tool: tool));
+        }
+      } else {
+        for (final block in item.blocks) {
+          if (block.isTool) {
+            // карточка адресуется идентификатором: сам вывод лежит в [AgentItem.tools], и
+            // ссылка без него означала бы сообщение из ничего
+            final tool = item.tools
+                .where((t) => t.id == block.toolId)
+                .firstOrNull;
+            if (tool != null) mine.add(_Entry(_EntryKind.tool, tool: tool));
+          } else if (block.isReasoning) {
+            mine.add(_Entry(_EntryKind.reasoning, text: block.text));
+          } else {
+            mine.add(_Entry(_EntryKind.text, text: block.text));
+          }
+        }
+      }
+      // ответ заказан, но ещё ничего не пришло: пузырь со спиннером, чтобы было видно,
+      // что работа идёт
+      if (mine.isEmpty && item.isAssistant && item.isEmpty) {
+        mine.add(const _Entry(_EntryKind.waiting));
+      }
+      // Ошибка прогона — часть того сообщения, на котором разговор оборвался: так видно,
+      // на каком шаге это случилось (например, «Request was aborted» после «Стоп»).
+      if (item.error.isNotEmpty && mine.isNotEmpty) {
+        mine[mine.length - 1] = mine.last.copyWith(error: item.error);
+      }
+      entries.addAll(mine);
+    }
+    return entries;
+  }
+
+  /// Одно сообщение переписки.
+  Widget _entry(_Entry entry) => switch (entry.kind) {
+    _EntryKind.note => _note(entry.text),
+    _EntryKind.bash => Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: _BashCard(command: entry.command, output: entry.text),
+    ),
+    _EntryKind.tool => _toolCard(entry.tool!),
+    _EntryKind.reasoning => _bubbleShell(
+      isUser: false,
+      child: _withCopy(
+        text: entry.text,
+        child: _ReasoningBlock(text: entry.text),
+      ),
+    ),
+    _EntryKind.user || _EntryKind.text || _EntryKind.waiting => _bubble(entry),
+  };
+
+  /// Пузырь с текстом сообщения: вопрос человека или кусок ответа агента.
+  ///
+  /// Кнопка «скопировать» стоит в правом нижнем углу — она не добавляет пузырю высоту и не
+  /// растягивает его: место под неё зарезервировано только у текста (см. [_withCopy]).
+  Widget _bubble(_Entry entry) {
+    final isUser = entry.kind == _EntryKind.user;
+    return _bubbleShell(
+      isUser: isUser,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (entry.text.isNotEmpty)
+            _withCopy(
+              text: entry.copyText,
+              child: isUser
+                  ? SelectableText(
+                      entry.text,
+                      style: const TextStyle(
+                        color: C.fg,
+                        fontSize: 14,
+                        height: 1.35,
+                      ),
+                    )
+                  : MarkdownText(entry.text),
+            ),
+          if (entry.kind == _EntryKind.waiting)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 2),
+              child: SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2),
               ),
             ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// Один элемент переписки: вопрос, ответ агента, команда оболочки или служебная строка.
-  Widget _item(AgentItem item) {
-    if (item.kind == 'note') return _note(item.text);
-    if (item.kind == 'bash') return _bashCard(item);
-
-    final isUser = item.isUser;
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        // ширину ограничиваем: пузырь во всю ширину на длинном ответе теряет границу между
-        // вопросом и ответом
-        constraints: BoxConstraints(maxWidth: _bubbleMax(context)),
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: isUser ? C.accentSoft : C.surface,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: isUser ? C.accent : C.brd),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Размышления приходят блоком в общем порядке (в старом ответе без блоков —
-            // отдельным полем выше текста): они длиннее ответа и нужны редко, но полностью
-            // скрывать их — значит врать о том, что модель сделала.
-            if (isUser)
-              SelectableText(
-                item.text,
-                style: const TextStyle(color: C.fg, fontSize: 14, height: 1.35),
-              )
-            else if (item.blocks.isNotEmpty)
-              // Блоки идут в том порядке, в каком агент работал: текст, карточка команды,
-              // снова текст. Так новый текст оказывается под тем, что было до него.
-              for (final block in item.blocks) _block(item, block)
-            else ...[
-              // ответ от моста без блоков (старая сборка) — рисуем как раньше
-              if (item.reasoning.isNotEmpty)
-                _ReasoningBlock(text: item.reasoning),
-              if (item.text.isNotEmpty) MarkdownText(item.text),
-              for (final tool in item.tools) _toolCard(tool),
-            ],
-            if (item.isAssistant && item.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 2),
-                child: SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+          if (entry.error.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                entry.error,
+                style: const TextStyle(
+                  color: C.warn,
+                  fontSize: 12.5,
+                  height: 1.3,
                 ),
               ),
-            // Ошибка прогона — часть ответа, а не отдельное сообщение: так видно, на каком шаге
-            // разговор оборвался (например, «Request was aborted» после «Стоп»).
-            if (item.error.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: Text(
-                  item.error,
-                  style: const TextStyle(
-                    color: C.warn,
-                    fontSize: 12.5,
-                    height: 1.3,
-                  ),
-                ),
-              ),
-          ],
-        ),
+            ),
+        ],
       ),
     );
   }
@@ -483,18 +565,36 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   double _bubbleMax(BuildContext context) =>
       (widget.paneWidth ?? MediaQuery.sizeOf(context).width) * 0.92;
 
-  /// Один блок ответа: кусок текста, «размышления» или карточка вызова инструмента.
+  /// Содержимое сообщения с кнопкой «скопировать» в правом нижнем углу.
   ///
-  /// Карточка ищется по идентификатору в [AgentItem.tools]: сам вывод инструмента живёт там
-  /// одним экземпляром, а блок задаёт только место карточки в ответе.
-  Widget _block(AgentItem item, AgentBlock block) {
-    if (block.isTool) {
-      final tool = item.tools.where((t) => t.id == block.toolId).firstOrNull;
-      return tool == null ? const SizedBox.shrink() : _toolCard(tool);
-    }
-    if (block.isReasoning) return _ReasoningBlock(text: block.text);
-    return MarkdownText(block.text);
-  }
+  /// Место под кнопку резервируется отступом текста, а не `Row` с `Expanded`: растянутый
+  /// ребёнок заставил бы пузырь занимать всю ширину панели, и короткий ответ выглядел бы
+  /// полосой. Кнопка лежит поверх зарезервированной полосы, поэтому высоту не меняет.
+  Widget _withCopy({required String text, required Widget child}) => Stack(
+    children: [
+      Padding(padding: const EdgeInsets.only(right: 34), child: child),
+      Positioned(right: 0, bottom: 0, child: _CopyButton(text: text)),
+    ],
+  );
+
+  /// Оболочка сообщения: пузырь с рамкой и предельной шириной.
+  ///
+  /// Ширину ограничиваем: пузырь во всю ширину на длинном ответе теряет границу между
+  /// вопросом и ответом.
+  Widget _bubbleShell({required bool isUser, required Widget child}) => Align(
+    alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+    child: Container(
+      constraints: BoxConstraints(maxWidth: _bubbleMax(context)),
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isUser ? C.accentSoft : C.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: isUser ? C.accent : C.brd),
+      ),
+      child: child,
+    ),
+  );
 
   /// Служебная строка: автоответ на подтверждение, которого человек не давал.
   ///
@@ -517,50 +617,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
   );
 
-  /// Карточка прямой команды оболочки (её выполнял не агент, а сам харнесс по просьбе клиента).
-  Widget _bashCard(AgentItem item) => Container(
-    width: double.infinity,
-    margin: const EdgeInsets.symmetric(vertical: 4),
-    padding: const EdgeInsets.all(10),
-    decoration: BoxDecoration(
-      color: C.surface2,
-      borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: C.brd),
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SelectableText(
-          '\$ ${item.command}',
-          style: const TextStyle(
-            color: C.fg2,
-            fontSize: 12.5,
-            fontFamily: 'monospace',
-          ),
-        ),
-        if (item.text.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: SelectableText(
-              item.text,
-              style: const TextStyle(
-                color: C.fg3,
-                fontSize: 12,
-                fontFamily: 'monospace',
-              ),
-            ),
-          ),
-      ],
-    ),
-  );
-
   /// Карточка вызова инструмента: что агент сделал, с чем и что получил.
   ///
   /// Это главное отличие агентского раздела от чата: здесь видно не только ответ, но и
   /// действия — команду, правку файла, поиск по коду. Свёрнута по умолчанию: вывод бывает
   /// на сотни строк, а нужен редко.
   Widget _toolCard(AgentTool tool) => Padding(
-    padding: const EdgeInsets.only(top: 8),
+    padding: const EdgeInsets.symmetric(vertical: 4),
     child: _ToolCard(tool: tool),
   );
 
@@ -794,24 +857,33 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Отложенно: длина списка в момент вызова ещё не учитывает новый текст, и прыжок к прежнему
   /// максимуму не дотянул бы до конца ответа.
   ///
-  /// Следование проверяется здесь, а не там, где прыжок поставлен в очередь: между этими двумя
-  /// моментами человек успевает отлистать вверх — и раньше список всё равно прыгал вниз, после
-  /// чего снова считал себя «внизу» и залипал там навсегда. Пока человек держит палец на экране,
-  /// не прыгаем вовсе.
+  /// Пока идёт первый прыжок ([_initialJumpDone]), он повторяется: история приходит и
+  /// раскладывается несколькими кадрами, и максимум прокрутки растёт уже после прыжка — с
+  /// одного раза длинный разговор открывался бы с начала. Дальше следование проверяется в сам
+  /// момент прыжка, а не в момент постановки в очередь: между ними человек успевает отлистать
+  /// вверх — и раньше список всё равно прыгал вниз, после чего снова считал себя «внизу» и
+  /// залипал там навсегда. Пока человек держит палец на экране, не прыгаем вовсе.
   void _scrollToBottomSoon() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_follow || !_scroll.hasClients) return;
-      if (_scroll.position.isScrollingNotifier.value) return;
+      if (!mounted || !_scroll.hasClients) return;
+      final initial = !_initialJumpDone;
+      // до первого прыжка ни отлист, ни признак прокрутки не учитываем: открываем с конца
+      if (!initial && !_follow) return;
+      if (!initial && _scroll.position.isScrollingNotifier.value) return;
+      final before = _scroll.position.maxScrollExtent;
       _selfScroll = true;
-      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      _scroll.jumpTo(before);
       _selfScroll = false;
+      if (!initial) return;
+      // список доехал не целиком (разметка и картинки считаются не в первом кадре) —
+      // прыгаем ещё раз; потолок, чтобы не зациклиться на вечно доезжающем содержимом
+      _initialJumpTries++;
+      if (_scroll.position.maxScrollExtent > before && _initialJumpTries < 8) {
+        _scrollToBottomSoon();
+      } else {
+        _initialJumpDone = true;
+      }
     });
-  }
-
-  /// Возвращает список к концу разговора по кнопке и снова включает следование.
-  void _jumpToBottom() {
-    setState(() => _follow = true);
-    _scrollToBottomSoon();
   }
 
   /// Сколько идёт текущая работа словами: «12 с», «1 мин 20 с», «5 мин 3 с».
@@ -875,9 +947,13 @@ class _ToolCardState extends State<_ToolCard> {
   Widget build(BuildContext context) {
     final tool = widget.tool;
     final summary = tool.summary;
+    // копируем и подпись вызова, и вывод: строка карточки без вывода смысла не имеет
+    final copyText = [summary, tool.output]
+        .where((s) => s.trim().isNotEmpty)
+        .join('\n');
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+      padding: const EdgeInsets.fromLTRB(8, 6, 6, 6),
       decoration: BoxDecoration(
         color: C.surface2,
         borderRadius: BorderRadius.circular(10),
@@ -886,62 +962,261 @@ class _ToolCardState extends State<_ToolCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          InkWell(
-            onTap: tool.output.isEmpty
-                ? null
-                : () => setState(() => _open = !_open),
-            child: Row(
-              children: [
-                Icon(_icon, size: 15, color: C.fg3),
-                const SizedBox(width: 6),
-                Text(
-                  tool.name,
-                  style: const TextStyle(
-                    color: C.fg2,
-                    fontSize: 12.5,
-                    fontFamily: 'monospace',
+          Row(
+            children: [
+              // кнопка копирования стоит рядом с карточкой, а не внутри нажатия: иначе тап по
+              // ней заодно разворачивал бы вывод
+              Expanded(
+                child: InkWell(
+                  onTap: tool.output.isEmpty
+                      ? null
+                      : () => setState(() => _open = !_open),
+                  child: Row(
+                    children: [
+                      Icon(_icon, size: 15, color: C.fg3),
+                      const SizedBox(width: 6),
+                      Text(
+                        tool.name,
+                        style: const TextStyle(
+                          color: C.fg2,
+                          fontSize: 12.5,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                      if (summary.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            summary,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: C.fg3,
+                              fontSize: 12,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                        ),
+                      ] else
+                        const Spacer(),
+                      if (tool.running)
+                        const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      else if (tool.isError)
+                        const Icon(
+                          Icons.error_outline,
+                          size: 15,
+                          color: C.danger,
+                        )
+                      else
+                        const Icon(Icons.check, size: 15, color: C.ok),
+                      if (tool.output.isNotEmpty)
+                        Icon(
+                          _open ? Icons.expand_less : Icons.expand_more,
+                          size: 16,
+                          color: C.fg3,
+                        ),
+                    ],
                   ),
                 ),
-                if (summary.isNotEmpty) ...[
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      summary,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: C.fg3,
-                        fontSize: 12,
-                        fontFamily: 'monospace',
-                      ),
-                    ),
-                  ),
-                ] else
-                  const Spacer(),
-                if (tool.running)
-                  const SizedBox(
-                    width: 12,
-                    height: 12,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                else if (tool.isError)
-                  const Icon(Icons.error_outline, size: 15, color: C.danger)
-                else
-                  const Icon(Icons.check, size: 15, color: C.ok),
-                if (tool.output.isNotEmpty)
-                  Icon(
-                    _open ? Icons.expand_less : Icons.expand_more,
-                    size: 16,
-                    color: C.fg3,
-                  ),
-              ],
-            ),
+              ),
+              _CopyButton(text: copyText),
+            ],
           ),
           if (_open && tool.output.isNotEmpty)
             Padding(
-              padding: const EdgeInsets.only(top: 6),
+              padding: const EdgeInsets.only(top: 6, right: 4),
               child: SelectableText(
                 tool.output,
+                style: const TextStyle(
+                  color: C.fg3,
+                  fontSize: 12,
+                  fontFamily: 'monospace',
+                  height: 1.3,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Пункт переписки на экране: одно сообщение вместе со всем, что к нему относится.
+///
+/// Отдельным типом от [AgentItem]: тот описывает ответ агента целиком, а на экране он
+/// разворачивается в несколько сообщений (см. `_AgentThreadScreenState._entries`).
+class _Entry {
+  /// Вид пункта: вопрос, кусок текста, «размышления», карточка команды, прямая команда
+  /// оболочки, служебная строка или ещё не начатый ответ.
+  final _EntryKind kind;
+
+  /// Текст сообщения: вопрос, кусок ответа или вывод команды.
+  final String text;
+
+  /// Вызов инструмента — у вида [_EntryKind.tool].
+  final AgentTool? tool;
+
+  /// Команда — у вида [_EntryKind.bash].
+  final String command;
+
+  /// Ошибка прогона, показываемая под текстом этого сообщения.
+  final String error;
+
+  /// Пункт переписки.
+  const _Entry(
+    this.kind, {
+    this.text = '',
+    this.tool,
+    this.command = '',
+    this.error = '',
+  });
+
+  /// Что уйдёт в буфер по кнопке «скопировать».
+  ///
+  /// У команды — она сама и её вывод: отдельно друг от друга они бесполезны. У «размышлений»
+  /// и текста — сам текст; у служебной строки копировать нечего, и кнопки у неё нет.
+  String get copyText => switch (kind) {
+    _EntryKind.tool => [
+      tool?.summary ?? '',
+      tool?.output ?? '',
+    ].where((s) => s.trim().isNotEmpty).join('\n'),
+    _EntryKind.bash => ['\$ $command', text]
+        .where((s) => s.trim().isNotEmpty)
+        .join('\n'),
+    _ => text,
+  };
+
+  /// Копия с добавленной ошибкой прогона (остальные поля не меняются).
+  _Entry copyWith({String? error}) => _Entry(
+    kind,
+    text: text,
+    tool: tool,
+    command: command,
+    error: error ?? this.error,
+  );
+}
+
+/// Вид пункта переписки на экране; по нему выбирается оформление сообщения.
+enum _EntryKind { user, text, reasoning, tool, bash, note, waiting }
+
+/// Копирует текст сообщения в буфер обмена и подтверждает это коротким сообщением.
+///
+/// Свободная функция, а не метод экрана: кнопка есть и у карточки команды, а карточка —
+/// отдельный виджет. Проверка `context.mounted` обязательна — запись в буфер асинхронная, и
+/// экран за это время могли закрыть.
+Future<void> copyMessage(BuildContext context, String text) async {
+  if (text.trim().isEmpty) return;
+  await Clipboard.setData(ClipboardData(text: text));
+  if (context.mounted) snack(context, 'Скопировано');
+}
+
+/// Кнопка «скопировать сообщение» — одна и та же у пузырей и у карточек команд.
+///
+/// Нужна, чтобы копировать целиком, не выделяя текст пальцем: выделение на телефоне попадает
+/// мимо нужных строк, а команду с выводом так копировать неудобно совсем.
+class _CopyButton extends StatelessWidget {
+  /// Текст, который уйдёт в буфер обмена.
+  final String text;
+
+  /// Кнопка копирования.
+  const _CopyButton({required this.text});
+
+  @override
+  Widget build(BuildContext context) => IconButton(
+    tooltip: 'Скопировать сообщение',
+    // копировать пустое нечего: у ещё не начатого ответа и служебных строк кнопки и нет
+    onPressed: text.trim().isEmpty ? null : () => copyMessage(context, text),
+    icon: const Icon(Icons.content_copy, size: 15, color: C.fg3),
+    visualDensity: VisualDensity.compact,
+    padding: EdgeInsets.zero,
+    constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+  );
+}
+
+/// Карточка прямой команды оболочки: строка команды и свёрнутый вывод.
+///
+/// Свёрнута по умолчанию: такую команду запускал не агент, а харнесс по просьбе клиента, и в
+/// переписке важен сам факт запуска; вывод нужен только когда за ним зачем-то полезли.
+class _BashCard extends StatefulWidget {
+  /// Команда целиком, как её запускали.
+  final String command;
+
+  /// Вывод команды.
+  final String output;
+
+  /// Карточка команды.
+  const _BashCard({required this.command, required this.output});
+
+  @override
+  State<_BashCard> createState() => _BashCardState();
+}
+
+/// Состояние карточки команды: показан ли вывод.
+class _BashCardState extends State<_BashCard> {
+  /// Показан ли вывод команды.
+  bool _open = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasOutput = widget.output.trim().isNotEmpty;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(10, 6, 6, 6),
+      decoration: BoxDecoration(
+        color: C.surface2,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: C.brd),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  // сворачивать нечего, если команда ничего не напечатала
+                  onTap: hasOutput
+                      ? () => setState(() => _open = !_open)
+                      : null,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: SelectableText(
+                          '\$ ${widget.command}',
+                          style: const TextStyle(
+                            color: C.fg2,
+                            fontSize: 12.5,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ),
+                      if (hasOutput)
+                        Icon(
+                          _open ? Icons.expand_less : Icons.expand_more,
+                          size: 16,
+                          color: C.fg3,
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              // копируем команду вместе с выводом: отдельно друг от друга они бесполезны
+              _CopyButton(
+                text: ['\$ ${widget.command}', widget.output]
+                    .where((s) => s.trim().isNotEmpty)
+                    .join('\n'),
+              ),
+            ],
+          ),
+          if (_open)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, right: 4),
+              child: SelectableText(
+                widget.output,
                 style: const TextStyle(
                   color: C.fg3,
                   fontSize: 12,
