@@ -8,7 +8,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers.dart';
 import '../../theme.dart';
-import '../../util/format.dart';
 import '../../util/widgets.dart';
 import 'agent_controller.dart';
 import 'agent_new_session.dart';
@@ -431,7 +430,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   Widget _addTile(AgentSessionsState state, {required bool wide}) => Padding(
     // поля только сверху и снизу: подложка должна упираться в края колонки, иначе она
     // выглядит плавающей кнопкой, а не первой строкой списка
-    padding: const EdgeInsets.fromLTRB(0, 8, 0, 4),
+    padding: const EdgeInsets.fromLTRB(0, 14, 0, 12),
     child: SizedBox(
       height: 46,
       width: double.infinity,
@@ -461,71 +460,136 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     ),
   );
 
-  /// Строка списка: имя разговора, проект, харнесс, модель, число сообщений и время.
+  /// Строка списка: значок состояния разговора и его имя.
+  ///
+  /// Значок отвечает на единственный вопрос, который задаёт список, — считает ли агент
+  /// прямо сейчас: пустой круг — ничего не происходит, вращение — считает, галочка — ответ
+  /// готов и его ещё не открывали. Харнесса, модели, проекта и числа сообщений в строке нет:
+  /// по ним разговор не выбирают, а место они отнимали больше, чем имя.
+  ///
+  /// Высота строки — как у пункта левого бара (значок и отступ 11 сверху и снизу): оба
+  /// списка читаются одним ритмом.
   Widget _sessionTile(AgentSession session, {required bool wide}) {
     final activity = ref.watch(agentActivityProvider);
     final selected = wide && session.id == _selectedId;
-    return ListTile(
-      // Выбранный разговор подсвечен: в двухпанельном виде он же открыт справа, и по списку
-      // должно быть видно, какой именно
-      tileColor: selected ? C.accentSoft : null,
-      leading: Icon(
-        _harnessIcon(session.harness),
-        // значок агента подсвечен, пока он работает или пока ответ ждёт просмотра: разговор
-        // может считаться и без открытого экрана, и это должно быть видно из списка
-        color: session.busy ||
-                activity.isRunning(session.id) ||
-                activity.isFinished(session.id)
-            ? C.ok
-            : C.fg2,
-      ),
-      title: Text(
-        _title(session),
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(color: C.fg, fontSize: 15),
-      ),
-      subtitle: Text(
-        [
-          // «Работает» — агент считает прямо сейчас (даже если экран разговора закрыт);
-          // «готово» — он закончил, пока на него не смотрели
-          if (session.busy || activity.isRunning(session.id))
-            '● работает'
-          else if (activity.isFinished(session.id))
-            '✓ готово',
-          if (session.projectName.isNotEmpty) session.projectName,
-          ref.read(agentHarnessesProvider).nameOf(session.harness),
-          if (session.modelLabel.isNotEmpty) session.modelLabel,
-          '${session.messages} сообщ.',
-          if (session.updatedAt != null)
-            listDate(session.updatedAt!, DateTime.now()),
-        ].join(' · '),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(color: C.fg3, fontSize: 12),
-      ),
-      onTap: session.path.isEmpty
-          ? null
-          : () {
-              // Повторное нажатие на уже открытый разговор ничего не делает: перезапускать
-              // процесс на маке ради того же самого незачем
-              if (wide && session.id == _selectedId) return;
-              _open(
-                AgentProject.fromPath(session.path),
-                harness: session.harness.isEmpty ? 'pi' : session.harness,
-                sessionId: session.id,
-                embedded: wide,
-              );
-            },
-      // Удаление — иконкой прямо в строке: это единственное действие над разговором, а меню
-      // «троеточие» заставляло открывать его ради одной строки. Закрывать процесс вручную не
-      // нужно: агент отпускает память сам, когда закончил работу.
-      trailing: IconButton(
-        tooltip: 'Удалить сессию',
-        onPressed: () => _delete(session),
-        icon: const Icon(Icons.delete_outline, color: C.danger),
+    // Считает прямо сейчас — даже если экран разговора закрыт; «готово» — закончил, пока
+    // на него не смотрели
+    final running = session.busy || activity.isRunning(session.id);
+    final finished = !running && activity.isFinished(session.id);
+    // `Material` на строку — ради отклика на нажатие: подложку выбранного разговора рисует
+    // он же, и всплеск от нажатия оказывается поверх подсветки, а не под ней
+    return Material(
+      color: selected ? C.accentSoft : Colors.transparent,
+      child: InkWell(
+        onTap: session.path.isEmpty ? null : () => _openOrSelect(session, wide: wide),
+        // Действия над разговором — по длинному нажатию: удаление иконкой в строке спорило за
+        // место с именем, а на телефоне в неё легко попасть мимо
+        onLongPress: () => _actions(session),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+          child: Row(
+            children: [
+              Icon(
+                running
+                    ? Icons.autorenew
+                    : finished
+                    ? Icons.check_circle
+                    : Icons.circle_outlined,
+                size: 22,
+                color: running || finished ? C.ok : C.fg3,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  _title(session),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: C.fg, fontSize: 15),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
+  }
+
+  /// Открывает разговор из строки списка.
+  ///
+  /// Повторное нажатие на уже открытый разговор ничего не делает: перезапускать процесс на
+  /// маке ради того же самого незачем.
+  void _openOrSelect(AgentSession session, {required bool wide}) {
+    if (wide && session.id == _selectedId) return;
+    _open(
+      AgentProject.fromPath(session.path),
+      harness: session.harness.isEmpty ? 'pi' : session.harness,
+      sessionId: session.id,
+      embedded: wide,
+    );
+  }
+
+  /// Меню действий над разговором, которое открывает длинное нажатие.
+  ///
+  /// Меню выезжает снизу — так же, как выбор папки в почте: попасть в строку меню пальцем
+  /// проще, чем в иконку внутри строки списка, и строке разговора не приходится отдавать
+  /// место под кнопки. Имя разговора стоит в меню заголовком: по строке, которую нажали,
+  /// не всегда видно, что именно переименовываешь или удаляешь.
+  Future<void> _actions(AgentSession session) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text(
+                _title(session),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: C.fg3, fontSize: 13),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.drive_file_rename_outline, color: C.fg2),
+              title: const Text('Переименовать'),
+              onTap: () => Navigator.pop(ctx, 'rename'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: C.danger),
+              title: const Text('Удалить сессию'),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'rename') await _rename(session);
+    if (action == 'delete') await _delete(session);
+  }
+
+  /// Переименовывает разговор.
+  ///
+  /// Имя хранят сами харнессы, в журнале разговора (у pi — запись `session_info`, у Claude
+  /// Code — `custom-title`), поэтому переименование видно и в `/resume` на маке, а не только
+  /// в приложении. Имя в список и в шапку открытого разговора ставим по ответу моста: он
+  /// отдаёт строку уже очищенной от лишних пробелов.
+  Future<void> _rename(AgentSession session) async {
+    final name = await promptDialog(
+      context,
+      'Имя разговора',
+      initial: session.name,
+    );
+    if (!mounted || name == null) return;
+    final clean = name.trim();
+    if (clean.isEmpty) return;
+    final saved = await _sessions.rename(session.id, clean);
+    if (!mounted || saved == null) return;
+    // Открытый справа разговор берёт имя из своего состояния, а не из списка: без этого
+    // шапка осталась бы со старым именем, пока разговор не переоткроют
+    if (_opened?.id == session.id) {
+      ref.read(agentThreadProvider.notifier).rename(saved);
+    }
   }
 
   /// Сообщение об ошибке над списком: «мост недоступен» — состояние раздела, а не сбой строки.
@@ -556,8 +620,4 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       ],
     ),
   );
-
-  /// Значок харнесса: у pi терминал, у Claude Code — звёздочка его бренда.
-  IconData _harnessIcon(String harness) =>
-      harness == 'claude' ? Icons.auto_awesome : Icons.terminal;
 }

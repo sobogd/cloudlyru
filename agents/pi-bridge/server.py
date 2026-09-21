@@ -34,6 +34,7 @@ stdio и умеет ровно то, что нужно разделу «Прое
   POST   /sessions/<id>/abort         — остановить генерацию;
   POST   /sessions/<id>/compact       — сжать контекст;
   POST   /sessions/<id>/model         — сменить модель;
+  POST   /sessions/<id>/name          — переименовать разговор (записью в его журнал);
   POST   /sessions/<id>/ui            — ответ на диалог расширения (по умолчанию не нужен);
   DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается.
 
@@ -112,6 +113,7 @@ BUILTIN_PROVIDERS = [
 COMMAND_TIMEOUT = 60.0     # ожидание ответа на команду (get_state, prompt-подтверждение)
 IDLE_STOP_SECONDS = 1800.0  # простой, после которого процесс pi закрывается
 MAX_MESSAGE_CHARS = 20_000  # потолок сообщения, чтобы одним запросом не забить контекст
+MAX_NAME_CHARS = 120        # потолок имени сессии: в списке оно всё равно режется одной строкой
 # События pi, которые уходят приложению. Остальные (message_start, turn_start и прочая
 # служебная механика) наружу не нужны: экран строится по дельтим и вызовам инструментов.
 # События, которыми харнесс сообщает, что прогон закончился: у pi это `agent_settled`, у
@@ -573,12 +575,42 @@ def read_claude_meta(file):
         elif entry.get("type") == "assistant" and not meta["model"]:
             meta["model"] = str(message.get("model") or "")
 
+    # Имя, поставленное командой `/rename` (или флагом `--name`), Claude Code дописывает записью
+    # `custom-title` в конец журнала — в разобранных 400 КБ начала его может не быть, а
+    # побеждает последняя такая запись. Поэтому ищем её отдельно по всему файлу.
+    renamed = last_jsonl_field(data, "custom-title", "customTitle")
+    if renamed:
+        meta["name"] = renamed
     if not meta["name"]:
         meta["name"] = meta["title"]
     if not meta["startedAt"]:
         meta["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
     meta["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
     return meta
+
+
+def last_jsonl_field(data, kind, field):
+    """Последнее значение поля из записей указанного типа в разобранном журнале сессии.
+
+    Ищем по сырым байтам, а не разбором всех строк: журнал Claude Code измеряется десятками
+    мегабайт, а имя, поставленное `/rename`, лежит в самом конце — разбирать ради него весь
+    файл при каждом обновлении списка нельзя. `None` — записи такого типа нет.
+    """
+    marker = b'"type":"' + kind.encode("utf-8") + b'"'
+    index = data.rfind(marker)
+    if index < 0:
+        return None
+    start = data.rfind(b"\n", 0, index) + 1
+    end = data.find(b"\n", index)
+    line = data[start:end if end >= 0 else len(data)]
+    try:
+        entry = json.loads(line.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get(field)
+    return value.strip() if isinstance(value, str) else None
 
 
 def normalize_claude_messages(entries):
@@ -1178,6 +1210,76 @@ def remove_session_files(key):
     except OSError as e:
         raise PiError("не смог удалить файл сессии %s: %s" % (file, e))
     return file
+
+
+def last_journal_id(file, tail_bytes=64 * 1024):
+    """id последней записи журнала: `parentId` для записи, которую мы дописываем в конец.
+
+    Читается только хвост: журнал бывает в десятки мегабайт, а нужна одна последняя строка.
+    Обрывок последней записи (харнесс пишет построчно и может не успеть) пропускается — берём
+    предыдущую целую. `None` означает, что id взять неоткуда: запись без родителя харнессы
+    примут, а вот угадывать его нельзя.
+    """
+    try:
+        with file.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - tail_bytes))
+            data = handle.read()
+    except OSError:
+        return None
+    for line in reversed(data.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            return entry["id"]
+    return None
+
+
+def set_session_name(key, name):
+    """Ставит разговору новое имя — записью в его собственный журнал.
+
+    Имя харнессы хранят сами, в журнале сессии, а не в отдельном хранилище моста: у pi это
+    запись `session_info`, у Claude Code — `custom-title` (её же пишут его `/rename` и флаг
+    `--name`). Пишем одну строку в конец файла и ничего не переписываем: журнал только растёт,
+    а живой процесс сессии от этого не сбивается. Оба харнесса читают такие записи по принципу
+    «побеждает последняя», поэтому новое имя сразу видно и в приложении, и в `/resume` на маке.
+
+    `parentId` у записи pi — id последней записи журнала: так имя остаётся записью того же
+    разговора, а не вторым корнем дерева. Возвращает сохранённое имя.
+    """
+    harness, session_id = split_key(key)
+    file = find_session_file(harness, session_id)
+    if file is None:
+        raise PiError("сессия не найдена: %s" % key)
+    # Переводы строк в имени сломали бы разбор журнала: запись — это одна строка
+    clean = " ".join(str(name or "").split())
+    if not clean:
+        raise PiError("пустое имя")
+    if len(clean) > MAX_NAME_CHARS:
+        raise PiError("имя длиннее %d символов" % MAX_NAME_CHARS)
+    if harness == HARNESS_CLAUDE:
+        entry = {"type": "custom-title", "customTitle": clean, "sessionId": session_id}
+    else:
+        entry = {
+            "type": "session_info",
+            "id": uuid.uuid4().hex[:8],
+            "parentId": last_journal_id(file),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z",
+            "name": clean,
+        }
+    try:
+        with file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise PiError("не смог записать имя сессии %s: %s" % (file, e))
+    log("переименовал сессию %s (%s): %s" % (file, harness, clean))
+    return clean
 
 
 def purge_session(key):
@@ -2569,6 +2671,11 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(200, {"queued": False, "position": 0})
                         return
                     self._json(200, {"queued": True, "position": session.enqueue(text)})
+                    return
+                # Переименование обрабатывается до поиска в пуле: имя лежит в журнале сессии, а не
+                # в процессе, и переименовать можно в том числе закрытый разговор
+                if action == "name":
+                    self._json(200, {"name": set_session_name(parts[2], body.get("name"))})
                     return
                 if action == "abort":
                     session = POOL.maybe(parts[2])

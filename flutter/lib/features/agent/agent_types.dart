@@ -230,6 +230,42 @@ class AgentSessionInfo {
     this.sessionFile = '',
   });
 
+  /// Копия описания с другим именем — для переименованного разговора.
+  ///
+  /// Нужна потому, что класс неизменяемый, а имя в шапке открытого разговора берётся именно
+  /// отсюда: без обновления правка была бы видна в списке, но не в шапке самого разговора.
+  /// Метод узкий, а не полный `copyWith`: менять у описания бывает только имя, а полный список
+  /// полей пришлось бы править при каждом новом поле и легко было бы в нём ошибиться.
+  AgentSessionInfo withName(String value) => AgentSessionInfo(
+    id: id,
+    path: path,
+    name: value,
+    model: model,
+    provider: provider,
+    modelName: modelName,
+    local: local,
+    harness: harness,
+    harnessName: harnessName,
+    contextEstimated: contextEstimated,
+    messages: messages,
+    busy: busy,
+    thinkingLevel: thinkingLevel,
+    contextTokens: contextTokens,
+    contextWindow: contextWindow,
+    contextPercent: contextPercent,
+    tokensInput: tokensInput,
+    tokensOutput: tokensOutput,
+    tokensCacheRead: tokensCacheRead,
+    tokensTotal: tokensTotal,
+    cost: cost,
+    userMessages: userMessages,
+    assistantMessages: assistantMessages,
+    toolCalls: toolCalls,
+    startedAt: startedAt,
+    updatedAt: updatedAt,
+    sessionFile: sessionFile,
+  );
+
   /// Разбор сессии из ответа моста.
   factory AgentSessionInfo.fromJson(Map<String, dynamic> json) {
     final tokens = json['tokens'] is Map

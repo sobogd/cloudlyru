@@ -305,6 +305,21 @@ class AgentApi {
     return _sessionOf(data);
   }
 
+  /// Ставит сессии новое имя.
+  ///
+  /// Возвращает сохранённое имя: мост обрезает лишние пробелы и переводы строк, и показывать
+  /// в списке надо ровно то, что записано на маке. Имя хранится в журнале сессии у самого
+  /// харнесса, поэтому открытый процесс для переименования не нужен.
+  Future<String> renameSession(String id, String name) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post(
+        '/projects/sessions/$id/name',
+        data: <String, dynamic>{'name': name},
+      ),
+    );
+    return data?['name']?.toString() ?? '';
+  }
+
   /// Разбирает `провайдер/идентификатор` в пару; `null` — строка пустая или без провайдера.
   ///
   /// Делим по первому слэшу: у моделей llama.cpp идентификатор сам содержит слэш

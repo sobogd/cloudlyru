@@ -385,6 +385,25 @@ export class ProjectsController {
   }
 
   /**
+   * Ставит сессии новое имя.
+   *
+   * Имя хранят сами харнессы, в журнале разговора (у pi — запись `session_info`, у Claude Code —
+   * `custom-title`), поэтому открытый процесс для этого не нужен: переименовать можно и закрытый
+   * разговор. Пустое имя — ошибка: снять имя совсем нельзя.
+   */
+  @Post('sessions/:id/name')
+  async rename(@Param('id') id: string, @Body() body: Record<string, unknown> = {}) {
+    const name = typeof body.name === 'string' ? body.name : '';
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'POST',
+        `/sessions/${encodeURIComponent(id)}/name`,
+        { body: { name } },
+      ),
+    );
+  }
+
+  /**
    * Удаляет сессию: процесс гасится, файл истории стирается с мака.
    *
    * Необратимо, поэтому в приложении это действие с подтверждением.

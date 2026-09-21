@@ -275,6 +275,12 @@ class _NavBar extends StatelessWidget {
   /// Отступ между иконкой и подписью раздела в широком виде.
   static const _labelGap = 12.0;
 
+  /// Боковые отступы пункта в широком виде.
+  ///
+  /// Больше [_tapPad]: рядом с иконкой теперь текст, и от края полосы ему нужен воздух —
+  /// иначе подпись липнет к границе бара и ряд читается как обрезанный.
+  static const _widePad = 16.0;
+
   /// Ширина полосы с подписями.
   ///
   /// Число, а не «по самой длинной подписи»: ширина бара менялась бы от набора разделов, и
@@ -319,7 +325,10 @@ class _NavBar extends StatelessWidget {
         child: Container(
           // подсветка выбранного — мягкая заливка акцентом, как у нижней панели разделов раньше
           color: selected ? C.accentSoft : null,
-          padding: const EdgeInsets.all(_tapPad),
+          padding: EdgeInsets.symmetric(
+            horizontal: wide ? _widePad : _tapPad,
+            vertical: _tapPad,
+          ),
           child: Row(
             children: [
               Icon(

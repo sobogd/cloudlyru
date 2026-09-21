@@ -610,6 +610,22 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     }
   }
 
+  /// Ставит разговору новое имя; возвращает сохранённое имя, а `null` — если мост отказал.
+  ///
+  /// Список после этого перечитывается с мака: имя приходит из файла сессии, и сразу показать
+  /// его иначе нельзя — в строке осталось бы прежнее. Ошибка, как и у остальных ручек над
+  /// списком, показывается строкой над ним.
+  Future<String?> rename(String sessionId, String name) async {
+    try {
+      final saved = await _api.renameSession(sessionId, name);
+      await load();
+      return saved;
+    } on AgentApiException catch (e) {
+      showError(e.message);
+      return null;
+    }
+  }
+
   /// Показывает ошибку, полученную не от списка (например, отказ моста на открытии).
   void showError(String message) {
     state = AgentSessionsState(sessions: state.sessions, error: message);
@@ -844,6 +860,17 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     if (session == null || state.sending || lastUser.text.isEmpty) return;
     state = state.clearError();
     await _run(session.id, lastUser.text);
+  }
+
+  /// Обновляет имя открытого разговора после переименования в списке.
+  ///
+  /// Шапка берёт имя из описания сессии, полученного при открытии, а список живёт отдельным
+  /// состоянием: без этого правка была бы видна слева, но не в шапке справа, пока разговор
+  /// не закроют и не откроют заново.
+  void rename(String name) {
+    final session = state.session;
+    if (session == null || name.isEmpty) return;
+    state = state.copyWith(session: session.withName(name));
   }
 
   /// Отпускает поток, не трогая агента: экран закрыли, а работа на маке продолжается.
