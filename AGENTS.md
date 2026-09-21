@@ -10,42 +10,37 @@
 2. **Автопуш в main** — `./scripts/gh-push.sh main` (токен берётся из `~/work/.env`, ключ
    `GH_SOBOGD`; других учёток не использовать). Push в `src/**` и `prisma/**` сам запускает
    деплой сервера (`deploy.yml`) — отдельно его дёргать не нужно.
-3. **Менялся Flutter — поднять версию в `pubspec.yaml` и запустить релизные сборки**.
-   Перед сборкой обновить `version: 1.0.0+N` в `flutter/pubspec.yaml` (номер сборки +1, чтобы
-   Google Play принимал обновление). После правки запустить:
+3. **Менялся Flutter — поднять версию в `pubspec.yaml` и собрать релиз локально.**
+   Перед сборкой обновить `version: 1.0.0+N` в `flutter/pubspec.yaml` (номер сборки +1). Затем:
    ```
-   source /Users/sobogd/work/.git-token.sh
-cd flutter
-git add pubspec.yaml
-git commit -m "bump version to $N"
-git push
-cd /Users/sobogd/work/iq-rest/cloudlyru
-gh workflow run android.yml --repo sobogd/cloudlyru
-gh workflow run macos.yml   --repo sobogd/cloudlyru
-gh workflow run ios.yml     --repo sobogd/cloudlyru
+   ./scripts/build-release.sh all
    ```
-   **Три сборки — Android, macOS, iOS — запускать всегда вместе**, одним заходом на один номер.
+   Сборки приложений в GitHub Actions больше нет: всё собирается и публикуется с этого мака
+   (`scripts/build-release.sh` → `publish-*.mjs` → S3). Скрипт понимает `android`, `macos`, `ios`
+   и `all`.
+
+   **Три сборки — Android, macOS, iOS — делать всегда вместе**, одним заходом на один номер.
    Номер сборки (`+N` в `pubspec.yaml`) общий для платформ: из него выходят `versionCode` на
    Android, `CFBundleVersion` на маке и на iOS. Если номер поднят, а какая-то платформа не
    выпущена, следующая её публикация упадёт: публикующий скрипт не даёт положить сборку с тем
    же или меньшим номером, а поднять номер ещё раз уже нельзя — Android с этим номером выпущен.
 
-   Публикация упадёт с ошибкой, если `versionCode` в релизе равен или больше текущего — нужно
-   поднять версию перед запуском рабочих процессов. Поэтому порядок такой: сначала номер, потом
-   все три workflow, и только потом следующий номер.
+   Пересобираешь ту же версию для проверки — `./scripts/build-release.sh android --force`.
+   Кнопкой «Обновить» такое обновление не увидит никто (номер не вырос): на Android сборку
+   ставят по adb, на iPad — страницей `.../ios/install`.
 
    iOS — не забывать: он публикует Ad Hoc-сборку в https://files.iq-factura.com/ios (ставится
    по воздуху через `.../ios/install`), и пропущенный iOS — это iPad и iPhone, которые к новым
    правкам не обновятся.
-4. **За CI не следить.** Запустил workflow — и пошёл дальше: `gh run watch` не нужен, итог
-   владельцу не докладывать. Ждать и следить — только если он попросил об этом прямо
-   (разово, вручную).
+4. **За деплоем сервера не следить.** Push в `src/**` сам запускает `deploy.yml` — `gh run watch`
+   не нужен, итог владельцу не докладывать. Ждать и следить — только если он попросил об этом
+   прямо (разово, вручную).
 
 ## Телефон по adb — установка сразу
 
 - **Определять подключение самому**: `adb devices` (adb нет в `PATH`, он лежит в
   `/opt/homebrew/share/android-commandlinetools/platform-tools/adb`).
-- **Телефон подключён — ставить сборку туда сразу**, не дожидаясь CI:
+- **Телефон подключён — ставить сборку туда сразу**, не дожидаясь релиза:
   `flutter build apk --release` (подпись берётся из `flutter/android/keystore.properties`,
   ключ тот же, что у установленного приложения) и `adb install -r build/app/outputs/flutter-apk/app-release.apk`.
   Данные и настройки при этом сохраняются.
@@ -56,8 +51,8 @@ gh workflow run ios.yml     --repo sobogd/cloudlyru
 
 ## Настольное приложение на маке
 
-- Собирается из того же `flutter/` (`flutter build macos --release`), публикуется workflow
-  `macos.yml` в https://files.iq-factura.com/macos.
+- Собирается из того же `flutter/` (`flutter build macos --release`), публикуется
+  `./scripts/build-release.sh macos` в https://files.iq-factura.com/macos.
 - Установлено в `/Applications/Cloudly.app` и обновляется кнопкой в «Настройках»: приложение
   само скачивает архив, проверяет размер и sha256 и подменяет свой бандл
   (`flutter/lib/features/settings/macos_update.dart`). Ставить сборку руками не нужно.

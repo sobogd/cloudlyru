@@ -15,18 +15,25 @@
 #
 #   ./scripts/build-ios.sh                  # собрать, подписать и опубликовать в /ios
 #   ./scripts/build-ios.sh --no-publish     # только собрать (файл в flutter/build/ios/ipa)
+#   ./scripts/build-ios.sh --force          # опубликовать поверх того же номера сборки
 #   ASC_KEY_FILE=/путь/к/ключу.p8 ./scripts/build-ios.sh
 #
-# В CI ключ лежит во временном файле — путь передаётся через ASC_KEY_FILE.
+# --force нужен, когда пересобирают ту же версию (проверка на устройстве): публикация
+# с тем же номером иначе отказала бы, а страница /ios/install всё равно отдаёт последнюю
+# загруженную сборку. Кнопкой «Обновить» такое обновление не увидит никто — номер не вырос.
+#
+# Ключ из файла (ASC_KEY_FILE) нужен там, где p8 лежит не в ~/.appstoreconnect/private_keys.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 ENV_FILE="${CLOUDLY_ENV_FILE:-$HOME/work/.env}"
 PUBLISH=1
+FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --no-publish) PUBLISH=0 ;;
+    --force) FORCE=1 ;;
     *) echo "неизвестный аргумент: $arg" >&2; exit 2 ;;
   esac
 done
@@ -146,9 +153,14 @@ if [ "$PUBLISH" = 0 ]; then
   exit 0
 fi
 
-# Публикация: локально ключи S3 берутся из файла окружения, в CI они уже в переменных.
+# Публикация: ключи S3 лежат в файле окружения — скрипт публикации получает их через
+# `node --env-file`, в переменные окружения этого скрипта они не попадают.
 NODE_ENV_ARGS=()
-[ -f "$ENV_FILE" ] && NODE_ENV_ARGS+=("--env-file=$ENV_FILE")
+if [ -f "$ENV_FILE" ]; then NODE_ENV_ARGS+=("--env-file=$ENV_FILE"); fi
+# Флаг пересборки той же версии — до самого публикатора, решение о перезаписи принимает он.
+FORCE_ARGS=()
+if [ "$FORCE" = 1 ]; then FORCE_ARGS+=(--force); fi
 node ${NODE_ENV_ARGS[@]+"${NODE_ENV_ARGS[@]}"} scripts/publish-ios.mjs "$IPA" \
   --version-name "$VERSION_NAME" \
-  --version-code "$VERSION_CODE"
+  --version-code "$VERSION_CODE" \
+  ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}

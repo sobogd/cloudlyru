@@ -259,23 +259,26 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 (`release/android/cloudlyru-sync.apk`), рядом — `latest.json` с версией, размером и sha256:
 по нему приложение понимает, что вышло обновление (`GET /api/v1/app/android`).
 
-Публикация — ручной прогон workflow `.github/workflows/android.yml`: он собирает Flutter-клиент
-(`flutter/`) и заливает подписанный APK (тестов в проекте нет, проверка — `flutter analyze` и
-телефон). Перед запуском поднять `versionCode` в
+Публикация — локальный скрипт `./scripts/build-release.sh`: он собирает Flutter-клиент
+(`flutter/`) на этом маке и заливает подписанную сборку (тестов в проекте нет, проверка —
+`flutter analyze` и телефон). Перед запуском поднять `versionCode` в
 `flutter/pubspec.yaml` (`version: <versionName>+<versionCode>`, сейчас `1.0.0+45`) — скрипт
 публикации не даёт положить сборку с тем же или меньшим номером, иначе телефон её как обновление
 не увидит:
 
 ```bash
-gh workflow run android.yml --repo sobogd/cloudlyru
-gh workflow run macos.yml   --repo sobogd/cloudlyru   # настольное, /macos
-gh workflow run ios.yml     --repo sobogd/cloudlyru   # iPad/iPhone, /ios
+./scripts/build-release.sh all        # android + macos + ios на один номер
+./scripts/build-release.sh android    # или по одной платформе
 ```
 
-**Все три запускаются вместе, на один номер сборки.** `+N` в `pubspec.yaml` — общий: из него
+**Все три платформы собираются вместе, на один номер.** `+N` в `pubspec.yaml` — общий: из него
 выходит `versionCode` на Android и `CFBundleVersion` на маке и iOS. Если номер поднят, а часть
 платформ не выпущена, опубликоваться позже с тем же номером они уже не смогут (скрипт публикации
 его не пропустит), а поднять номер второй раз нельзя — Android с ним уже выпущен.
+
+Пересобрать ту же версию для проверки — `--force`: `./scripts/build-release.sh android --force`.
+Кнопкой «Обновить» такое обновление не увидит никто, на Android его ставят по adb,
+на iPad — страницей установки.
 
 Заменять нативный синхронизатор нечем и не нужно: единственный клиент — это приложение из
 `flutter/`, у него `applicationId` `ru.cloudly.sync` и та же подпись, поэтому оно встаёт поверх
