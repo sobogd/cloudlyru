@@ -158,11 +158,17 @@ export class MailFaviconService {
   }
 
   private async fetch(domain: string): Promise<Favicon | null> {
-    // Классическое /favicon.ico, потом — <link rel="icon"> из главной страницы.
+    // Классическое /favicon.ico, потом — <link rel="icon"> из главной страницы, потом — Google Favicon Service.
     const direct = await this.fetchUrl(`https://${domain}/favicon.ico`);
     if (direct) return direct;
     const iconHref = await this.findIconLink(domain);
-    return iconHref ? this.fetchUrl(iconHref) : null;
+    if (iconHref) {
+      const fetched = this.fetchUrl(iconHref);
+      if (fetched) return fetched;
+    }
+    // Google Favicon Service как запасной вариант — работает для доменов, которые блокируют прямой доступ.
+    const google = await this.fetchGoogleFavicon(domain);
+    return google ?? null;
   }
 
   /**
@@ -218,6 +224,26 @@ export class MailFaviconService {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /** Google Favicon Service: https://www.google.com/s2/favicons?domain=example.com&sz=64.
+
+Работает для доменов, которые блокируют прямой доступ (LinkedIn, Facebook и др.).
+Использует реферер Google, поэтому обходит многие CORS ограничения.
+
+Лимит 300KB — достаточно для любых фавиконок. Таймаут 4с — тот же, что и для прямых запросов.
+*/
+  private async fetchGoogleFavicon(domain: string): Promise<Favicon | null> {
+    const url = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=64`;
+    const got = await fetchPublicBytes(url, {
+      maxBytes: 300 * 1024,
+      timeoutMs: FETCH_TIMEOUT_MS,
+      maxRedirects: 3,
+      userAgent: `CloudlyRu/0.1 (+GoogleFavicon)`,
+      accept: 'image/*,*/*;q=0.8',
+      onProblem: (reason) => this.logger.warn(`favicon ${domain} (Google): ${reason}`),
+    });
+    return got ? { bytes: got.bytes, mime: got.mime } : null;
   }
 }
 
