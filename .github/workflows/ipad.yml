@@ -1,0 +1,46 @@
+name: iPad Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'flutter/**'
+
+env:
+  FLUTTER_VERSION: 3.29.0
+  CLOUDLY_CI_VERSION_CODE: 129
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+
+      - name: Install Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Get dependencies
+        working-directory: flutter
+        run: flutter pub get
+
+      - name: Build for iPad (arm64)
+        working-directory: flutter
+        run: flutter build macos --release --no-codesign --dart-define=flutter.buildMode=release
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudly-macos-ipad
+          path: flutter/build/macos/Build/Products/Release/*.app
+          retention-days: 7

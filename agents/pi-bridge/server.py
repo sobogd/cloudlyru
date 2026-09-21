@@ -444,6 +444,22 @@ def claude_sessions_dir(cwd):
     return claude_projects_dir() / ("-" + encoded)
 
 
+def session_cwd(harness, session_id):
+    """Рабочая папка сессии по её файлу: нужна, чтобы открыть разговор заново.
+
+    Мост может потерять открытую сессию (перезапуск, остановка процесса по простою), а
+    приложение продолжает с ней работать — и тогда на вопрос прилетал отказ «сессия не
+    открыта». Рабочий каталог записан в самой истории, поэтому разговор поднимается заново без
+    участия человека.
+    """
+    file = find_session_file(harness, session_id)
+    if file is None:
+        return None
+    reader = read_claude_meta if harness == HARNESS_CLAUDE else read_session_meta
+    cwd = str(reader(file).get("cwd") or "")
+    return cwd or None
+
+
 def find_session_file(harness, session_id):
     """Файл сессии по идентификатору, если он есть на диске; иначе `None`.
 
@@ -2499,7 +2515,14 @@ class Handler(BaseHTTPRequestHandler):
                     session.abort()
                     self._json(200, {"ok": True, "aborted": True})
                     return
-                session = POOL.find(parts[2])
+                # Сессия могла быть потеряна мостом (перезапуск, простой) — тогда поднимаем её
+                # заново из файла: приложение в этот момент просто продолжает разговор, и
+                # отказывать ему в этом незачем.
+                session = POOL.maybe(parts[2])
+                if session is None and action == "prompt":
+                    session = self._reopen(parts[2])
+                if session is None:
+                    session = POOL.find(parts[2])
                 if action == "prompt":
                     self._prompt(session, body)
                 elif action == "compact":
@@ -2634,6 +2657,22 @@ class Handler(BaseHTTPRequestHandler):
         session = POOL.open(path, harness, session_id, provider=provider, model=model)
         session.refresh_state()
         self._json(200, {"session": self._session_brief(session)})
+
+    def _reopen(self, key):
+        """Поднимает сессию из её файла, если мост её потерял; иначе `None`.
+
+        Рабочий каталог берётся из самой истории, поэтому человеку не нужно ничего открывать
+        заново: он продолжает разговор, а процесс агента поднимается под ним.
+        """
+        harness, native_id = split_key(key)
+        cwd = session_cwd(harness, native_id)
+        if not cwd:
+            return None
+        path = allowed_path(cwd)
+        if path is None:
+            raise PiError("сессия открыта в папке вне разрешённых корней: %s" % cwd)
+        log("поднимаю потерянную сессию %s заново в %s" % (key, path))
+        return POOL.open(path, harness, native_id)
 
     def _purge_sessions(self, body):
         """Убирает старые сессии проекта: разговор, который закрыли, чтобы освободить список.
