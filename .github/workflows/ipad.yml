@@ -8,8 +8,8 @@ on:
       - 'flutter/**'
 
 env:
-  FLUTTER_VERSION: 3.29.0
-  CLOUDLY_CI_VERSION_CODE: 129
+  FLUTTER_VERSION: 3.47.4
+  CLOUDLY_CI_VERSION_CODE: 130
 
 jobs:
   build:
