@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -58,10 +59,18 @@ class _MailBodyWebState extends State<MailBodyWeb> {
       // Скрипты выключены: измерять высоту больше нечего (см. комментарий класса), а чужой
       // разметке внутри приложения исполняться незачем.
       ..setJavaScriptMode(JavaScriptMode.disabled)
-      // Фон белый: письмо верстают под белый лист, а WebView по умолчанию прозрачный —
-      // на тёмной теме это выглядело бы как чёрный прямоугольник до первой отрисовки.
-      ..setBackgroundColor(const Color(0xFFFFFFFF))
       ..setNavigationDelegate(NavigationDelegate(onNavigationRequest: _onNavigation));
+
+    // Фон белый — но только там, где плагин это умеет. На macOS `setBackgroundColor` падает:
+    // в WKWebView на маке нет ни `setOpaque`, ни своего фона, и реализация бросает
+    // `UnimplementedError: opaque is not implemented on macOS` **сразу**, синхронно.
+    // Вызов идёт из `initState`, где исключение роняет сборку всего тела письма: экран письма
+    // на маке не открывался вовсе, а вместо него показывался серый прямоугольник (так выглядит
+    // подменивший виджет `ErrorWidget` в релизной сборке). Белый лист письму и без этого даёт
+    // его же разметка: [_normalizeCss] белит `html` и `body` документа.
+    if (!Platform.isMacOS) {
+      unawaited(controller.setBackgroundColor(const Color(0xFFFFFFFF)));
+    }
 
     // Смешанный контент разрешаем: в письмах сплошь и рядом картинки по `http://` (проверено
     // на живой почте: 20 таких картинок в 5 письмах из 14), а WebView по умолчанию часть
