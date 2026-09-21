@@ -4,7 +4,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../theme.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
-import '../agent/projects_screen.dart';
 import 'chat_controller.dart';
 import 'chat_thread_screen.dart';
 import 'chat_types.dart';
@@ -86,17 +85,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       appBar: AppBar(
         title: const Text('Чат', style: TextStyle(color: C.fg, fontSize: 18)),
         actions: [
-          IconButton(
-            // Раздел «Проекты» — родственный чату, но другой: там агент работает в папке
-            // проекта (читает и правит файлы, запускает команды), а здесь модель отвечает с
-            // поиском и источниками. Вход из шапки чата, а не отдельной вкладкой: в нижней
-            // панели уже восемь разделов, и девятый сделал бы её нечитаемой на телефоне.
-            tooltip: 'Проекты',
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => const ProjectsScreen()),
-            ),
-            icon: const Icon(Icons.terminal),
-          ),
           IconButton(
             // Память — про все чаты сразу, поэтому вход в неё из списка, а не из переписки
             tooltip: 'Память',

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
+import '../features/agent/projects_screen.dart';
 import '../features/chat/chat_screen.dart';
 import '../features/files/files_screen.dart';
 import '../features/mail/mail_screen.dart';
@@ -16,33 +17,59 @@ import '../features/trash/trash_screen.dart';
 import '../providers.dart';
 import '../theme.dart';
 
-/// Разделы приложения — ровно те, что стоят в нижней панели, в том же порядке.
+/// Разделы приложения — ровно те, что стоят в левом баре, в том же порядке.
 ///
-/// Имя значения (`name`) — это ключ, под которым выбранная вкладка лежит в настройках
+/// Имя значения (`name`) — это ключ, под которым выбранный раздел лежит в настройках
 /// (`settings.ui`, поле `tab`), поэтому переименование значений сломало бы восстановление
-/// последней вкладки: [_ShellState.initState] ищет сохранённое имя по `name` и при промахе
-/// молча остаётся на «Файлах».
-///
-/// Порядок значений тоже значим: панель работает индексами (`selectedIndex = _tab.index`,
-/// а в обработчике нажатия — `AppTab.values[i]`), поэтому порядок `destinations` в
-/// [_ShellState.build] обязан совпадать с порядком значений здесь, иначе подсветится и
-/// откроется не тот раздел. Число `destinations` — тоже ровно по числу значений.
-enum AppTab { files, mail, media, map, invoices, chat, trash, settings }
+/// последнего раздела: [_ShellState.initState] ищет сохранённое имя по `name` и при промахе
+/// молча остаётся на «Файлах». Список открытый: новый раздел — новое значение здесь и строка
+/// в [_tabLook], больше менять нечего.
+enum AppTab { files, mail, media, map, invoices, chat, projects, trash, settings }
 
-/// Иконки для каждого раздела. Имена соответствуют `AppTab.name`, чтобы можно было
-/// восстанавливать последнюю вкладку из настроек, даже если иконка изменится.
-final Map<AppTab, IconData> _tabIcons = {
-  AppTab.files: Icons.folder_outlined,
-  AppTab.mail: Icons.mail_outline,
-  AppTab.media: Icons.photo_library_outlined,
-  AppTab.map: Icons.map_outlined,
-  AppTab.invoices: Icons.receipt_long_outlined,
-  AppTab.chat: Icons.chat_bubble_outline,
-  AppTab.trash: Icons.delete_outline,
-  AppTab.settings: Icons.settings_outlined,
+/// Название раздела для человека и его иконка.
+///
+/// Подписи здесь именно человеческие: «Медиа», а не `media`, и «Инвойсы», а не `invoices`.
+/// Ключом для настроек остаётся `AppTab.name` (см. комментарий к нему), поэтому менять эти
+/// подписи можно свободно — сохранённый раздел от них не зависит.
+///
+/// Подписи — и подсказка при наведении, и имя для экранного диктора: на экране их не видно
+/// (бар только с иконками на всех платформах), но без них иконку пришлось бы угадывать.
+typedef _TabLook = ({String label, IconData icon, IconData activeIcon});
+
+const Map<AppTab, _TabLook> _tabLook = {
+  AppTab.files: (label: 'Файлы', icon: Icons.folder_outlined, activeIcon: Icons.folder),
+  AppTab.mail: (label: 'Почта', icon: Icons.mail_outline, activeIcon: Icons.mail),
+  AppTab.media: (
+    label: 'Медиа',
+    icon: Icons.photo_library_outlined,
+    activeIcon: Icons.photo_library,
+  ),
+  AppTab.map: (label: 'Карта', icon: Icons.map_outlined, activeIcon: Icons.map),
+  AppTab.invoices: (
+    label: 'Инвойсы',
+    icon: Icons.receipt_long_outlined,
+    activeIcon: Icons.receipt_long,
+  ),
+  AppTab.chat: (label: 'Чат', icon: Icons.chat_bubble_outline, activeIcon: Icons.chat_bubble),
+  AppTab.projects: (label: 'Проекты', icon: Icons.terminal_outlined, activeIcon: Icons.terminal),
+  AppTab.trash: (label: 'Корзина', icon: Icons.delete_outline, activeIcon: Icons.delete),
+  AppTab.settings: (
+    label: 'Настройки',
+    icon: Icons.settings_outlined,
+    activeIcon: Icons.settings,
+  ),
 };
 
-/// Оболочка после входа: держит выбранный раздел и нижнюю панель навигации.
+/// Оболочка после входа: держит выбранный раздел и левый бар с разделами.
+///
+/// Бар стоит слева во всю высоту экрана и виден только на основных страницах разделов. Это
+/// выходит само собой, без слежения за навигацией: вложенные экраны (письмо, разговор с
+/// агентом, настройки синхронизации) уходят в корневой навигатор приложения (`MaterialApp`), а он лежит
+/// выше оболочки — то есть перекрывает её целиком, вместе с баром. Поэтому у вложенного экрана
+/// есть своя шапка с кнопкой «назад» во всю ширину, а бар в этот момент не виден.
+///
+/// Своей шапки у оболочки нет намеренно: раздел видно и так — по подсветке в баре, а нижняя
+/// шапка отнимала бы высоту у списков ради названия, которое уже написано в баре.
 ///
 /// Разделы живут в `IndexedStack` и создаются один раз — при первом показе вкладки. Раньше
 /// тело было `switch (_tab)`, то есть каждый переход создавал экран заново: раздел терял
@@ -59,7 +86,6 @@ class Shell extends ConsumerStatefulWidget {
 /// Состояние оболочки: выбранный раздел и уже построенные экраны разделов.
 class _ShellState extends ConsumerState<Shell> {
   AppTab _tab = AppTab.files;
-  bool _drawerOpen = false;
 
   /// Построенные экраны разделов: `IndexedStack` держит их живыми, поэтому на экран,
   /// в который человек уже заходил, он возвращается с той же открытой папкой и прокруткой.
@@ -129,6 +155,7 @@ class _ShellState extends ConsumerState<Shell> {
         AppTab.map => const MapScreen(),
         AppTab.invoices => const InvoicesScreen(),
         AppTab.chat => const ChatScreen(),
+        AppTab.projects => const ProjectsScreen(),
         AppTab.trash => const TrashScreen(),
         AppTab.settings => const SettingsScreen(),
       });
@@ -136,79 +163,129 @@ class _ShellState extends ConsumerState<Shell> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // Разделы не пересоздаются: `IndexedStack` держит построенные экраны в дереве, поэтому
-      // возврат на вкладку не повторяет её загрузку и не сбрасывает прокрутку. Ещё не
-      // открытые вкладки остаются пустыми заглушками — их экраны создаются при первом показе.
-      body: IndexedStack(
-        index: _tab.index,
-        children: [
-          for (final tab in AppTab.values)
-            (tab == _tab || _screens.containsKey(tab)) ? _screenFor(tab) : const SizedBox.shrink(),
-        ],
-      ),
-      // Боковая панель вместо нижней: открывается по кнопке в AppBar.
-      // На мобильном — только по кнопке, на десктопе — можно оставить открытым или тоже по кнопке.
-      drawer: _buildDrawer(),
-      // Кнопка меню в AppBar для открытия/закрытия Drawer.
-      appBar: AppBar(
-        title: Text(_tab.name),
-        // Кнопка гамбургер: иконка меняется в зависимости от состояния Drawer.
-        actions: [
-          IconButton(
-            icon: Icon(_drawerOpen ? Icons.close : Icons.menu),
-            onPressed: () => setState(() => _drawerOpen = !_drawerOpen),
-          ),
-        ],
+      // Бар — слева и во всю высоту, рядом с ним — раздел. `SafeArea` у каждого свой: иначе
+      // отступ под «вырезом» камеры (в альбомной ориентации) достался бы обоим и лёг бы в
+      // середину раскладки, а не по краям экрана.
+      body: SafeArea(
+        left: true,
+        right: false,
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _NavBar(current: _tab, onSelect: _selectTab),
+            // Рамка вместо тени: на тёмной теме тень между двумя поверхностями почти не
+            // читается, а линия отделяет бар от содержимого в любом месте одинаково.
+            const VerticalDivider(width: 1, thickness: 1, color: C.brd),
+            // Разделы не пересоздаются: `IndexedStack` держит построенные экраны в дереве,
+            // поэтому возврат на раздел не повторяет его загрузку и не сбрасывает прокрутку.
+            // Ещё не открытые разделы остаются пустыми заглушками — их экраны создаются при
+            // первом показе.
+            Expanded(
+              child: IndexedStack(
+                index: _tab.index,
+                children: [
+                  for (final tab in AppTab.values)
+                    (tab == _tab || _screens.containsKey(tab))
+                        ? _screenFor(tab)
+                        : const SizedBox.shrink(),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  /// Строит боковую панель навигации.
-  Widget _buildDrawer() {
-    return Drawer(
-      child: ListView(
-        // Отступ сверху, чтобы не наезжать на AppBar.
-        padding: const EdgeInsets.only(top: 16, left: 8, right: 8, bottom: 8),
-        children: [
-          // Заголовок Drawer — просто название приложения или логотип.
-          Container(
-            height: 120,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [C.accent, C.accent2],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-            ),
-            child: Center(
-              child: Text(
-                'Cloudly',
-                style: TextStyle(
-                  color: C.accentFg,
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
+  /// Открывает раздел и запоминает выбор.
+  ///
+  /// Запись не ждём: раздел — мелочь, ради которой нельзя задерживать перерисовку.
+  /// Повторное нажатие на открытый раздел ничего не делает: сбрасывать его состояние (открытую
+  /// папку, прокрутку) было бы неожиданно — это не «обновить», а «сбросить».
+  void _selectTab(AppTab tab) {
+    if (_tab == tab) return;
+    setState(() => _tab = tab);
+    unawaited(ref.read(appStateProvider).settings.ui.patch({'tab': tab.name}));
+  }
+}
+
+/// Левый бар с разделами: полоса во всю высоту экрана.
+///
+/// Только иконки, без подписей — одинаково на всех платформах: список короткий и узнаваемый, а
+/// подписи отняли бы у содержимого ширину, которая нужнее спискам файлов и писем. Название
+/// раздела остаётся в подсказке при наведении и в подписи для экранного диктора (`Tooltip`),
+/// так что иконку не приходится угадывать.
+///
+/// Содержимое бара прокручивается, чтобы новые разделы не упирались в нижний край, когда их
+/// станет больше, чем помещается на экран.
+class _NavBar extends StatelessWidget {
+  const _NavBar({required this.current, required this.onSelect});
+
+  /// Открытый сейчас раздел — его строка подсвечена.
+  final AppTab current;
+
+  /// Что делать при выборе раздела.
+  final ValueChanged<AppTab> onSelect;
+
+  /// Размер иконки и отступ вокруг неё.
+  ///
+  /// Кнопка раздела — квадрат со стороной [_iconSize] + 2·[_tapPad], а ширина всей полосы —
+  /// ровно по ней с полем [_sideGap] по краям. Числа сведены в одно место, чтобы ширина полосы
+  /// и размер кнопки не разъехались: лишнее место здесь читается как «полоса шире, чем нужно»
+  /// и отнимает ширину у списков.
+  static const _iconSize = 22.0;
+  static const _tapPad = 11.0;
+  static const _sideGap = 4.0;
+
+  /// Ширина полосы: иконка, отступы вокруг кнопки и поля по краям.
+  static const _width = _iconSize + 2 * _tapPad + 2 * _sideGap;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: _width,
+      // `Material` — не для красоты: без него `InkWell` в строках не рисует отклик на нажатие.
+      // Цвет бара — `island` (тот же, что у карточек), а не фон приложения: бар отделяется от
+      // содержимого цветом, и разделитель (см. `body`) тогда только подчёркивает границу.
+      child: Material(
+        color: C.island,
+        child: ListView(
+          // прокрутка содержимого бара: разделов со временем станет больше, чем помещается по
+          // высоте, и последние обязаны остаться доступными
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          children: [
+            for (final tab in AppTab.values) _item(tab),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Кнопка раздела: иконка и подсветка выбранного.
+  ///
+  /// Вместо `ListTile` — свой квадрат с равными отступами: `ListTile` держит минимум 56 px и
+  /// собственные боковые поля, из-за которых кнопка вышла бы шире, чем полоса.
+  Widget _item(AppTab tab) {
+    final look = _tabLook[tab]!;
+    final selected = tab == current;
+    return Tooltip(
+      // подпись раздела — единственное место, где он назван словами: видна при наведении
+      // (на маке — курсором) и читается экранным диктором
+      message: look.label,
+      child: InkWell(
+        onTap: () => onSelect(tab),
+        child: Container(
+          // подсветка выбранного — мягкая заливка акцентом, как у нижней панели разделов раньше
+          color: selected ? C.accentSoft : null,
+          // поле только по бокам: вертикального нет, иначе кнопка перестала бы быть квадратом
+          margin: const EdgeInsets.symmetric(horizontal: _sideGap),
+          padding: const EdgeInsets.all(_tapPad),
+          child: Icon(
+            selected ? look.activeIcon : look.icon,
+            size: _iconSize,
+            color: selected ? C.accent : C.fg3,
           ),
-          // Список разделов навигации.
-          ...AppTab.values.map((tab) {
-            final selectedIcon = _tabIcons[tab];
-            final icon = tab == _tab ? Icon(selectedIcon) : Icon(selectedIcon);
-            return ListTile(
-              leading: icon,
-              title: Text(tab.name),
-              onTap: () {
-                setState(() {
-                  _tab = tab;
-                  _drawerOpen = false; // Закрыть Drawer после выбора.
-                });
-                // Запись в настройки — не ждём, вкладка — мелочь.
-                unawaited(ref.read(appStateProvider).settings.ui.patch({'tab': tab.name}));
-              },
-            );
-          }),
-        ],
+        ),
       ),
     );
   }

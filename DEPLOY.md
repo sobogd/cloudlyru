@@ -268,7 +268,14 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 
 ```bash
 gh workflow run android.yml --repo sobogd/cloudlyru
+gh workflow run macos.yml   --repo sobogd/cloudlyru   # настольное, /macos
+gh workflow run ios.yml     --repo sobogd/cloudlyru   # iPad/iPhone, /ios
 ```
+
+**Все три запускаются вместе, на один номер сборки.** `+N` в `pubspec.yaml` — общий: из него
+выходит `versionCode` на Android и `CFBundleVersion` на маке и iOS. Если номер поднят, а часть
+платформ не выпущена, опубликоваться позже с тем же номером они уже не смогут (скрипт публикации
+его не пропустит), а поднять номер второй раз нельзя — Android с ним уже выпущен.
 
 Заменять нативный синхронизатор нечем и не нужно: единственный клиент — это приложение из
 `flutter/`, у него `applicationId` `ru.cloudly.sync` и та же подпись, поэтому оно встаёт поверх

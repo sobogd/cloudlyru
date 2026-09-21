@@ -39,13 +39,6 @@ class C {
   static const danger = Color(0xFFFF6B6B);
 }
 
-/// Высота панели разделов: только иконки, без подписей.
-///
-/// Значение Material 3 по умолчанию — 80; здесь панель ниже, чтобы не отъедать экран у списков.
-/// Системный отступ снизу не входит: Flutter добавляет его сам, поэтому на жестовой навигации
-/// панель окажется выше ровно на высоту полосы жеста.
-const _navBarHeight = 56.0;
-
 /// Собирает тёмную тему приложения из палитры [C].
 ///
 /// Единственная точка настройки вида: всё, что задано здесь, дальше применяется ко всем экранам,
@@ -139,26 +132,10 @@ ThemeData buildTheme() {
         borderSide: const BorderSide(color: C.accent),
       ),
     ),
-    // Боковая панель — узкая полоса слева только с иконками: подписи скрыты, высота урезана
-    // с 80 (значение Material 3 по умолчанию) до [_navBarHeight]. Высота считается без
-    // системного отступа снизу — Flutter добавляет его сам, поэтому на жестовой навигации
-    // панель будет выше ровно на высоту полосы жеста.
-    drawerTheme: DrawerThemeData(
-      backgroundColor: C.surface,
-    ),
-    navigationBarTheme: NavigationBarThemeData(
-      backgroundColor: C.island,
-      indicatorColor: C.accentSoft,
-      surfaceTintColor: Colors.transparent,
-      height: _navBarHeight,
-      labelBehavior: NavigationDestinationLabelBehavior.alwaysHide,
-      // labelTextStyle здесь нет намеренно: при alwaysHide подписи не рисуются вообще,
-      // и настройка была бы мёртвой — цвет иконок задаёт iconTheme ниже.
-      iconTheme: WidgetStateProperty.resolveWith((states) {
-        final selected = states.contains(WidgetState.selected);
-        return IconThemeData(color: selected ? C.accent : C.fg3, size: 24);
-      }),
-    ),
+    // Настроек для `drawerTheme` и `navigationBarTheme` здесь больше нет: выезжающая панель и
+    // нижняя панель разделов остались в прошлом — разделы живут в левом баре оболочки
+    // (`shell/shell.dart`), и он рисуется своими виджетами, а не `Drawer` или `NavigationBar`.
+    //
     // Основная кнопка — заливка акцентом, текстовая — только цветом текста: на карточках
     // вторая заливка спорила бы с подложкой и рамкой.
     filledButtonTheme: FilledButtonThemeData(

@@ -10,15 +10,33 @@
 2. **Автопуш в main** — `./scripts/gh-push.sh main` (токен берётся из `~/work/.env`, ключ
    `GH_SOBOGD`; других учёток не использовать). Push в `src/**` и `prisma/**` сам запускает
    деплой сервера (`deploy.yml`) — отдельно его дёргать не нужно.
-3. **Менялся Flutter — запустить релизные сборки платформ** (обе, номер общий):
+3. **Менялся Flutter — поднять версию в `pubspec.yaml` и запустить релизные сборки**.
+   Перед сборкой обновить `version: 1.0.0+N` в `flutter/pubspec.yaml` (номер сборки +1, чтобы
+   Google Play принимал обновление). После правки запустить:
    ```
-   GH_TOKEN=$(sed -n 's/^GH_SOBOGD=//p' ~/work/.env) gh workflow run android.yml --repo sobogd/cloudlyru
-   GH_TOKEN=$(sed -n 's/^GH_SOBOGD=//p' ~/work/.env) gh workflow run macos.yml   --repo sobogd/cloudlyru
+   source /Users/sobogd/work/.git-token.sh
+cd flutter
+git add pubspec.yaml
+git commit -m "bump version to $N"
+git push
+cd /Users/sobogd/work/iq-rest/cloudlyru
+gh workflow run android.yml --repo sobogd/cloudlyru
+gh workflow run macos.yml   --repo sobogd/cloudlyru
+gh workflow run ios.yml     --repo sobogd/cloudlyru
    ```
-   Перед этим поднять номер сборки в `flutter/pubspec.yaml` (`version: 1.0.0+N`): он один на
-   Android и macOS — из него выходит `versionCode` в APK и `CFBundleVersion` в настольной
-   сборке, а публикация не принимает тот же или меньший номер. Поднимать достаточно один раз,
-   дальше обе сборки берут его из `pubspec.yaml`.
+   **Три сборки — Android, macOS, iOS — запускать всегда вместе**, одним заходом на один номер.
+   Номер сборки (`+N` в `pubspec.yaml`) общий для платформ: из него выходят `versionCode` на
+   Android, `CFBundleVersion` на маке и на iOS. Если номер поднят, а какая-то платформа не
+   выпущена, следующая её публикация упадёт: публикующий скрипт не даёт положить сборку с тем
+   же или меньшим номером, а поднять номер ещё раз уже нельзя — Android с этим номером выпущен.
+
+   Публикация упадёт с ошибкой, если `versionCode` в релизе равен или больше текущего — нужно
+   поднять версию перед запуском рабочих процессов. Поэтому порядок такой: сначала номер, потом
+   все три workflow, и только потом следующий номер.
+
+   iOS — не забывать: он публикует Ad Hoc-сборку в https://files.iq-factura.com/ios (ставится
+   по воздуху через `.../ios/install`), и пропущенный iOS — это iPad и iPhone, которые к новым
+   правкам не обновятся.
 4. **За CI не следить.** Запустил workflow — и пошёл дальше: `gh run watch` не нужен, итог
    владельцу не докладывать. Ждать и следить — только если он попросил об этом прямо
    (разово, вручную).
