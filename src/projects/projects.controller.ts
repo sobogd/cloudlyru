@@ -59,6 +59,18 @@ export class ProjectsController {
     return this.wrap(() => this.projects.call<Record<string, unknown>>('GET', '/projects'));
   }
 
+  /**
+   * Модели, доступные харнессу на маке: локальная и, если настроены, удалённые по API.
+   *
+   * Список целиком определяется настройками pi на маке (`~/.pi/agent/models.json` и его
+   * каталог провайдеров) — сервер и приложение его только показывают. Ключи от API остаются
+   * на маке и наружу не уходят: приложению приходит признак «ключ задан», а не сам ключ.
+   */
+  @Get('models')
+  async models() {
+    return this.wrap(() => this.projects.call<Record<string, unknown>>('GET', '/models'));
+  }
+
   /** Сессии проекта: их мост читает из файлов pi на маке. */
   @Get('sessions')
   async sessions(@Query('path') path?: string) {
@@ -102,9 +114,18 @@ export class ProjectsController {
     const path = typeof body.path === 'string' ? body.path.trim() : '';
     if (!path) throw badRequest('path обязателен');
     const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+    // модель выбирается при открытии: у pi их бывает несколько (локальная и удалённая по API),
+    // а после открытия её меняет ручка model, не перезапуская разговор
+    const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
+    const model = typeof body.model === 'string' ? body.model.trim() : '';
     return this.wrap(() =>
       this.projects.call<Record<string, unknown>>('POST', '/sessions', {
-        body: { path, ...(sessionId ? { sessionId } : {}) },
+        body: {
+          path,
+          ...(sessionId ? { sessionId } : {}),
+          ...(provider ? { provider } : {}),
+          ...(model ? { model } : {}),
+        },
         // запуск процесса pi на маке — секунды, но не мгновение
         timeoutMs: 120_000,
       }),
@@ -204,13 +225,28 @@ export class ProjectsController {
   }
 
   /**
-   * Закрывает процесс pi (файл истории остаётся).
+   * Закрывает процесс pi на маке, оставляя историю: освобождает память под контекст модели.
    *
-   * Нужно, когда человек уходит с экрана: живой процесс держит контекст модели в памяти мака,
-   * а память там дороже пары секунд на следующий запуск.
+   * Зовётся и при уходе с экрана, и явной кнопкой в приложении. Повторное закрытие — не
+   * ошибка: сессия могла быть уже закрыта или приложение перезапускалось.
+   */
+  @Post('sessions/:id/close')
+  async close(@Param('id') id: string) {
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'POST',
+        `/sessions/${encodeURIComponent(id)}/close`,
+      ),
+    );
+  }
+
+  /**
+   * Удаляет сессию: процесс гасится, файл истории стирается с мака.
+   *
+   * Необратимо, поэтому в приложении это отдельное действие с подтверждением.
    */
   @Delete('sessions/:id')
-  async close(@Param('id') id: string) {
+  async remove(@Param('id') id: string) {
     return this.wrap(() =>
       this.projects.call<Record<string, unknown>>(
         'DELETE',

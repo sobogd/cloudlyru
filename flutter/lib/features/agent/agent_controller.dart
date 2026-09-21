@@ -13,6 +13,62 @@ import 'agent_types.dart';
 /// клиент читается заново, а не хранится. Так же устроен чат.
 final agentApiProvider = Provider<AgentApi>((ref) => AgentApi(ref.read(appStateProvider).api));
 
+// --- модели ---
+
+/// Состояние списка моделей: что pi на маке может запустить.
+class AgentModelsState {
+  /// Локальные и удалённые модели.
+  final List<AgentModel> models;
+
+  /// Идёт загрузка.
+  final bool loading;
+
+  /// Причина последней неудачи или `null`.
+  final String? error;
+
+  /// Состояние списка моделей.
+  const AgentModelsState({this.models = const [], this.loading = false, this.error});
+
+  /// Только локальные (считают на маке) и только удалённые — для группировки в выборе.
+  List<AgentModel> get local => [for (final m in models) if (m.local) m];
+
+  /// Модели по API.
+  List<AgentModel> get remote => [for (final m in models) if (!m.local) m];
+
+  /// Модель по ключу `провайдер/идентификатор`, если она есть в списке.
+  AgentModel? byKey(String? key) {
+    if (key == null || key.isEmpty) return null;
+    for (final m in models) {
+      if (m.key == key) return m;
+    }
+    return null;
+  }
+}
+
+/// Провайдер списка моделей.
+final agentModelsProvider =
+    NotifierProvider<AgentModelsController, AgentModelsState>(AgentModelsController.new);
+
+/// Список моделей харнесса: читается один раз при первом открытии выбора и обновляется кнопкой.
+class AgentModelsController extends Notifier<AgentModelsState> {
+  /// Клиент раздела.
+  AgentApi get _api => ref.read(agentApiProvider);
+
+  @override
+  AgentModelsState build() => const AgentModelsState();
+
+  /// Читает список моделей у моста.
+  Future<void> load() async {
+    state = AgentModelsState(models: state.models, loading: true);
+    try {
+      final models = await _api.models();
+      state = AgentModelsState(models: models);
+    } on AgentApiException catch (e) {
+      state = AgentModelsState(models: state.models, error: e.message);
+    }
+  }
+}
+
 // --- проекты ---
 
 /// Состояние списка проектов: сами проекты, признак загрузки, состояние моста и ошибка.
@@ -153,7 +209,11 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
   ///
   /// Возвращает описание открытой сессии (её идентификатор выдаёт pi) либо `null`, если мост
   /// отказал: причина при этом уже лежит в состоянии и показывается на экране.
-  Future<AgentSessionInfo?> open(AgentProject project, {String? sessionId}) async {
+  Future<AgentSessionInfo?> open(
+    AgentProject project, {
+    String? sessionId,
+    String? modelKey,
+  }) async {
     state = AgentSessionsState(
       project: project,
       sessions: state.sessions,
@@ -161,7 +221,12 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
       error: state.error,
     );
     try {
-      final session = await _api.openSession(project.path, sessionId: sessionId);
+      // модель передаём только для новой сессии: у существующей она уже записана в её файле
+      final session = await _api.openSession(
+        project.path,
+        sessionId: sessionId,
+        modelKey: sessionId == null ? modelKey : null,
+      );
       state = AgentSessionsState(project: project, sessions: state.sessions);
       return session;
     } on AgentApiException catch (e) {
@@ -171,6 +236,31 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
         error: e.message,
       );
       return null;
+    }
+  }
+
+  /// Удаляет сессию на маке вместе с историей.
+  ///
+  /// Необратимо, поэтому вызывающий сначала спрашивает подтверждение. Список обновляется
+  /// локально: сервер уже удалил файл, и перечитывать его ради одной строки незачем.
+  Future<void> remove(String sessionId) async {
+    try {
+      await _api.deleteSession(sessionId);
+      state = AgentSessionsState(
+        project: state.project,
+        sessions: [for (final s in state.sessions) if (s.id != sessionId) s],
+      );
+    } on AgentApiException catch (e) {
+      showError(e.message);
+    }
+  }
+
+  /// Закрывает процесс сессии на маке, оставляя историю (освобождает память под контекст).
+  Future<void> close(String sessionId) async {
+    try {
+      await _api.closeSession(sessionId);
+    } on AgentApiException catch (e) {
+      showError(e.message);
     }
   }
 
@@ -209,6 +299,10 @@ class AgentThreadState {
   /// Причина последней неудачи или `null`.
   final String? error;
 
+  /// Когда человек отправил текущее сообщение: по этому времени экран считает, сколько уже
+  /// идёт работа. Живёт в состоянии, а не в виджете, потому что перерисовок за прогон много.
+  final DateTime? runStartedAt;
+
   /// Состояние разговора.
   const AgentThreadState({
     this.session,
@@ -218,6 +312,7 @@ class AgentThreadState {
     this.step = '',
     this.usage,
     this.error,
+    this.runStartedAt,
   });
 
   /// Копия состояния; ошибку и расход трогают только явные методы.
@@ -228,6 +323,7 @@ class AgentThreadState {
     bool? sending,
     String? step,
     AgentUsage? usage,
+    DateTime? runStartedAt,
   }) =>
       AgentThreadState(
         session: session ?? this.session,
@@ -237,6 +333,7 @@ class AgentThreadState {
         step: step ?? this.step,
         usage: usage ?? this.usage,
         error: error,
+        runStartedAt: runStartedAt ?? this.runStartedAt,
       );
 
   /// Копия с проставленной ошибкой.
@@ -248,6 +345,7 @@ class AgentThreadState {
         step: step,
         usage: usage,
         error: message,
+        runStartedAt: runStartedAt,
       );
 
   /// Копия без ошибки.
@@ -258,6 +356,7 @@ class AgentThreadState {
         sending: sending,
         step: step,
         usage: usage,
+        runStartedAt: runStartedAt,
       );
 
   /// Последний элемент переписки (в него дописывается текущий ответ), либо `null`.
@@ -354,6 +453,55 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     _finish();
   }
 
+  /// Закрывает процесс pi на маке по явной просьбе, оставляя разговор в истории.
+  ///
+  /// Отличается от [close] только намерением: [close] зовётся при уходе с экрана (это уборка),
+  /// а здесь человек осознанно освобождает память мака, оставаясь в разделе.
+  Future<bool> closeSession() async {
+    final session = state.session;
+    if (session == null) return false;
+    try {
+      await _api.closeSession(session.id);
+      return true;
+    } on AgentApiException catch (e) {
+      state = state.withError(e.message);
+      return false;
+    }
+  }
+
+  /// Удаляет сессию на маке вместе с историей. Необратимо: подтверждение спрашивает экран.
+  ///
+  /// Занятость снимаем до удаления: работающий процесс держит файл открытым, и стирать его
+  /// из-под агента — верный способ получить обрывок сессии на диске.
+  Future<bool> deleteSession() async {
+    final session = state.session;
+    if (session == null) return false;
+    if (state.sending) await stop();
+    try {
+      await _api.deleteSession(session.id);
+      return true;
+    } on AgentApiException catch (e) {
+      state = state.withError(e.message);
+      return false;
+    }
+  }
+
+  /// Меняет модель открытой сессии: разговор продолжается, меняется тот, кто считает.
+  ///
+  /// Выбор запоминается в настройках как модель по умолчанию для новых сессий — человек,
+  /// который перешёл на удалённую модель, ждёт её и в следующем проекте.
+  Future<void> setModel(AgentModel model) async {
+    final session = state.session;
+    if (session == null || state.sending) return;
+    try {
+      final updated = await _api.setModel(session.id, model.key);
+      state = state.copyWith(session: updated).clearError();
+      await ref.read(settingsProvider).ui.setAgentModel(model.key);
+    } on AgentApiException catch (e) {
+      state = state.withError(e.message);
+    }
+  }
+
   /// Сжимает контекст сессии: длинный разговор иначе перестанет влезать в окно модели.
   Future<void> compact() async {
     final session = state.session;
@@ -383,7 +531,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
 
   /// Запускает поток ответа на [prompt], который уже лежит в состоянии последним вопросом.
   Future<void> _run(String sessionId, String prompt) async {
-    state = state.copyWith(sending: true, step: '');
+    state = state.copyWith(sending: true, step: '', runStartedAt: DateTime.now());
     _cancelledByUser = false;
     final done = Completer<void>();
     _done = done;

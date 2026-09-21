@@ -17,6 +17,7 @@ stdio и умеет ровно то, что нужно разделу «Прое
   GET    /health                      — жив ли сервис, есть ли pi, что с процессами;
   GET    /projects                    — проекты из allowlist-корней (папки с .git);
   GET    /sessions?path=<папка>       — сессии проекта (файлы pi), свежие сверху;
+  GET    /models                      — модели, доступные pi (локальные и по API);
   POST   /sessions                    — открыть сессию: поднять процесс pi в этой папке;
   GET    /sessions/<id>               — состояние сессии (модель, контекст, занятость);
   GET    /sessions/<id>/messages      — переписка в нормализованном виде;
@@ -24,8 +25,9 @@ stdio и умеет ровно то, что нужно разделу «Прое
   POST   /sessions/<id>/abort         — остановить генерацию;
   POST   /sessions/<id>/compact       — сжать контекст;
   POST   /sessions/<id>/model         — сменить модель;
+  POST   /sessions/<id>/close         — закрыть процесс (файл сессии остаётся);
   POST   /sessions/<id>/ui            — ответ на диалог расширения (по умолчанию не нужен);
-  DELETE /sessions/<id>               — закрыть процесс (файл сессии остаётся).
+  DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается.
 
 Кто сюда ходит: только сервер приложения, и только через reverse-SSH туннель мака — порт
 18820 слушает loopback на обоих концах (см. jevel.ai/agents/run-dsh-tunnel.sh), ровно как
@@ -48,6 +50,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import secrets
 import subprocess
 import sys
@@ -96,6 +99,11 @@ FORWARDED_EVENTS = {
 }
 
 log_lock = threading.Lock()
+
+# Кэш списка моделей: pi отвечает таблицей, а вызывается она при каждом открытии выбора
+# модели. Минута — потому что список меняется только правкой настроек pi.
+_models_cache = None
+models_lock = threading.Lock()
 
 
 def log(message):
@@ -311,6 +319,8 @@ def read_session_meta(file):
         "name": "",
         "title": "",
         "messages": 0,
+        "provider": "",
+        "model": "",
     }
     try:
         with file.open("r", encoding="utf-8", errors="replace") as handle:
@@ -329,6 +339,13 @@ def read_session_meta(file):
                     meta["id"] = str(entry.get("id") or meta["id"])
                     meta["cwd"] = str(entry.get("cwd") or "")
                     meta["startedAt"] = entry.get("timestamp")
+                elif kind == "model_change":
+                    # модель, которой считался разговор: в списке сессий по ней видно, какая
+                    # это была сессия — локальная или по API. Первая запись побеждает: она
+                    # пишется при открытии, а дальше модель могла меняться по ходу.
+                    if not meta["model"]:
+                        meta["provider"] = str(entry.get("provider") or "")
+                        meta["model"] = str(entry.get("modelId") or "")
                 elif kind == "session_info":
                     # побеждает последняя такая запись: пустое имя означает «имя снято»
                     name = entry.get("name")
@@ -427,6 +444,204 @@ def allowed_path(path):
     return None
 
 
+def session_file(session):
+    """Файл сессии pi для живого процесса: путь из `get_state`, иначе поиск по идентификатору.
+
+    Искать приходится потому, что у только что открытой сессии файл может появиться позже
+    первого вопроса, а удалять и показывать время старта нужно и до него. Имя файла всегда
+    оканчивается идентификатором сессии (`<время>_<id>.jsonl`), поэтому поиск однозначный.
+    """
+    if session.file_cache:
+        return session.file_cache
+    state_file = session.state.get("sessionFile") if isinstance(session.state, dict) else None
+    if isinstance(state_file, str) and state_file and Path(state_file).exists():
+        session.file_cache = Path(state_file)
+    elif session.id:
+        found = sorted(PI_SESSIONS.glob("*/**%s.jsonl" % session.id))
+        if found:
+            session.file_cache = found[0]
+    if session.file_cache and session.start_meta is None:
+        session.start_meta = read_session_meta(session.file_cache)
+    return session.file_cache
+
+
+def session_mtime(file):
+    """Время последнего изменения файла сессии в ISO — «когда в ней последний раз что-то было»."""
+    if not file:
+        return None
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
+    except OSError:
+        return None
+
+
+def is_local_model(model):
+    """Считает ли модель этот мак, а не удалённый сервер по API.
+
+    Признак по адресу провайдера: у локальной модели это loopback (llama.cpp на 1234), у
+    удалённой — внешний адрес. Нужен экрану, чтобы подписать сессию словами: «локальная» или
+    «по API», и не путать, где именно считаются токены.
+    """
+    if not isinstance(model, dict):
+        return False
+    base = str(model.get("baseUrl") or "")
+    provider = str(model.get("provider") or "")
+    if not base:
+        return provider == "local"
+    try:
+        host = urllib.parse.urlparse(base).hostname or ""
+    except ValueError:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def list_models():
+    """Список моделей, доступных pi на этом маке, для выбора в приложении.
+
+    Источник — сам pi (`pi --list-models`): он знает и локальные провайдеры из `models.json`,
+    и встроенный каталог с ключами из `auth.json` или переменных окружения. Разбирать его
+    файлы вместо этого значило бы гадать, что pi считает доступным. Подписи и признак «есть
+    ключ» добавляются из `models.json`, если провайдер там описан: у встроенных провайдеров
+    ключ живёт не в этом файле.
+
+    Кэш на минуту: список меняется только правкой настроек pi, а вызывается он при каждом
+    открытии выбора модели.
+    """
+    global _models_cache
+    with models_lock:
+        if _models_cache and time.time() - _models_cache[0] < 60:
+            return _models_cache[1]
+
+    rows = []
+    try:
+        out = subprocess.run(
+            [str(CONFIG.get("pi") or "pi"), "--list-models"],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in (out.stdout or "").splitlines()[1:]:
+            parts = re.split(r"\s{2,}", line.strip())
+            if len(parts) < 2:
+                continue
+            rows.append({
+                "provider": parts[0],
+                "id": parts[1],
+                "contextWindow": parse_size(parts[2]) if len(parts) > 2 else None,
+                "maxTokens": parse_size(parts[3]) if len(parts) > 3 else None,
+                "thinking": (parts[4].lower() in ("yes", "да")) if len(parts) > 4 else False,
+            })
+    except (OSError, subprocess.SubprocessError) as e:
+        log("pi --list-models не ответил: %s" % e)
+
+    described = describe_providers()
+    models = []
+    for row in rows:
+        info = described.get(row["provider"], {})
+        by_id = info.get("models", {}).get(row["id"], {})
+        base = by_id.get("baseUrl") or info.get("baseUrl") or ""
+        models.append({
+            **row,
+            "name": by_id.get("name") or row["id"],
+            # точные значения из models.json важнее округлённых из таблицы pi («32.8K»)
+            "contextWindow": by_id.get("contextWindow") or row["contextWindow"],
+            "maxTokens": by_id.get("maxTokens") or row["maxTokens"],
+            "baseUrl": base,
+            "local": is_local_model({"baseUrl": base, "provider": row["provider"]}),
+            # у встроенных провайдеров ключ лежит не в models.json, и pi их уже перечислил —
+            # значит считаем, что он настроен; «нужен ключ» показываем только для своих
+            # провайдеров без apiKey
+            "hasKey": by_id.get("hasKey", info.get("hasKey", True)),
+        })
+
+    if not models:
+        # pi не ответил — отдаём хотя бы то, что описано в models.json, чтобы выбор не пустовал
+        for provider, info in described.items():
+            for model_id, by_id in (info.get("models") or {}).items():
+                models.append({
+                    "provider": provider,
+                    "id": model_id,
+                    "name": by_id.get("name") or model_id,
+                    "contextWindow": by_id.get("contextWindow"),
+                    "maxTokens": by_id.get("maxTokens"),
+                    "thinking": bool(by_id.get("reasoning")),
+                    "baseUrl": by_id.get("baseUrl") or info.get("baseUrl") or "",
+                    "local": is_local_model({"baseUrl": by_id.get("baseUrl") or info.get("baseUrl"), "provider": provider}),
+                    "hasKey": by_id.get("hasKey", info.get("hasKey", True)),
+                })
+
+    with models_lock:
+        _models_cache = (time.time(), models)
+    return models
+
+
+def describe_providers():
+    """Провайдеры и модели из `~/.pi/agent/models.json` — с признаком «ключ задан», без ключей.
+
+    Ключ наружу не отдаётся никогда: приложению нужно только знать, готов ли провайдер, чтобы
+    не предлагать модель, которая всё равно не ответит.
+    """
+    try:
+        data = json.loads(PI_MODELS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    providers = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(providers, dict):
+        return {}
+    result = {}
+    for name, body in providers.items():
+        if not isinstance(body, dict):
+            continue
+        models = {}
+        for model in body.get("models") or []:
+            if not isinstance(model, dict) or not model.get("id"):
+                continue
+            models[str(model["id"])] = {
+                "name": model.get("name"),
+                "baseUrl": model.get("baseUrl") or body.get("baseUrl"),
+                "contextWindow": model.get("contextWindow"),
+                "maxTokens": model.get("maxTokens"),
+                "reasoning": bool(model.get("reasoning")),
+                "hasKey": bool(str(body.get("apiKey") or "").strip()),
+            }
+        result[str(name)] = {
+            "name": body.get("name"),
+            "baseUrl": body.get("baseUrl"),
+            "hasKey": bool(str(body.get("apiKey") or "").strip()),
+            "models": models,
+        }
+    return result
+
+
+def parse_size(raw):
+    """Разбирает «32.8K» из таблицы pi в число токенов; непонятное значение — None."""
+    text = str(raw or "").strip().upper()
+    match = re.match(r"^([0-9.]+)\s*([KMG]?)$", text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    for suffix, factor in (("K", 1_000), ("M", 1_000_000), ("G", 1_000_000_000)):
+        if match.group(2) == suffix:
+            value *= factor
+    return int(value)
+
+
+def purge_session(session_id):
+    """Удаляет файл сессии pi с диска: разговор исчезает совсем, а не только из приложения.
+
+    Ищем по имени файла, а не по папке проекта: сессию можно удалить и когда она не открыта, а
+    идентификатор в имени файла уникален. Возвращаем число удалённых файлов — приложение по нему
+    понимает, было ли что удалять.
+    """
+    removed = 0
+    for file in PI_SESSIONS.glob("*/**%s.jsonl" % session_id):
+        try:
+            file.unlink()
+            removed += 1
+            log("удалил файл сессии %s" % file)
+        except OSError as e:
+            raise PiError("не смог удалить файл сессии %s: %s" % (file, e))
+    return removed
+
+
 class PiError(Exception):
     """Ошибка работы с харнессом: текст пригоден и для лога, и для показа в приложении."""
 
@@ -440,10 +655,17 @@ class PiSession:
     промпта в llama.cpp.
     """
 
-    def __init__(self, cwd, session_id=None):
-        """Поднимает процесс pi в папке [cwd], при необходимости продолжая сессию [session_id]."""
+    def __init__(self, cwd, session_id=None, provider=None, model=None):
+        """Поднимает процесс pi в папке [cwd], при необходимости продолжая сессию [session_id].
+
+        [provider] и [model] — выбор модели для этой сессии. Приложению он нужен, потому что
+        моделей может быть несколько (локальная и удалённая по API), и выбор делается в момент
+        открытия сессии; пустые значения означают «модель по умолчанию из настроек моста».
+        """
         self.cwd = str(cwd)
         self.id = session_id or ""
+        self.provider = provider or ""
+        self.model = model or ""
         self.proc = None
         self.reader = None
         self.lock = threading.Lock()
@@ -452,12 +674,16 @@ class PiSession:
         self.busy = False          # идёт генерация: второй запрос в ту же сессию не пускаем
         self.touched = time.time()  # время последнего обращения (для остановки по простою)
         self.state = {}            # последнее get_state: модель, контекст, число сообщений
+        self.start_meta = None      # заголовок файла сессии (время старта) — читается один раз
+        self.file_cache = None      # путь к файлу сессии: ищем один раз по идентификатору
         self.stderr_tail = []      # хвост stderr pi — попадает в текст ошибки, если процесс умер
         self._start(session_id)
 
     def _start(self, session_id):
         """Собирает команду запуска pi и заводит потоки чтения stdout и stderr."""
         provider, model = default_model()
+        provider = self.provider or provider
+        model = self.model or model
         cmd = [str(CONFIG.get("pi") or "pi"), "--mode", "rpc"]
         if session_id:
             # --session-id продолжает существующую сессию или создаёт её с этим id: так
@@ -620,19 +846,32 @@ class PiSession:
         return normalize_messages(messages if isinstance(messages, list) else [])
 
     def refresh_state(self):
-        """Обновляет снимок состояния: модель, контекст, число сообщений."""
+        """Обновляет снимок состояния: модель, контекст, расход, счётчики.
+
+        Два запроса, а не один, потому что у pi они про разное: `get_state` — что за модель и
+        сколько сообщений, `get_session_stats` — расход токенов и заполнение контекста. Экран
+        показывает и то, и другое, а обновляется снимок только по запросу: сам pi чисел не
+        пушит, и без этого в шапке сессии висели бы значения с момента открытия.
+        """
         try:
             self.state = self.command("get_state")
             stats = self.command("get_session_stats")
         except PiError as e:
             log("не смог обновить состояние сессии %s: %s" % (self.id, e))
             return self.state
-        context = stats.get("contextUsage") if isinstance(stats, dict) else None
-        return {
+        stats = stats if isinstance(stats, dict) else {}
+        context = stats.get("contextUsage")
+        self.state = {
             **self.state,
-            "tokens": (stats or {}).get("tokens"),
+            "tokens": stats.get("tokens") if isinstance(stats.get("tokens"), dict) else None,
             "contextUsage": context if isinstance(context, dict) else None,
+            "cost": stats.get("cost"),
+            "userMessages": stats.get("userMessages"),
+            "assistantMessages": stats.get("assistantMessages"),
+            "toolCalls": stats.get("toolCalls"),
+            "totalMessages": stats.get("totalMessages"),
         }
+        return self.state
 
     def stop(self):
         """Закрывает процесс pi: приложению сессия больше не нужна."""
@@ -665,7 +904,7 @@ class Pool:
         self.reaper = threading.Thread(target=self._reap, daemon=True)
         self.reaper.start()
 
-    def open(self, cwd, session_id=None):
+    def open(self, cwd, session_id=None, provider=None, model=None):
         """Отдаёт сессию в папке [cwd], поднимая процесс, если его ещё нет.
 
         Занятая сессия не переоткрывается: два клиента в одной сессии — это два писателя в
@@ -680,7 +919,7 @@ class Pool:
                 session.touched = time.time()
                 return session
 
-            session = PiSession(cwd, session_id)
+            session = PiSession(cwd, session_id, provider=provider, model=model)
             if not session.id:
                 session.stop()
                 raise PiError("pi не сообщил идентификатор сессии")
@@ -710,6 +949,15 @@ class Pool:
                 {"id": s.id, "cwd": s.cwd, "busy": s.busy, "idle": round(time.time() - s.touched)}
                 for s in self.sessions.values()
             ]
+
+    def take(self, session_id):
+        """Забирает сессию из пула, если она там есть; иначе `None`.
+
+        Нужно закрытию и удалению: сессия может быть уже закрыта (или приложение
+        перезапускалось), и это не ошибка — тогда просто нечего останавливать.
+        """
+        with self.lock:
+            return self.sessions.pop(session_id, None)
 
     def take_all(self):
         """Забирает все сессии из пула и очищает его: нужен при остановке сервиса."""
@@ -819,6 +1067,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, self._health())
             elif path == "/projects":
                 self._json(200, {"projects": list_projects()})
+            elif path == "/models":
+                self._json(200, {"models": list_models()})
             elif path == "/sessions":
                 self._list_sessions(params)
             elif path.startswith("/sessions/"):
@@ -848,8 +1098,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             parts = path.split("/")
             if len(parts) >= 4 and parts[1] == "sessions":
-                session = POOL.find(parts[2])
                 action = parts[3]
+                # закрытие обрабатывается до поиска в пуле: закрыть уже закрытую сессию — не
+                # ошибка, приложение зовёт эту ручку и при уходе с экрана, и явной кнопкой
+                if action == "close":
+                    self._close(parts[2])
+                    return
+                session = POOL.find(parts[2])
                 if action == "prompt":
                     self._prompt(session, body)
                 elif action == "abort":
@@ -869,7 +1124,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not provider or not model:
                         raise PiError("нужны provider и modelId")
                     session.command("set_model", provider=provider, modelId=model)
-                    self._json(200, {"session": session.refresh_state()})
+                    # наружу отдаём описание сессии в том же виде, что и везде: приложение
+                    # показывает им шапку и сведения, и сырое состояние pi тут не подходит
+                    session.refresh_state()
+                    self._json(200, {"session": self._session_brief(session)})
                 elif action == "ui":
                     self._json(200, self._manual_ui(session, body))
                 else:
@@ -880,17 +1138,22 @@ class Handler(BaseHTTPRequestHandler):
         self._guard(run)
 
     def do_DELETE(self):  # noqa: N802
-        """Закрывает сессию: процесс pi гасится, файл истории остаётся на диске."""
+        """Удаляет сессию: процесс pi гасится, файл истории стирается с диска.
+
+        Разрушительно и необратимо, поэтому в приложении это отдельное действие с
+        подтверждением. Закрыть разговор (без потери истории) — ручка `POST /close`.
+        """
         path, _ = self._route()
 
         def run():
             parts = path.split("/")
             if len(parts) == 3 and parts[1] == "sessions":
-                session = POOL.find(parts[2])
-                with POOL.lock:
-                    POOL.sessions.pop(session.id, None)
-                session.stop()
-                self._json(200, {"ok": True})
+                session = POOL.take(parts[2])
+                if session is not None:
+                    session.stop()
+                # файл ищем всегда: удалить разговор можно и у закрытой сессии
+                removed = purge_session(parts[2])
+                self._json(200, {"ok": True, "deleted": removed})
             else:
                 self._json(404, {"error": "неизвестная ручка: %s" % path})
 
@@ -929,36 +1192,78 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"path": str(path), "sessions": meta})
 
     def _open_session(self, body):
-        """Открывает сессию в выбранной папке (или продолжает существующую по id)."""
+        """Открывает сессию в выбранной папке (или продолжает существующую по id).
+
+        Провайдер и модель можно задать здесь же: у pi моделей бывает несколько (локальная и
+        удалённая по API), и для новой сессии выбор делается в момент открытия — потом его
+        меняет ручка `model`, не перезапуская разговор.
+        """
         raw = str(body.get("path") or "").strip()
         path = allowed_path(raw) if raw else None
         if path is None:
             raise PiError("папка вне разрешённых корней: %s" % raw)
         session_id = str(body.get("sessionId") or "").strip() or None
-        session = POOL.open(path, session_id)
+        provider = str(body.get("provider") or "").strip() or None
+        model = str(body.get("model") or "").strip() or None
+        session = POOL.open(path, session_id, provider=provider, model=model)
+        session.refresh_state()
         self._json(200, {"session": self._session_brief(session)})
 
-    def _session_brief(self, session):
-        """Короткое описание сессии для списков и заголовка экрана.
+    def _close(self, session_id):
+        """Закрывает процесс pi, оставляя историю: освобождает память на маке.
 
-        Расход контекста берётся из того же снимка состояния: приложению он нужен, чтобы
-        показать, сколько окна модели уже занято, — и это единственное место, откуда он
-        приходит (у pi он живёт в `get_session_stats`).
+        Отдельно от удаления: закрыть — это «я закончил разговор сейчас», после него сессия
+        открывается снова из своего файла. Повторное закрытие не ошибка (сессия могла быть уже
+        закрыта или приложение перезапускалось), поэтому отсутствие процесса в пуле — не отказ.
+        """
+        session = POOL.take(session_id)
+        if session is not None:
+            session.stop()
+        self._json(200, {"ok": True, "closed": session is not None})
+
+    def _session_brief(self, session):
+        """Описание сессии для экрана: модель, контекст, расход, счётчики и время.
+
+        Всё берётся из одного снимка состояния (`get_state` + `get_session_stats`), который
+        обновляется перед отдачей: приложение показывает этими числами, сколько окна модели
+        занято и не пора ли сжимать разговор, а по времени видно, как долго идёт работа.
+
+        `local` — признак того, что модель считает на этом маке, а не по API: по нему
+        приложение подписывает сессию, чтобы удалённая модель не выглядела как локальная.
         """
         state = session.state if isinstance(session.state, dict) else {}
         model = state.get("model") if isinstance(state.get("model"), dict) else {}
         context = state.get("contextUsage") if isinstance(state.get("contextUsage"), dict) else {}
+        tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else {}
+        file = session_file(session)
+        meta = session.start_meta or {}
         return {
             "id": session.id,
             "path": session.cwd,
             "name": str(state.get("sessionName") or ""),
             "model": str(model.get("id") or ""),
+            "modelName": str(model.get("name") or ""),
             "provider": str(model.get("provider") or ""),
+            "local": is_local_model(model),
             "thinkingLevel": str(state.get("thinkingLevel") or ""),
             "busy": session.busy,
             "messages": int(state.get("messageCount") or 0),
             "contextTokens": context.get("tokens"),
             "contextWindow": context.get("contextWindow") or model.get("contextWindow"),
+            "contextPercent": round(float(context.get("percent") or 0), 1),
+            "tokens": {
+                "input": int(tokens.get("input") or 0),
+                "output": int(tokens.get("output") or 0),
+                "cacheRead": int(tokens.get("cacheRead") or 0),
+                "total": int(tokens.get("total") or 0),
+            },
+            "cost": float(state.get("cost") or 0),
+            "userMessages": int(state.get("userMessages") or 0),
+            "assistantMessages": int(state.get("assistantMessages") or 0),
+            "toolCalls": int(state.get("toolCalls") or 0),
+            "startedAt": meta.get("startedAt"),
+            "updatedAt": session_mtime(file),
+            "sessionFile": str(file) if file else "",
         }
 
     def _settled_brief(self, session):

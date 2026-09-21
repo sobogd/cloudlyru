@@ -74,6 +74,19 @@ class AgentApi {
     return AgentHealth.fromJson(data ?? const {});
   }
 
+  /// Модели, доступные харнессу на маке: локальная и, если настроены, удалённые по API.
+  ///
+  /// Ключей от API в ответе нет — они остаются на маке; приходит только признак «ключ задан».
+  Future<List<AgentModel>> models() async {
+    final data = await _send<Map<String, dynamic>>(() => _http.get('/projects/models'));
+    final raw = data?['models'];
+    return <AgentModel>[
+      if (raw is List)
+        for (final m in raw)
+          if (m is Map) AgentModel.fromJson(m.cast<String, dynamic>()),
+    ];
+  }
+
   /// Проекты: папки внутри разрешённых корней, в которых можно работать.
   Future<List<AgentProject>> projects() async {
     final data = await _send<Map<String, dynamic>>(() => _http.get('/projects'));
@@ -100,14 +113,45 @@ class AgentApi {
 
   /// Открывает сессию в папке проекта: сервер просит мост поднять процесс pi в этой папке
   /// (или продолжить сессию [sessionId], если она уже есть в истории).
-  Future<AgentSessionInfo> openSession(String path, {String? sessionId}) async {
+  ///
+  /// [modelKey] задаёт модель для новой сессии в виде `провайдер/идентификатор`: у pi моделей
+  /// может быть несколько (локальная и удалённая по API), и выбрать её можно до начала разговора.
+  Future<AgentSessionInfo> openSession(String path, {String? sessionId, String? modelKey}) async {
+    final split = _splitModel(modelKey);
     final data = await _send<Map<String, dynamic>>(
       () => _http.post('/projects/sessions', data: <String, dynamic>{
         'path': path,
         if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+        if (split != null) 'provider': split.$1,
+        if (split != null) 'model': split.$2,
       }),
     );
     return _sessionOf(data);
+  }
+
+  /// Смена модели у открытой сессии: разговор продолжается, меняется только тот, кто считает.
+  Future<AgentSessionInfo> setModel(String id, String modelKey) async {
+    final split = _splitModel(modelKey);
+    if (split == null) throw const AgentApiException(0, 'модель не выбрана');
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post('/projects/sessions/$id/model', data: <String, dynamic>{
+        'provider': split.$1,
+        'modelId': split.$2,
+      }),
+    );
+    return _sessionOf(data);
+  }
+
+  /// Разбирает `провайдер/идентификатор` в пару; `null` — строка пустая или без провайдера.
+  ///
+  /// Делим по первому слэшу: у моделей llama.cpp идентификатор сам содержит слэш
+  /// (`qwen/qwen3.5-9b`), поэтому «последний слэш» здесь был бы ошибкой.
+  (String, String)? _splitModel(String? key) {
+    final text = (key ?? '').trim();
+    if (text.isEmpty) return null;
+    final cut = text.indexOf('/');
+    if (cut <= 0 || cut == text.length - 1) return null;
+    return (text.substring(0, cut), text.substring(cut + 1));
   }
 
   /// Состояние сессии: модель, занятость, расход контекста.
@@ -189,12 +233,23 @@ class AgentApi {
     return data?['summary']?.toString() ?? '';
   }
 
-  /// Закрывает процесс pi на маке (файл истории остаётся: разговор можно продолжить позже).
+  /// Закрывает процесс pi на маке, оставляя историю: освобождает память под контекст модели.
   ///
-  /// Нужно, когда человек уходит из раздела: живой процесс держит контекст модели в памяти
-  /// мака, а она там дороже пары секунд на следующий запуск.
+  /// Нужно, когда человек уходит из раздела, а также по явной кнопке: живой процесс держит
+  /// контекст модели в памяти мака, и продолжение разговора потом поднимает его заново из файла.
   Future<void> closeSession(String id) async {
-    await _send<Map<String, dynamic>>(() => _http.delete('/projects/sessions/$id'));
+    await _send<Map<String, dynamic>>(() => _http.post('/projects/sessions/$id/close'));
+  }
+
+  /// Удаляет сессию на маке: процесс гасится, файл истории стирается.
+  ///
+  /// Необратимо — в приложении это отдельное действие с подтверждением, а не то же самое, что
+  /// «закрыть».
+  Future<int> deleteSession(String id) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.delete('/projects/sessions/$id'),
+    );
+    return data?['deleted'] is num ? (data!['deleted'] as num).toInt() : 0;
   }
 
   /// Описание сессии из ответа сервера (`{"session": {...}}`).

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
@@ -12,7 +13,8 @@ import 'agent_types.dart';
 ///
 /// Сессии — это файлы pi (`~/.pi/agent/sessions/--<путь>--/`), поэтому список показывает то
 /// же, что человек увидит в терминале командой `pi -r`: разговор, начатый здесь, продолжается
-/// на маке, и наоборот.
+/// на маке, и наоборот. Здесь же сессию можно закрыть (освободить память мака, историю
+/// сохранив) или удалить совсем.
 class AgentSessionsScreen extends ConsumerStatefulWidget {
   /// Проект, чьи сессии открываются.
   final AgentProject project;
@@ -40,10 +42,12 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
 
   /// Открывает сессию (новую или существующую) и переходит в переписку.
   ///
-  /// Открытие — это запуск процесса pi на маке: он занимает секунду-две, поэтому кнопка
-  /// на это время гаснет, а отказ моста показывается на экране, а не молчанием.
+  /// Открытие — это запуск процесса pi на маке: он занимает секунду-две, поэтому кнопка на это
+  /// время гаснет, а отказ показывается на экране, а не молчанием. У новой сессии модель берётся
+  /// из выбранной ранее (`ui.agentModel`), у существующей — та, что записана в её файле.
   Future<void> _open({String? sessionId}) async {
-    final session = await _sessions.open(widget.project, sessionId: sessionId);
+    final modelKey = ref.read(settingsProvider).ui.agentModel;
+    final session = await _sessions.open(widget.project, sessionId: sessionId, modelKey: modelKey);
     if (session == null || !mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -52,6 +56,34 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
     );
     if (mounted) await _sessions.load(widget.project);
   }
+
+  /// Удаляет сессию на маке вместе с историей.
+  ///
+  /// Спрашиваем подтверждение: файл стирается с диска, и вернуть разговор нечем. Отдельно от
+  /// «закрыть» — там история остаётся и сессию можно открыть снова.
+  Future<void> _delete(AgentSession session) async {
+    final ok = await confirmDialog(
+      context,
+      'Удалить сессию',
+      'Разговор «${_title(session)}» будет удалён на маке вместе с историей '
+          '(${session.messages} сообщ.). Восстановить его нечем.',
+      danger: true,
+      confirmLabel: 'Удалить',
+    );
+    if (!ok || !mounted) return;
+    await _sessions.remove(session.id);
+    if (mounted) snack(context, 'Сессия удалена');
+  }
+
+  /// Закрывает процесс сессии на маке: история остаётся, память под контекст освобождается.
+  Future<void> _close(AgentSession session) async {
+    await _sessions.close(session.id);
+    if (mounted) snack(context, 'Сессия закрыта на маке (история сохранена)');
+  }
+
+  /// Подпись сессии для списка и вопросов: имя, а если его нет — начало идентификатора.
+  String _title(AgentSession session) =>
+      session.name.isEmpty ? 'Сессия ${session.id.substring(0, 8)}' : session.name;
 
   @override
   Widget build(BuildContext context) {
@@ -129,24 +161,35 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
     );
   }
 
-  /// Строка списка: имя сессии, число сообщений и время последнего обращения.
+  /// Строка списка: имя сессии, модель, число сообщений и время последнего обращения.
   Widget _sessionTile(AgentSession session) {
     return ListTile(
       leading: const Icon(Icons.terminal, color: C.fg2),
       title: Text(
-        session.name.isEmpty ? 'Сессия ${session.id.substring(0, 8)}' : session.name,
+        _title(session),
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(color: C.fg, fontSize: 15),
       ),
       subtitle: Text(
         [
+          if (session.modelLabel.isNotEmpty) session.modelLabel,
           '${session.messages} сообщ.',
           if (session.updatedAt != null) listDate(session.updatedAt!, DateTime.now()),
         ].join(' · '),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
         style: const TextStyle(color: C.fg3, fontSize: 12),
       ),
       onTap: () => _open(sessionId: session.id),
+      trailing: PopupMenuButton<String>(
+        tooltip: 'Действия',
+        onSelected: (v) => v == 'close' ? _close(session) : _delete(session),
+        itemBuilder: (context) => const [
+          PopupMenuItem(value: 'close', child: Text('Закрыть на маке')),
+          PopupMenuItem(value: 'delete', child: Text('Удалить сессию')),
+        ],
+      ),
     );
   }
 

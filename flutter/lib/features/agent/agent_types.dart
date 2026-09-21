@@ -52,6 +52,13 @@ class AgentSession {
   /// Сколько сообщений в сессии.
   final int messages;
 
+  /// Модель, которой считался разговор (`провайдер` и идентификатор из первой записи сессии).
+  ///
+  /// Нужна списку: по ней видно, где считалась сессия — на маке или по API, — и это не
+  /// приходится выяснять, открыв разговор.
+  final String provider;
+  final String model;
+
   /// Когда сессия начата и когда в ней последний раз что-то происходило.
   final DateTime? startedAt;
   final DateTime? updatedAt;
@@ -61,6 +68,8 @@ class AgentSession {
     required this.id,
     this.name = '',
     this.messages = 0,
+    this.provider = '',
+    this.model = '',
     this.startedAt,
     this.updatedAt,
   });
@@ -70,12 +79,21 @@ class AgentSession {
         id: json['id']?.toString() ?? '',
         name: json['name']?.toString() ?? '',
         messages: json['messages'] is num ? (json['messages'] as num).toInt() : 0,
+        provider: json['provider']?.toString() ?? '',
+        model: json['model']?.toString() ?? '',
         startedAt: DateTime.tryParse(json['startedAt']?.toString() ?? ''),
         updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
       );
+
+  /// Подпись модели для строки списка: `провайдер/идентификатор` или пустая строка.
+  String get modelLabel => model.isEmpty ? '' : '$provider/$model';
 }
 
 /// Открытая сессия: то, что мост шлёт в ответ на открытие и в конце каждого ответа.
+///
+/// Кроме модели и занятости несёт статистику разговора: сколько занято окно модели, сколько
+/// токенов израсходовано и сколько в сессии сообщений и вызовов инструментов. Это нужно экрану
+/// сессии — по этим числам видно, когда пора сжимать контекст, и как долго идёт работа.
 class AgentSessionInfo {
   /// Идентификатор сессии.
   final String id;
@@ -90,15 +108,49 @@ class AgentSessionInfo {
   final String model;
   final String provider;
 
+  /// Человеческое название модели («Qwen3.5-9B Q6_K (локально, llama.cpp)»), если pi его дал.
+  final String modelName;
+
+  /// Модель считает на домашнем маке, а не по API — по этому признаку сессия подписывается
+  /// словами, чтобы удалённая модель не выглядела как локальная.
+  final bool local;
+
   /// Сколько сообщений в сессии.
   final int messages;
 
   /// Занята ли сессия: идёт генерация.
   final bool busy;
 
+  /// Уровень «размышлений» у pi (`off`, `medium`, …): у локальной модели выключен, у
+  /// reasoning-моделей по API включается на маке.
+  final String thinkingLevel;
+
   /// Сколько токенов контекста занято и каково окно модели.
   final int? contextTokens;
   final int? contextWindow;
+
+  /// Заполнение окна в процентах — то же число, что показывает pi.
+  final double contextPercent;
+
+  /// Расход токенов за всю сессию (по данным провайдера) и стоимость, если провайдер её считает.
+  final int tokensInput;
+  final int tokensOutput;
+  final int tokensCacheRead;
+  final int tokensTotal;
+  final double cost;
+
+  /// Счётчики разговора: вопросов, ответов и вызовов инструментов.
+  final int userMessages;
+  final int assistantMessages;
+  final int toolCalls;
+
+  /// Когда сессия начата и когда в ней последний раз что-то происходило.
+  final DateTime? startedAt;
+  final DateTime? updatedAt;
+
+  /// Файл сессии на маке: путь показывается в сведениях, чтобы разговор можно было найти
+  /// в терминале (`pi -r`) или удалить руками.
+  final String sessionFile;
 
   /// Сессия из ответа моста.
   const AgentSessionInfo({
@@ -107,26 +159,132 @@ class AgentSessionInfo {
     this.name = '',
     this.model = '',
     this.provider = '',
+    this.modelName = '',
+    this.local = false,
     this.messages = 0,
     this.busy = false,
+    this.thinkingLevel = '',
     this.contextTokens,
     this.contextWindow,
+    this.contextPercent = 0,
+    this.tokensInput = 0,
+    this.tokensOutput = 0,
+    this.tokensCacheRead = 0,
+    this.tokensTotal = 0,
+    this.cost = 0,
+    this.userMessages = 0,
+    this.assistantMessages = 0,
+    this.toolCalls = 0,
+    this.startedAt,
+    this.updatedAt,
+    this.sessionFile = '',
   });
 
   /// Разбор сессии из ответа моста.
-  factory AgentSessionInfo.fromJson(Map<String, dynamic> json) => AgentSessionInfo(
-        id: json['id']?.toString() ?? '',
-        path: json['path']?.toString() ?? '',
-        name: json['name']?.toString() ?? '',
-        model: json['model']?.toString() ?? '',
+  factory AgentSessionInfo.fromJson(Map<String, dynamic> json) {
+    final tokens = json['tokens'] is Map ? (json['tokens'] as Map).cast<String, dynamic>() : const {};
+    int? num_(Object? v) => v is num ? v.toInt() : null;
+    return AgentSessionInfo(
+      id: json['id']?.toString() ?? '',
+      path: json['path']?.toString() ?? '',
+      name: json['name']?.toString() ?? '',
+      model: json['model']?.toString() ?? '',
+      provider: json['provider']?.toString() ?? '',
+      modelName: json['modelName']?.toString() ?? '',
+      local: json['local'] == true,
+      messages: num_(json['messages']) ?? 0,
+      busy: json['busy'] == true,
+      thinkingLevel: json['thinkingLevel']?.toString() ?? '',
+      contextTokens: num_(json['contextTokens']),
+      contextWindow: num_(json['contextWindow']),
+      contextPercent: json['contextPercent'] is num ? (json['contextPercent'] as num).toDouble() : 0,
+      tokensInput: num_(tokens['input']) ?? 0,
+      tokensOutput: num_(tokens['output']) ?? 0,
+      tokensCacheRead: num_(tokens['cacheRead']) ?? 0,
+      tokensTotal: num_(tokens['total']) ?? 0,
+      cost: json['cost'] is num ? (json['cost'] as num).toDouble() : 0,
+      userMessages: num_(json['userMessages']) ?? 0,
+      assistantMessages: num_(json['assistantMessages']) ?? 0,
+      toolCalls: num_(json['toolCalls']) ?? 0,
+      startedAt: DateTime.tryParse(json['startedAt']?.toString() ?? ''),
+      updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
+      sessionFile: json['sessionFile']?.toString() ?? '',
+    );
+  }
+
+  /// Сколько токенов окна ещё свободно; `null`, если pi пока не посчитал заполнение.
+  ///
+  /// Нужно экрану прямо: «осталось 5 021» понятнее, чем «84%», когда думаешь, влезет ли в
+  /// контекст ещё одна большая команда.
+  int? get contextFree {
+    final used = contextTokens;
+    final window = contextWindow;
+    if (used == null || window == null) return null;
+    return (window - used).clamp(0, window);
+  }
+
+  /// Подпись модели для шапки и сведений: название из pi, иначе идентификатор.
+  String get modelLabel => modelName.isNotEmpty ? modelName : model;
+
+  /// Где считает модель — словами для экрана.
+  String get whereLabel => local ? 'локальная (на маке)' : 'по API (удалённая)';
+}
+
+/// Модель, доступная харнессу на маке: локальная llama.cpp или удалённая по API.
+///
+/// Список приходит от pi, поэтому в нём ровно то, что он действительно может запустить.
+/// Ключей от API здесь нет: они остаются на маке, приложению приходит только признак «ключ
+/// задан», чтобы не предлагать модель, которая всё равно не ответит.
+class AgentModel {
+  /// Провайдер (`local`, `openai`, `deepseek`, …) и идентификатор модели.
+  final String provider;
+  final String id;
+
+  /// Человеческое название.
+  final String name;
+
+  /// Окно контекста и потолок ответа в токенах, если pi их знает.
+  final int? contextWindow;
+  final int? maxTokens;
+
+  /// Модель умеет «размышления».
+  final bool thinking;
+
+  /// Модель считает на этом маке, а не по API.
+  final bool local;
+
+  /// У провайдера задан ключ (или он не нужен, как у локальной модели).
+  final bool hasKey;
+
+  /// Модель из списка pi.
+  const AgentModel({
+    required this.provider,
+    required this.id,
+    this.name = '',
+    this.contextWindow,
+    this.maxTokens,
+    this.thinking = false,
+    this.local = false,
+    this.hasKey = true,
+  });
+
+  /// Разбор модели из ответа моста.
+  factory AgentModel.fromJson(Map<String, dynamic> json) => AgentModel(
         provider: json['provider']?.toString() ?? '',
-        messages: json['messages'] is num ? (json['messages'] as num).toInt() : 0,
-        busy: json['busy'] == true,
-        contextTokens:
-            json['contextTokens'] is num ? (json['contextTokens'] as num).toInt() : null,
-        contextWindow:
-            json['contextWindow'] is num ? (json['contextWindow'] as num).toInt() : null,
+        id: json['id']?.toString() ?? '',
+        name: json['name']?.toString() ?? '',
+        contextWindow: json['contextWindow'] is num ? (json['contextWindow'] as num).toInt() : null,
+        maxTokens: json['maxTokens'] is num ? (json['maxTokens'] as num).toInt() : null,
+        thinking: json['thinking'] == true,
+        local: json['local'] == true,
+        hasKey: json['hasKey'] != false,
       );
+
+  /// Строка для хранения выбора в настройках и для сравнения с текущей моделью сессии.
+  String get key => '$provider/$id';
+
+  /// Подпись строки списка: имя модели, а если его нет — идентификатор.
+  String get label => name.isNotEmpty ? name : id;
 }
 
 /// Вызов инструмента агентом: что попросил, с чем и что получил.
