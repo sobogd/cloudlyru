@@ -490,111 +490,134 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   }
 
   /// Одно сообщение переписки.
+  ///
+  /// Все виды — текст, «размышления», карточка команды и прямая команда оболочки — рисуются
+  /// одинаково: тот же пузырь, тот же кегль текста. Служебное содержимое отличается только
+  /// приглушёнными цветами ([muted]): оно поясняет работу агента, а не является ответом.
   Widget _entry(_Entry entry) => switch (entry.kind) {
     _EntryKind.note => _note(entry.text),
-    _EntryKind.bash => Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+    _EntryKind.bash => _message(
+      muted: true,
+      copyText: entry.copyText,
       child: _BashCard(command: entry.command, output: entry.text),
     ),
-    _EntryKind.tool => _toolCard(entry.tool!),
-    _EntryKind.reasoning => _bubbleShell(
-      isUser: false,
-      child: _withCopy(
-        text: entry.text,
-        child: _ReasoningBlock(text: entry.text),
-      ),
+    _EntryKind.tool => _message(
+      muted: true,
+      danger: entry.tool!.isError,
+      copyText: entry.copyText,
+      child: _ToolCard(tool: entry.tool!),
     ),
-    _EntryKind.user || _EntryKind.text || _EntryKind.waiting => _bubble(entry),
+    _EntryKind.reasoning => _message(
+      muted: true,
+      copyText: entry.copyText,
+      child: _ReasoningBlock(text: entry.text),
+    ),
+    _EntryKind.user || _EntryKind.text || _EntryKind.waiting => _message(
+      isUser: entry.kind == _EntryKind.user,
+      copyText: entry.copyText,
+      child: _bubbleContent(entry),
+    ),
   };
 
-  /// Пузырь с текстом сообщения: вопрос человека или кусок ответа агента.
-  ///
-  /// Кнопка «скопировать» стоит в правом нижнем углу — она не добавляет пузырю высоту и не
-  /// растягивает его: место под неё зарезервировано только у текста (см. [_withCopy]).
-  Widget _bubble(_Entry entry) {
+  /// Содержимое текстового сообщения: сам текст, ожидание ответа и ошибка прогона.
+  Widget _bubbleContent(_Entry entry) {
     final isUser = entry.kind == _EntryKind.user;
-    return _bubbleShell(
-      isUser: isUser,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (entry.text.isNotEmpty)
-            _withCopy(
-              text: entry.copyText,
-              child: isUser
-                  ? SelectableText(
-                      entry.text,
-                      style: const TextStyle(
-                        color: C.fg,
-                        fontSize: 14,
-                        height: 1.35,
-                      ),
-                    )
-                  : MarkdownText(entry.text),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (entry.text.isNotEmpty)
+          isUser
+              ? SelectableText(
+                  entry.text,
+                  style: const TextStyle(
+                    color: C.fg,
+                    fontSize: _textSize,
+                    height: 1.35,
+                  ),
+                )
+              : MarkdownText(entry.text),
+        // ответ заказан, но ещё ничего не пришло — видно, что работа идёт
+        if (entry.kind == _EntryKind.waiting)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 2),
+            child: SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(strokeWidth: 2),
             ),
-          if (entry.kind == _EntryKind.waiting)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 2),
-              child: SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        // Ошибка прогона — часть того сообщения, на котором разговор оборвался: так видно,
+        // на каком шаге это случилось (например, «Request was aborted» после «Стоп»).
+        if (entry.error.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              entry.error,
+              style: const TextStyle(
+                color: C.warn,
+                fontSize: _textSize,
+                height: 1.35,
               ),
             ),
-          if (entry.error.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Text(
-                entry.error,
-                style: const TextStyle(
-                  color: C.warn,
-                  fontSize: 12.5,
-                  height: 1.3,
-                ),
-              ),
-            ),
-        ],
-      ),
+          ),
+      ],
     );
   }
 
-  /// Предельная ширина пузыря: почти вся панель, в которой открыт разговор.
+  /// Предельная ширина пузыря: доля панели, в которой открыт разговор.
   ///
   /// Считается от ширины панели, а не окна ([widget.paneWidth]): в двухпанельном виде пузырь
-  /// во всю ширину окна вылез бы за край правой панели и уехал под неё.
+  /// во всю ширину окна вылез бы за край правой панели и уехал под неё. Меньше 0.8 — чтобы
+  /// сообщения оставались полосами переписки, а не страницами текста во всю ширину.
   double _bubbleMax(BuildContext context) =>
-      (widget.paneWidth ?? MediaQuery.sizeOf(context).width) * 0.92;
+      (widget.paneWidth ?? MediaQuery.sizeOf(context).width) * 0.8;
 
-  /// Содержимое сообщения с кнопкой «скопировать» в правом нижнем углу.
+  /// Одно сообщение переписки: пузырь и кнопка «скопировать» рядом с ним.
   ///
-  /// Место под кнопку резервируется отступом текста, а не `Row` с `Expanded`: растянутый
-  /// ребёнок заставил бы пузырь занимать всю ширину панели, и короткий ответ выглядел бы
-  /// полосой. Кнопка лежит поверх зарезервированной полосы, поэтому высоту не меняет.
-  Widget _withCopy({required String text, required Widget child}) => Stack(
-    children: [
-      Padding(padding: const EdgeInsets.only(right: 34), child: child),
-      Positioned(right: 0, bottom: 0, child: _CopyButton(text: text)),
-    ],
-  );
-
-  /// Оболочка сообщения: пузырь с рамкой и предельной шириной.
-  ///
-  /// Ширину ограничиваем: пузырь во всю ширину на длинном ответе теряет границу между
-  /// вопросом и ответом.
-  Widget _bubbleShell({required bool isUser, required Widget child}) => Align(
-    alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-    child: Container(
-      constraints: BoxConstraints(maxWidth: _bubbleMax(context)),
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: isUser ? C.accentSoft : C.surface,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: isUser ? C.accent : C.brd),
+  /// Кнопка стоит вне пузыря — внутри она отнимала бы место у текста и читалась бы как часть
+  /// содержимого. Чтобы пара поместилась в отведённую ширину, предел пузыря уменьшается на
+  /// ширину кнопки. У сообщения без текста (например, ожидания ответа) кнопки нет: копировать
+  /// нечего.
+  Widget _message({
+    required String copyText,
+    required Widget child,
+    bool isUser = false,
+    bool muted = false,
+    bool danger = false,
+  }) {
+    final bubble = ConstrainedBox(
+      constraints: BoxConstraints(
+        maxWidth: _bubbleMax(context) - _copyButtonWidth,
       ),
-      child: child,
-    ),
-  );
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          // служебное сообщение приглушено другим фоном, а не оттенком текста: так его видно
+          // боковым зрением, и оно не спорит с ответом агента
+          color: muted ? C.surface2 : (isUser ? C.accentSoft : C.surface),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: isUser ? C.accent : (danger ? C.danger : C.brd),
+          ),
+        ),
+        child: child,
+      ),
+    );
+    final button = copyText.trim().isEmpty
+        ? null
+        : _CopyButton(text: copyText);
+    return Align(
+      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: isUser
+            ? [?button, bubble]
+            : [bubble, ?button],
+      ),
+    );
+  }
 
   /// Служебная строка: автоответ на подтверждение, которого человек не давал.
   ///
@@ -615,16 +638,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         ),
       ],
     ),
-  );
-
-  /// Карточка вызова инструмента: что агент сделал, с чем и что получил.
-  ///
-  /// Это главное отличие агентского раздела от чата: здесь видно не только ответ, но и
-  /// действия — команду, правку файла, поиск по коду. Свёрнута по умолчанию: вывод бывает
-  /// на сотни строк, а нужен редко.
-  Widget _toolCard(AgentTool tool) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 4),
-    child: _ToolCard(tool: tool),
   );
 
   /// Ошибка над полем ввода: пока человек не повторит запрос, ответа нет, и причина должна
@@ -947,100 +960,89 @@ class _ToolCardState extends State<_ToolCard> {
   Widget build(BuildContext context) {
     final tool = widget.tool;
     final summary = tool.summary;
-    // копируем и подпись вызова, и вывод: строка карточки без вывода смысла не имеет
-    final copyText = [summary, tool.output]
-        .where((s) => s.trim().isNotEmpty)
-        .join('\n');
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(8, 6, 6, 6),
-      decoration: BoxDecoration(
-        color: C.surface2,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: tool.isError ? C.danger : C.brd),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: tool.output.isEmpty
+              ? null
+              : () => setState(() => _open = !_open),
+          child: Row(
+            // минимум по содержимому: короткая команда — узкий пузырь, а длина строки вывода
+            // задаётся пределом ширины пузыря, на котором текст переносится
+            mainAxisSize: MainAxisSize.min,
             children: [
-              // кнопка копирования стоит рядом с карточкой, а не внутри нажатия: иначе тап по
-              // ней заодно разворачивал бы вывод
-              Expanded(
-                child: InkWell(
-                  onTap: tool.output.isEmpty
-                      ? null
-                      : () => setState(() => _open = !_open),
-                  child: Row(
-                    children: [
-                      Icon(_icon, size: 15, color: C.fg3),
-                      const SizedBox(width: 6),
-                      Text(
-                        tool.name,
-                        style: const TextStyle(
-                          color: C.fg2,
-                          fontSize: 12.5,
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                      if (summary.isNotEmpty) ...[
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            summary,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: C.fg3,
-                              fontSize: 12,
-                              fontFamily: 'monospace',
-                            ),
-                          ),
-                        ),
-                      ] else
-                        const Spacer(),
-                      if (tool.running)
-                        const SizedBox(
-                          width: 12,
-                          height: 12,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      else if (tool.isError)
-                        const Icon(
-                          Icons.error_outline,
-                          size: 15,
-                          color: C.danger,
-                        )
-                      else
-                        const Icon(Icons.check, size: 15, color: C.ok),
-                      if (tool.output.isNotEmpty)
-                        Icon(
-                          _open ? Icons.expand_less : Icons.expand_more,
-                          size: 16,
-                          color: C.fg3,
-                        ),
-                    ],
+              Icon(_icon, size: 16, color: C.fg3),
+              const SizedBox(width: 6),
+              Text(
+                tool.name,
+                style: const TextStyle(
+                  color: C.fg2,
+                  fontSize: _textSize,
+                  fontFamily: 'monospace',
+                ),
+              ),
+              if (summary.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    summary,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: C.fg3,
+                      fontSize: _textSize,
+                      fontFamily: 'monospace',
+                    ),
                   ),
                 ),
-              ),
-              _CopyButton(text: copyText),
+              ] else
+                const Spacer(),
+              if (tool.running)
+                const Padding(
+                  padding: EdgeInsets.only(left: 8),
+                  child: SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                )
+              else if (tool.isError)
+                const Padding(
+                  padding: EdgeInsets.only(left: 8),
+                  child: Icon(Icons.error_outline, size: 16, color: C.danger),
+                )
+              else
+                const Padding(
+                  padding: EdgeInsets.only(left: 8),
+                  child: Icon(Icons.check, size: 16, color: C.ok),
+                ),
+              if (tool.output.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(left: 4),
+                  child: Icon(
+                    _open ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: C.fg3,
+                  ),
+                ),
             ],
           ),
-          if (_open && tool.output.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 6, right: 4),
-              child: SelectableText(
-                tool.output,
-                style: const TextStyle(
-                  color: C.fg3,
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  height: 1.3,
-                ),
+        ),
+        if (_open && tool.output.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: SelectableText(
+              tool.output,
+              style: const TextStyle(
+                color: C.fg3,
+                fontSize: _textSize,
+                fontFamily: 'monospace',
+                height: 1.35,
               ),
             ),
-        ],
-      ),
+          ),
+      ],
     );
   }
 }
@@ -1114,6 +1116,16 @@ Future<void> copyMessage(BuildContext context, String text) async {
   if (context.mounted) snack(context, 'Скопировано');
 }
 
+/// Кегль текста сообщений: один и тот же у ответа, команды и «размышлений».
+///
+/// Совпадает с `fontSize` обычного абзаца разметки (`markdownStyle`): ответ модели приходит
+/// разметкой, и другой кегль у остальных сообщений выглядел бы вставкой из другого приложения.
+const _textSize = 14.0;
+
+/// Ширина кнопки «скопировать» вместе с её полями: на неё уменьшается предел ширины пузыря,
+/// потому что кнопка стоит вне пузыря и пара должна целиком влезать в отведённое место.
+const _copyButtonWidth = 34.0;
+
 /// Кнопка «скопировать сообщение» — одна и та же у пузырей и у карточек команд.
 ///
 /// Нужна, чтобы копировать целиком, не выделяя текст пальцем: выделение на телефоне попадает
@@ -1130,10 +1142,10 @@ class _CopyButton extends StatelessWidget {
     tooltip: 'Скопировать сообщение',
     // копировать пустое нечего: у ещё не начатого ответа и служебных строк кнопки и нет
     onPressed: text.trim().isEmpty ? null : () => copyMessage(context, text),
-    icon: const Icon(Icons.content_copy, size: 15, color: C.fg3),
+    icon: const Icon(Icons.content_copy, size: 16, color: C.fg3),
     visualDensity: VisualDensity.compact,
     padding: EdgeInsets.zero,
-    constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
   );
 }
 
@@ -1163,70 +1175,51 @@ class _BashCardState extends State<_BashCard> {
   @override
   Widget build(BuildContext context) {
     final hasOutput = widget.output.trim().isNotEmpty;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(10, 6, 6, 6),
-      decoration: BoxDecoration(
-        color: C.surface2,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: C.brd),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          // сворачивать нечего, если команда ничего не напечатала
+          onTap: hasOutput ? () => setState(() => _open = !_open) : null,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Expanded(
-                child: InkWell(
-                  // сворачивать нечего, если команда ничего не напечатала
-                  onTap: hasOutput
-                      ? () => setState(() => _open = !_open)
-                      : null,
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: SelectableText(
-                          '\$ ${widget.command}',
-                          style: const TextStyle(
-                            color: C.fg2,
-                            fontSize: 12.5,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ),
-                      if (hasOutput)
-                        Icon(
-                          _open ? Icons.expand_less : Icons.expand_more,
-                          size: 16,
-                          color: C.fg3,
-                        ),
-                    ],
+              Flexible(
+                child: SelectableText(
+                  '\$ ${widget.command}',
+                  style: const TextStyle(
+                    color: C.fg2,
+                    fontSize: _textSize,
+                    fontFamily: 'monospace',
                   ),
                 ),
               ),
-              // копируем команду вместе с выводом: отдельно друг от друга они бесполезны
-              _CopyButton(
-                text: ['\$ ${widget.command}', widget.output]
-                    .where((s) => s.trim().isNotEmpty)
-                    .join('\n'),
-              ),
+              if (hasOutput)
+                Padding(
+                  padding: const EdgeInsets.only(left: 4),
+                  child: Icon(
+                    _open ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: C.fg3,
+                  ),
+                ),
             ],
           ),
-          if (_open)
-            Padding(
-              padding: const EdgeInsets.only(top: 6, right: 4),
-              child: SelectableText(
-                widget.output,
-                style: const TextStyle(
-                  color: C.fg3,
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  height: 1.3,
-                ),
+        ),
+        if (_open)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: SelectableText(
+              widget.output,
+              style: const TextStyle(
+                color: C.fg3,
+                fontSize: _textSize,
+                fontFamily: 'monospace',
+                height: 1.35,
               ),
             ),
-        ],
-      ),
+          ),
+      ],
     );
   }
 }
@@ -1259,6 +1252,7 @@ class _ReasoningBlockState extends State<_ReasoningBlock> {
         InkWell(
           onTap: () => setState(() => _open = !_open),
           child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
                 _open ? Icons.expand_less : Icons.expand_more,
@@ -1270,7 +1264,7 @@ class _ReasoningBlockState extends State<_ReasoningBlock> {
                 _open
                     ? 'Размышления'
                     : 'Размышления (${widget.text.length} симв.)',
-                style: const TextStyle(color: C.fg3, fontSize: 12),
+                style: const TextStyle(color: C.fg3, fontSize: _textSize),
               ),
             ],
           ),
@@ -1281,8 +1275,8 @@ class _ReasoningBlockState extends State<_ReasoningBlock> {
             child: SelectableText(
               widget.text,
               style: const TextStyle(
-                color: C.fg3,
-                fontSize: 12.5,
+                color: C.fg2,
+                fontSize: _textSize,
                 height: 1.35,
               ),
             ),
