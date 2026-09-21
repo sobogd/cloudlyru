@@ -757,32 +757,56 @@ def read_session_meta(file):
 
 
 def list_projects():
-    """Проекты: корни из allowlist плюс папки с `.git` внутри них.
+    """Проекты: папки, в которых есть чем работать, — плюс найденные по историям агентов.
 
-    Выбор проекта — это выбор рабочей папки, поэтому список строится из файловой системы,
-    а не из базы: у pi уже есть сессии по каждой папке, и «проект со шляпкой истории»
-    виден по наличию папки сессий. Папки без `.git` и без сессий в список не попадают:
-    иначе он превратился бы в браузер файловой системы.
+    «Проект» здесь — это рабочая папка агента, поэтому признаков три: свой `.git`, история pi
+    или история Claude Code. Последний появился вместе со вторым харнессом, и без него из
+    списка пропадали папки, где работали только им: например контейнер с репозиториями, у
+    которого своего `.git` нет (`~/work/tangem` — 246 разговоров Claude Code и ни одного pi).
+
+    Кроме обхода корней на заданную глубину список дополняется папками из самих историй: у каждой
+    сессии записан её рабочий каталог, и по нему проект находится на любой глубине — там, где
+    обход по `depth` до него не дошёл бы.
     """
     depth = int(CONFIG.get("depth") or 2)
     roots = [Path(str(r)).expanduser() for r in (CONFIG.get("roots") or [])]
     seen = set()
     projects = []
 
+    def inside_roots(path):
+        """Лежит ли папка внутри разрешённого корня (иначе её показывать нельзя)."""
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return None
+        for root in roots:
+            try:
+                base = root.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if resolved == base or base in resolved.parents:
+                return resolved
+        return None
+
     def add(path):
-        """Добавляет папку в список, если она ещё не добавлена и существует."""
-        key = str(path)
-        if key in seen or not path.is_dir():
+        """Добавляет папку в список, если она ещё не добавлена и существует.
+
+        Сессии считаются обоих харнессов: по ним видно, что в папке действительно работали, а
+        время последней берётся самое свежее — по нему список и сортируется.
+        """
+        resolved = inside_roots(path)
+        if resolved is None or not resolved.is_dir() or str(resolved) in seen:
             return
-        seen.add(key)
-        files = session_files(path)
+        seen.add(str(resolved))
+        files = session_files(resolved) + claude_session_files(resolved)
         last = None
         if files:
-            last = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(files[0].stat().st_mtime))
+            newest = max(f.stat().st_mtime for f in files)
+            last = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(newest))
         projects.append({
-            "path": key,
-            "name": path.name,
-            "root": str(next((r for r in roots if str(path).startswith(str(r))), path.parent)),
+            "path": str(resolved),
+            "name": resolved.name,
+            "root": str(next((r for r in roots if str(resolved).startswith(str(r))), resolved.parent)),
             "sessions": len(files),
             "lastUsed": last,
         })
@@ -801,8 +825,35 @@ def list_projects():
             for path in candidates:
                 if not path.is_dir() or path.name.startswith("."):
                     continue
-                if (path / ".git").exists() or sessions_dir_for(path).is_dir():
+                if (path / ".git").exists() or sessions_dir_for(path).is_dir() or claude_sessions_dir(path).is_dir():
                     add(path)
+
+    # Папки из историй агентов: у сессии записан её рабочий каталог, поэтому проект находится
+    # и на глубине больше `depth`, и там, где нет ни `.git`, ни обхода по шаблону.
+    for folder, reader in (
+        (PI_SESSIONS, read_session_meta),
+        (claude_projects_dir(), read_claude_meta),
+    ):
+        if not folder.is_dir():
+            continue
+        try:
+            directories = sorted(folder.iterdir())
+        except OSError as e:
+            log("не смог обойти истории %s: %s" % (folder, e))
+            continue
+        for directory in directories:
+            if not directory.is_dir():
+                continue
+            try:
+                files = sorted(directory.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+            except OSError:
+                continue
+            if not files:
+                continue
+            cwd = str(reader(files[0]).get("cwd") or "")
+            if cwd:
+                add(cwd)
+
     # сначала проекты с историей и свежие, потом остальные по имени
     projects.sort(key=lambda p: (p["lastUsed"] is None, p["name"].lower()))
     projects.sort(key=lambda p: p["lastUsed"] or "", reverse=True)
