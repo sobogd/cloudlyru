@@ -113,6 +113,11 @@ IDLE_STOP_SECONDS = 1800.0  # простой, после которого про
 MAX_MESSAGE_CHARS = 20_000  # потолок сообщения, чтобы одним запросом не забить контекст
 # События pi, которые уходят приложению. Остальные (message_start, turn_start и прочая
 # служебная механика) наружу не нужны: экран строится по дельтим и вызовам инструментов.
+# События, которыми харнесс сообщает, что прогон закончился: у pi это `agent_settled`, у
+# Claude Code — `result`. По ним сессия снимает занятость, и это единственное место, где она
+# снимается: пока прогон идёт, сессия занята по-настоящему.
+RUN_END_EVENTS = {"agent_settled", "result"}
+
 FORWARDED_EVENTS = {
     "message_update",
     "tool_execution_start",
@@ -1530,6 +1535,18 @@ class AgentSession:
         if events in self.subscribers:
             self.subscribers.remove(events)
 
+    def _watch_run_state(self, event):
+        """Отмечает конец прогона, даже когда за ним никто не смотрит.
+
+        Перевод событий в экранные делает тот, кто читает поток (ручка prompt), и когда
+        наблюдатель ушёл — не работает вовсе. А состояние сессии обязано обновляться всегда:
+        иначе разговор остался бы «занятым» навсегда, и следующий вопрос получил бы 409 без
+        выхода из положения. Поэтому завершающее событие ловит сам читатель потока.
+        """
+        if event.get("type") in RUN_END_EVENTS:
+            self.busy = False
+            self.touched = time.time()
+
     def _publish(self, event):
         """Рассылает событие всем открытым потокам SSE этой сессии."""
         for q in list(self.subscribers):
@@ -1562,7 +1579,12 @@ class AgentSession:
         log("закрыл процесс %s сессии %s" % (self.harness, self.id))
 
     def _fail_waiters(self, reason):
-        """Будит всех ожидающих после смерти процесса, чтобы запросы не висели вечно."""
+        """Будит всех ожидающих после смерти процесса, чтобы запросы не висели вечно.
+
+        Заодно снимаем занятость: процесс умер, значит прогона больше нет, и оставлять сессию
+        «занятой» значило бы отвечать 409 на каждый следующий вопрос без выхода из положения.
+        """
+        self.busy = False
         for key, q in list(self.pending.items()):
             q.put({"type": "response", "id": key, "success": False, "error": reason})
         self.pending.clear()
@@ -1579,6 +1601,7 @@ class AgentSession:
         Продолжение идёт по идентификатору сессии: у pi это `--session-id`, у Claude Code —
         `--resume`, и оба берут историю из своего файла, так что разговор не теряется.
         """
+        self.busy = False
         self._start(self.id)
 
     def prompt(self, text):
@@ -1687,6 +1710,7 @@ class PiSession(AgentSession):
             if kind == "extension_ui_request":
                 self._answer_ui(message)
                 continue
+            self._watch_run_state(message)
             if kind in FORWARDED_EVENTS:
                 self._publish(message)
 
@@ -1928,6 +1952,7 @@ class ClaudeSession(AgentSession):
             model = str(event.get("model") or "")
             if model and (not self.model or self.model == "default"):
                 self.model = model
+            self._watch_run_state(event)
             self._publish(event)
 
         # процесс закончился — будим всех, кто ждал событий
@@ -2628,6 +2653,10 @@ class Handler(BaseHTTPRequestHandler):
         sessions.sort(key=lambda s: s.get("updatedAt") or "", reverse=True)
         for session in sessions:
             session["id"] = session_key(session["harness"], session["id"])
+            # Сессия может работать прямо сейчас (агент продолжает и без наблюдателя): в списке
+            # это видно значком, иначе кажется, что разговор стоит
+            running = POOL.maybe(session["id"])
+            session["busy"] = bool(running and running.busy)
         self._json(200, {"path": str(path), "sessions": sessions})
 
     def _open_session(self, body):
@@ -2911,7 +2940,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        aborted = False
         try:
             # подписка стоит ДО отправки сообщения: события первого шага иначе можно потерять
             try:
@@ -2941,19 +2969,17 @@ class Handler(BaseHTTPRequestHandler):
                     self._event({"type": "done", "session": self._settled_brief(session)})
                     break
         except (BrokenPipeError, ConnectionResetError):
-            # клиент ушёл (уход с экрана, кнопка «Стоп», потеря сети): гасим и работу агента,
-            # иначе мак продолжит считать ответ, которого никто не ждёт
-            aborted = True
+            # Клиент ушёл: экран закрыли, приложение свернули, связь пропала. Работу НЕ гасим —
+            # человек вернётся и продолжит смотреть ответ (для этого есть ручка /events), а
+            # прерывает работу только явное «Стоп». Раньше разрыв убивал прогон, и ответ
+            # обрывался на полпути — ровно то, что выглядело как «агент застрял».
+            log("наблюдатель сессии %s отключился, работа продолжается" % session.id)
         finally:
-            if aborted and session.alive():
-                try:
-                    session.command("abort", timeout=30.0)
-                except PiError as e:
-                    log("не смог прервать сессию %s: %s" % (session.id, e))
-            session.busy = False
+            # Занятость здесь НЕ снимаем: если наблюдатель ушёл, а агент продолжает считать,
+            # сессия действительно занята до конца прогона — снимает её переводчик событий на
+            # завершающем событии харнесса (agent_settled или result).
+            session.unsubscribe(events)
             session.touched = time.time()
-            if events in session.subscribers:
-                session.subscribers.remove(events)
             try:
                 self._event({"type": "closed"})
             except (BrokenPipeError, ConnectionResetError, ValueError):

@@ -287,7 +287,12 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
   /// Строка списка: имя сессии, харнесс, модель, число сообщений и время последнего обращения.
   Widget _sessionTile(AgentSession session) {
     return ListTile(
-      leading: Icon(_harnessIcon(session.harness), color: C.fg2),
+      leading: Icon(
+        _harnessIcon(session.harness),
+        // значок агента подсвечен, пока он работает: разговор может считаться и без открытого
+        // экрана, и это должно быть видно из списка
+        color: session.busy ? C.ok : C.fg2,
+      ),
       title: Text(
         _title(session),
         maxLines: 2,
@@ -296,6 +301,7 @@ class _AgentSessionsScreenState extends ConsumerState<AgentSessionsScreen> {
       ),
       subtitle: Text(
         [
+          if (session.busy) '● работает',
           ref.read(agentHarnessesProvider).nameOf(session.harness),
           if (session.modelLabel.isNotEmpty) session.modelLabel,
           '${session.messages} сообщ.',

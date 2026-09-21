@@ -67,6 +67,12 @@ class AgentSession {
   final DateTime? startedAt;
   final DateTime? updatedAt;
 
+  /// Агент работает в этой сессии прямо сейчас — даже если экран разговора закрыт.
+  ///
+  /// Нужно списку: уход с экрана работу не останавливает, разговор может продолжать считаться,
+  /// и без пометки это выглядит как «ничего не происходит».
+  final bool busy;
+
   /// Сессия из ответа моста.
   const AgentSession({
     required this.id,
@@ -78,6 +84,7 @@ class AgentSession {
     this.harnessName = '',
     this.startedAt,
     this.updatedAt,
+    this.busy = false,
   });
 
   /// Разбор сессии из ответа моста.
@@ -91,6 +98,7 @@ class AgentSession {
     harnessName: json['harnessName']?.toString() ?? '',
     startedAt: DateTime.tryParse(json['startedAt']?.toString() ?? ''),
     updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
+    busy: json['busy'] == true,
   );
 
   /// Подпись модели для строки списка: `провайдер/идентификатор` или пустая строка.
