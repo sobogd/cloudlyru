@@ -81,37 +81,6 @@ class AgentApi {
     return AgentHealth.fromJson(data ?? const {});
   }
 
-  /// Убирает старые сессии проекта, оставляя свежие.
-  ///
-  /// Условия складываются: `olderThanDays` — что считать старым, `keep` — сколько самых свежих
-  /// не трогать вовсе. Хотя бы одно нужно: без него мост откажет, чтобы «убрать старое» не
-  /// превратилось в «удалить всё». Возвращает, сколько сессий удалено.
-  Future<AgentDeleteResult> purgeSessions({
-    required String path,
-    required String harness,
-    int? olderThanDays,
-    int? keep,
-  }) async {
-    final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
-        '/projects/sessions/purge',
-        data: <String, dynamic>{
-          'path': path,
-          'harness': harness,
-          // null-aware элементы: условие писать не нужно, поле просто не попадёт в тело
-          'olderThanDays': ?olderThanDays,
-          'keep': ?keep,
-        },
-      ),
-    );
-    return AgentDeleteResult(
-      deleted: data?['deleted'] is num ? (data!['deleted'] as num).toInt() : 0,
-      restored: data?['restored'] is num
-          ? (data!['restored'] as num).toInt()
-          : 0,
-    );
-  }
-
   /// Что считается на маке и что закончилось, пока приложения не было.
   Future<AgentActivity> activity() async {
     final data = await _send<Map<String, dynamic>>(
@@ -473,20 +442,9 @@ class AgentApi {
     return data?['summary']?.toString() ?? '';
   }
 
-  /// Закрывает процесс pi на маке, оставляя историю: освобождает память под контекст модели.
-  ///
-  /// Нужно, когда человек уходит из раздела, а также по явной кнопке: живой процесс держит
-  /// контекст модели в памяти мака, и продолжение разговора потом поднимает его заново из файла.
-  Future<void> closeSession(String id) async {
-    await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/sessions/$id/close'),
-    );
-  }
-
   /// Удаляет сессию на маке: процесс гасится, файл истории стирается.
   ///
-  /// Необратимо — в приложении это отдельное действие с подтверждением, а не то же самое, что
-  /// «закрыть».
+  /// Необратимо — в приложении это действие с подтверждением.
   Future<AgentDeleteResult> deleteSession(String id) async {
     final data = await _send<Map<String, dynamic>>(
       () => _http.delete('/projects/sessions/$id'),

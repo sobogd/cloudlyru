@@ -237,16 +237,14 @@ class _NavBar extends StatelessWidget {
 
   /// Размер иконки и отступ вокруг неё.
   ///
-  /// Кнопка раздела — квадрат со стороной [_iconSize] + 2·[_tapPad], а ширина всей полосы —
-  /// ровно по ней с полем [_sideGap] по краям. Числа сведены в одно место, чтобы ширина полосы
-  /// и размер кнопки не разъехались: лишнее место здесь читается как «полоса шире, чем нужно»
-  /// и отнимает ширину у списков.
+  /// Кнопка раздела — квадрат со стороной [_iconSize] + 2·[_tapPad], он же задаёт ширину всей
+  /// полосы. Боковых полей у кнопки нет: они читались как «полоса шире, чем нужно» и отнимали
+  /// ширину у списков.
   static const _iconSize = 22.0;
   static const _tapPad = 11.0;
-  static const _sideGap = 4.0;
 
-  /// Ширина полосы: иконка, отступы вокруг кнопки и поля по краям.
-  static const _width = _iconSize + 2 * _tapPad + 2 * _sideGap;
+  /// Ширина полосы: иконка и отступы вокруг кнопки.
+  static const _width = _iconSize + 2 * _tapPad;
 
   @override
   Widget build(BuildContext context) {
@@ -285,8 +283,6 @@ class _NavBar extends StatelessWidget {
         child: Container(
           // подсветка выбранного — мягкая заливка акцентом, как у нижней панели разделов раньше
           color: selected ? C.accentSoft : null,
-          // поле только по бокам: вертикального нет, иначе кнопка перестала бы быть квадратом
-          margin: const EdgeInsets.symmetric(horizontal: _sideGap),
           padding: const EdgeInsets.all(_tapPad),
           child: Icon(
             selected ? look.activeIcon : look.icon,

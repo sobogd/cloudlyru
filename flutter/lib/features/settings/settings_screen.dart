@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../theme.dart';
+import 'agent_panel.dart';
 import 'account_panel.dart';
 import 'mail_accounts_panel.dart';
 import 'queue_errors_screen.dart';
@@ -11,8 +12,8 @@ import 'thumbs_panel.dart';
 import 'tokens_panel.dart';
 import 'updater.dart';
 
-/// Экран «Настройки»: аккаунт, синхронизация телефона, обновление приложения, очередь превью,
-/// почтовые аккаунты и приложения с доступом по токену.
+/// Экран «Настройки»: аккаунт, агент (модели и ключи), синхронизация телефона, обновление
+/// приложения, очередь превью, почтовые аккаунты и приложения с доступом по токену.
 ///
 /// Сам экран ничего не показывает и не держит: он собирает независимые панели, и каждая
 /// сама ходит на сервер и сама себя перерисовывает по таймеру или по действию человека.
@@ -48,6 +49,7 @@ class SettingsScreen extends ConsumerWidget {
           // Аккаунт — первым: он про вход целиком (логин, пароль, сеансы), а дальше идут панели
           // про само устройство и разделы приложения.
           const AccountPanel(),
+          const AgentPanel(),
           const TokensPanel(),
           const SyncPanel(),
           const ThumbsPanel(),

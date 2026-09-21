@@ -588,34 +588,6 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     }
   }
 
-  /// Убирает старые сессии проекта и перечитывает список с мака.
-  ///
-  /// Папку и харнесс выбирает человек (в общем списке они не заданы). Возвращает итог (сколько
-  /// удалилось и сколько вернулось) или `null`, если мост отказал: причина при этом уже лежит в
-  /// состоянии и показывается на экране.
-  Future<AgentDeleteResult?> purgeOld({
-    required AgentProject project,
-    required String harness,
-    int? olderThanDays,
-    int? keep,
-  }) async {
-    try {
-      final result = await _api.purgeSessions(
-        path: project.path,
-        harness: harness,
-        olderThanDays: olderThanDays,
-        keep: keep,
-      );
-      // Список перечитываем с мака: удаление идёт по файлам, и показывать список, собранный
-      // до него, значит однажды снова увидеть удалённый разговор в списке.
-      await load();
-      return result;
-    } on AgentApiException catch (e) {
-      showError(e.message);
-      return null;
-    }
-  }
-
   /// Удаляет сессию на маке вместе с историей и возвращает итог (что удалилось, что вернулось).
   ///
   /// Необратимо, поэтому вызывающий сначала спрашивает подтверждение. Строка убирается сразу, а
@@ -635,15 +607,6 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     } on AgentApiException catch (e) {
       showError(e.message);
       return null;
-    }
-  }
-
-  /// Закрывает процесс сессии на маке, оставляя историю (освобождает память под контекст).
-  Future<void> close(String sessionId) async {
-    try {
-      await _api.closeSession(sessionId);
-    } on AgentApiException catch (e) {
-      showError(e.message);
     }
   }
 
@@ -918,22 +881,6 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     }
   }
 
-  /// Закрывает процесс pi на маке по явной просьбе, оставляя разговор в истории.
-  ///
-  /// Отличается от [close] только намерением: [close] зовётся при уходе с экрана (это уборка),
-  /// а здесь человек осознанно освобождает память мака, оставаясь в разделе.
-  Future<bool> closeSession() async {
-    final session = state.session;
-    if (session == null) return false;
-    try {
-      await _api.closeSession(session.id);
-      return true;
-    } on AgentApiException catch (e) {
-      state = state.withError(e.message);
-      return false;
-    }
-  }
-
   /// Удаляет сессию на маке вместе с историей. Необратимо: подтверждение спрашивает экран.
   ///
   /// Занятость снимаем до удаления: работающий процесс держит файл открытым, и стирать его
@@ -979,20 +926,6 @@ class AgentThreadController extends Notifier<AgentThreadState> {
       state = state.copyWith(step: '', session: await _api.session(session.id));
     } on AgentApiException catch (e) {
       state = state.copyWith(step: '').withError(e.message);
-    }
-  }
-
-  /// Закрывает процесс pi и отпускает память на маке.
-  ///
-  /// Вызывается при уходе с экрана: держать процесс живым ради разговора, который человек
-  /// закрыл, незачем — история лежит в файле сессии, и продолжение поднимет процесс заново.
-  Future<void> close() async {
-    final session = state.session;
-    if (session == null) return;
-    try {
-      await _api.closeSession(session.id);
-    } on AgentApiException {
-      // молча: закрытие — уборка, и мешать ею уходу с экрана незачем
     }
   }
 

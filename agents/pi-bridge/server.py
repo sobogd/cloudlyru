@@ -16,7 +16,8 @@ stdio и умеет ровно то, что нужно разделу «Прое
 Ручки (все отдаёт наружу сервер приложения, `src/projects` с префиксом `/projects/*`):
   GET    /health                      — жив ли сервис, есть ли pi, что с процессами;
   GET    /projects                    — проекты из allowlist-корней (папки с .git);
-  GET    /sessions?path=<папка>       — сессии проекта (файлы pi), свежие сверху; без `path` —
+  GET    /sessions?path=<папка>       — сессии проекта (файлы pi), новые по дате создания
+                                        сверху; без `path` —
                                         сессии всех проектов одним списком;
   GET    /models                      — модели, доступные pi (локальные и по API);
   GET    /providers                   — провайдеры и признак «ключ задан» (самих ключей нет);
@@ -33,10 +34,8 @@ stdio и умеет ровно то, что нужно разделу «Прое
   POST   /sessions/<id>/abort         — остановить генерацию;
   POST   /sessions/<id>/compact       — сжать контекст;
   POST   /sessions/<id>/model         — сменить модель;
-  POST   /sessions/<id>/close         — закрыть процесс (файл сессии остаётся);
   POST   /sessions/<id>/ui            — ответ на диалог расширения (по умолчанию не нужен);
-  DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается;
-  POST   /sessions/purge              — убрать старые сессии проекта (старше N дней / кроме K свежих).
+  DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается.
 
 Кто сюда ходит: только сервер приложения, и только через reverse-SSH туннель мака — порт
 18820 слушает loopback на обоих концах (см. jevel.ai/agents/run-dsh-tunnel.sh), ровно как
@@ -1197,45 +1196,6 @@ def purge_session(key):
     if restored:
         log("файл %s восстановлен живым процессом: разговор ведётся снаружи" % file)
     return {"deleted": not restored, "restored": restored}
-
-
-def purge_old_sessions(path, harness, older_days, keep):
-    """Удаляет старые сессии проекта, оставляя свежие: уборка, а не удаление по одной.
-
-    Условия складываются: удаляем то, что старше [older_days] дней И при этом не входит в
-    [keep] самых свежих. Второе условие нужно, чтобы «удалить старше недели» не снесло
-    разговор, который человек только что оставил открытым на паузе: свежие сессии неприкосновенны
-    независимо от порога. Хотя бы одно условие обязательно — иначе ручка снесла бы всё подряд.
-    """
-    if older_days is None and keep is None:
-        raise PiError("нужно условие: старше скольких дней удалять или сколько свежих оставить")
-    files = (claude_session_files(path) if harness == HARNESS_CLAUDE else session_files(path))
-    newest_first = sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
-    protected = set(str(f) for f in newest_first[: max(0, keep or 0)])
-    threshold = time.time() - (older_days * 86400) if older_days is not None else None
-
-    deleted = []
-    removed_files = []
-    for file in newest_first:
-        if str(file) in protected:
-            continue
-        if threshold is not None and file.stat().st_mtime >= threshold:
-            continue
-        session_id = file.stem.split("_")[-1] if harness != HARNESS_CLAUDE else file.stem
-        gone = remove_session_files(session_key(harness, session_id))
-        if gone is not None:
-            deleted.append(session_key(harness, session_id))
-            removed_files.append(gone)
-
-    # Одна проверка на всю пачку: сколько файлов вернули себе живые процессы (разговоры,
-    # открытые в терминале). Их считать удалёнными нельзя.
-    restored = []
-    if removed_files:
-        time.sleep(0.4)
-        restored = [session_key(harness, f.stem.split("_")[-1] if harness != HARNESS_CLAUDE else f.stem)
-                    for f in removed_files if f.exists()]
-    log("уборка сессий в %s (%s): удалено %d, вернулось %d" % (path, harness, len(deleted) - len(restored), len(restored)))
-    return {"deleted": [k for k in deleted if k not in restored], "restored": restored}
 
 
 def read_json_file(path):
@@ -2564,9 +2524,6 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/sessions":
                 self._open_session(body)
                 return
-            if path == "/sessions/purge":
-                self._json(200, self._purge_sessions(body))
-                return
             if path == "/providers":
                 self._json(200, {"providers": save_provider(body)})
                 return
@@ -2590,12 +2547,9 @@ class Handler(BaseHTTPRequestHandler):
             parts = path.split("/")
             if len(parts) >= 4 and parts[1] == "sessions":
                 action = parts[3]
-                # Закрытие и остановка обрабатываются до поиска в пуле: и то, и другое —
-                # уборка, и повторять её на уже закрытой сессии не ошибка. Раньше «Стоп» на
-                # такой сессии отвечал 400, и человек видел ошибку там, где всё в порядке.
-                if action == "close":
-                    self._close(parts[2])
-                    return
+                # Остановка обрабатывается до поиска в пуле: это уборка, и повторять её на уже
+                # закрытой сессии не ошибка. Раньше «Стоп» на такой сессии отвечал 400, и
+                # человек видел ошибку там, где всё в порядке.
                 if action == "queue":
                     # Сообщение в занятую сессию: не отказ, а очередь. Приложение шлёт сюда, когда
                     # у него уже открыт поток текущего прогона: второй поток дал бы двойной текст.
@@ -2667,7 +2621,7 @@ class Handler(BaseHTTPRequestHandler):
         """Удаляет сессию: процесс pi гасится, файл истории стирается с диска.
 
         Разрушительно и необратимо, поэтому в приложении это отдельное действие с
-        подтверждением. Закрыть разговор (без потери истории) — ручка `POST /close`.
+        подтверждением.
         """
         path, _ = self._route()
 
@@ -2744,8 +2698,10 @@ class Handler(BaseHTTPRequestHandler):
             if asked in ("", HARNESS_CLAUDE):
                 for file in claude_session_files(folder):
                     sessions.append({**read_claude_meta(file), "harness": HARNESS_CLAUDE, "path": str(folder)})
-        # свежие сверху: два списка складываются в один по времени последнего обращения
-        sessions.sort(key=lambda s: s.get("updatedAt") or "", reverse=True)
+        # по дате создания, новые сверху: два списка складываются в один, и порядок в нём не
+        # должен меняться от того, что в каком-то разговоре только что что-то произошло — иначе
+        # строки прыгали бы под пальцем. Что разговор жив, видно по значку работы
+        sessions.sort(key=lambda s: s.get("startedAt") or "", reverse=True)
         for session in sessions:
             session["id"] = session_key(session["harness"], session["id"])
             # Сессия может работать прямо сейчас (агент продолжает и без наблюдателя): в списке
@@ -2797,50 +2753,6 @@ class Handler(BaseHTTPRequestHandler):
             raise PiError("сессия открыта в папке вне разрешённых корней: %s" % cwd)
         log("поднимаю потерянную сессию %s заново в %s" % (key, path))
         return POOL.open(path, harness, native_id)
-
-    def _purge_sessions(self, body):
-        """Убирает старые сессии проекта: разговор, который закрыли, чтобы освободить список.
-
-        Разрушительно и необратимо, поэтому условия приходят от человека явно (`olderThanDays`
-        и/или `keep`) и проверяются в `purge_old_sessions`: без хотя бы одного ручка откажет,
-        а не снесёт всё подряд.
-        """
-        raw = str(body.get("path") or "").strip()
-        path = allowed_path(raw) if raw else None
-        if path is None:
-            raise PiError("папка вне разрешённых корней: %s" % raw)
-        harness = str(body.get("harness") or HARNESS_PI).strip().lower()
-        if harness not in HARNESS_NAMES:
-            raise PiError("неизвестный харнесс: %s" % harness)
-        older = body.get("olderThanDays")
-        keep = body.get("keep")
-        if older is not None:
-            older = int(older)
-            if older < 0:
-                raise PiError("olderThanDays не может быть отрицательным")
-        if keep is not None:
-            keep = int(keep)
-            if keep < 0:
-                raise PiError("keep не может быть отрицательным")
-        result = purge_old_sessions(path, harness, older, keep)
-        return {
-            "deleted": len(result["deleted"]),
-            "restored": len(result["restored"]),
-            "sessions": result["deleted"],
-            "restoredSessions": result["restored"],
-        }
-
-    def _close(self, session_id):
-        """Закрывает процесс pi, оставляя историю: освобождает память на маке.
-
-        Отдельно от удаления: закрыть — это «я закончил разговор сейчас», после него сессия
-        открывается снова из своего файла. Повторное закрытие не ошибка (сессия могла быть уже
-        закрыта или приложение перезапускалось), поэтому отсутствие процесса в пуле — не отказ.
-        """
-        session = POOL.take(session_id)
-        if session is not None:
-            session.stop()
-        self._json(200, {"ok": True, "closed": session is not None})
 
     def _session_brief(self, session):
         """Описание сессии для экрана: модель, контекст, расход, счётчики и время.

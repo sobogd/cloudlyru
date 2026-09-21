@@ -336,8 +336,8 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ],
   );
 
-  /// Действия над разговором одним меню «троеточие»: сведения, модель, сжатие контекста,
-  /// завершение процесса на маке и удаление.
+  /// Действия над разговором одним меню «троеточие»: сведения, модель, сжатие контекста
+  /// и удаление.
   ///
   /// Всё в меню, а не отдельными кнопками: в шапке их должно быть ровно две — стрелка назад и
   /// троеточие — иначе на телефоне кнопки отъедают место у названия разговора. «Сведения»
@@ -348,7 +348,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       'details' => setState(() => _details = !_details),
       'model' => _pickModel(),
       'compact' => _compact(),
-      'close' => _closeOnMac(),
       _ => _delete(),
     },
     // плотнее и без внутренних отступов: кнопка стоит рядом со стрелкой и не должна занимать
@@ -369,26 +368,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         value: 'compact',
         enabled: !state.sending,
         child: const Text('Сжать контекст'),
-      ),
-      PopupMenuItem(
-        value: 'close',
-        // сер, пока процесс на маке не работает: завершать нечего, и делать вид, что что-то
-        // закрылось, хуже, чем честно показать, что действие сейчас неприменимо
-        enabled: state.sending || (state.session?.busy ?? false),
-        // подпись под названием — ответ на «а что это вообще значит»: процесс умрёт,
-        // а история разговора останется
-        child: const Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('Завершить процесс на маке'),
-            SizedBox(height: 2),
-            Text(
-              'Процесс агента завершится и освободит память; история разговора останется.',
-              style: TextStyle(color: C.fg3, fontSize: 11.5, height: 1.25),
-            ),
-          ],
-        ),
       ),
       const PopupMenuItem(value: 'delete', child: Text('Удалить сессию')),
     ],
@@ -424,14 +403,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       ],
     ),
   );
-
-  /// Закрывает процесс pi на маке, оставляя разговор в истории.
-  Future<void> _closeOnMac() async {
-    final session = ref.read(agentThreadProvider).session;
-    if (session == null) return;
-    await _thread.closeSession();
-    if (mounted) snack(context, 'Процесс завершён на маке, история сохранена');
-  }
 
   /// Тело экрана: загрузка истории или переписка.
   Widget _body(AgentThreadState state) {
