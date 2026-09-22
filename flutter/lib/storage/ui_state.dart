@@ -127,6 +127,20 @@ class UiStateStore {
   Future<void> setAgentModel(String harness, String key) =>
       patch({'agent_model_$harness': key});
 
+  /// Уровень усилия, выбранный для харнесса в разделе «Проекты», либо пусто.
+  ///
+  /// Хранится отдельно от модели, потому что в файле разговора у Claude Code его нет: без этой
+  /// памяти выбор терялся бы при перезапуске моста, и возобновлённая сессия считалась бы с
+  /// умолчанием модели. Пусто — «пусть решает модель», и это значение по умолчанию.
+  String agentEffort(String harness) {
+    final v = read()['agent_effort_$harness'];
+    return v is String ? v : '';
+  }
+
+  /// Запоминает выбранный уровень усилия (см. [agentEffort]).
+  Future<void> setAgentEffort(String harness, String effort) =>
+      patch({'agent_effort_$harness': effort});
+
   /// Дописывает поля к сохранённому состоянию: читает текущий объект, накладывает [patch]
   /// и записывает обратно.
   ///

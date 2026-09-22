@@ -85,6 +85,9 @@ class AgentModelsState {
   /// Локальные и удалённые модели.
   final List<AgentModel> models;
 
+  /// Уровни усилия харнесса: у Claude Code их пять, у pi список пустой.
+  final List<AgentEffort> efforts;
+
   /// Идёт загрузка.
   final bool loading;
 
@@ -95,6 +98,7 @@ class AgentModelsState {
   const AgentModelsState({
     this.harness = 'pi',
     this.models = const [],
+    this.efforts = const [],
     this.loading = false,
     this.error,
   });
@@ -142,14 +146,28 @@ class AgentModelsController extends Notifier<AgentModelsState> {
   /// модели не того агента.
   Future<void> load({String harness = 'pi'}) async {
     final keep = state.harness == harness ? state.models : const <AgentModel>[];
-    state = AgentModelsState(harness: harness, models: keep, loading: true);
+    final keepEfforts = state.harness == harness
+        ? state.efforts
+        : const <AgentEffort>[];
+    state = AgentModelsState(
+      harness: harness,
+      models: keep,
+      efforts: keepEfforts,
+      loading: true,
+    );
     try {
-      final models = await _api.models(harness: harness);
-      state = AgentModelsState(harness: harness, models: models);
+      // Модели и уровни усилия — один ответ моста: у Claude Code он несёт и то и другое
+      final (models, efforts) = await _api.catalog(harness: harness);
+      state = AgentModelsState(
+        harness: harness,
+        models: models,
+        efforts: efforts,
+      );
     } on AgentApiException catch (e) {
       state = AgentModelsState(
         harness: harness,
         models: keep,
+        efforts: keepEfforts,
         error: e.message,
       );
     }
@@ -566,6 +584,7 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
     String harness = 'pi',
     String? sessionId,
     String? modelKey,
+    String? effort,
   }) async {
     state = AgentSessionsState(
       sessions: state.sessions,
@@ -573,12 +592,15 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
       error: state.error,
     );
     try {
-      // модель передаём только для новой сессии: у существующей она уже записана в её файле
+      // модель передаём только для новой сессии: у существующей она уже записана в её файле.
+      // Усилие, наоборот, уезжает всегда: в файле разговора его нет, и без него возобновлённый
+      // Claude Code взял бы умолчание модели вместо выбранного человеком
       final session = await _api.openSession(
         project.path,
         harness: harness,
         sessionId: sessionId,
         modelKey: sessionId == null ? modelKey : null,
+        effort: harness == 'claude' ? effort : null,
       );
       state = AgentSessionsState(sessions: state.sessions);
       return session;
@@ -981,6 +1003,26 @@ class AgentThreadController extends Notifier<AgentThreadState> {
           .read(settingsProvider)
           .ui
           .setAgentModel(updated.harness, model.key);
+    } on AgentApiException catch (e) {
+      state = state.withError(e.message);
+    }
+  }
+
+  /// Меняет уровень усилия у сессии Claude Code: процесс перезапускается с тем же разговором.
+  ///
+  /// Пустая строка — «пусть решает модель»: это осмысленный выбор, поэтому он передаётся как
+  /// есть. Выбор запоминается в настройках и уезжает при открытии следующих сессий: в файле
+  /// разговора усилие не хранится, и без этой памяти оно терялось бы при каждом перезапуске моста.
+  Future<void> setEffort(String effort) async {
+    final session = state.session;
+    if (session == null || state.sending) return;
+    try {
+      final updated = await _api.setEffort(session.id, effort);
+      state = state.copyWith(session: updated).clearError();
+      await ref
+          .read(settingsProvider)
+          .ui
+          .setAgentEffort(updated.harness, effort);
     } on AgentApiException catch (e) {
       state = state.withError(e.message);
     }

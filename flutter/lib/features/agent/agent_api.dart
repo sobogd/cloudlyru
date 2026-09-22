@@ -105,7 +105,17 @@ class AgentApi {
   /// Модели харнесса: у pi — локальная и удалённые по API, у Claude Code — его собственные.
   ///
   /// Ключей от API в ответе нет — они остаются на маке; приходит только признак «ключ задан».
-  Future<List<AgentModel>> models({String harness = 'pi'}) async {
+  Future<List<AgentModel>> models({String harness = 'pi'}) async =>
+      (await catalog(harness: harness)).$1;
+
+  /// Модели и уровни усилия харнесса одним запросом.
+  ///
+  /// Уровни усилия есть только у Claude Code (у pi — пустой список), но запрос тот же: мост
+  /// отдаёт их тем же ответом `/models`, и второй запрос ради второй половины данных был бы
+  /// лишним. Первый элемент пары — модели, второй — уровни усилия.
+  Future<(List<AgentModel>, List<AgentEffort>)> catalog({
+    String harness = 'pi',
+  }) async {
     final data = await _send<Map<String, dynamic>>(
       () => _http.get(
         '/projects/models',
@@ -113,11 +123,18 @@ class AgentApi {
       ),
     );
     final raw = data?['models'];
-    return <AgentModel>[
+    final rawEfforts = data?['efforts'];
+    final models = <AgentModel>[
       if (raw is List)
         for (final m in raw)
           if (m is Map) AgentModel.fromJson(m.cast<String, dynamic>()),
     ];
+    final efforts = <AgentEffort>[
+      if (rawEfforts is List)
+        for (final e in rawEfforts)
+          if (e is Map) AgentEffort.fromJson(e.cast<String, dynamic>()),
+    ];
+    return (models, efforts);
   }
 
   /// Провайдеры, настроенные у pi на маке: свои и встроенные.
@@ -247,8 +264,8 @@ class AgentApi {
   /// Сессии: одной папки или всех проектов сразу.
   ///
   /// Без [path] мост обходит все разрешённые проекты и отдаёт один список разговоров обоих
-  /// харнессов, свежие сверху — им приложение рисует общий список. С [path] — разговоры одной
-  /// папки.
+  /// харнессов, свежие сверху (порядок моста). С [path] — разговоры одной папки. Раздел
+  /// «Проекты» показывает список наоборот — от старых к новым.
   Future<List<AgentSession>> sessions([String? path]) async {
     final dir = (path ?? '').trim();
     final data = await _send<Map<String, dynamic>>(
@@ -275,6 +292,7 @@ class AgentApi {
     String harness = 'pi',
     String? sessionId,
     String? modelKey,
+    String? effort,
   }) async {
     final split = _splitModel(modelKey);
     final data = await _send<Map<String, dynamic>>(
@@ -286,6 +304,9 @@ class AgentApi {
           if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
           if (split != null) 'provider': split.$1,
           if (split != null) 'model': split.$2,
+          // усилие не записывается в файл разговора, поэтому уезжает и для существующей сессии:
+          // иначе возобновлённый процесс Claude Code взял бы умолчание модели
+          if (effort != null && effort.isNotEmpty) 'effort': effort,
         },
       ),
     );
@@ -300,6 +321,20 @@ class AgentApi {
       () => _http.post(
         '/projects/sessions/$id/model',
         data: <String, dynamic>{'provider': split.$1, 'modelId': split.$2},
+      ),
+    );
+    return _sessionOf(data);
+  }
+
+  /// Смена уровня усилия у сессии Claude Code; пустая строка — вернуться к умолчанию модели.
+  ///
+  /// Процесс при этом перезапускается с тем же разговором: уровень задаётся при запуске, а не
+  /// меняется на ходу. У pi такого выбора нет — мост ответит отказом.
+  Future<AgentSessionInfo> setEffort(String id, String effort) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post(
+        '/projects/sessions/$id/effort',
+        data: <String, dynamic>{'effort': effort},
       ),
     );
     return _sessionOf(data);

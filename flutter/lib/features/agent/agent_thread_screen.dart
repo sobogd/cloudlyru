@@ -203,6 +203,26 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     if (mounted) snack(context, 'Модель: ${chosen.label}');
   }
 
+  /// Открывает выбор уровня усилия Claude Code: сколько модель думает над ответом.
+  ///
+  /// Выбор запоминается и уезжает при открытии следующих сессий: процесс перезапускается, а
+  /// разговор продолжается из файла, поэтому «отменить» выбор можно только так же — правкой
+  /// уровня, а не перезапуском сессии руками.
+  Future<void> _pickEffort() async {
+    final session = ref.read(agentThreadProvider).session;
+    if (session == null) return;
+    final chosen = await showEffortPicker(context, ref, current: session.effort);
+    if (chosen == null || !mounted) return;
+    await _thread.setEffort(chosen);
+    if (!mounted) return;
+    snack(
+      context,
+      chosen.isEmpty
+          ? 'Усилие: как решает Claude Code'
+          : 'Усилие: ${agentEffortLabel(chosen)}',
+    );
+  }
+
   /// Сжимает контекст разговора: длинная работа иначе перестанет влезать в окно модели.
   Future<void> _compact() async {
     final ok = await confirmDialog(
@@ -343,8 +363,8 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ],
   );
 
-  /// Действия над разговором одним меню «троеточие»: сведения, модель, сжатие контекста
-  /// и удаление.
+  /// Действия над разговором одним меню «троеточие»: сведения, модель, усилие (у Claude Code),
+  /// сжатие контекста и удаление.
   ///
   /// Всё в меню, а не отдельными кнопками: в шапке их должно быть ровно две — стрелка назад и
   /// троеточие — иначе на телефоне кнопки отъедают место у названия разговора. «Сведения»
@@ -354,6 +374,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     onSelected: (v) => switch (v) {
       'details' => setState(() => _details = !_details),
       'model' => _pickModel(),
+      'effort' => _pickEffort(),
       'compact' => _compact(),
       _ => _delete(),
     },
@@ -371,6 +392,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         child: Text(_details ? 'Скрыть сведения' : 'Сведения о сессии'),
       ),
       const PopupMenuItem(value: 'model', child: Text('Модель')),
+      // Уровень усилия — выбор Claude Code: у pi размышления задаёт сама модель, и отдельного
+      // пункта в меню там быть не должно
+      if (state.session?.harness == 'claude')
+        const PopupMenuItem(value: 'effort', child: Text('Усилие')),
       PopupMenuItem(
         value: 'compact',
         enabled: !state.sending,
@@ -825,7 +850,16 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       ('Харнесс', session.harnessName.isEmpty ? 'pi' : session.harnessName),
       ('Модель', session.modelLabel),
       ('Где считает', session.whereLabel),
-      if (session.thinkingLevel.isNotEmpty)
+      // У pi уровень «размышлений» задаёт модель, у Claude Code его выбирает человек — показываем
+      // то, что действительно действует в этом разговоре
+      if (session.harness == 'claude')
+        (
+          'Усилие',
+          session.effort.isEmpty
+              ? 'как решает Claude Code'
+              : agentEffortLabel(session.effort),
+        )
+      else if (session.thinkingLevel.isNotEmpty)
         ('Размышления', session.thinkingLevel),
       (
         'Начата',

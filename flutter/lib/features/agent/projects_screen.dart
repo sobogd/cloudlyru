@@ -22,8 +22,9 @@ import 'agent_types.dart';
 /// терминале, открывается отсюда одним тапом, а не через выбор папки и фильтр.
 ///
 /// Агент работает на маке, но запросы делает сервер приложения; приложению виден только раздел
-/// `/projects/*`. Кнопка «Новая сессия» в начале списка открывает мастер: папка → модель
-/// (локальные, удалённые, Claude Code).
+/// `/projects/*`. Кнопка «Новая сессия» — последней строкой списка, тем же лейаутом, что и
+/// разговоры: значок слева, имя за ним; открывает мастер «папка → модель» (локальные, удалённые,
+/// Claude Code).
 class ProjectsScreen extends ConsumerStatefulWidget {
   /// Экран раздела «Проекты».
   const ProjectsScreen({super.key});
@@ -193,6 +194,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       harness: harness,
       sessionId: sessionId,
       modelKey: modelKey,
+      // Усилие хранится в настройках, а не в файле разговора: без этого возобновлённый Claude
+      // Code считался бы с умолчанием модели вместо выбранного человеком уровня. У pi выбор
+      // игнорируется — у него уровень задаёт сама модель
+      effort: harness == 'claude'
+          ? ref.read(settingsProvider).ui.agentEffort('claude')
+          : null,
     );
     // Пока ждали ответа, человек мог выбрать другой разговор или закрыть панель: тогда этот
     // ответ уже никому не нужен, и показывать его нельзя
@@ -300,7 +307,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// Однопанельный вид: список во всю ширину, разговор открывается экраном поверх (телефон).
   ///
   /// Шапки нет вовсе: раздел назван подсветкой в левом баре, а строка «Проекты» отнимала бы
-  /// высоту у списка. Новая сессия открывается кнопкой во всю ширину в самом верху списка.
+  /// высоту у списка. Новая сессия открывается строкой в самом низу списка — под старыми
+  /// разговорами: список идёт от старых к новым, и новая сессия встаёт туда же, где появится
+  /// сам разговор.
   Widget _singlePane(AgentSessionsState state) => Scaffold(
     body: _sidebar(state, wide: false),
   );
@@ -396,7 +405,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     if (state.loading && state.sessions.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
-    final empty = state.sessions.isEmpty;
+    final count = state.sessions.length;
+    final empty = count == 0;
     return RefreshIndicator(
       onRefresh: () => _sessions.load(),
       child: ListView.builder(
@@ -406,54 +416,57 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         // низ отбит от края: плавающей кнопки больше нет, но список упирался бы в системную
         // полосу жестов на телефоне
         padding: EdgeInsets.only(bottom: navBarInset(context) + 24),
-        // первым элементом идёт кнопка новой сессии: она всегда под рукой, даже когда
-        // разговоров ещё нет
-        itemCount: state.sessions.length + 1 + (empty ? 1 : 0),
+        // последним элементом идёт кнопка новой сессии: список идёт от старых разговоров к новым,
+        // и кнопка стоит там же, где появится заведённый ею разговор
+        itemCount: count + 1 + (empty ? 1 : 0),
         itemBuilder: (context, i) {
-          if (i == 0) return _addTile(state, wide: wide);
-          if (empty) return _emptyHint();
-          return _sessionTile(state.sessions[i - 1], wide: wide);
+          // мост отдаёт разговоры новыми сверху, а раздел показывает их наоборот — старыми
+          // вверх: строка с номером `i` — та же сессия, только с другого конца списка
+          if (i < count) return _sessionTile(state.sessions[count - 1 - i], wide: wide);
+          // пояснение стоит выше кнопки — так оно читается до неё, а не после
+          if (i == count && empty) return _emptyHint();
+          return _addTile(state, wide: wide);
         },
       ),
     );
   }
 
-  /// Кнопка новой сессии: первая строка списка во всю ширину колонки.
+  /// Кнопка новой сессии: последняя строка списка.
   ///
-  /// Раньше это была плавающая кнопка в углу, но она перекрывала последние строки списка и
-  /// спорила с полем ввода разговора. Строкой во всю ширину её видно всегда, и открывать
-  /// мастер приходится не через поиск кнопки в углу.
+  /// Лейаут — как у строки разговора ([_sessionTile]): значок слева, имя за ним, те же отступы
+  /// и высота. От строк списка её отличает только цвет: знак «плюс» и подпись акцентные, чтобы
+  /// кнопку было видно среди разговоров, но она не перетягивала взгляд заливкой во всю ширину.
   ///
-  /// Заливка — не ярким акцентом, а мягкой подложкой ([C.accentSoft]) от края до края колонки:
-  /// на фоне списка ([C.island]) яркая кнопка перетягивала бы взгляд с разговоров на себя.
-  /// Текст и значок при этом остаются акцентными — что это кнопка и что она делает, видно.
-  Widget _addTile(AgentSessionsState state, {required bool wide}) => Padding(
-    // полей нет вовсе: подложка упирается в верхнюю кромку списка, а сам список начинается
-    // сразу под ней — лишние полосы над кнопкой и между ней и первой строкой только отнимали
-    // высоту у разговоров, к которым сюда и заходят
-    padding: EdgeInsets.zero,
-    child: SizedBox(
-      height: 46,
-      width: double.infinity,
-      child: FilledButton.icon(
-        onPressed: state.loading ? null : () => _newSession(wide: wide),
-        icon: const Icon(Icons.add, size: 20),
-        label: const Text('Новая сессия'),
-        style: FilledButton.styleFrom(
-          backgroundColor: C.accentSoft,
-          foregroundColor: C.accent,
-          // без скругления: подложка идёт от края до края, и радиус на такой полосе смотрелся
-          // бы случайным пятном
-          shape: const RoundedRectangleBorder(),
+  /// Раньше это была плавающая кнопка в углу, затем полоса во всю ширину в самом верху: внизу
+  /// же она оказывается там, где появляются новые разговоры, и не разрывает порядок списка.
+  Widget _addTile(AgentSessionsState state, {required bool wide}) => Material(
+    color: Colors.transparent,
+    child: InkWell(
+      onTap: state.loading ? null : () => _newSession(wide: wide),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+        child: Row(
+          children: [
+            const Icon(Icons.add, size: 22, color: C.accent),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Новая сессия',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: C.accent, fontSize: 15),
+              ),
+            ),
+          ],
         ),
       ),
     ),
   );
 
-  /// Пояснение под кнопкой, когда разговоров ещё нет.
+  /// Пояснение над кнопкой, когда разговоров ещё нет.
   Widget _emptyHint() => const Padding(
-    // без верхнего поля: оно отделяло бы пояснение от кнопки, над которой оно стоит
-    padding: EdgeInsets.fromLTRB(24, 0, 24, 24),
+    // без нижнего поля: оно отделяло бы пояснение от кнопки, под которой оно стоит
+    padding: EdgeInsets.fromLTRB(24, 24, 24, 0),
     child: Text(
       'Разговоров пока нет. Нажмите «Новая сессия» — выберите папку и модель, и агент '
       'запустится в ней: он сможет читать и править файлы проекта и запускать команды.',

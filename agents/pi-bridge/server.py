@@ -19,7 +19,7 @@ stdio и умеет ровно то, что нужно разделу «Прое
   GET    /sessions?path=<папка>       — сессии проекта (файлы pi), новые по дате создания
                                         сверху; без `path` —
                                         сессии всех проектов одним списком;
-  GET    /models                      — модели, доступные pi (локальные и по API);
+  GET    /models?harness=<pi|claude>   — модели харнесса и, у Claude Code, уровни усилия;
   GET    /providers                   — провайдеры и признак «ключ задан» (самих ключей нет);
   POST   /providers                   — создать или изменить своего провайдера (models.json);
   POST   /providers/probe             — проверить адрес и ключ, получить список моделей;
@@ -34,6 +34,7 @@ stdio и умеет ровно то, что нужно разделу «Прое
   POST   /sessions/<id>/abort         — остановить генерацию;
   POST   /sessions/<id>/compact       — сжать контекст;
   POST   /sessions/<id>/model         — сменить модель;
+  POST   /sessions/<id>/effort        — сменить уровень усилия (только Claude Code);
   POST   /sessions/<id>/name          — переименовать разговор (записью в его журнал);
   POST   /sessions/<id>/ui            — ответ на диалог расширения (по умолчанию не нужен);
   DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается.
@@ -186,12 +187,42 @@ def load_config():
         "pi": "pi",          # бинарь харнесса (PATH launchd задан в plist)
         "provider": "",      # пусто — взять первого провайдера из models.json pi
         "model": "",         # пусто — взять первую модель этого провайдера
+        # Уровень усилия Claude Code для сессий, открываемых без выбора приложения: в файле
+        # разговора он не хранится, и без этого возобновлённый процесс потерял бы выбор человека
+        "claude_effort": "",
         "token": secrets.token_hex(24),
     }
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.chmod(CONFIG_PATH, 0o600)
+    save_config(cfg)
     log("создал %s — токен и корни внутри файла, откройте его и впишите в приложение" % CONFIG_PATH)
     return cfg
+
+
+def save_config(cfg):
+    """Записывает настройки моста в тот же файл, что читает человек, и тем же режимом 600.
+
+    Файл перезаписывается целиком из уже прочитанного `CONFIG`: так туда попадают только те
+    поля, которые мост действительно помнит (сейчас — уровень усилия), а токен и корни не
+    теряются.
+    """
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def remember_claude_effort(effort):
+    """Запоминает уровень усилия Claude Code в настройках моста.
+
+    Зачем: в файле разговора усилие не хранится, а процесс после простоя или перезапуска моста
+    поднимается заново (`_reopen`) — без этой памяти выбор человека молча сменился бы на
+    умолчание модели. Ошибка записи не должна ломать текущую сессию, поэтому её только логируем.
+    """
+    value = str(effort or "").strip()
+    if str(CONFIG.get("claude_effort") or "") == value:
+        return
+    CONFIG["claude_effort"] = value
+    try:
+        save_config(CONFIG)
+    except OSError as e:
+        log("не смог сохранить уровень усилия в %s (%s)" % (CONFIG_PATH, e))
 
 
 CONFIG = load_config()
@@ -381,14 +412,80 @@ HARNESS_PI = "pi"
 HARNESS_CLAUDE = "claude"
 HARNESS_NAMES = {HARNESS_PI: "pi", HARNESS_CLAUDE: "Claude Code"}
 
-# Модели Claude Code задаются псевдонимами: так их понимает и он сам, и они не устаревают с
-# выходом новых версий. Окно контекста у них одно и то же (длинные варианты — отдельные модели).
-CLAUDE_MODELS = [
+# Псевдонимы семейств Claude Code: он сам разрешает их в новейшую версию, доступную аккаунту,
+# поэтому такой выбор переживает выход новых версий и не ломается об ограничения подписки.
+CLAUDE_ALIASES = [
     {"id": "default", "name": "Как настроено в Claude Code", "contextWindow": 200_000},
-    {"id": "opus", "name": "Opus — самый сильный", "contextWindow": 200_000},
-    {"id": "sonnet", "name": "Sonnet — баланс", "contextWindow": 200_000},
-    {"id": "haiku", "name": "Haiku — самый быстрый", "contextWindow": 200_000},
+    {"id": "fable", "name": "Fable — последняя", "contextWindow": 1_000_000},
+    {"id": "opus", "name": "Opus — последняя", "contextWindow": 1_000_000},
+    {"id": "opusplan", "name": "Opus Plan — Opus в планировании, Sonnet в работе", "contextWindow": 1_000_000},
+    {"id": "sonnet", "name": "Sonnet — последняя", "contextWindow": 1_000_000},
+    {"id": "haiku", "name": "Haiku — последняя", "contextWindow": 200_000},
 ]
+
+# Конкретные версии из встроенного каталога установленного Claude Code (порядок — от новых к
+# старым). Четвёртое поле — есть ли у версии 1M-вариант: Claude Code принимает его тем же
+# идентификатором с суффиксом `[1m]`, и такая строка добавляется рядом с базовой. Список
+# повторяет каталог именно этой версии, а не документацию: показать то, чего она не знает,
+# значит гарантировать ошибку при выборе.
+_CLAUDE_VERSIONS = [
+    ("claude-fable-5-1", "Fable 5.1", 1_000_000, False),
+    ("claude-fable-5", "Fable 5", 1_000_000, False),
+    ("claude-mythos-5-1", "Mythos 5.1", 1_000_000, False),
+    ("claude-mythos-5", "Mythos 5", 1_000_000, False),
+    ("claude-opus-5", "Opus 5", 1_000_000, False),
+    ("claude-opus-4-8", "Opus 4.8", 1_000_000, False),
+    ("claude-opus-4-7", "Opus 4.7", 1_000_000, False),
+    ("claude-opus-4-6", "Opus 4.6", 200_000, True),
+    ("claude-opus-4-5", "Opus 4.5", 200_000, True),
+    ("claude-opus-4-1", "Opus 4.1", 200_000, True),
+    ("claude-opus-4-0", "Opus 4", 200_000, True),
+    ("claude-sonnet-5", "Sonnet 5", 1_000_000, False),
+    ("claude-sonnet-4-6", "Sonnet 4.6", 200_000, True),
+    ("claude-sonnet-4-5", "Sonnet 4.5", 200_000, True),
+    ("claude-sonnet-4-0", "Sonnet 4", 200_000, True),
+    ("claude-3-7-sonnet", "Sonnet 3.7", 200_000, False),
+    ("claude-3-5-sonnet", "Sonnet 3.5", 200_000, False),
+    ("claude-haiku-4-5", "Haiku 4.5", 200_000, True),
+    ("claude-3-5-haiku", "Haiku 3.5", 200_000, False),
+]
+
+
+def claude_models():
+    """Собирает список моделей Claude Code: псевдонимы семейств и конкретные версии.
+
+    Нужен отдельной функцией, потому что версии бывают с 1M-вариантом: он добавляется рядом с
+    базовой строкой, и вручную дублировать имя и окно было бы легко ошибиться.
+    """
+    models = [dict(entry) for entry in CLAUDE_ALIASES]
+    for model_id, name, window, long in _CLAUDE_VERSIONS:
+        models.append({"id": model_id, "name": name, "contextWindow": window})
+        if long:
+            models.append({
+                "id": model_id + "[1m]",
+                "name": name + " (1M)",
+                "contextWindow": 1_000_000,
+            })
+    return models
+
+
+CLAUDE_MODELS = claude_models()
+
+# Усилие — сколько модель думает над ответом (`--effort`). Значения и порядок заданы Claude Code;
+# модель без поддержки уровня всё равно ответит, взяв своё умолчание, поэтому лишний выбор здесь
+# безвреден. Пустой выбор — «как решает Claude Code», а не «средний»: умолчание у моделей разное.
+CLAUDE_EFFORTS = [
+    {"id": "low", "name": "Низкое — быстрее и дешевле"},
+    {"id": "medium", "name": "Среднее"},
+    {"id": "high", "name": "Высокое"},
+    {"id": "xhigh", "name": "Очень высокое"},
+    {"id": "max", "name": "Максимальное — самое долгое и дорогое"},
+]
+
+
+def claude_effort_ids():
+    """Идентификаторы уровней усилия: ими проверяется то, что прислало приложение."""
+    return {entry["id"] for entry in CLAUDE_EFFORTS}
 
 
 def session_key(harness, session_id):
@@ -1042,9 +1139,10 @@ def is_local_model(model):
 def list_models(harness=HARNESS_PI):
     """Список моделей харнесса для выбора в приложении.
 
-    У pi он собирается из его собственного каталога (см. ниже), у Claude Code — фиксированный:
-    модели задаются псевдонимами (`opus`, `sonnet`, `haiku`), и придумывать им список из
-    документации значило бы показывать то, чего в этой версии может уже не быть.
+    У pi он собирается из его собственного каталога (см. ниже), у Claude Code — из каталога
+    его версии: псевдонимы семейств (их он сам разрешает в новейшую доступную версию) и
+    конкретные версии, включая 1M-варианты. Список придумывать из документации нельзя: он
+    должен совпадать с тем, что знает установленный Claude Code.
     """
     if harness == HARNESS_CLAUDE:
         return [
@@ -2056,16 +2154,29 @@ class ClaudeSession(AgentSession):
 
     harness = "claude"
 
-    def __init__(self, cwd, session_id=None, model=None):
+    def __init__(self, cwd, session_id=None, model=None, effort=None):
         """Поднимает процесс Claude Code в папке [cwd], продолжая сессию [session_id].
 
         Идентификатор новой сессии задаём сами (`--session-id`): свой Claude Code сообщает
         только вместе с первым ответом, а он нужен сразу — иначе приложение не смогло бы ни
         запомнить разговор, ни показать его в списке сессий. Продолжение идёт через `--resume`
         с тем же идентификатором.
+
+        [effort] — уровень усилия (`--effort`); пусто означает «как решает Claude Code». Свой
+        у модели он разный, поэтому пустое значение — это именно отказ от выбора, а не средний
+        уровень; проверяем его здесь, чтобы опечатка не превращалась молча в умолчание.
+        `None` — «про выбор ничего не сказали»: берётся уровень из настроек моста — так его не
+        теряет сессия, поднятая заново без участия приложения (см. [remember_claude_effort]).
         """
         super().__init__(cwd, model=model)
         self.id = session_id or str(uuid.uuid4())
+        if effort is None:
+            effort = CONFIG.get("claude_effort")
+        effort = str(effort or "").strip()
+        if effort and effort not in claude_effort_ids():
+            raise PiError("неизвестный уровень усилия: %s" % effort)
+        #: Уровень усилия этой сессии; задаётся при запуске и меняется перезапуском процесса
+        self.effort = effort
         self.last_usage = {}   # расход последнего хода: из него считается занятое окно
         self._start(session_id)
 
@@ -2089,6 +2200,10 @@ class ClaudeSession(AgentSession):
         model = self.model.split("/", 1)[1] if "/" in self.model else self.model
         if model and model != "default":
             cmd += ["--model", model]
+        if self.effort:
+            # Уровень усилия: без него Claude Code берёт умолчание модели (у каждой своё),
+            # поэтому пустой выбор — это именно «пусть решает сам»
+            cmd += ["--effort", self.effort]
 
         env = dict(os.environ)
         profile = claude_profile()
@@ -2188,8 +2303,23 @@ class ClaudeSession(AgentSession):
 
         Разговор при этом не теряется: новый процесс поднимается с `--resume` и продолжает ту же
         сессию из её файла. Другого способа у него нет — модель в живом процессе не меняется.
+        Уровень усилия при этом остаётся прежним.
         """
         self.model = model
+        self.stop()
+        self._start(self.id)
+
+    def set_effort(self, effort):
+        """Меняет уровень усилия: как и модель, он задаётся при запуске, поэтому процесс перезапускается.
+
+        Разговор продолжается из файла (`--resume`) — тот же путь, что и у смены модели:
+        теряется только прогрев промпта, а история, инструменты и контекст остаются.
+        """
+        effort = str(effort or "").strip()
+        if effort and effort not in claude_effort_ids():
+            raise PiError("неизвестный уровень усилия: %s" % effort)
+        self.effort = effort
+        remember_claude_effort(effort)
         self.stop()
         self._start(self.id)
 
@@ -2215,6 +2345,9 @@ class ClaudeSession(AgentSession):
             **self.state,
             "model": {"id": model, "name": claude_model_label(model), "provider": "claude"},
             "thinkingLevel": "on",
+            # Уровень усилия показываем как есть: пусто — «умолчание Claude Code», и врать
+            # конкретным уровнем, которого человек не выбирал, нельзя
+            "effort": self.effort,
             "messageCount": (self.counters["userMessages"] + self.counters["assistantMessages"]) or meta.get("messages") or 0,
             "tokens": tokens,
             "cost": self.state.get("cost") or 0,
@@ -2471,12 +2604,15 @@ class Pool:
         self.reaper = threading.Thread(target=self._reap, daemon=True)
         self.reaper.start()
 
-    def open(self, cwd, harness=HARNESS_PI, session_id=None, provider=None, model=None):
+    def open(self, cwd, harness=HARNESS_PI, session_id=None, provider=None, model=None, effort=None):
         """Отдаёт сессию в папке [cwd], поднимая процесс нужного харнесса, если его ещё нет.
 
         Занятая сессия не переоткрывается: два клиента в одной сессии — это два писателя в один
         файл истории, и разговор бы разъехался. Проверка «занято» живёт в ручке prompt, здесь же
         важно не потерять уже поднятый процесс.
+
+        [model] и [effort] — выбор для запускаемой сессии: у pi это пара «провайдер/модель», у
+        Claude Code — модель и уровень усилия.
         """
         key = session_key(harness, session_id) if session_id else ""
         with self.lock:
@@ -2487,9 +2623,10 @@ class Pool:
                 session.touched = time.time()
                 return session
 
-            session = (ClaudeSession if harness == HARNESS_CLAUDE else PiSession)(
-                cwd, session_id, model=model, **({"provider": provider} if harness != HARNESS_CLAUDE else {}),
-            )
+            if harness == HARNESS_CLAUDE:
+                session = ClaudeSession(cwd, session_id, model=model, effort=effort)
+            else:
+                session = PiSession(cwd, session_id, model=model, provider=provider)
             if not session.id:
                 detail = session.stderr_tail[-1] if session.stderr_tail else "без вывода"
                 session.stop()
@@ -2661,7 +2798,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"harnesses": harness_status()})
             elif path == "/models":
                 harness = str((params.get("harness") or [HARNESS_PI])[0]).strip().lower() or HARNESS_PI
-                self._json(200, {"models": list_models(harness), "harness": harness})
+                # Уровни усилия есть только у Claude Code: у pi размышления задаются уровнем
+                # самой модели, и отдельного выбора к ней не прилагается
+                self._json(200, {
+                    "models": list_models(harness),
+                    "harness": harness,
+                    "efforts": CLAUDE_EFFORTS if harness == HARNESS_CLAUDE else [],
+                })
             elif path == "/providers":
                 self._json(200, {"providers": provider_list()})
             elif path == "/sessions":
@@ -2814,6 +2957,16 @@ class Handler(BaseHTTPRequestHandler):
                     # показывает им шапку и сведения, и сырое состояние харнесса тут не подходит
                     session.refresh_state()
                     self._json(200, {"session": self._session_brief(session)})
+                elif action == "effort":
+                    # Уровень усилия есть только у Claude Code: у pi «размышления» — свойство
+                    # модели, и отдельного выбора к ней не прилагается
+                    if session.harness != HARNESS_CLAUDE:
+                        raise PiError("уровень усилия есть только у Claude Code")
+                    # Пустая строка — вернуться к умолчанию модели: это осмысленный выбор, и
+                    # отказывать в нём нельзя
+                    session.set_effort(str(body.get("effort") or ""))
+                    session.refresh_state()
+                    self._json(200, {"session": self._session_brief(session)})
                 elif action == "ui":
                     self._json(200, self._manual_ui(session, body))
                 else:
@@ -2921,7 +3074,9 @@ class Handler(BaseHTTPRequestHandler):
 
         Провайдер и модель можно задать здесь же: у pi моделей бывает несколько (локальная и
         удалённая по API), и для новой сессии выбор делается в момент открытия — потом его
-        меняет ручка `model`, не перезапуская разговор.
+        меняет ручка `model`, не перезапуская разговор. У Claude Code здесь же принимается
+        `effort`: он не записывается в файл разговора, поэтому приложение шлёт его и для уже
+        существующей сессии — иначе возобновлённый процесс взял бы умолчание модели.
         """
         raw = str(body.get("path") or "").strip()
         path = allowed_path(raw) if raw else None
@@ -2940,7 +3095,12 @@ class Handler(BaseHTTPRequestHandler):
         session_id = split_key(raw_id)[1] if raw_id else None
         provider = str(body.get("provider") or "").strip() or None
         model = str(body.get("model") or "").strip() or None
-        session = POOL.open(path, harness, session_id, provider=provider, model=model)
+        effort = str(body.get("effort") or "").strip() or None
+        # Выбор усилия помним в настройках моста: он не лежит в файле разговора, а процесс
+        # может быть поднят заново уже без приложения (см. remember_claude_effort)
+        if harness == HARNESS_CLAUDE and effort is not None:
+            remember_claude_effort(effort)
+        session = POOL.open(path, harness, session_id, provider=provider, model=model, effort=effort)
         session.refresh_state()
         self._json(200, {"session": self._session_brief(session)})
 
@@ -2991,6 +3151,8 @@ class Handler(BaseHTTPRequestHandler):
             "provider": str(model.get("provider") or ""),
             "local": is_local_model(model),
             "thinkingLevel": str(state.get("thinkingLevel") or ""),
+            # Уровень усилия: только у Claude Code; пусто — «умолчание модели»
+            "effort": str(state.get("effort") or ""),
             "busy": session.busy,
             "messages": int(state.get("messageCount") or 0),
             "contextTokens": context.get("tokens"),

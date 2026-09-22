@@ -169,8 +169,14 @@ class AgentSessionInfo {
   final bool busy;
 
   /// Уровень «размышлений» у pi (`off`, `medium`, …): у локальной модели выключен, у
-  /// reasoning-моделей по API включается на маке.
+  /// reasoning-моделей по API включается на маке. У Claude Code вместо него — [effort].
   final String thinkingLevel;
+
+  /// Уровень усилия Claude Code (`low`, `medium`, …, пусто — умолчание модели).
+  ///
+  /// Нужен экрану сессии: выбор уровня живёт в меню и показывается в сведениях, а у pi такого
+  /// выбора нет — его размышления задаёт сама модель.
+  final String effort;
 
   /// Сколько токенов контекста занято и каково окно модели.
   final int? contextTokens;
@@ -214,6 +220,7 @@ class AgentSessionInfo {
     this.messages = 0,
     this.busy = false,
     this.thinkingLevel = '',
+    this.effort = '',
     this.contextTokens,
     this.contextWindow,
     this.contextPercent = 0,
@@ -250,6 +257,7 @@ class AgentSessionInfo {
     messages: messages,
     busy: busy,
     thinkingLevel: thinkingLevel,
+    effort: effort,
     contextTokens: contextTokens,
     contextWindow: contextWindow,
     contextPercent: contextPercent,
@@ -286,6 +294,7 @@ class AgentSessionInfo {
       messages: num_(json['messages']) ?? 0,
       busy: json['busy'] == true,
       thinkingLevel: json['thinkingLevel']?.toString() ?? '',
+      effort: json['effort']?.toString() ?? '',
       contextTokens: num_(json['contextTokens']),
       contextWindow: num_(json['contextWindow']),
       contextPercent: json['contextPercent'] is num
@@ -494,6 +503,53 @@ class AgentProvider {
 
   /// Подпись для экрана: название, а если его нет — идентификатор.
   String get label => name.isNotEmpty ? name : key;
+}
+
+/// Уровень усилия Claude Code: сколько модель думает над ответом (флаг `--effort`).
+///
+/// Список приходит от моста тем же ответом, что и модели, и бывает пустым: у pi такого выбора
+/// нет, а у модели Claude Code без поддержки уровня выбор всё равно остаётся за ней самой.
+/// Идентификатор уходит в мост как есть, название показывается человеку.
+class AgentEffort {
+  /// Идентификатор уровня (`low`, `medium`, `high`, `xhigh`, `max`).
+  final String id;
+
+  /// Человеческое название уровня.
+  final String name;
+
+  /// Уровень усилия из ответа моста.
+  const AgentEffort({required this.id, this.name = ''});
+
+  /// Разбор уровня из ответа моста.
+  factory AgentEffort.fromJson(Map<String, dynamic> json) => AgentEffort(
+    id: json['id']?.toString() ?? '',
+    name: json['name']?.toString() ?? '',
+  );
+
+  /// Подпись для экрана: название, а если его нет — идентификатор.
+  String get label => name.isNotEmpty ? name : id;
+}
+
+/// Название уровня усилия по идентификатору.
+///
+/// Нужно сведениям о сессии и подписи после выбора: в описании сессии лежит только идентификатор
+/// (`high`), а список уровней приходит отдельно и в этот момент может быть не загружен. Для
+/// незнакомого идентификатора возвращаем его самого — показать пустоту было бы хуже.
+String agentEffortLabel(String id) {
+  switch (id.trim()) {
+    case 'low':
+      return 'низкое';
+    case 'medium':
+      return 'среднее';
+    case 'high':
+      return 'высокое';
+    case 'xhigh':
+      return 'очень высокое';
+    case 'max':
+      return 'максимальное';
+    default:
+      return id;
+  }
 }
 
 /// Модель, доступная харнессу на маке: локальная llama.cpp или удалённая по API.

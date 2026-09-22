@@ -110,8 +110,9 @@ class _ModelPickerDialog extends ConsumerWidget {
                     const SizedBox(height: 8),
                     Text(
                       harness == 'claude'
-                          ? 'Модели Claude Code задаются псевдонимами, а доступ у него свой — '
-                                'подписка или ключ на маке, и приложение в него не вмешивается.'
+                          ? 'Список — из каталога установленного Claude Code: псевдонимы семейств'
+                                ' и конкретные версии. Доступ у него свой — подписка или ключ на'
+                                ' маке, и приложение в него не вмешивается.'
                           : 'Удалённую модель добавляют кнопкой «Добавить провайдера»: адрес и '
                                 'ключ уедут на мак и останутся там — в приложении ключей нет.',
                       style: const TextStyle(
@@ -219,5 +220,156 @@ class _ModelPickerDialog extends ConsumerWidget {
       buffer.write(text[i]);
     }
     return buffer.toString();
+  }
+}
+
+/// Диалог выбора уровня усилия Claude Code: сколько модель думает над ответом.
+///
+/// Возвращает идентификатор уровня, пустую строку — «как решает Claude Code» — или `null`,
+/// если диалог закрыли. Пустая строка отличается от отмены намеренно: снять выбор и вернуться
+/// к умолчанию модели — осмысленное действие, и молча путать его с закрытием диалога нельзя.
+Future<String?> showEffortPicker(
+  BuildContext context,
+  WidgetRef ref, {
+  required String current,
+}) async {
+  // Список уровней приходит тем же ответом, что и модели. Читаем его здесь, а не при входе в
+  // разговор: запрос нужен только тому, кто действительно открывает выбор усилия.
+  unawaited(ref.read(agentModelsProvider.notifier).load(harness: 'claude'));
+  return showDialog<String>(
+    context: context,
+    builder: (_) => _EffortPickerDialog(current: current),
+  );
+}
+
+/// Диалог выбора уровня усилия: «как решает модель» плюс уровни, которые знает мост.
+class _EffortPickerDialog extends ConsumerWidget {
+  /// Текущий уровень сессии; пусто — умолчание модели.
+  final String current;
+
+  /// Диалог выбора усилия.
+  const _EffortPickerDialog({required this.current});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(agentModelsProvider);
+    // Уровни приходят только от Claude Code: у pi список пуст, и показывать там нечего
+    final efforts = state.harness == 'claude'
+        ? state.efforts
+        : const <AgentEffort>[];
+
+    return AlertDialog(
+      backgroundColor: C.surface,
+      title: const Text(
+        'Усилие · Claude Code',
+        style: TextStyle(color: C.fg, fontSize: 16),
+      ),
+      content: SizedBox(
+        width: 420,
+        child: state.loading && efforts.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.all(24),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            : SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (state.error != null)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text(
+                          state.error!,
+                          style: const TextStyle(
+                            color: C.danger,
+                            fontSize: 12.5,
+                            height: 1.3,
+                          ),
+                        ),
+                      ),
+                    _row(
+                      context,
+                      id: '',
+                      label: 'Как решает Claude Code',
+                      note: 'умолчание модели',
+                    ),
+                    for (final effort in efforts)
+                      _row(context, id: effort.id, label: effort.label),
+                    if (!state.loading && efforts.isEmpty && state.error == null)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 8),
+                        child: Text(
+                          'Уровни усилия мост не вернул. Проверьте на маке, что Claude Code '
+                          'отвечает: claude --effort high -p "привет".',
+                          style: TextStyle(
+                            color: C.fg3,
+                            fontSize: 12.5,
+                            height: 1.3,
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Усилие — сколько модель думает над ответом: ниже быстрее и дешевле, выше '
+                          'умнее. Смена уровня перезапускает процесс агента и продолжает тот '
+                          'же разговор.',
+                      style: TextStyle(
+                        color: C.fg3,
+                        fontSize: 11.5,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Закрыть'),
+        ),
+      ],
+    );
+  }
+
+  /// Строка уровня: по тапу возвращает идентификатор наружу.
+  Widget _row(
+    BuildContext context, {
+    required String id,
+    required String label,
+    String? note,
+  }) {
+    final selected = current.trim() == id;
+    return InkWell(
+      onTap: () => Navigator.of(context).pop(id),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(
+              selected
+                  ? Icons.radio_button_checked
+                  : Icons.radio_button_unchecked,
+              size: 18,
+              color: selected ? C.accent : C.fg3,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                label,
+                style: const TextStyle(color: C.fg, fontSize: 14),
+              ),
+            ),
+            if (note != null)
+              Text(
+                note,
+                style: const TextStyle(color: C.fg3, fontSize: 11.5),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 }

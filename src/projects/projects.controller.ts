@@ -246,6 +246,9 @@ export class ProjectsController {
     // а после открытия её меняет ручка model, не перезапуская разговор
     const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
     const model = typeof body.model === 'string' ? body.model.trim() : '';
+    // уровень усилия — выбор Claude Code; он не записывается в файл разговора, поэтому уезжает
+    // и для существующей сессии, иначе возобновлённый процесс взял бы умолчание модели
+    const effort = typeof body.effort === 'string' ? body.effort.trim() : '';
     return this.wrap(() =>
       this.projects.call<Record<string, unknown>>('POST', '/sessions', {
         body: {
@@ -254,6 +257,7 @@ export class ProjectsController {
           ...(harness ? { harness } : {}),
           ...(provider ? { provider } : {}),
           ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
         },
         // запуск процесса pi на маке — секунды, но не мгновение
         timeoutMs: 120_000,
@@ -407,6 +411,24 @@ export class ProjectsController {
         'POST',
         `/sessions/${encodeURIComponent(id)}/model`,
         { body: { provider, modelId } },
+      ),
+    );
+  }
+
+  /**
+   * Смена уровня усилия у сессии Claude Code (быстрее — дешевле, выше — умнее).
+   *
+   * Пустая строка означает «вернуться к умолчанию модели»: это осмысленный выбор, поэтому
+   * пустое значение не отклоняем. У pi такого выбора нет — там размышления задаёт сама модель.
+   */
+  @Post('sessions/:id/effort')
+  async effort(@Param('id') id: string, @Body() body: Record<string, unknown> = {}) {
+    const effort = typeof body.effort === 'string' ? body.effort.trim() : '';
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'POST',
+        `/sessions/${encodeURIComponent(id)}/effort`,
+        { body: { effort } },
       ),
     );
   }
