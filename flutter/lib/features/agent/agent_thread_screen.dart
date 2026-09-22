@@ -531,50 +531,65 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     return entries;
   }
 
-  /// Одно сообщение переписки.
+  /// Один пункт журнала переписки.
   ///
-  /// Все виды — текст, «размышления», карточка команды и прямая команда оболочки — рисуются
-  /// одинаково: тот же пузырь, тот же кегль текста. Служебное содержимое отличается только
-  /// приглушёнными цветами ([muted]): оно поясняет работу агента, а не является ответом.
+  /// Журнал — это столбик сообщений без плашек: вопрос человека отмечен акцентной чертой слева,
+  /// ответ идёт обычным текстом во всю ширину, а работа агента (размышления, инструменты,
+  /// команды) — от вертикальной направляющей. Шрифт и кегль у всего текста одни ([_textSize]),
+  /// различает пункты только цвет.
   ///
-  /// Свёрнутым по умолчанию идёт служебное: «размышления», карточка вызова инструмента и
-  /// прямая команда оболочки. В переписке важны ответы, а не то, как агент к ним шёл; в
-  /// свёрнутом виде у них видна первая строка — по ней узнаётся, о чём речь.
+  /// Свёрнутым по умолчанию идёт служебное: «размышления», вызов инструмента и прямая команда
+  /// оболочки. В переписке важны ответы, а не то, как агент к ним шёл; в свёрнутом виде у шага
+  /// видна его первая строка — по ней узнаётся, о чём речь.
   Widget _entry(_Entry entry) => switch (entry.kind) {
     _EntryKind.note => _note(entry.text),
-    _EntryKind.bash => _message(
-      muted: true,
+    _EntryKind.bash => _serviceEntry(
       icon: Icons.terminal,
+      title: '\$ ${entry.command}',
       copyText: entry.copyText,
       expandKey: _entryKey(entry),
-      collapsedPreview: _firstLine('\$ ${entry.command}'),
-      child: _BashCard(command: entry.command, output: entry.text),
+      body: entry.text.trim().isEmpty ? null : _OutputText(entry.text),
     ),
-    // Свёрнутый вызов показывает саму инструкцию — команду, путь или шаблон: по ней выбирают,
+    // Заголовок шага показывает саму инструкцию — команду, путь или шаблон: по ней выбирают,
     // раскрывать ли вывод. Раньше здесь стояла первая строка вывода, и у вызова без вывода
     // (правка файла, запись) свёрнутая строка читалась как «пусто», ничего не сообщая.
-    _EntryKind.tool => _message(
-      muted: true,
+    _EntryKind.tool => _serviceEntry(
       icon: Icons.build_outlined,
+      title: entry.tool!.summary.isEmpty
+          ? entry.tool!.name
+          : entry.tool!.summary,
       copyText: entry.copyText,
       expandKey: _entryKey(entry),
-      collapsedPreview: _firstLine(
-        entry.tool!.summary.isEmpty ? entry.tool!.name : entry.tool!.summary,
-      ),
-      child: _ToolCard(tool: entry.tool!),
+      // Значок состояния прямо в заголовке: без него не видно, вызов ещё идёт или упал
+      status: entry.tool!.running
+          ? const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : entry.tool!.isError
+          ? const Icon(Icons.error_outline, size: 16, color: C.danger)
+          : null,
+      body: entry.tool!.output.trim().isEmpty
+          ? null
+          : _OutputText(entry.tool!.output),
     ),
-    _EntryKind.reasoning => _message(
-      muted: true,
+    // Заголовок «размышлений» не повторяет их первую строку: свёрнутый шаг и так показывает
+    // её сам ([preview]), а раскрытый начинается сразу с текста ниже.
+    _EntryKind.reasoning => _serviceEntry(
       icon: Icons.psychology_outlined,
+      title: 'Размышления',
+      preview: _firstLine(entry.text),
       copyText: entry.copyText,
       expandKey: _entryKey(entry),
-      collapsedPreview: _firstLine(entry.text),
-      child: _ReasoningBlock(text: entry.text),
+      body: entry.text.trim().isEmpty
+          ? null
+          : _OutputText(entry.text, color: C.fg2),
     ),
     _EntryKind.user || _EntryKind.text || _EntryKind.waiting => _message(
       isUser: entry.kind == _EntryKind.user,
       copyText: entry.copyText,
-      child: _bubbleContent(entry),
+      child: _entryContent(entry),
     ),
   };
 
@@ -602,7 +617,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   }
 
   /// Содержимое текстового сообщения: сам текст, ожидание ответа и ошибка прогона.
-  Widget _bubbleContent(_Entry entry) {
+  Widget _entryContent(_Entry entry) {
     final isUser = entry.kind == _EntryKind.user;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -646,115 +661,133 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     );
   }
 
-  /// Предельная ширина пузыря: доля панели, в которой открыт разговор.
+  /// Сообщение журнала: вопрос человека или ответ агента.
   ///
-  /// Считается от ширины панели, а не окна ([widget.paneWidth]): в двухпанельном виде пузырь
-  /// во всю ширину окна вылез бы за край правой панели и уехал под неё. Меньше 0.8 — чтобы
-  /// сообщения оставались полосами переписки, а не страницами текста во всю ширину.
-  double _bubbleMax(BuildContext context) =>
-      (widget.paneWidth ?? MediaQuery.sizeOf(context).width) * 0.8;
-
-  /// Одно сообщение переписки: пузырь со значком вида (у служебного), содержимым и кнопками.
-  ///
-  /// Значок вида и кнопки действий стоят внутри пузыря, по его краям: сообщение читается одним
-  /// блоком, и наружу ничего не выносится. У сообщения без текста (например, ожидания ответа)
-  /// кнопок нет: ни копировать, ни раскрывать нечего.
-  ///
-  /// Свёрнутое служебное сообщение — одна строка. Её содержимое поднимается до высоты ряда
-  /// иконок ([_toggleRowHeight]) и центрируется в ней, поэтому значок вида и кнопки стоят по её
-  /// центру, а не выше текста. У раскрытого сообщения содержимое начинается сверху, а иконки
-  /// остаются на том же месте по вертикали — при раскрытии они не съезжают вниз к середине.
-  ///
-  /// Кнопка «раскрыть» стоит вплотную к «скопировать», одним рядом в правом верхнем углу
-  /// пузыря: это два действия над одним сообщением, и искать их по тексту не приходится.
-  ///
-  /// Значок вида ([icon]) — только у служебного: «размышления» и инструменты начинаются с
-  /// иконки, по которой видно, что это не ответ агента, а его работа.
+  /// Пузырей нет: текст идёт во всю ширину панели, а кнопка «скопировать» стоит в правом краю
+  /// первой строки. Вопрос отмечен акцентной чертой слева — единственное, чем он отличается
+  /// от ответа: кегль, шрифт и цвет текста у них общие ([_textSize]).
   Widget _message({
-    IconData? icon,
     required String copyText,
     required Widget child,
     bool isUser = false,
-    bool muted = false,
-    String? expandKey,
-    String collapsedPreview = '',
   }) {
-    final expanded = expandKey != null && _open.contains(expandKey);
-    final collapsed = expandKey != null && !expanded;
-    // Свёрнутая строка занимает всю высоту ряда иконок и центрируется в ней: только так
-    // кнопки и значок вида стоят по её центру.
-    final content = collapsed
-        ? GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => _toggle(expandKey),
-            child: SizedBox(
-              height: _toggleRowHeight,
-              // `widthFactor` обязателен: без него `Align` растянулся бы на всю доступную
-              // ширину, и свёрнутый пузырь занял бы всю переписку даже на короткой строке.
-              child: Align(
-                alignment: Alignment.centerLeft,
-                widthFactor: 1,
-                child: CollapsedLine(text: collapsedPreview),
+    // У вопроса слева акцентная черта: она и говорит, что это реплика человека, а не ответ
+    final body = isUser
+        ? Container(
+            decoration: const BoxDecoration(
+              border: Border(
+                left: BorderSide(color: C.accent, width: _accentBarWidth),
               ),
             ),
+            // черта стоит в отступе, а текст вопроса — в колонке остального текста
+            padding: const EdgeInsets.only(left: _textIndent - _accentBarWidth),
+            child: child,
           )
-        : child;
-    final buttons = <Widget>[
-      if (copyText.trim().isNotEmpty) _CopyButton(text: copyText),
-      if (expandKey != null)
-        _ExpandButton(expanded: expanded, onPressed: () => _toggle(expandKey)),
-    ];
-    final row = Row(
-      mainAxisSize: MainAxisSize.min,
-      // Всё прижато к верху пузыря: у раскрытого длинного сообщения иконки остаются у начала
-      // текста, а не уезжают к его середине.
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (icon != null) ...[
-          SizedBox(
-            // высота — как у кнопки: по ней значок, кнопки и свёрнутая строка стоят на одной
-            // линии; ширина — по самому значку, чтобы он не отъедал место у текста
-            width: _entryIconWidth,
-            height: _toggleRowHeight,
-            child: Center(
-              child: Icon(icon, size: 14, color: C.fg3.withValues(alpha: 0.55)),
-            ),
-          ),
-          const SizedBox(width: _entryIconGap),
+        : Padding(
+            padding: const EdgeInsets.only(left: _textIndent),
+            child: child,
+          );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(child: body),
+          if (copyText.trim().isNotEmpty) ...[
+            const SizedBox(width: _actionGap),
+            _CopyButton(text: copyText),
+          ],
         ],
-        // `Flexible`, а не `Expanded`: пузырь остаётся по ширине содержимого и растёт лишь
-        // тогда, когда текст доходит до предела ширины
-        Flexible(child: content),
-        if (buttons.isNotEmpty) ...[
-          const SizedBox(width: _toggleGap),
-          Row(mainAxisSize: MainAxisSize.min, children: buttons),
-        ],
-      ],
-    );
-    final bubble = ConstrainedBox(
-      // Иконки теперь внутри пузыря, поэтому отдельного места под них по бокам не нужно:
-      // предел ширины — целиком доля панели, в которой открыт разговор
-      constraints: BoxConstraints(maxWidth: _bubbleMax(context)),
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          // служебное сообщение приглушено другим фоном, а не оттенком текста: так его видно
-          // боковым зрением, и оно не спорит с ответом агента
-          color: muted ? C.surface2 : (isUser ? C.accentSoft : C.surface),
-          borderRadius: BorderRadius.circular(14),
-          // Рамка одна на все виды сообщений, включая неудачные вызовы: об ошибке говорит
-          // красная иконка внутри карточки, а красная рамка делала бы из этого сообщения
-          // самое заметное в переписке.
-          border: Border.all(color: isUser ? C.accent : C.brd),
-        ),
-        child: row,
       ),
     );
-    // Вопрос поджат к правому краю, ответ и служебные сообщения — к левому
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: bubble,
+  }
+
+  /// Строка журнала о работе агента: «размышления», вызов инструмента, команда оболочки.
+  ///
+  /// От вертикальной направляющей слева идут значок вида и заголовок одной строкой: он
+  /// обрезается многоточием, чтобы шаг занимал одну строку и журнал читался целиком. Кнопки
+  /// действий — в правом краю заголовка, там же, где у сообщений. Тело (вывод команды, текст
+  /// размышлений) показывается ниже и сдвинуто за направляющую: видно, что это подробности
+  /// шага, а не отдельная реплика.
+  Widget _serviceEntry({
+    required IconData icon,
+    required String title,
+    required String copyText,
+    required String expandKey,
+    String? preview,
+    Widget? status,
+    Widget? body,
+  }) {
+    final expanded = _open.contains(expandKey);
+    // Свёрнутый шаг показывает первую строку содержимого, раскрытый — название шага: так
+    // заголовок не повторяет ту же строку, которая идёт сразу под ним.
+    final header = expanded ? title : (preview ?? title);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
+      child: Container(
+        // направляющая — левая граница блока: она тянется на всю его высоту, включая тело
+        decoration: const BoxDecoration(
+          border: Border(left: BorderSide(color: C.brd, width: _railWidth)),
+        ),
+        padding: const EdgeInsets.only(left: _textIndent - _railWidth),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  // высота строки текста: по ней значок встаёт центром на заголовок
+                  width: _entryIconSize,
+                  height: _textLineHeight,
+                  child: Center(
+                    child: Icon(
+                      icon,
+                      size: _entryIconSize,
+                      color: C.fg3.withValues(alpha: 0.55),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: _entryIconGap),
+                // `Expanded`, а не `Flexible`: заголовок занимает всю строку, а кнопки стоят
+                // в её правом краю — на одном месте у каждого шага
+                Expanded(
+                  child: Text(
+                    header.trim().isEmpty ? 'пусто' : header,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: C.fg3,
+                      fontSize: _textSize,
+                      height: 1.35,
+                    ),
+                  ),
+                ),
+                if (status != null) ...[
+                  const SizedBox(width: 8),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: status,
+                  ),
+                ],
+                const SizedBox(width: _actionGap),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (copyText.trim().isNotEmpty) _CopyButton(text: copyText),
+                    _ExpandButton(
+                      expanded: expanded,
+                      onPressed: () => _toggle(expandKey),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            if (expanded && body != null)
+              Padding(padding: const EdgeInsets.only(top: 6), child: body),
+          ],
+        ),
+      ),
     );
   }
 
@@ -780,7 +813,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         Expanded(
           child: Text(
             text,
-            style: const TextStyle(color: C.fg3, fontSize: 12, height: 1.3),
+            style: const TextStyle(color: C.fg3, fontSize: _textSize, height: 1.35),
           ),
         ),
       ],
@@ -1107,75 +1140,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   }
 }
 
-/// Карточка вызова инструмента: подпись вызова и его вывод целиком.
-///
-/// Прятать вывод за нажатием не нужно: в переписке важно, что агент сделал, и лишний тап
-/// за каждой командой только мешал бы. Имени инструмента и значка вида тоже нет — по подписи
-/// (команда, путь, шаблон) и так видно, что произошло.
-class _ToolCard extends StatelessWidget {
-  /// Вызов инструмента со всем, что о нём известно.
-  final AgentTool tool;
-
-  /// Карточка вызова инструмента.
-  const _ToolCard({required this.tool});
-
-  @override
-  Widget build(BuildContext context) {
-    final summary = tool.summary;
-    // пустые строки вывода убираем: они съедают высоту сообщения, ничего не сообщая
-    final output = _compactLines(tool.output);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (summary.isNotEmpty)
-              Flexible(
-                child: SelectableText(
-                  summary,
-                  style: const TextStyle(
-                    color: C.fg2,
-                    fontSize: _textSize,
-                    fontFamily: 'monospace',
-                  ),
-                ),
-              ),
-            // Значок состояния оставляем: без него не видно, вызов ещё идёт или упал.
-            if (tool.running)
-              const Padding(
-                padding: EdgeInsets.only(left: 8),
-                child: SizedBox(
-                  width: 12,
-                  height: 12,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              )
-            else if (tool.isError)
-              const Padding(
-                padding: EdgeInsets.only(left: 8),
-                child: Icon(Icons.error_outline, size: 16, color: C.danger),
-              ),
-          ],
-        ),
-        if (output.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: SelectableText(
-              output,
-              style: const TextStyle(
-                color: C.fg3,
-                fontSize: _textSize,
-                fontFamily: 'monospace',
-                height: 1.35,
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
 /// Пункт переписки на экране: одно сообщение вместе со всем, что к нему относится.
 ///
 /// Отдельным типом от [AgentItem]: тот описывает ответ агента целиком, а на экране он
@@ -1270,36 +1234,54 @@ String _compactLines(String text) => text
 /// разметкой, и другой кегль у остальных сообщений выглядел бы вставкой из другого приложения.
 const _textSize = 14.0;
 
-/// Ширина кнопки действий (у пары с раскрытием и у одиночного копирования) вместе с её полями.
+/// Сторона кнопки действий («скопировать», «раскрыть») вместе с её полями.
 ///
-/// Кнопки стоят внутри пузыря одним рядом; на ширину ряда содержимое уступает место через
-/// `Flexible`, а не через уменьшение предела пузыря.
-const _copyButtonWidth = 28.0;
+/// Кнопки стоят в правом краю строки журнала; на их ширину и отступ текст уступает место,
+/// чтобы ряд не вылез за предел ширины переписки.
+const _actionSize = 28.0;
 
-/// Ширина значка вида в начале служебного сообщения.
-///
-/// Это ещё и ширина его слота внутри пузыря: по ней значок встаёт отдельным элементом ряда
-/// перед содержимым.
-const _entryIconWidth = 14.0;
-
-/// Отступ от значка вида до содержимого сообщения.
-///
-/// Больше, чем [_toggleGap]: значок — не кнопка рядом с текстом, а знак вида сообщения, и
-/// без заметного отступа он читался бы частью текста.
-const _entryIconGap = 8.0;
-
-/// Отступ от содержимого сообщения до ряда кнопок — и между кнопками тоже.
+/// Отступ от текста до кнопок действий — и между кнопками тоже.
 ///
 /// Аналитический отступ у [IconButton] для этого не годится: на разных размерах экрана он
 /// гулял, и кнопка то липла к тексту, то ли отъезжала от него. Здесь он один и тот же везде.
-const _toggleGap = 4.0;
+const _actionGap = 4.0;
 
-/// Высота ряда кнопок — она же высота значка вида и слота свёрнутой строки.
+/// Отступ между двумя соседними строками журнала.
 ///
-/// Кнопки одной высоты, и по этой же высоте выровнен значок вида. Свёрнутое служебное
-/// сообщение тоже поднимается до неё и центрируется внутри: только так кнопки, значок и
-/// строка стоят на одной линии посередине, а при раскрытии иконки не двигаются по вертикали.
-const _toggleRowHeight = 28.0;
+/// Свой у каждой строки, поэтому у соседей он складывается в двойной — этого хватает, чтобы
+/// сообщения не читались одним блоком.
+const _messageGapV = 6.0;
+
+/// Ширина вертикальной направляющей у шагов агента.
+///
+/// Тонкая, потому что шагов в переписке много и линия не должна спорить с текстом; она только
+/// показывает, где заканчивается ответ и начинается работа над ним.
+const _railWidth = 2.0;
+
+/// Ширина акцентной черты у вопроса человека.
+///
+/// Толще направляющей: реплик человека мало, и каждая должна быть видна.
+const _accentBarWidth = 3.0;
+
+/// Отступ текста от левого края переписки.
+///
+/// В нём стоят акцентная черта вопроса и направляющая шагов, а сам текст — и вопроса, и ответа,
+/// и шагов — начинается с этого отступа: весь журнал читается одной колонкой.
+const _textIndent = 13.0;
+
+/// Высота строки текста сообщения.
+///
+/// По ней выравнивается значок вида: он должен стоять центром на первой строке заголовка.
+const _textLineHeight = _textSize * 1.35;
+
+/// Размер значка вида в начале служебной строки.
+const _entryIconSize = 14.0;
+
+/// Отступ от значка вида до текста строки.
+///
+/// Больше, чем [_actionGap]: значок — не кнопка рядом с текстом, а знак вида шага, и без
+/// заметного отступа он читался бы частью текста.
+const _entryIconGap = 8.0;
 
 /// Сколько символов первой строки видно у свёрнутого служебного сообщения.
 ///
@@ -1309,7 +1291,7 @@ const _collapsedChars = 160;
 
 /// Кнопка «раскрыть сообщение» — у «размышлений», вызовов инструментов и прямых команд.
 ///
-/// Стоит вплотную к кнопке копирования (их разделяет только [_toggleGap]): это два действия
+/// Стоит вплотную к кнопке копирования (их разделяет только [_actionGap]): это два действия
 /// над одним сообщением, и разносить их по краям ряда незачем. Стрелка вниз — раскрыть,
 /// вверх — свернуть.
 class _ExpandButton extends StatelessWidget {
@@ -1337,41 +1319,13 @@ class _ExpandButton extends StatelessWidget {
     visualDensity: VisualDensity.compact,
     padding: EdgeInsets.zero,
     constraints: const BoxConstraints(
-      minWidth: _copyButtonWidth,
-      minHeight: _toggleRowHeight,
+      minWidth: _actionSize,
+      minHeight: _actionSize,
     ),
   );
 }
 
-/// Свёрнутое служебное сообщение: одна строка — первое, что в нём есть.
-///
-/// Моноширинный шрифт и приглушённый цвет — те же, что у вывода, который строка заменяет:
-/// по виду понятно, что это не ответ агента, а его работа.
-class CollapsedLine extends StatelessWidget {
-  /// Первая строка содержимого (обрезанная по длине).
-  final String text;
-
-  /// Свёрнутая строка.
-  const CollapsedLine({required this.text, super.key});
-
-  @override
-  Widget build(BuildContext context) => Text(
-    text.trim().isEmpty ? 'пусто' : text,
-    maxLines: 1,
-    overflow: TextOverflow.ellipsis,
-    style: TextStyle(
-      color: C.fg3,
-      fontSize: _textSize,
-      fontFamily: 'monospace',
-      height: 1.35,
-      // пустая строка вывода не должна выглядеть как щель в пузыре: место по высоте остаётся
-      // тем же, что у настоящей строки
-      fontStyle: text.trim().isEmpty ? FontStyle.italic : FontStyle.normal,
-    ),
-  );
-}
-
-/// Кнопка «скопировать сообщение» — одна и та же у пузырей и у карточек команд.
+/// Кнопка «скопировать сообщение» — одна и та же у сообщений и у шагов журнала.
 ///
 /// Нужна, чтобы копировать целиком, не выделяя текст пальцем: выделение на телефоне попадает
 /// мимо нужных строк, а команду с выводом так копировать неудобно совсем.
@@ -1387,8 +1341,8 @@ class _CopyButton extends StatelessWidget {
     tooltip: 'Скопировать сообщение',
     // копировать пустое нечего: у ещё не начатого ответа и служебных строк кнопки и нет
     onPressed: text.trim().isEmpty ? null : () => copyMessage(context, text),
-    // Приглушённее остальных иконок: кнопка стоит вне пузыря и не должна спорить за внимание
-    // с содержимым сообщения — оттенок берём от fg3, своего цвета для неё в палитре нет.
+    // Приглушённее остальных иконок: кнопка стоит в краю строки и не должна спорить
+    // за внимание с содержимым сообщения — оттенок берём от fg3, своего цвета для неё нет.
     icon: Icon(
       Icons.content_copy,
       size: 14,
@@ -1397,79 +1351,29 @@ class _CopyButton extends StatelessWidget {
     visualDensity: VisualDensity.compact,
     padding: EdgeInsets.zero,
     constraints: const BoxConstraints(
-      minWidth: _copyButtonWidth,
-      minHeight: _toggleRowHeight,
+      minWidth: _actionSize,
+      minHeight: _actionSize,
     ),
   );
 }
 
-/// Карточка прямой команды оболочки: строка команды и её вывод целиком.
+/// Подробности шага журнала: вывод команды или текст «размышлений».
 ///
-/// Такую команду запускал не агент, а харнесс по просьбе клиента; прятать её вывод за
-/// нажатием не нужно — раскрывать его пришлось бы каждый раз, чтобы просто прочитать ответ.
-class _BashCard extends StatelessWidget {
-  /// Команда целиком, как её запускали.
-  final String command;
-
-  /// Вывод команды.
-  final String output;
-
-  /// Карточка команды.
-  const _BashCard({required this.command, required this.output});
-
-  @override
-  Widget build(BuildContext context) {
-    // пустые строки вывода убираем: команда печатает их пачками, а несут они только высоту
-    final text = _compactLines(output);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SelectableText(
-          '\$ $command',
-          style: const TextStyle(
-            color: C.fg2,
-            fontSize: _textSize,
-            fontFamily: 'monospace',
-          ),
-        ),
-        if (text.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: SelectableText(
-              text,
-              style: const TextStyle(
-                color: C.fg3,
-                fontSize: _textSize,
-                fontFamily: 'monospace',
-                height: 1.35,
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-/// «Размышления» модели: полный текст, приглушённый и без раскрытия.
-///
-/// Мешать чтению они не будут и так: они идут отдельным сообщением, приглушённым фоном и
-/// цветом. Прятать их за нажатием значило бы заставлять человека лезть за ними каждый раз —
-/// а это часть того, что модель на самом деле сделала.
-class _ReasoningBlock extends StatelessWidget {
-  /// Текст размышлений целиком; дописывается по мере генерации.
+/// Шрифт и кегль — те же, что у ответа агента, поэтому служебное отличается от него только
+/// цветом. Пустые строки выкидываются: команды печатают их пачками, а несут они только высоту.
+class _OutputText extends StatelessWidget {
+  /// Текст как он пришёл.
   final String text;
 
-  /// Блок размышлений.
-  const _ReasoningBlock({required this.text});
+  /// Цвет текста: у вывода команды приглушённый, у «размышлений» — второстепенный.
+  final Color color;
+
+  /// Подробности шага.
+  const _OutputText(this.text, {this.color = C.fg3});
 
   @override
   Widget build(BuildContext context) => SelectableText(
-    // пустые строки в размышлениях убираем: модель ставит их пачками, а несут они только высоту
     _compactLines(text),
-    style: const TextStyle(
-      color: C.fg2,
-      fontSize: _textSize,
-      height: 1.35,
-    ),
+    style: TextStyle(color: color, fontSize: _textSize, height: 1.35),
   );
 }
