@@ -1,13 +1,17 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
 
 import '../../theme.dart';
 import '../../util/format.dart';
 import '../../util/markdown_view.dart';
 import '../../util/widgets.dart';
+import 'agent_api.dart';
 import 'agent_controller.dart';
 import 'agent_model_picker.dart';
 import 'agent_types.dart';
@@ -119,6 +123,21 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Контроллер разговора, взятый один раз в `initState`.
   late final AgentThreadController _thread;
 
+  /// Диктофон голосового ввода. Один на экран: пока открыт разговор, запись только одна.
+  final _recorder = AudioRecorder();
+
+  /// Идёт запись голоса — кнопка в композере в это время останавливает запись.
+  bool _recording = false;
+
+  /// Запись уже ушла на распознавание: кнопка показывает спиннер, поле в это время не трогаем.
+  bool _transcribing = false;
+
+  /// Путь временного файла текущей записи; `null` — записи нет.
+  ///
+  /// Файл живёт в временной папке приложения и удаляется сразу после распознавания: держать
+  /// аудио в памяти нельзя (запись может быть минутной), а после отправки оно не нужно.
+  String? _recordPath;
+
   @override
   void initState() {
     super.initState();
@@ -150,6 +169,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     _thread.detach();
     _input.dispose();
     _scroll.dispose();
+    // Уход с экрана отпускает микрофон: без этого недописанная запись осталась бы висеть на
+    // устройстве (индикатор записи на Android/iOS) до следующего открытия разговора.
+    _recorder.dispose();
     super.dispose();
   }
 
@@ -175,6 +197,84 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     // принудительно, даже если он перед этим читал середину переписки
     _follow = true;
     await _thread.send(text);
+  }
+
+  /// Начинает запись голосового ввода.
+  ///
+  /// Пишем в файл, а не в память: кодировку выбирает платформа, а запись может быть
+  /// минутной — держать её в куче незачем. Формат роли не играет: сервер на маке приводит вход
+  /// через ffmpeg. Доступ к микрофону спрашиваем здесь, при нажатии, а не заранее при входе.
+  Future<void> _startRecording() async {
+    if (_recording || _transcribing) return;
+    try {
+      if (!await _recorder.hasPermission()) {
+        if (mounted) snack(context, 'Нет доступа к микрофону');
+        return;
+      }
+      final dir = await getTemporaryDirectory();
+      final path =
+          '${dir.path}/voice-${DateTime.now().millisecondsSinceEpoch}.wav';
+      await _recorder.start(
+        // 16 кГц моно — родной формат whisper: так распознавание не зависит от того, умеет ли
+        // сервер на маке сам конвертировать вход (он запущен с `--convert`, но это запасной путь).
+        const RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+        path: path,
+      );
+      if (!mounted) return;
+      setState(() {
+        _recordPath = path;
+        _recording = true;
+      });
+    } catch (e) {
+      if (mounted) snack(context, 'Не удалось начать запись: $e');
+    }
+  }
+
+  /// Останавливает запись и отправляет её на распознавание.
+  ///
+  /// Пока идёт распознавание, кнопка — спиннер: получить текст без ожидания нельзя, а показать
+  /// что-то другое значило бы соврать про то, что происходит. Распознанный текст подставляем в
+  /// поле и не отправляем: человек видит, что услышала модель, и отправляет сам.
+  Future<void> _stopRecordingAndTranscribe() async {
+    if (!_recording) return;
+    final path = _recordPath;
+    _recordPath = null;
+    setState(() {
+      _recording = false;
+      _transcribing = true;
+    });
+    try {
+      await _recorder.stop();
+      if (path == null) throw const FileSystemException('путь записи потерян');
+      final file = File(path);
+      final audio = await file.readAsBytes();
+      // запись больше не нужна ни при каком исходе: распознавание идёт по байтам в памяти
+      try {
+        await file.delete();
+      } catch (_) {
+        // не смогли удалить — не повод терять уже полученный текст
+      }
+      if (audio.isEmpty) throw const FileSystemException('пустая запись');
+      final text = await ref.read(agentApiProvider).transcribe(audio);
+      if (!mounted) return;
+      if (text.isEmpty) {
+        snack(context, 'Речь не распознана');
+        return;
+      }
+      // Курсор ставим в конец: после диктовки чаще всего дописывают слова руками.
+      _input.text = text;
+      _input.selection = TextSelection.collapsed(offset: text.length);
+    } on AgentApiException catch (e) {
+      if (mounted) snack(context, e.message);
+    } catch (e) {
+      if (mounted) snack(context, 'Распознавание не удалось: $e');
+    } finally {
+      if (mounted) setState(() => _transcribing = false);
+    }
   }
 
   /// Включает и выключает тикер времени по признаку «идёт работа».
@@ -375,6 +475,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       'details' => setState(() => _details = !_details),
       'model' => _pickModel(),
       'effort' => _pickEffort(),
+      // «Стоп» живёт только в шапке: в композере остановка записи голоса, и две совсем разные
+      // кнопки «стоп» рядом читались бы как одна.
+      'stop' => _thread.stop(),
       'compact' => _compact(),
       _ => _delete(),
     },
@@ -396,6 +499,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       // пункта в меню там быть не должно
       if (state.session?.harness == 'claude')
         const PopupMenuItem(value: 'effort', child: Text('Усилие')),
+      // Серым, а не спрятанным: пункт всегда на месте, и человек знает, где останавливать
+      // работу, — но жать его нечего, пока агент не работает.
+      PopupMenuItem(
+        value: 'stop',
+        enabled: state.sending,
+        child: const Text('Стоп'),
+      ),
       PopupMenuItem(
         value: 'compact',
         enabled: !state.sending,
@@ -1004,51 +1114,58 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                   border: InputBorder.none,
                   enabledBorder: InputBorder.none,
                   focusedBorder: InputBorder.none,
-                  // справа — место под кнопку отправки (и «Стоп» рядом с ней во время работы),
-                  // слева — обычный отступ текста от края экрана
-                  // const здесь нельзя: правый отступ зависит от состояния отправки
-                  contentPadding: EdgeInsets.fromLTRB(
-                    14,
-                    10,
-                    state.sending ? 100 : 52,
-                    10,
-                  ),
+                  // справа — место под единственную кнопку у правого края, слева — обычный
+                  // отступ текста от края экрана
+                  contentPadding: const EdgeInsets.fromLTRB(14, 10, 52, 10),
                 ),
                 onChanged: (_) => setState(() {}),
               ),
             ),
-            // Кнопки у правого нижнего края: отправка доступна и во время работы агента —
-            // сообщение встанет в очередь. «Стоп» рядом, потому что остановить прогон и
-            // дописать сообщение — разные действия.
+            // Кнопка у правого нижнего края — одна, и что она делает, решает состояние:
+            //  • текст пуст — голосовой ввод: запись уезжает на распознавание, а её текст
+            //    подставляется в поле;
+            //  • идёт запись — второй тап («начал — остановил») останавливает её и отправляет
+            //    на распознавание;
+            //  • идёт распознавание — спиннер: повторять тут нечего;
+            //  • текст набран — «Отправить»: если агент занят, сообщение встанет в очередь,
+            //    а если свободен — уйдёт в работу (это решает контроллер разговора).
+            // «Стоп» для работы агента сюда не попадает намеренно — он в меню шапки: две
+            // разные остановки рядом читались бы как одна кнопка.
             Positioned(
               right: 4,
               bottom: 2,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    tooltip: state.sending ? 'Отправить в очередь' : 'Отправить',
-                    // кнопка активна только при непустом тексте: серая кнопка честнее кнопки,
-                    // которая молча ничего не делает
-                    onPressed: _input.text.trim().isEmpty ? null : _send,
-                    icon: Icon(
-                      state.sending ? Icons.playlist_add : Icons.send,
-                      size: 28,
-                      color: _input.text.trim().isEmpty ? C.fg3 : C.accent,
-                    ),
-                  ),
-                  if (state.sending)
-                    IconButton(
-                      tooltip: 'Стоп',
-                      onPressed: () => _thread.stop(),
+              child: _transcribing
+                  ? const Padding(
+                      padding: EdgeInsets.all(12),
+                      child: SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    )
+                  : _recording
+                  ? IconButton(
+                      tooltip: 'Остановить запись',
+                      onPressed: _stopRecordingAndTranscribe,
                       icon: const Icon(
                         Icons.stop_circle_outlined,
                         color: C.danger,
                         size: 32,
                       ),
+                    )
+                  : _input.text.trim().isEmpty
+                  ? IconButton(
+                      tooltip: 'Голосовой ввод',
+                      onPressed: _startRecording,
+                      icon: const Icon(Icons.mic_none, size: 28, color: C.fg3),
+                    )
+                  : IconButton(
+                      tooltip: state.sending
+                          ? 'Отправить в очередь'
+                          : 'Отправить',
+                      onPressed: _send,
+                      icon: const Icon(Icons.send, size: 28, color: C.accent),
                     ),
-                ],
-              ),
             ),
           ],
         ),

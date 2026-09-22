@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { Readable } from 'node:stream';
-import { ApiError, badRequest } from '../common/errors';
+import { ApiError, badRequest, payloadTooLarge } from '../common/errors';
 import { RateLimit } from '../common/decorators';
 import { ProjectsError, ProjectsService } from './projects.service';
 import {
@@ -23,6 +23,14 @@ import {
 
 /** Потолок длины сообщения агенту: его принимает и мост, но отказ лучше дать здесь, с текстом. */
 const MAX_PROMPT_CHARS = 20_000;
+
+/**
+ * Потолок аудио голосового ввода.
+ *
+ * 16 МБ — это минуты речи в любом формате, который даёт платформа; больше — уже не реплика в
+ * композер, а утечка памяти на сервере: запись целиком держится в буфере, прежде чем уйти на мак.
+ */
+const MAX_AUDIO_BYTES = 16 * 1024 * 1024;
 
 /**
  * Раздел «Проекты»: выбор папки проекта на домашнем маке и работа с агентом pi внутри неё.
@@ -464,6 +472,44 @@ export class ProjectsController {
         `/sessions/${encodeURIComponent(id)}`,
       ),
     );
+  }
+
+  /**
+   * Распознаёт записанную речь в текст для голосового ввода в композере разговора.
+   *
+   * Тело — само аудио (`application/octet-stream`), а не JSON: сервер его не разбирает, а
+   * перекладывает на локальный whisper.cpp на маке. Мимо JSON-парсера такие тела проходят как
+   * есть (см. комментарий к `express.json` в `main.ts`), поэтому поток читаем сами и сразу
+   * считаем длину — иначе один цикл залил бы всю память процесса.
+   */
+  @Post('transcribe')
+  @RateLimit(60, 60_000)
+  async transcribe(@Req() req: Request) {
+    // Тип приходит от клиента и нужен только как подсказка whisper: своего разбора форматов
+    // здесь нет, поэтому незнакомый (или вовсе отсутствующий) тип отправляем как есть.
+    const mime = String(req.headers['content-type'] ?? '')
+      .split(';')[0]
+      .trim();
+
+    const contentLength = Number(req.headers['content-length'] ?? 0);
+    if (Number.isFinite(contentLength) && contentLength > MAX_AUDIO_BYTES) {
+      throw payloadTooLarge('запись слишком длинная');
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of req) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > MAX_AUDIO_BYTES) throw payloadTooLarge('запись слишком длинная');
+      chunks.push(buf);
+    }
+    if (total === 0) throw badRequest('пустая запись');
+
+    const text = await this.wrap(() =>
+      this.projects.transcribe(Buffer.concat(chunks), mime),
+    );
+    return { text };
   }
 
   /**

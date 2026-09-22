@@ -131,11 +131,16 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # Мост до харнесса pi: раздел «Проекты» — агент работает в папке проекта на маке.
           PI_BRIDGE_URL: ${{ secrets.PI_BRIDGE_URL || 'http://127.0.0.1:18820' }}
+          # Локальный whisper.cpp для голосового ввода в композере разговора. Приходит тем же
+          # reverse-SSH туннелем мака (порт 18818), поэтому адрес — loopback VPS.
+          STT_URL: ${{ secrets.STT_URL || 'http://127.0.0.1:18818' }}
+          # Пусто — whisper определяет язык сам: в русской речи бывают английские вставки.
+          STT_LANGUAGE: ${{ secrets.STT_LANGUAGE }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,PI_BRIDGE_URL
+          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,PI_BRIDGE_URL,STT_URL,STT_LANGUAGE
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -237,6 +242,9 @@ jobs:
 
             # Мост до харнесса pi (раздел «Проекты») приходит reverse-SSH туннелем мака.
             PI_BRIDGE_URL=$PI_BRIDGE_URL
+            # Локальное распознавание речи для голосового ввода — тем же туннелем мака.
+            STT_URL=$STT_URL
+            STT_LANGUAGE=$STT_LANGUAGE
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \

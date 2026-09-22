@@ -20,6 +20,14 @@ export class ProjectsError extends Error {
 const REQUEST_TIMEOUT_MS = 60_000;
 
 /**
+ * Потолок ожидания распознавания речи.
+ *
+ * whisper-server считает запись на маке целиком и на длинной диктовке может уйти за минуту;
+ * таймаут нужен только чтобы зависший запрос не держал соединение вечно, а не как бюджет.
+ */
+const STT_TIMEOUT_MS = 120_000;
+
+/**
  * Клиент моста до харнесса pi на домашнем маке (`agents/pi-bridge/`).
  *
  * Сервер ходит к мосту через reverse-SSH туннель, на
@@ -42,6 +50,16 @@ export class ProjectsService {
   /** Адрес моста без хвостовых слэшей, чтобы пути склеивались одним способом. */
   private base(): string {
     return env.PI_BRIDGE_URL.trim().replace(/\/+$/, '');
+  }
+
+  /** Настроено ли распознавание речи: без адреса ручка голосового ввода не работает. */
+  get sttConfigured(): boolean {
+    return env.STT_URL.trim().length > 0;
+  }
+
+  /** Адрес whisper-сервера без хвостовых слэшей, чтобы путь `/inference` склеивался верно. */
+  private sttBase(): string {
+    return env.STT_URL.trim().replace(/\/+$/, '');
   }
 
   /**
@@ -82,6 +100,64 @@ export class ProjectsService {
     const res = await this.send(method, path, { ...rest, body });
     if (!res.body) throw new ProjectsError(502, 'мост закрыл соединение, не прислав ответ');
     return res.body as ReadableStream<Uint8Array>;
+  }
+
+  /**
+   * Распознаёт записанную речь локальным whisper.cpp на маке.
+   *
+   * Запись уходит на `/inference` полем `file` (multipart) — так её ждёт whisper-server.
+   * Формат не важен: сервер запущен с `--convert` и сам приводит вход через ffmpeg, поэтому
+   * приложение записывает то, что умеет платформа. Наружу отдаём только текст: метки времени
+   * и вероятности экрану не нужны. Отказ (туннель отключился, модель не поднялась) — тот же
+   * [ProjectsError], что и у моста, и по коду 502 приложение понимает «повторять бессмысленно».
+   */
+  async transcribe(audio: Buffer, mime: string): Promise<string> {
+    if (!this.sttConfigured) {
+      throw new ProjectsError(503, 'голосовой ввод не настроен: распознавание речи недоступно');
+    }
+
+    const form = new FormData();
+    form.append(
+      'file',
+      new Blob([new Uint8Array(audio)], { type: mime || 'application/octet-stream' }),
+      'voice',
+    );
+    // `json` — самый простой ответ whisper-server (`{text}`); `language` добавляем только
+    // когда он задан явно: пустая строка означает автоопределение (см. STT_LANGUAGE).
+    form.append('response_format', 'json');
+    const language = env.STT_LANGUAGE.trim();
+    if (language) form.append('language', language);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), STT_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${this.sttBase()}/inference`, {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new ProjectsError(
+          502,
+          `распознавание речи ответило ${res.status}${text ? `: ${text.slice(0, 200)}` : ''}`,
+        );
+      }
+      const raw = (await res.json().catch(() => ({}))) as { text?: unknown };
+      return typeof raw.text === 'string' ? raw.text.trim() : '';
+    } catch (e) {
+      if (e instanceof ProjectsError) throw e;
+      if (controller.signal.aborted) {
+        throw new ProjectsError(504, 'распознавание речи не ответило за 120 с');
+      }
+      this.logger.warn(`распознавание речи недоступно: ${String(e)}`);
+      throw new ProjectsError(
+        502,
+        'распознавание речи недоступно: whisper на маке не отвечает',
+      );
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
@@ -488,6 +489,22 @@ class AgentApi {
     await _send<Map<String, dynamic>>(
       () => _http.post('/projects/sessions/$id/abort'),
     );
+  }
+
+  /// Распознаёт записанную речь в текст голосового ввода.
+  ///
+  /// Тело — байты записи, а не JSON: сервер перекладывает их на локальный whisper.cpp на маке
+  /// и возвращает готовый текст. Формат записи роли не играет — сервер на маке приводит вход
+  /// через ffmpeg, — поэтому уходит ровно то, что записала платформа.
+  Future<String> transcribe(Uint8List audio) async {
+    final data = await _send<Map<String, dynamic>>(
+      () => _http.post<Map<String, dynamic>>(
+        '/projects/transcribe',
+        data: audio,
+        options: Options(contentType: 'application/octet-stream'),
+      ),
+    );
+    return data?['text']?.toString().trim() ?? '';
   }
 
   /// Сжимает контекст сессии: длинная работа иначе перестанет влезать в окно модели.

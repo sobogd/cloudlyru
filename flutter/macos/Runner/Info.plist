@@ -4,6 +4,9 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<!-- Голосовой ввод: приложение пишет речь в микрофон, распознаёт её локальный whisper на маке. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Запись голоса для голосового ввода в разговоре с агентом</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIconFile</key>

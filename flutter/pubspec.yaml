@@ -20,7 +20,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # scripts/build-release.sh на своём маке (workflow сборки приложений больше нет), и номер
 # сборки обязан расти с каждым выпуском. Номер общий для платформ: из него же берётся
 # CFBundleVersion настольной и iOS-сборки, поэтому поднимать его достаточно один раз.
-version: 1.0.0+162
+version: 1.0.0+163
 
 environment:
   sdk: ^3.13.3
@@ -77,6 +77,7 @@ dependencies:
   path: ^1.9.1
   flutter_secure_storage: ^11.1.1
   webview_flutter_wkwebview: ^3.26.1
+  record: ^7.1.1
 
 dev_dependencies:
   # Тестов в проекте нет намеренно (решение владельца): `flutter_test` и каталог `test/`

@@ -2,6 +2,10 @@
     xmlns:tools="http://schemas.android.com/tools">
     <!-- Без этого разрешения release-сборка не может ходить в сеть вовсе. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Голосовой ввод в композере разговора: приложение записывает речь, а распознаёт её
+         локальный whisper на маке. Разрешение спрашивается системой при первом нажатии на
+         микрофон; до этого кнопка голосового ввода до диктофона не доходит. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <!-- Обновление по кнопке: открывает системный установщик APK. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <!-- «Доступ ко всем файлам»: без него не видно ни дерева папок, ни содержимого разделов.
