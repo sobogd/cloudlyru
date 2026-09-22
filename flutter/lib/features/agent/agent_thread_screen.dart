@@ -1087,14 +1087,16 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         _contextBorder(state),
         Stack(
           children: [
-            // Cmd+Enter (Ctrl+Enter там, где Cmd нет) отправляет набранное: в многострочном
-            // поле Enter — это перенос строки, и без отдельного сочетания отправить сообщение
-            // с клавиатуры нечем. Модификаторы сверяются точно, поэтому Shift+Cmd+Enter под
-            // сочетание не попадает и оставляет в поле обычный перенос строки.
+            // Cmd+Enter, Ctrl+Enter (там, где Cmd нет) и Alt+Enter отправляют набранное: в
+            // многострочном поле Enter — это перенос строки, и без отдельного сочетания
+            // отправить сообщение с клавиатуры нечем. Модификаторы сверяются точно,
+            // поэтому Shift+Cmd+Enter под сочетание не попадает и оставляет в поле обычный
+            // перенос строки.
             CallbackShortcuts(
               bindings: {
                 const SingleActivator(LogicalKeyboardKey.enter, meta: true): _send,
                 const SingleActivator(LogicalKeyboardKey.enter, control: true): _send,
+                const SingleActivator(LogicalKeyboardKey.enter, alt: true): _send,
               },
               child: TextField(
                 controller: _input,
