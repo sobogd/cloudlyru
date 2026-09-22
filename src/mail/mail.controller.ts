@@ -15,6 +15,7 @@ import { sendObjectOr404 } from '../common/http-object';
 import { CurrentUser, Public, RateLimit, RequestUser, SessionOnly } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { badRequest } from '../common/errors';
+import { isPlainObject } from '../common/utils';
 import { secretEquals } from './mail-crypto';
 import { envelopeRecipient } from './mail-parse';
 
@@ -56,6 +57,10 @@ const FAVICON_MIME = new Set([
  *
  * Статические пути объявлены до параметрических: иначе `messages` уехало бы в `:id`.
  */
+
+/** Потолок пачки id в ручках массового удаления: больше за один раз выбирать нечего. */
+const BULK_IDS_MAX = 500;
+
 @Controller('mail')
 export class MailController {
   private readonly logger = new Logger(MailController.name);
@@ -292,6 +297,37 @@ export class MailController {
 
   // ===== Письмо =====
 
+  /**
+   * Массовое удаление: отмеченную галочками пачку писем — в корзину почты.
+   *
+   * Статический путь (`messages/bulk-delete`) объявлен до параметрических ручек письма
+   * сознательно: так id письма `bulk-delete` никогда не перехватит этот маршрут.
+   *
+   * Одним запросом на всю пачку, а не циклом клиента по одиночным `DELETE /messages/:id`:
+   * сервер делает одно обновление по списку id, а каждый вызов — это отдельная транзакция,
+   * запись в журнал и обход списка на клиенте.
+   */
+  @Post('messages/bulk-delete')
+  @SessionOnly()
+  @UseGuards(RateLimitGuard)
+  @RateLimit(600, 60_000)
+  bulkDelete(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
+    return this.feed.deleteMessages(user.id, bulkIds(body));
+  }
+
+  /**
+   * Массовое удаление навсегда (только из корзины). `@SessionOnly` — по той же причине, что
+   * у одиночного `messages/:id/purge`: безвозвратная очистка не должна быть доступна токену
+   * устройства, иначе политика ручки-соседа обходится одним запросом по списку id.
+   */
+  @Post('messages/bulk-purge')
+  @SessionOnly()
+  @UseGuards(RateLimitGuard)
+  @RateLimit(300, 60_000)
+  bulkPurge(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
+    return this.feed.purgeMessages(user.id, bulkIds(body));
+  }
+
   @Get('messages/:id')
   @SessionOnly()
   get(@Param('id') id: string, @CurrentUser() user: RequestUser) {
@@ -484,6 +520,23 @@ export class MailController {
   ) {
     return this.feed.attachment(user.id, id, attachmentId);
   }
+}
+
+/**
+ * Список id из тела запроса на массовую операцию: строки, без повторов и пустых значений,
+ * не больше [BULK_IDS_MAX].
+ *
+ * Ошибка вместо молчаливого усечения: отброшенный id означал бы, что человек выбрал десять
+ * писем, а удалилось восемь, и об этом он не узнал бы ни из ответа, ни из списка.
+ */
+function bulkIds(body: Record<string, unknown>): string[] {
+  if (!isPlainObject(body)) throw badRequest('invalid body');
+  const raw = body.ids;
+  if (!Array.isArray(raw)) throw badRequest('ids must be array');
+  const ids = [...new Set(raw.filter((x): x is string => typeof x === 'string' && x.length > 0))];
+  if (!ids.length) throw badRequest('ids required');
+  if (ids.length > BULK_IDS_MAX) throw badRequest('too many ids');
+  return ids;
 }
 
 /** Папка из строки запроса: у почты их три, любое другое значение — ошибка. */

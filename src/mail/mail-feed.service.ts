@@ -501,6 +501,27 @@ export class MailFeedService {
     return { ok: true };
   }
 
+  /**
+   * Удалить в корзину пачку писем — то же мягкое удаление, что и у [deleteMessage], но одним
+   * запросом.
+   *
+   * Списком, а не по одному письму: в ленте человек отмечает галочками десятки строк, и каждый
+   * отдельный DELETE — это отдельная транзакция и отдельная перерисовка списка на клиенте.
+   * Условие `deletedAt: null` — как у одиночного удаления: письмо, уже лежащее в корзине, не
+   * должно «удалиться» второй раз и уехать вверх корзины по новой отметке времени.
+   *
+   * Возвращает число реально удалённых писем: часть id могла устареть (письмо уже в корзине
+   * или удалено с другого устройства), и по этому числу вызывающий понимает, что вышло.
+   */
+  async deleteMessages(userId: string, ids: string[]): Promise<{ ok: true; deleted: number }> {
+    if (!ids.length) return { ok: true, deleted: 0 };
+    const res = await this.prisma.mailMessage.updateMany({
+      where: { id: { in: ids }, userId, deletedAt: null },
+      data: { deletedAt: new Date() },
+    });
+    return { ok: true, deleted: res.count };
+  }
+
   /** Вернуть письмо из корзины почты: вложения никуда не девались, письмо снова в ленте. */
   async restoreMessage(userId: string, id: string): Promise<{ ok: true }> {
     const res = await this.prisma.mailMessage.updateMany({
@@ -515,6 +536,21 @@ export class MailFeedService {
   async purgeMessage(userId: string, id: string): Promise<{ ok: true; purged: number }> {
     const purged = await this.hardDelete(userId, [id]);
     if (!purged) throw notFound('mail message not found');
+    return { ok: true, purged };
+  }
+
+  /**
+   * Удалить пачку писем навсегда. Правила те же, что у [purgeMessage]: только письма из корзины
+   * (остальные отсекает условие внутри [hardDelete]), вместе с вложениями и сырым `.eml`.
+   *
+   * Порциями по [PURGE_BATCH]: выбранных строк бывает больше, чем влезает в одну транзакцию,
+   * а тот же размер порции уже проверен на очистке корзины целиком ([purgeTrash]).
+   */
+  async purgeMessages(userId: string, ids: string[]): Promise<{ ok: true; purged: number }> {
+    let purged = 0;
+    for (let i = 0; i < ids.length; i += PURGE_BATCH) {
+      purged += await this.hardDelete(userId, ids.slice(i, i + PURGE_BATCH));
+    }
     return { ok: true, purged };
   }
 

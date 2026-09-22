@@ -34,6 +34,10 @@ const _faviconSize = 18.0;
 /// подменяется кружком с буквой: нет логотипа — нет и иконки. Место под логотип при этом
 /// остаётся занятым: если бы строка сжималась, имя отправителя прыгало бы влево-вправо
 /// в момент загрузки картинки (в ленте строки появляются на ходу при прокрутке).
+///
+/// В режиме выбора ([selectable]) слева появляется чекбокс, а нажатие по строке не открывает
+/// письмо, а переключает отметку — что именно делать по нажатию и по долгому нажатию, решает
+/// экран и передаёт в [onTap]/[onLongPress]: сама строка про режим выбора ничего не знает.
 class MailRow extends StatelessWidget {
   const MailRow({
     super.key,
@@ -41,6 +45,9 @@ class MailRow extends StatelessWidget {
     required this.item,
     required this.accounts,
     required this.onTap,
+    this.onLongPress,
+    this.selectable = false,
+    this.selected = false,
   });
 
   /// Клиент API: из него берутся заголовки сессии для картинки логотипа.
@@ -49,18 +56,45 @@ class MailRow extends StatelessWidget {
   final MailListItem item;
   /// Аккаунты пользователя: по ним решается, показывать в строке домен или полный адрес.
   final List<MailAccountRow> accounts;
-  /// Что делать по нажатию — открыть письмо.
+  /// Что делать по нажатию — открыть письмо, а в режиме выбора — переключить отметку.
   final VoidCallback onTap;
+  /// Что делать по долгому нажатию. В ленте этого достаточно, чтобы войти в режим выбора;
+  /// у поиска (`mail_search_screen.dart`) его нет — там строки только открывают письмо.
+  final VoidCallback? onLongPress;
+  /// Идёт режим выбора: у строки слева рисуется чекбокс.
+  final bool selectable;
+  /// Строка отмечена — чекбокс включён, фон строки подсвечен.
+  final bool selected;
 
   @override
   Widget build(BuildContext context) {
     final domain = domainOfEmail(item.fromAddr);
     return InkWell(
       onTap: onTap,
+      onLongPress: onLongPress,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(border: Border(bottom: BorderSide(color: C.brd))),
+        decoration: BoxDecoration(
+          // Отмеченную строку видно и по галочке, и по фону: в ленте строки одного цвета,
+          // и без подсветки при беглом взгляде непонятно, что уже отмечено.
+          color: selected ? C.accentSoft : null,
+          border: Border(bottom: BorderSide(color: C.brd)),
+        ),
         child: Row(children: [
+          if (selectable) ...[
+            // Плотность и tapTarget сжаты: у строки в ленте фиксированная высота (`itemExtent`),
+            // и стандартный 48-пиксельный отступ чекбокса вылез бы за неё. Нажатие по всей
+            // строке всё равно переключает отметку, так что маленькая цель ничего не теряет.
+            Checkbox(
+              value: selected,
+              onChanged: (_) => onTap(),
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              activeColor: C.accent,
+              side: const BorderSide(color: C.fg3),
+            ),
+            const SizedBox(width: 6),
+          ],
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [

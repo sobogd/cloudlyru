@@ -80,8 +80,17 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// решения, доступна ли кнопка «Написать» (нет включённых аккаунтов — писать не с чего).
   List<MailAccountRow> _accounts = const [];
   String? _error;
-  /// Идёт необратимая операция над папкой (очистка корзины): блокирует повторное нажатие.
+  /// Идёт необратимая операция над папкой (очистка корзины, удаление отмеченных писем):
+  /// блокирует повторное нажатие.
   bool _busy = false;
+  /// Отмеченные галочками письма — их id, а не индексы.
+  ///
+  /// Именно id: лента виртуальная, строки приходят по абсолютным индексам, и после удаления
+  /// пачки или обновления списка индексы у отмеченных писем сдвинулись бы. Отдельного флага
+  /// «режим выбора» нет намеренно: режим без единой отметки ничего не значит — из него нечего
+  /// удалять, поэтому признак режима — непустой набор, а выход из него — снятие последней
+  /// отметки (крестик в шапке или системный «назад»).
+  final Set<String> _selected = {};
   /// Скролл списка: из его позиции считается видимое окно строк.
   final ScrollController _sc = ScrollController();
   /// Задержка перед загрузкой видимого окна (см. `_onScroll`).
@@ -319,6 +328,69 @@ class _MailScreenState extends ConsumerState<MailScreen> {
     }
   }
 
+  /// Переключает отметку письма — вход в режим выбора (долгое нажатие) и переключение отметок
+  /// в нём (обычное нажатие). Снятие последней отметки закрывает режим: отдельного флага у режима
+  /// нет (см. [_selected]). Побочно: перерисовка списка.
+  void _toggleSelected(String id) {
+    setState(() {
+      if (!_selected.remove(id)) _selected.add(id);
+    });
+  }
+
+  /// Снимает все отметки и возвращает шапку к обычной.
+  ///
+  /// Отсюда и системный «назад» (см. `PopScope` в [build]), и крестик в шапке: пока список
+  /// в режиме выбора, уходить с экрана нечем, и жест «назад» должен сначала закрыть именно он.
+  void _clearSelection() {
+    if (_selected.isEmpty) return;
+    setState(_selected.clear);
+  }
+
+  /// Удаляет все отмеченные письма: в корзину — в обычных папках, навсегда — в самой корзине.
+  ///
+  /// Действие то же, что у просмотрщика одного письма (`MailViewerScreen`): «удалить» из
+  /// входящих переносит письмо в корзину, а в корзине удаляет окончательно. Отсюда два разных
+  /// диалога и две разные ручки сервера: безвозвратное удаление сделано опасным и подписано явно.
+  ///
+  /// Отметки снимаются только после успеха и вместе с перечиткой счётчиков: часть id могла
+  /// устареть (письмо удалили с другого устройства), и строки, которых на сервере уже нет,
+  /// не должны остаться отмеченными в новой ленте.
+  ///
+  /// [_busy] поднимается на время запроса: пачка удаляется одним вызовом, и второе нажатие
+  /// (или нажатие на другом устройстве по тем же письмам) отправило бы по ним второй запрос.
+  Future<void> _deleteSelected() async {
+    if (_busy || _selected.isEmpty) return;
+    final n = _selected.length;
+    final trash = _box == 'trash';
+    final ok = await confirmDialog(
+      context,
+      trash ? 'Удалить выбранные письма навсегда?' : 'Удалить выбранные письма?',
+      trash ? 'Их $n — вернуть будет нельзя.' : 'Их $n — все уйдут в корзину.',
+      danger: true,
+    );
+    if (!ok || !mounted) return;
+    // Снимок отметок до запроса: пока он идёт, пользователь может выйти из режима или отметить
+    // ещё письмо, и удалять он должен то, что выбрал на момент подтверждения, — иначе одна
+    // операция накрыла бы две разные пачки.
+    final ids = _selected.toList();
+    setState(() => _busy = true);
+    try {
+      final api = ref.read(appStateProvider).api;
+      if (trash) {
+        await api.mailPurgeMany(ids);
+      } else {
+        await api.mailDeleteMany(ids);
+      }
+      if (!mounted) return;
+      _clearSelection();
+      await _loadCounters();
+    } catch (e) {
+      if (mounted) snack(context, e.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   /// Открывает письмо в просмотрщике.
   ///
   /// `inTrash` передаётся флагом: в корзине набор действий другой (восстановить и удалить
@@ -392,12 +464,35 @@ class _MailScreenState extends ConsumerState<MailScreen> {
     // Клиент берётся один раз на сборку: `_row` вызывается на каждую видимую строку, и чтение
     // провайдера в нём — это чтение на строку на кадр.
     final api = ref.read(appStateProvider).api;
-    return Scaffold(
-      backgroundColor: C.canvas,
-      appBar: AppBar(
-        // В заголовке — открытая папка, а не три иконки подряд: папки переключаются баром из
-        // иконки в шапке (как разделы фактур), и на узком экране одна подпись читается лучше,
-        // чем три пиктограммы, значение которых надо угадывать.
+    return PopScope(
+      // В режиме выбора маршрут не закрывается: системный «назад» сначала снимает отметки, и
+      // только следующее нажатие уходит с экрана. Без этого жест, которым обычно выходят из
+      // раздела, выбрасывал бы список вместе с недоделанным выбором.
+      canPop: _selected.isEmpty,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _clearSelection();
+      },
+      child: Scaffold(
+        backgroundColor: C.canvas,
+        // В режиме выбора шапка другая: счётчик и одно действие. Остальные действия экрана
+        // (папки, поиск, «написать») в этот момент недоступны — выбор отменяют или доводят.
+        appBar: _selected.isEmpty ? _boxAppBar(t) : _selectionAppBar(),
+        // Обновление — только жестом «потянуть вниз»: своей кнопки у экрана нет.
+        body: RefreshIndicator(
+          onRefresh: _refresh,
+          child: _list(t, api),
+        ),
+      ),
+    );
+  }
+
+  /// Шапка списка: открытая папка и действия над ней (очистка корзины, поиск, письмо, папки).
+  ///
+  /// В заголовке — открытая папка, а не три иконки подряд: папки переключаются баром из иконки
+  /// в шапке (как разделы фактур), и на узком экране одна подпись читается лучше, чем три
+  /// пиктограммы, значение которых надо угадывать. [t] — число писем в папке: по нему решается,
+  /// показывать ли кнопку очистки корзины (на пустой корзине чистить нечего).
+  AppBar _boxAppBar(int? t) => AppBar(
         title: Text(_boxLabel(_box), style: const TextStyle(color: C.fg, fontSize: 18)),
         actions: [
           if (_box == 'trash' && (t ?? 0) > 0)
@@ -418,14 +513,31 @@ class _MailScreenState extends ConsumerState<MailScreen> {
             onPressed: _openFoldersMenu,
           ),
         ],
-      ),
-      // Обновление — только жестом «потянуть вниз»: своей кнопки у экрана нет.
-      body: RefreshIndicator(
-        onRefresh: _refresh,
-        child: _list(t, api),
-      ),
-    );
-  }
+      );
+
+  /// Шапка режима выбора: сколько писем отмечено и что с ними сделать.
+  ///
+  /// Действие одно — удаление: в корзине оно необратимое (и красное, как и в просмотрщике
+  /// письма), в остальных папках мягкое. Восстановления из корзины тут нет намеренно — выбор
+  /// заведён под удаление, а лишние кнопки в шапке отнимали бы место у счётчика.
+  AppBar _selectionAppBar() => AppBar(
+        leading: IconButton(
+          tooltip: 'Отменить выбор',
+          icon: const Icon(Icons.close, color: C.fg),
+          onPressed: _clearSelection,
+        ),
+        title: Text('Выбрано: ${_selected.length}', style: const TextStyle(color: C.fg, fontSize: 18)),
+        actions: [
+          IconButton(
+            tooltip: _box == 'trash' ? 'Удалить навсегда' : 'Удалить',
+            icon: Icon(
+              _box == 'trash' ? Icons.delete_forever_outlined : Icons.delete_outline,
+              color: _box == 'trash' ? C.danger : C.fg,
+            ),
+            onPressed: _busy ? null : _deleteSelected,
+          ),
+        ],
+      );
 
   /// Тело экрана: ошибка, пустая папка или список писем.
   ///
@@ -521,6 +633,9 @@ class _MailScreenState extends ConsumerState<MailScreen> {
       _box = id;
       _total = null;
       _items.clear();
+      // Отметки принадлежат папке: «письмо №5 во входящих» и то же место в корзине — разные
+      // записи, и выбор, сделанный в одной папке, в другой отмечал бы чужие письма.
+      _selected.clear();
     });
     // Новый запрос поднимет поколение, и ответы прежней папки (счётчик и уже запрошенные
     // порции строк) будут отброшены по `gen != _gen`.
@@ -541,11 +656,19 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   Widget _row(CloudlyApi api, int i) {
     final item = _items[i];
     if (item == null) return const SizedBox.shrink();
+    // Пока ничего не отмечено, нажатие открывает письмо, а долгое — входит в режим выбора.
+    // Дальше нажатие переключает отметку (как в любом списке писем), а долгое снимает её с уже
+    // отмеченной строки; открыть письмо в режиме выбора нельзя — выход из него крестиком
+    // в шапке или системным «назад».
+    final selected = _selected.contains(item.id);
     return MailRow(
       api: api,
       item: item,
       accounts: _accounts,
-      onTap: () => _openMessage(item.id),
+      selectable: _selected.isNotEmpty,
+      selected: selected,
+      onTap: _selected.isEmpty ? () => _openMessage(item.id) : () => _toggleSelected(item.id),
+      onLongPress: () => _toggleSelected(item.id),
     );
   }
 }

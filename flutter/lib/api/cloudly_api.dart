@@ -968,6 +968,13 @@ class CloudlyApi {
   /// Убирает письмо в корзину почты — она отдельная от корзины файлов.
   Future<void> mailDelete(String id) async => _req('/mail/messages/$id', method: 'DELETE');
 
+  /// Убирает в корзину почты пачку писем — то же, что [mailDelete], для списка с галочками.
+  ///
+  /// Одним запросом, а не циклом по [mailDelete]: сервер по списку id делает одно обновление,
+  /// а N отдельных DELETE — это N транзакций и N перечитываний ленты.
+  Future<void> mailDeleteMany(List<String> ids) async =>
+      _req('/mail/messages/bulk-delete', method: 'POST', body: {'ids': ids});
+
   /// Отправляет письмо; тело запроса собирает экран (адресаты, текст, вложения).
   ///
   /// Возвращает ответ сервера как есть: модели для результата отправки нет.
@@ -989,6 +996,13 @@ class CloudlyApi {
   /// Удаляет письмо навсегда — только из корзины, вместе с вложениями и исходным `.eml`.
   Future<void> mailPurgeMessage(String id) async =>
       _req('/mail/messages/$id/purge', method: 'POST', body: {});
+
+  /// Удаляет навсегда пачку писем — то же, что [mailPurgeMessage], для списка с галочками.
+  ///
+  /// Ручка сервера доступна только веб-сессии (как и одиночная очистка): безвозвратное удаление
+  /// от имени device-токена не предусмотрено.
+  Future<void> mailPurgeMany(List<String> ids) async =>
+      _req('/mail/messages/bulk-purge', method: 'POST', body: {'ids': ids});
 
   /// Очищает корзину почты целиком; доступна только веб-сессии.
   Future<Map<String, dynamic>> mailPurgeTrash() async =>
