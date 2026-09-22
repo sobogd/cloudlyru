@@ -519,6 +519,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     _EntryKind.note => _note(entry.text),
     _EntryKind.bash => _message(
       muted: true,
+      icon: Icons.terminal,
       copyText: entry.copyText,
       expandKey: _entryKey(entry),
       collapsedPreview: _firstLine('\$ ${entry.command}'),
@@ -526,6 +527,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
     _EntryKind.tool => _message(
       muted: true,
+      icon: Icons.build_outlined,
       copyText: entry.copyText,
       expandKey: _entryKey(entry),
       collapsedPreview: _firstLine(entry.tool!.output),
@@ -533,6 +535,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
     _EntryKind.reasoning => _message(
       muted: true,
+      icon: Icons.psychology_outlined,
       copyText: entry.copyText,
       expandKey: _entryKey(entry),
       collapsedPreview: _firstLine(entry.text),
@@ -621,17 +624,27 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   double _bubbleMax(BuildContext context) =>
       (widget.paneWidth ?? MediaQuery.sizeOf(context).width) * 0.8;
 
-  /// Одно сообщение переписки: пузырь и кнопки «скопировать» и «раскрыть» рядом с ним.
+  /// Одно сообщение переписки: значок вида (у служебного), пузырь и кнопки действий рядом.
   ///
   /// Кнопки стоят вне пузыря — внутри они отнимали бы место у текста и читались бы как часть
-  /// содержимого. Чтобы пара поместилась в отведённую ширину, предел пузыря уменьшается на
+  /// содержимого. Чтобы ряд поместился в отведённую ширину, предел пузыря уменьшается на
   /// ширину кнопок. У сообщения без текста (например, ожидания ответа) кнопок нет: ни
   /// копировать, ни раскрывать нечего.
+  ///
+  /// И у вопроса, и у ответа кнопки идут за пузырём слева направо: «скопировать» — первой,
+  /// «раскрыть» — сразу за ней. У вопроса ряд разворачивается зеркально вместе с пузырём,
+  /// иначе кнопки уехали бы к противоположному краю окна и расстояние до текста менялось бы
+  /// от ширины экрана.
   ///
   /// Раскрытие вынесено к кнопке копирования, а не спрятано внутри служебного сообщения: там
   /// его пришлось бы искать взглядом в тексте вывода, а рядом с копированием обе кнопки стоят
   /// на одном месте у каждого сообщения и не зависят от того, что внутри.
+  ///
+  /// Значок вида ([icon]) — только у служебного: «размышления» и инструменты начинаются с
+  /// иконки, по которой видно, что это не ответ агента, а его работа. Заодно она отделяет
+  /// такие сообщения друг от друга, когда подряд идут несколько служебных.
   Widget _message({
+    IconData? icon,
     required String copyText,
     required Widget child,
     bool isUser = false,
@@ -640,6 +653,14 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     String collapsedPreview = '',
   }) {
     final expanded = expandKey != null && _open.contains(expandKey);
+    // значок стоит одной высотой с рядом кнопок: иначе он укорачивал бы пузырь и колонка
+    // служебных сообщений читалась бы рваной
+    final badge = icon == null
+        ? null
+        : SizedBox(
+            height: _toggleRowHeight,
+            child: Icon(icon, size: 14, color: C.fg3.withValues(alpha: 0.55)),
+          );
     final bubble = ConstrainedBox(
       constraints: BoxConstraints(
         maxWidth: _bubbleMax(context) - _togglesWidth,
@@ -673,17 +694,41 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       if (expandKey != null)
         _ExpandButton(expanded: expanded, onPressed: () => _toggle(expandKey)),
     ];
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        // кнопки стоят по центру пузыря по вертикали: у высокого сообщения они не уезжают
-        // к нижнему краю и не выглядят приклеенными к тексту
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: isUser
-            ? [...buttons.reversed, bubble]
-            : [bubble, ...buttons],
-      ),
+    // Кнопки прижаты к верху пузыря отступом изнутри ряда, а не выравниванием по его низу:
+    // `CrossAxisAlignment.start` без этого отступа прижимал бы их к самой кромке пузыря.
+    // Сам ряд при этом растягивается на всю высоту пузыря и его отступы не учитывает: иначе
+    // высокое сообщение уехало бы вниз на высоту отступа.
+    final actions = Padding(
+      padding: const EdgeInsets.only(left: _toggleGap, top: _toggleTopGap),
+      child: Row(mainAxisSize: MainAxisSize.min, children: buttons),
+    );
+    final row = Row(
+      mainAxisSize: MainAxisSize.min,
+      // Ряд действий прижат к верху пузыря, а не стоит по его центру: у длинного сообщения
+      // кнопки оказывались ровно посередине, то есть там, где взгляд их не ищет и где до них
+      // ещё надо доехать прокруткой. Сверху они всегда на виду, у начала сообщения.
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: isUser
+          ? [
+              actions,
+              bubble,
+              ?badge,
+            ]
+          : [
+              ?badge,
+              bubble,
+              actions,
+            ],
+    );
+    // Вопрос поджат к правому краю: пузырь и кнопки сдвигаются вместе, поэтому расстояние
+    // между текстом и кнопками одинаковое на любой ширине экрана.
+    if (isUser) return Align(alignment: Alignment.centerRight, child: row);
+    // Ответ и служебные сообщения идут слева и начинаются ниже ряда кнопок: сам ряд отвечает
+    // только за верхнее выравнивание внутри пузыря и о высоте строки списка не знает
+    return Padding(
+      // Нижний край — отдельная строка: две соседние строки иначе сползались бы в одну
+      padding: const EdgeInsets.only(top: _toggleStride, bottom: _toggleTopGap),
+      child: row,
     );
   }
 
@@ -1190,15 +1235,46 @@ String _compactLines(String text) => text
 /// разметкой, и другой кегль у остальных сообщений выглядел бы вставкой из другого приложения.
 const _textSize = 14.0;
 
-/// Ширина кнопки «скопировать» вместе с её полями: на неё уменьшается предел ширины пузыря,
-/// потому что кнопка стоит вне пузыря и пара должна целиком влезать в отведённое место.
-const _copyButtonWidth = 30.0;
+/// Ширина кнопки действий (у пары с раскрытием и у одиночного копирования) вместе с её полями:
+/// на два таких отступа уменьшается предел ширины пузыря, потому что кнопки стоят вне пузыря
+/// и ряд должен целиком влезать в отведённое место.
+const _copyButtonWidth = 28.0;
+
+/// Ширина значка вида в начале служебного сообщения.
+///
+/// Учтена в [_togglesWidth] рядом с кнопками: значок тоже занимает место в ряду, и без этого
+/// свёрнутое сообщение с ним вылезало бы за предел ширины переписки на ширину значка.
+const _entryIconWidth = 14.0;
+
+/// Отступ от начала ряда кнопок до кнопки — и между кнопками тоже.
+///
+/// Аналитический отступ у [IconButton] для этого не годится: на разных размерах экрана он
+/// гулял, и кнопка то липла к пузырю, то ли отъезжала от него. Здесь он один и тот же везде.
+const _toggleGap = 4.0;
+
+/// Высота ряда кнопок — она же высота значка вида и отступ сверху рядом с пузырём.
+///
+/// Кнопки одной высоты, и по этой же высоте выровнен значок вида: только так все элементы
+/// ряда встают на одну линию у верха пузыря вне зависимости от длины сообщения.
+const _toggleRowHeight = 28.0;
+
+/// Отступ ряда кнопок от верха пузыря.
+///
+/// Небольшой намеренно: кнопки должны читаться как часть того же сообщения, а не как
+/// отдельный элемент над ним.
+const _toggleTopGap = 6.0;
+
+/// Высота ряда вместе с верхним отступом: на неё кнопки, а не центр пузыря, прижаты книзу
+/// доступной области (см. `_message`).
+const _toggleStride = _toggleRowHeight + _toggleTopGap;
 
 /// Ширина пары кнопок у служебного сообщения — «скопировать» и «раскрыть».
 ///
-/// Кнопок может быть две, и предел ширины пузыря считается по обеим сразу: иначе у
-/// раскрытого служебного сообщения пара кнопок вылезла бы за предел ширины переписки.
-const _togglesWidth = 2 * _copyButtonWidth;
+/// У служебного сообщения кнопок всегда две (у текста и вопроса — только «скопировать»), и
+/// предел ширины пузыря считается по паре, значку вида и отступам между всем этим: иначе
+/// раскрытое служебное сообщение вылезало бы за предел ширины переписки.
+const _togglesWidth =
+    _copyButtonWidth + _toggleGap + _copyButtonWidth + _entryIconWidth;
 
 /// Сколько символов первой строки видно у свёрнутого служебного сообщения.
 ///
@@ -1208,8 +1284,9 @@ const _collapsedChars = 160;
 
 /// Кнопка «раскрыть сообщение» — у «размышлений», вызовов инструментов и прямых команд.
 ///
-/// Стоит рядом с кнопкой копирования: обе — действия над сообщением, и искать их разбросанными
-/// по тексту не приходится. Стрелка вниз — раскрыть, вверх — свернуть.
+/// Стоит вплотную к кнопке копирования (их разделяет только [_toggleGap]): это два действия
+/// над одним сообщением, и разносить их по краям ряда незачем. Стрелка вниз — раскрыть,
+/// вверх — свернуть.
 class _ExpandButton extends StatelessWidget {
   /// Раскрыто ли сообщение сейчас: от этого зависит направление стрелки и подсказка.
   final bool expanded;
@@ -1224,15 +1301,20 @@ class _ExpandButton extends StatelessWidget {
   Widget build(BuildContext context) => IconButton(
     tooltip: expanded ? 'Свернуть' : 'Показать целиком',
     onPressed: onPressed,
-    // вид тот же, что у копирования: две кнопки в одном ряду не должны выглядеть по-разному
+    // вид тот же, что у копирования: две кнопки в одном ряду не должны выглядеть по-разному.
+    // Шеврон, а не `unfold_*`: стрелка вниз — раскрыть, вверх — свернуть, без дополнительных
+    // линий, которые у `unfold` читаются как «развернуть на весь экран».
     icon: Icon(
-      expanded ? Icons.unfold_less : Icons.unfold_more,
-      size: 14,
+      expanded ? Icons.expand_less : Icons.expand_more,
+      size: 18,
       color: C.fg3.withValues(alpha: 0.45),
     ),
     visualDensity: VisualDensity.compact,
     padding: EdgeInsets.zero,
-    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+    constraints: const BoxConstraints(
+      minWidth: _copyButtonWidth,
+      minHeight: _toggleRowHeight,
+    ),
   );
 }
 
@@ -1289,7 +1371,10 @@ class _CopyButton extends StatelessWidget {
     ),
     visualDensity: VisualDensity.compact,
     padding: EdgeInsets.zero,
-    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+    constraints: const BoxConstraints(
+      minWidth: _copyButtonWidth,
+      minHeight: _toggleRowHeight,
+    ),
   );
 }
 

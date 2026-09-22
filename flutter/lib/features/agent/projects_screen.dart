@@ -428,9 +428,10 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// на фоне списка ([C.island]) яркая кнопка перетягивала бы взгляд с разговоров на себя.
   /// Текст и значок при этом остаются акцентными — что это кнопка и что она делает, видно.
   Widget _addTile(AgentSessionsState state, {required bool wide}) => Padding(
-    // поля только сверху и снизу: подложка должна упираться в края колонки, иначе она
-    // выглядит плавающей кнопкой, а не первой строкой списка
-    padding: const EdgeInsets.fromLTRB(0, 14, 0, 12),
+    // полей нет вовсе: подложка упирается в верхнюю кромку списка, а сам список начинается
+    // сразу под ней — лишние полосы над кнопкой и между ней и первой строкой только отнимали
+    // высоту у разговоров, к которым сюда и заходят
+    padding: EdgeInsets.zero,
     child: SizedBox(
       height: 46,
       width: double.infinity,
@@ -451,7 +452,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
   /// Пояснение под кнопкой, когда разговоров ещё нет.
   Widget _emptyHint() => const Padding(
-    padding: EdgeInsets.fromLTRB(24, 16, 24, 24),
+    // без верхнего поля: оно отделяло бы пояснение от кнопки, над которой оно стоит
+    padding: EdgeInsets.fromLTRB(24, 0, 24, 24),
     child: Text(
       'Разговоров пока нет. Нажмите «Новая сессия» — выберите папку и модель, и агент '
       'запустится в ней: он сможет читать и править файлы проекта и запускать команды.',
