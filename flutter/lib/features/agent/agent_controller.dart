@@ -751,6 +751,19 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// показывать не нужно, во втором — нужно.
   bool _cancelledByUser = false;
 
+  /// Текст вопроса, который сейчас выполняет агент.
+  ///
+  /// Нужен, чтобы не отправлять тот же вопрос второй раз, пока на него не ответили: повторы
+  /// уходили после обрыва связи и по кнопке «Повторить», и каждый из них прогонял всю работу
+  /// заново вместе с расходом токенов.
+  String _runningText = '';
+
+  /// Уже пробовали подключиться к оборвавшемуся прогону.
+  ///
+  /// Одна попытка на прогон: если и она не удалась, дальше только ошибка, иначе при мёртвом
+  /// соединении приложение уходило бы в бесконечный круг переподключений.
+  bool _resumed = false;
+
   /// Клиент моста.
   AgentApi get _api => ref.read(agentApiProvider);
 
@@ -814,6 +827,21 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final prompt = text.trim();
     final session = state.session;
     if (prompt.isEmpty || session == null) return;
+    // Такой же вопрос, пока на него не ответили, второй раз не отправляем: отправка стоит
+    // целого прогона, а ответ придёт и без неё. Строкой в переписке объясняем, почему отправки
+    // не произошло, — молчать про нажатую кнопку хуже.
+    if (state.sending && _runningText == prompt) {
+      state = state.copyWith(
+        items: [
+          ...state.items,
+          const AgentItem(
+            kind: 'note',
+            text: 'этот вопрос уже в работе — ответ придёт сюда',
+          ),
+        ],
+      );
+      return;
+    }
     state = state
         .copyWith(
           items: [
@@ -834,15 +862,30 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// Ставит сообщение в очередь занятой сессии.
   ///
   /// Если сессия успела освободиться (мост отвечает «очередь не нужна»), отправляем вопрос
-  /// обычным путём: иначе он остался бы висеть в очереди, которой уже нет.
+  /// обычным путём: иначе он остался бы висеть в очереди, которой уже нет. Если мост узнал
+  /// такой же вопрос в работе или в очереди, он повтор не принимает — тогда показываем это
+  /// строкой и настоящее место, а второй раз не отправляем.
   Future<void> _queue(String sessionId, String prompt) async {
     try {
-      final position = await _api.queueMessage(sessionId, prompt);
-      if (position == 0) {
+      final result = await _api.queueMessage(sessionId, prompt);
+      if (result.duplicate) {
+        state = state.copyWith(
+          queued: result.position,
+          items: [
+            ...state.items,
+            const AgentItem(
+              kind: 'note',
+              text: 'этот вопрос уже отправлен — жду ответа на него',
+            ),
+          ],
+        );
+        return;
+      }
+      if (result.position == 0) {
         await _run(sessionId, prompt);
         return;
       }
-      state = state.copyWith(queued: position);
+      state = state.copyWith(queued: result.position);
     } on AgentApiException catch (e) {
       state = state.withError(e.message);
     }
@@ -964,6 +1007,8 @@ class AgentThreadController extends Notifier<AgentThreadState> {
       runStartedAt: DateTime.now(),
     );
     _cancelledByUser = false;
+    _runningText = prompt;
+    _resumed = false;
     final done = Completer<void>();
     _done = done;
 
@@ -971,14 +1016,69 @@ class AgentThreadController extends Notifier<AgentThreadState> {
         .prompt(sessionId, prompt)
         .listen(
           _applyEvent,
-          onError: (Object e) {
-            if (!_cancelledByUser) _fail(e);
-            _finish();
-          },
+          onError: (Object e) => _onStreamBroken(sessionId, e),
           onDone: _finish,
         );
 
     await done.future;
+  }
+
+  /// Поток ответа оборвался: подключаемся к идущему прогону, а не показываем ошибку.
+  ///
+  /// Обрыв потока не значит, что прогон кончился: работу на маке мост не гасит (сеть мигнула,
+  /// экран свернули, приложение перезапустили), и ответ продолжает писаться. Раньше здесь сразу
+  /// появлялась ошибка с кнопкой «Повторить», человек по ней отправлял тот же вопрос, и агент
+  /// прогонял ту же работу заново — по нескольку раз на один вопрос. Теперь сначала идём в /events
+  /// (ручка для наблюдения за идущим прогоном), а ошибку показываем, только если прогона там уже
+  /// нет или повторное подключение тоже оборвалось: тогда «Повторить» осмысленно.
+  void _onStreamBroken(String sessionId, Object error) {
+    if (_cancelledByUser || _resumed) {
+      _fail(error);
+      _finish();
+      return;
+    }
+    _resumed = true;
+    state = state.copyWith(step: 'связь прервалась — продолжаю смотреть ответ');
+    _sub = _api
+        .running(sessionId)
+        .listen(
+          (event) {
+            // Прогона нет: пока связи не было, он либо дописался, либо оборвался. Что именно —
+            // видно только по истории на маке, её и перечитываем.
+            if (event.idle) {
+              unawaited(_reloadAfterBreak(error));
+              return;
+            }
+            _applyEvent(event);
+          },
+          onError: (Object e) {
+            _fail(e);
+            _finish();
+          },
+          onDone: _finish,
+        );
+  }
+
+  /// Перечитывает переписку после обрыва и решает, показать ли ошибку.
+  ///
+  /// История приходит с мака, и в ней уже есть всё, что агент успел написать без нас: если
+  /// ответ там есть, показываем его и ошибки не показываем. Если последним стоит вопрос без
+  /// ответа, значит ответ потерян вместе со связью — тогда причина видна, а вопрос на месте,
+  /// и его можно повторить.
+  Future<void> _reloadAfterBreak(Object error) async {
+    final sessionId = state.session?.id;
+    if (sessionId != null) {
+      try {
+        state = state.copyWith(items: await _api.messages(sessionId));
+      } on AgentApiException {
+        // Историю не отдали — ниже показываем причину обрыва: она честнее молчания
+      }
+    }
+    final items = state.items;
+    if (items.isNotEmpty && items.last.isUser) {
+      state = state.withError(_messageOf(error));
+    }
+    _finish();
   }
 
   /// Дописывает полученное событие в состояние экрана.
@@ -1127,14 +1227,16 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     state = state.copyWith(items: items);
   }
 
+  /// Причина для экрана: у отказа моста есть свой текст, остальное — общая формулировка.
+  String _messageOf(Object e) =>
+      e is AgentApiException ? e.message : 'Не удалось получить ответ агента.';
+
   /// Показывает ошибку потока и убирает пустой каркас ответа.
   ///
   /// Пустой каркас после ошибки — это пузырь без текста, который ничего не объясняет: причину
   /// показывает сообщение об ошибке, а вопрос остаётся на месте, чтобы его повторить.
   void _fail(Object e) {
-    final message = e is AgentApiException
-        ? e.message
-        : 'Не удалось получить ответ агента.';
+    final message = _messageOf(e);
     final items = [...state.items];
     if (items.isNotEmpty && items.last.isAssistant && items.last.isEmpty) {
       items.removeLast();
@@ -1150,6 +1252,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final done = _done;
     _done = null;
     _sub = null;
+    // Прогон закончился: повторять его текст уже некому, а новый вопрос вправе быть таким же
+    _runningText = '';
+    _resumed = false;
     if (state.sending) {
       final items = [...state.items];
       if (items.isNotEmpty && items.last.isAssistant && items.last.isEmpty) {

@@ -378,16 +378,22 @@ class AgentApi {
 
   /// Ставит сообщение в очередь занятой сессии.
   ///
-  /// Возвращает номер в очереди; `0` означает, что сессия успела освободиться — тогда сообщение
-  /// надо отправить обычным вопросом ([prompt]), иначе оно потерялось бы.
-  Future<int> queueMessage(String id, String text) async {
+  /// Возвращает место сообщения в очереди и признак «такой же вопрос уже отправлен»: мост
+  /// отсекает повторы, и тогда место указывает на уже отправленное сообщение, а второй раз
+  /// агенту ничего не уходит. `position == 0` без `duplicate` означает, что сессия успела
+  /// освободиться — тогда сообщение надо отправить обычным вопросом ([prompt]), иначе оно
+  /// потерялось бы.
+  Future<({int position, bool duplicate})> queueMessage(String id, String text) async {
     final data = await _send<Map<String, dynamic>>(
       () => _http.post(
         '/projects/sessions/$id/queue',
         data: <String, dynamic>{'text': text},
       ),
     );
-    return data?['position'] is num ? (data!['position'] as num).toInt() : 0;
+    return (
+      position: data?['position'] is num ? (data!['position'] as num).toInt() : 0,
+      duplicate: data?['duplicate'] == true,
+    );
   }
 
   /// Подключается к уже идущему прогону агента и отдаёт его события.
@@ -550,6 +556,14 @@ class AgentApi {
       case 'queued':
         final position = json['position'];
         return position is num ? AgentEvent(queued: position.toInt()) : null;
+      case 'duplicate':
+        // Мост отсекает повторные отправки того же вопроса: показываем это строкой в переписке,
+        // иначе ответ на идущий прогон выглядел бы ответом на неотправленный повтор
+        return const AgentEvent(
+          note: 'этот вопрос уже отправлен — показываю идущий ответ',
+        );
+      case 'idle':
+        return const AgentEvent(idle: true);
       case 'queued_started':
         // Сообщение из очереди ушло агенту: подпись «в очереди» снимается, текст ответа
         // приходит следом обычными delta
