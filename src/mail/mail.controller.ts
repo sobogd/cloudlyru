@@ -9,6 +9,7 @@ import { MailFaviconService } from './mail-favicon.service';
 import { MailImageService } from './mail-image.service';
 import { MailIngestService } from './mail-ingest.service';
 import { MailSendService } from './mail-send.service';
+import { MailTranslateService } from './mail-translate.service';
 import { S3Service } from '../s3/s3.service';
 import { sendObjectOr404 } from '../common/http-object';
 import { CurrentUser, Public, RateLimit, RequestUser, SessionOnly } from '../common/decorators';
@@ -68,6 +69,7 @@ export class MailController {
     private readonly ingestService: MailIngestService,
     private readonly faviconService: MailFaviconService,
     private readonly imageService: MailImageService,
+    private readonly translator: MailTranslateService,
     private readonly s3: S3Service,
   ) {}
 
@@ -313,6 +315,24 @@ export class MailController {
     @Query('text') text?: string,
   ) {
     return this.feed.body(user.id, id, images === '1', text === '1');
+  }
+
+  /**
+   * Перевод письма на русский локальной моделью на маке. Возвращает обычный текст перевода.
+   *
+   * Отдельный маршрут, а не поле в теле письма: перевод может идти десятки секунд, и городить
+   * его в запрос, который открывает письмо, значило бы держать экран пустым всё это время.
+   * Кэш переводит повторный вызов в мгновенный ответ (см. `mail-translate.service.ts`).
+   *
+   * Лимит ниже остальных почтовых ручек намеренно: каждый промах кэша занимает один из четырёх
+   * слотов движка на маке, и десяток одновременных переводов выстроил бы за ним весь сайт.
+   */
+  @Post('messages/:id/translate')
+  @SessionOnly()
+  @UseGuards(RateLimitGuard)
+  @RateLimit(20, 60_000)
+  translateMessage(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.translator.translate(user.id, id);
   }
 
   /** Сырое письмо файлом: содержимое письма как оно пришло, ничего не потеряно. */

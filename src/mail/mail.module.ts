@@ -13,6 +13,8 @@ import { MailIndexService } from './mail-index.service';
 import { MailPurgeService } from './mail-purge.service';
 import { MailSearchService } from './mail-search.service';
 import { MailSendService } from './mail-send.service';
+import { MailTranslateService } from './mail-translate.service';
+import { LlmModule } from '../llm/llm.module';
 import { MailSyncService } from './mail-sync.service';
 
 /**
@@ -20,9 +22,12 @@ import { MailSyncService } from './mail-sync.service';
  *
  * FilesModule нужен, чтобы вложения становились обычными записями дерева (с дедупом по
  * sha256): тогда превью, скачивание и деталка файла работают для них без отдельного кода.
+ *
+ * LlmModule — ради перевода писем: модель на маке живёт отдельным модулем, потому что она
+ * общий ресурс, а не часть почты (см. `src/llm`).
  */
 @Module({
-  imports: [PrismaModule, S3Module, AuthModule, FilesModule],
+  imports: [PrismaModule, S3Module, AuthModule, FilesModule, LlmModule],
   controllers: [MailController],
   providers: [
     MailAccountsService,
@@ -35,6 +40,7 @@ import { MailSyncService } from './mail-sync.service';
     MailImageService,
     MailSearchService,
     MailIndexService,
+    MailTranslateService,
   ],
   exports: [MailAccountsService, MailFeedService, MailSyncService, MailSendService, MailPurgeService, MailSearchService],
 })

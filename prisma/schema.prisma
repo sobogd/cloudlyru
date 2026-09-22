@@ -513,6 +513,7 @@ model MailMessage {
   account          MailAccount      @relation(fields: [accountId], references: [id], onDelete: Cascade)
   rawAsset         Asset            @relation("MailRawAsset", fields: [rawAssetId], references: [id], onDelete: Restrict)
   attachments      MailAttachment[]
+  translations     MailTranslation[]
   // Индекс под догоняющую чистку (accountId + createdAt, только письма с живой копией
   // у провайдера) тоже объявлен в миграции: он частичный (WHERE "remoteDeletedAt" IS NULL),
   // а частичный индекс в схеме не выражается. См. 20260916000100_mail_purge_index.
@@ -534,6 +535,26 @@ model MailMessage {
   // Postgres без GIN идёт перебором строк. Массив маленький (обычно 0–1 элемент), поэтому
   // индекс дешёвый и по размеру, и по записи.
   @@index([alsoBoxes], type: Gin)
+}
+
+// Перевод письма — результат локальной модели на маке (см. src/llm).
+//
+// Отдельной таблицей, а не колонкой в письме: язык цели со временем может стать не одним,
+// а письмо с переводом — это пара «письмо × язык», и уникальность пары держит БД, а не код.
+// `text` — готовый перевод видимого текста письма (без разметки); исходный текст в S3 и в
+// `bodyText` уже есть, дублировать его незачем. Запись живёт, пока живо письмо: `onDelete:
+// Cascade` не оставляет сирот после безвозвратного удаления.
+model MailTranslation {
+  id        String      @id @default(uuid())
+  messageId String
+  message   MailMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  target    String // язык перевода, ISO 639-1 ('ru')
+  text      String
+  createdAt DateTime    @default(now())
+
+  // Один перевод на письмо и язык: второй прогон должен попадать в ту же строку, а не плодить
+  // дубликаты при открытии письма с двух устройств.
+  @@unique([messageId, target])
 }
 
 // Вложение письма = обычная запись дерева в скрытой зоне MAIL плюс связь с письмом.

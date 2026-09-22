@@ -343,30 +343,8 @@ export class MailFeedService {
     allowRemote: boolean,
     asText = false,
   ): Promise<{ html: string; blockedRemote: number; kind: 'html' | 'text'; truncated: boolean }> {
-    const row = await this.prisma.mailMessage.findFirst({
-      where: { id, userId },
-      select: { id: true, bodyText: true, rawAsset: { select: { sha256: true } } },
-    });
-    if (!row) throw notFound('mail message not found');
-
-    let parsed: { html: string | null; text: string } | null = null;
-    try {
-      const key = S3Service.assetKey(row.rawAsset.sha256);
-      const size = await this.s3.objectSize(key);
-      if (size > MAX_PARSE_BYTES) {
-        this.logger.warn(
-          `тело письма ${id}: сырьё ${Math.round(size / 1024 / 1024)} МБ больше предела разбора (${MAX_PARSE_BYTES / 1024 / 1024} МБ) — отдаём превью из БД`,
-        );
-      } else {
-        const source = await this.s3.getObjectBytes(key, MAX_PARSE_BYTES);
-        const full = await parseMessage(source);
-        parsed = { html: full.html, text: full.fullText };
-      }
-    } catch (e) {
-      // Содержимого нет в хранилище или письмо не разобралось — отдаём превью из БД:
-      // пустой экран тут хуже, чем текст без оформления.
-      this.logger.warn(`тело письма ${id} не разобрано: ${(e as Error).message}`);
-    }
+    const row = await this.loadRow(userId, id);
+    const parsed = await this.parseRaw(id, row.rawAsset.sha256);
 
     if (!asText && parsed?.html && htmlWithinLimit(parsed.html)) {
       // Чужие адреса картинок уходят в наш прокси — тогда письмо грузит их с нашего домена
@@ -380,6 +358,64 @@ export class MailFeedService {
     const text = full || row.bodyText || '';
     // truncated — только когда пришлось взять превью из БД: там первые SNAPSHOT_CHARS символов.
     return { html: textToHtml(text), blockedRemote: 0, kind: 'text', truncated: !full && Boolean(row.bodyText) };
+  }
+
+  /**
+   * Полный видимый текст письма — для перевода.
+   *
+   * Отдаётся ровно то же, что показывает экран письма обычным текстом: текстовая часть письма,
+   * а если её нет — текст, выведенный из HTML-разметки (разборщик снимает теги, `src/mail/mail-parse.ts`).
+   * Никакой разметки здесь не остаётся, и это не упрощение: переводится смысл, а не вёрстка,
+   * а таблицы и медиазапросы рассылок после подмены текстовых узлов разваливаются в любом движке.
+   *
+   * `null` вместо текста, когда разобрать письмо не удалось (нет объекта в S3, размер сверх
+   * предела): перевод в этом случае честно говорит, что переводить нечего, а не переводит
+   * обрезанное превью из БД.
+   */
+  async plainText(userId: string, id: string): Promise<string | null> {
+    const row = await this.loadRow(userId, id);
+    const parsed = await this.parseRaw(id, row.rawAsset.sha256);
+    const text = parsed?.text ?? '';
+    return text.trim() ? text : null;
+  }
+
+  /** Строка письма с полями, которые нужны и показу тела, и переводу: превью из БД и ключ
+   *  сырого `.eml`, который разбирается заново. 404 — письма у этого пользователя нет. */
+  private async loadRow(userId: string, id: string) {
+    const row = await this.prisma.mailMessage.findFirst({
+      where: { id, userId },
+      select: { id: true, bodyText: true, rawAsset: { select: { sha256: true } } },
+    });
+    if (!row) throw notFound('mail message not found');
+    return row;
+  }
+
+  /**
+   * Разбирает письмо из S3 или возвращает `null`.
+   *
+   * Общий шаг для показа тела и для перевода: условия (предел размера объекта, тихий откат
+   * на превью, запись причины в лог) обязаны совпадать в обоих случаях — иначе получилось бы
+   * «показывается, но не переводится» без единого следа причины.
+   */
+  private async parseRaw(id: string, sha256: string): Promise<{ html: string | null; text: string } | null> {
+    try {
+      const key = S3Service.assetKey(sha256);
+      const size = await this.s3.objectSize(key);
+      if (size > MAX_PARSE_BYTES) {
+        this.logger.warn(
+          `письмо ${id}: сырьё ${Math.round(size / 1024 / 1024)} МБ больше предела разбора (${MAX_PARSE_BYTES / 1024 / 1024} МБ) — содержимое не читаем`,
+        );
+        return null;
+      }
+      const source = await this.s3.getObjectBytes(key, MAX_PARSE_BYTES);
+      const full = await parseMessage(source);
+      return { html: full.html, text: full.fullText };
+    } catch (e) {
+      // Содержимого нет в хранилище или письмо не разобралось — вызывающий сам решит, что
+      // показать: пустой экран тут хуже, чем текст без оформления, но об этом надо знать в логе.
+      this.logger.warn(`письмо ${id} не разобрано: ${(e as Error).message}`);
+      return null;
+    }
   }
 
   /** Сырой .eml: ключ объекта для отдачи файлом (содержимое письма как оно пришло). */

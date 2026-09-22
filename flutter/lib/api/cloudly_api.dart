@@ -948,6 +948,19 @@ class CloudlyApi {
   Future<Map<String, dynamic>> mailBody(String id) async =>
       _m(await _req('/mail/messages/$id/body?images=1'));
 
+  /// Перевод письма на русский локальной моделью на маке.
+  ///
+  /// Ответ приходит целиком, а не потоком: на маке перевод идёт десятки секунд, а длинное
+  /// письмо — несколькими вызовами подряд. Поэтому таймаут на ответ здесь щедрый, а не общие
+  /// 60 секунд. Повторный вызов обслужит кэш на сервере — модель второй раз не зовётся.
+  Future<Map<String, dynamic>> mailTranslate(String id) async => _m(await _req(
+        '/mail/messages/${Uri.encodeComponent(id)}/translate',
+        method: 'POST',
+        body: const <String, dynamic>{},
+        // Потолок на весь перевод; на сервере такой же на один вызов модели (LLM_TIMEOUT_MS).
+        receiveTimeout: const Duration(minutes: 10),
+      ));
+
   /// Помечает письмо прочитанным или непрочитанным.
   Future<void> mailSetSeen(String id, bool seen) async =>
       _req('/mail/messages/$id/seen', method: 'POST', body: {'seen': seen});

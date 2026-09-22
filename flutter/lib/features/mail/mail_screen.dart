@@ -18,6 +18,7 @@ import '../files/file_detail.dart';
 import 'mail_body_web.dart';
 import 'mail_row.dart';
 import 'mail_search_screen.dart';
+import 'mail_translate.dart';
 
 /// Базовая высота строки письма — до поправки на системный размер шрифта.
 ///
@@ -662,6 +663,22 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
     }
   }
 
+  /// Открывает модалку с переводом письма на русский.
+  ///
+  /// Запрос уходит уже из самой модалки (см. [MailTranslationSheet]): перевод идёт десятки
+  /// секунд, и открывать её сразу с индикатором честнее, чем ждать ответа на экране письма без
+  /// единого признака работы. `backgroundColor` и скругление заданы тут, потому что цвета и форма
+  /// модалки — дело экрана, а не её содержимого.
+  Future<void> _translate() => showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: C.canvas,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        builder: (_) => MailTranslationSheet(messageId: widget.messageId),
+      );
+
   /// Удаляет письмо — оно уходит в корзину почты, откуда его можно вернуть.
   ///
   /// `_busy` включён на время запроса, чтобы письмо не удалили дважды. Успех закрывает экран
@@ -728,13 +745,20 @@ class _MailViewerScreenState extends ConsumerState<MailViewerScreen> {
             maxLines: 1,
             overflow: TextOverflow.ellipsis),
         actions: [
-          if (m != null && !widget.inTrash) ...[
-            IconButton(tooltip: 'Ответить', icon: const Icon(Icons.reply, color: C.fg), onPressed: () => _reply('reply')),
-            IconButton(tooltip: 'Удалить', icon: const Icon(Icons.delete_outline, color: C.fg), onPressed: _busy ? null : _delete),
-          ],
-          if (m != null && widget.inTrash) ...[
-            IconButton(tooltip: 'Восстановить', icon: const Icon(Icons.restore, color: C.fg), onPressed: _restore),
-            IconButton(tooltip: 'Удалить навсегда', icon: const Icon(Icons.delete_forever_outlined, color: C.danger), onPressed: _purgeForever),
+          if (m != null) ...[
+            IconButton(
+              tooltip: 'Перевести на русский',
+              icon: const Icon(Icons.translate, color: C.fg),
+              onPressed: _translate,
+            ),
+            if (!widget.inTrash) ...[
+              IconButton(tooltip: 'Ответить', icon: const Icon(Icons.reply, color: C.fg), onPressed: () => _reply('reply')),
+              IconButton(tooltip: 'Удалить', icon: const Icon(Icons.delete_outline, color: C.fg), onPressed: _busy ? null : _delete),
+            ],
+            if (widget.inTrash) ...[
+              IconButton(tooltip: 'Восстановить', icon: const Icon(Icons.restore, color: C.fg), onPressed: _restore),
+              IconButton(tooltip: 'Удалить навсегда', icon: const Icon(Icons.delete_forever_outlined, color: C.danger), onPressed: _purgeForever),
+            ],
           ],
           // Остальные действия — в меню: в шапке стоит отправитель, и четыре-пять иконок рядом
           // с подписью оставляли бы от неё считанные буквы.
