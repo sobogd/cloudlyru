@@ -91,6 +91,14 @@ PI_MODELS = Path.home() / ".pi" / "agent" / "models.json"
 # поэтому при правке мы сохраняем и структуру, и права.
 PI_AUTH = Path.home() / ".pi" / "agent" / "auth.json"
 
+# Память выбора модели и усилия по сессиям. На диске, а не только в пуле процессов, потому что
+# процесс харнесса живёт до перезапуска моста или до остановки по простою, а выбор человека
+# должен переживать и то, и другое: при подъёме процесса мост иначе брал бы модель по умолчанию
+# из models.json — а там первым идёт `local`, и разговор молча съезжал на локальную модель.
+SESSIONS_PATH = Path(os.environ.get(
+    "PI_BRIDGE_SESSIONS", str(Path.home() / ".pi-bridge-sessions.json")
+))
+
 # Встроенные провайдеры pi, для которых приложению разрешено класть ключ в auth.json. Список
 # нужен только для подсказки в интерфейсе: pi знает их сам и подхватит ключ из файла, поэтому
 # значение здесь — просто идентификатор и человеческое название.
@@ -226,6 +234,69 @@ def remember_claude_effort(effort):
 
 
 CONFIG = load_config()
+
+
+# Выбор модели и усилия по сессиям: разговор продолжается тем же, чем его вели.
+_sessions_lock = threading.Lock()
+
+
+def session_choice(key):
+    """Выбор модели и усилия для сессии [key] (`харнесс--id`); пустой словарь, если неизвестен.
+
+    Ошибка чтения не должна мешать работать: без памяти мост откатится к модели из журнала
+    сессии или к умолчанию — это хуже, но не отказ разговора целиком.
+    """
+    if not key:
+        return {}
+    with _sessions_lock:
+        data = read_json_file(SESSIONS_PATH)
+    entry = data.get(key)
+    return entry if isinstance(entry, dict) else {}
+
+
+def remember_session_choice(key, provider=None, model=None, effort=None):
+    """Запоминает выбор модели и усилия для сессии [key] на диске.
+
+    Пишем только то, что передали: `None` означает «про это ничего не сказали», и такое поле
+    не затирается — иначе смена усилия у Claude Code стирала бы выбранную модель.
+    Ошибку записи только логируем: потеря памяти хуже, но текущий разговор ломать нельзя.
+    """
+    if not key:
+        return
+    with _sessions_lock:
+        data = read_json_file(SESSIONS_PATH)
+        entry = data.get(key)
+        # Чужая запись (например, дописанная руками) сохраняется: правим только известные поля
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        if provider is not None:
+            entry["provider"] = str(provider)
+        if model is not None:
+            entry["model"] = str(model)
+        if effort is not None:
+            entry["effort"] = str(effort)
+        entry["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        data[key] = entry
+        try:
+            write_json_file(SESSIONS_PATH, data)
+        except OSError as e:
+            log("не смог сохранить выбор модели для %s (%s): %s" % (key, SESSIONS_PATH, e))
+
+
+def journal_model(harness, session_id, file=None):
+    """Модель и провайдер из журнала сессии — второй источник после памяти моста.
+
+    Нужен для разговоров, начатых не из приложения (в терминале): их выбора в памяти моста нет,
+    а журнал знает, чем они считались. Читается только при подъёме процесса, так что цена —
+    один разбор файла на старт, а не на каждый запрос.
+    """
+    if not session_id:
+        return "", ""
+    file = file or find_session_file(harness, session_id)
+    if file is None:
+        return "", ""
+    reader = read_claude_meta if harness == HARNESS_CLAUDE else read_session_meta
+    meta = reader(file)
+    return str(meta.get("provider") or ""), str(meta.get("model") or "")
 
 
 def default_model():
@@ -678,9 +749,17 @@ def read_claude_meta(file):
         meta["name"] = renamed
     if not meta["name"]:
         meta["name"] = meta["title"]
-    if not meta["startedAt"]:
-        meta["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
-    meta["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
+    if not meta["startedAt"] or not meta.get("updatedAt"):
+        # Файл мог исчезнуть между чтением и этим моментом (разговор удалили): без времени
+        # список обойдётся, а падать из-за одного файла не должен.
+        try:
+            stamp = file.stat().st_mtime
+        except OSError:
+            stamp = None
+        if not meta["startedAt"] and stamp is not None:
+            meta["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
+        if not meta.get("updatedAt") and stamp is not None:
+            meta["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
     return meta
 
 
@@ -889,6 +968,32 @@ def read_jsonl(file):
     return entries
 
 
+# Кэш разобранных метаданных сессии по файлу. Зачем: `read_session_meta` / `read_claude_meta`
+# читают файл целиком до конца (имя и счётчики лежат в разных записях, иначе их не собрать), и
+# обход всех папок на маке — это тысячи разборов JSON на каждый показ списка разговоров. Файл
+# сессии только дописывается, а не переписывается, поэтому пара «размер + mtime» — честный ключ:
+# пока она та же, содержимое то же.
+_meta_cache = {}
+meta_cache_lock = threading.Lock()
+
+
+def cached_meta(file, reader):
+    """Метаданные сессии через кэш: `reader`_base вызывается только при изменении файла."""
+    try:
+        info = file.stat()
+        key = (str(file), info.st_size, info.st_mtime)
+    except OSError:
+        return reader(file)
+    with meta_cache_lock:
+        cached = _meta_cache.get(str(file))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+    meta = reader(file)
+    with meta_cache_lock:
+        _meta_cache[str(file)] = (key, meta)
+    return meta
+
+
 def read_session_meta(file):
     """Читает из файла сессии то, что нужно строке списка: id, время, имя, число сообщений.
 
@@ -951,12 +1056,88 @@ def read_session_meta(file):
         log("не смог прочитать сессию %s: %s" % (file, e))
     if not meta["name"]:
         meta["name"] = meta["title"]
-    if not meta["startedAt"]:
-        meta["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime))
-    meta["updatedAt"] = time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(file.stat().st_mtime)
-    )
+    if not meta["startedAt"] or not meta.get("updatedAt"):
+        # Файл мог исчезнуть между чтением и этим моментом (разговор удалили) или не читаться
+        # вовсе: тогда ни времени старта, ни времени правки нет — лучше пустая строка, чем
+        # падение всей ручки списка из-за одного файла.
+        try:
+            stamp = file.stat().st_mtime
+        except OSError:
+            stamp = None
+        if not meta["startedAt"] and stamp is not None:
+            meta["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
+        if not meta.get("updatedAt") and stamp is not None:
+            meta["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
     return meta
+
+
+# Кэш времени последнего использования по папкам проекта. Нужен потому, что «самая свежая сессия
+# в папке» считается как максимум mtime по всем её файлам истории, а это `stat` на каждый файл
+# при каждом вызове `/projects` — то есть работа растёт со всей историей на маке, а не с числом
+# проектов. Ключ — число файлов и время правки каталогов истории: `mtime` самой папки проекта
+# для этого не годится, он меняется только при создании и удалении имени в каталоге, а
+# дописывание существующего файла сессии его не трогает. Поэтому смотрим на папки, где файлы
+# действительно лежат (`sessions_dir_for`, `claude_sessions_dir`): их mtime меняется при
+# добавлении и удалении файла, а число файлов ловит случай, когда удалили один и добавили
+# другой в ту же секунду.
+_last_used_cache = {}
+last_used_lock = threading.Lock()
+
+
+def folder_last_used(folder, files):
+    """Время последней сессии в папке [folder] по её файлам [files] — с кэшем по их папкам.
+
+    Возвращает ISO-время или `None`, если файлов нет. Значащее для экрана действие — добавить
+    сессию или удалить её; дописывание одного и того же файла время в списке не меняет значимо,
+    а полноценно отследить его без `stat` по файлам всё равно нельзя. Кэш живёт в памяти
+    процесса моста: после его перезапуска первый проход всегда полный.
+    """
+    if not files:
+        return None
+    # Ключ — по папкам, где реально лежат файлы истории этой папки проекта (обычно 0–2 штуки),
+    # а не по самой папке проекта: см. пояснение выше про mtime.
+    signature = []
+    for directory in {f.parent for f in files}:
+        try:
+            signature.append((str(directory), directory.stat().st_mtime))
+        except OSError:
+            return None
+    signature.append(len(files))
+    key = str(folder)
+    with last_used_lock:
+        cached = _last_used_cache.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+    try:
+        newest = max(f.stat().st_mtime for f in files)
+    except OSError:
+        return None
+    value = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(newest))
+    with last_used_lock:
+        _last_used_cache[key] = (signature, value)
+    return value
+
+
+# Короткий кэш дорогих ответов: `/projects` пересчитывается обходом всей истории на маке, а
+# спрашивает его каждый вход на экран и каждый мастер новой сессии. Пяти секунд хватает, чтобы
+# серия запросов одного действия обошлась одним обходом, и мало, чтобы человек увидел устаревший
+# список: сессия появляется не чаще, чем он успевает ткнуться в экран дважды.
+PROJECTS_CACHE_SECONDS = 5.0
+_projects_cache = None
+projects_lock = threading.Lock()
+
+
+def list_projects_cached():
+    """Список проектов из короткого кэша — чтобы частое обращение не стоило обхода истории."""
+    global _projects_cache
+    with projects_lock:
+        now = time.time()
+        if _projects_cache and now - _projects_cache[0] < PROJECTS_CACHE_SECONDS:
+            return _projects_cache[1]
+    value = list_projects()
+    with projects_lock:
+        _projects_cache = (time.time(), value)
+    return value
 
 
 def list_projects():
@@ -1002,10 +1183,9 @@ def list_projects():
             return
         seen.add(str(resolved))
         files = session_files(resolved) + claude_session_files(resolved)
-        last = None
-        if files:
-            newest = max(f.stat().st_mtime for f in files)
-            last = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(newest))
+        # Время последней сессии в папке — через кэш: `stat` по всем её файлам истории на каждом
+        # вызове /projects стоил бы дороже всего остального в этой ручке (см. folder_last_used).
+        last = folder_last_used(resolved, files)
         projects.append({
             "path": str(resolved),
             "name": resolved.name,
@@ -1053,7 +1233,7 @@ def list_projects():
                 continue
             if not files:
                 continue
-            cwd = str(reader(files[0]).get("cwd") or "")
+            cwd = str(cached_meta(files[0], reader).get("cwd") or "")
             if cwd:
                 add(cwd)
 
@@ -1952,6 +2132,23 @@ class PiSession(AgentSession):
         provider, model = default_model()
         provider = self.provider or provider
         model = self.model or model
+        if session_id and not self.provider and not self.model:
+            # Процесс поднимается заново (остановка по простою, перезапуск моста, обрыв туннеля),
+            # и модель берётся не из общего умолчания, а из выбора этой сессии: сначала из памяти
+            # моста, затем из её журнала. Иначе разговор молча съезжал на первого провайдера
+            # models.json — а им идёт `local`.
+            key = session_key(self.harness, session_id)
+            remembered = session_choice(key)
+            self.provider = str(remembered.get("provider") or "")
+            self.model = str(remembered.get("model") or "")
+            provider = self.provider or provider
+            model = self.model or model
+            if not self.provider and not self.model:
+                provider, model = journal_model(self.harness, session_id) or (provider, model)
+                self.provider, self.model = provider, model
+            if self.provider or self.model:
+                log("сессия %s: поднимаю с прежней моделью %s/%s" % (
+                    session_id, self.provider or "?", self.model or "?"))
         cmd = [str(CONFIG.get("pi") or "pi"), "--mode", "rpc"]
         if session_id:
             # --session-id продолжает существующую сессию или создаёт её с этим id: так
@@ -2096,6 +2293,10 @@ class PiSession(AgentSession):
     def set_model(self, provider, model):
         """Меняет модель у открытой сессии: разговор продолжается, меняется считающий."""
         self.command("set_model", provider=provider, modelId=model)
+        # Запоминаем на диске: у pi смена модели живёт только в живом процессе, а после подъёма
+        # заново он взял бы умолчание. Это и есть источник выбора для [_start].
+        self.provider, self.model = provider, model
+        remember_session_choice(session_key(self.harness, self.id), provider=provider, model=model)
 
     def messages(self):
         """Переписка сессии в нормализованном виде."""
@@ -2170,8 +2371,18 @@ class ClaudeSession(AgentSession):
         """
         super().__init__(cwd, model=model)
         self.id = session_id or str(uuid.uuid4())
+        # Модель и усилие поднятой заново сессии берутся из памяти моста: в отличие от pi,
+        # Claude Code не пишет `model_change` в журнал в том же виде, поэтому второго источника
+        # (журнала) здесь нет — без этой памяти выбор человека терялся бы при каждом перезапуске
+        # процесса (смена модели/усилия, простой, перезапуск моста).
+        remembered = session_choice(session_key(self.harness, self.id))
+        if not self.model:
+            self.model = str(remembered.get("model") or "")
         if effort is None:
-            effort = CONFIG.get("claude_effort")
+            # Пустое значение в памяти — это именно отказ от выбора, поэтому через `or` его
+            # подменять нельзя: различаем «не знаем» (`None`) и «знаем, что пусто» (`""`).
+            stored = remembered.get("effort")
+            effort = stored if isinstance(stored, str) else CONFIG.get("claude_effort")
         effort = str(effort or "").strip()
         if effort and effort not in claude_effort_ids():
             raise PiError("неизвестный уровень усилия: %s" % effort)
@@ -2306,6 +2517,7 @@ class ClaudeSession(AgentSession):
         Уровень усилия при этом остаётся прежним.
         """
         self.model = model
+        remember_session_choice(session_key(self.harness, self.id), model=model)
         self.stop()
         self._start(self.id)
 
@@ -2320,6 +2532,7 @@ class ClaudeSession(AgentSession):
             raise PiError("неизвестный уровень усилия: %s" % effort)
         self.effort = effort
         remember_claude_effort(effort)
+        remember_session_choice(session_key(self.harness, self.id), effort=effort)
         self.stop()
         self._start(self.id)
 
@@ -2631,6 +2844,15 @@ class Pool:
                 detail = session.stderr_tail[-1] if session.stderr_tail else "без вывода"
                 session.stop()
                 raise PiError("%s не сообщил идентификатор сессии (%s)" % (harness, detail))
+            # Запоминаем выбор на диске: приложение присылает его только для новой сессии, и без
+            # этой памяти поднятый заново процесс (простой, перезапуск моста) взял бы модель по
+            # умолчанию. У pi и Claude Code запись идёт после запуска, когда уже известен id.
+            remember_session_choice(
+                session.key,
+                provider=provider,
+                model=model,
+                effort=session.effort if harness == HARNESS_CLAUDE else None,
+            )
             # если такой процесс уже был под другим ключом — закрываем дубль
             existing = self.sessions.get(session.key)
             if existing is not None and existing is not session:
@@ -2793,7 +3015,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 self._json(200, self._health())
             elif path == "/projects":
-                self._json(200, {"projects": list_projects()})
+                self._json(200, {"projects": list_projects_cached()})
             elif path == "/harnesses":
                 self._json(200, {"harnesses": harness_status()})
             elif path == "/models":
@@ -3045,7 +3267,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise PiError("папка вне разрешённых корней: %s" % raw)
             folders = [path]
         else:
-            folders = [Path(str(p["path"])) for p in list_projects()]
+            # Список папок — из короткого кэша: эта ветка и есть частый запрос списка разговоров,
+            # и обход истории на маке здесь нужен только чтобы узнать, какие папки показывать.
+            folders = [Path(str(p["path"])) for p in list_projects_cached()]
 
         sessions = []
         for folder in folders:
@@ -3053,10 +3277,10 @@ class Handler(BaseHTTPRequestHandler):
                 for file in session_files(folder):
                     # `path` — рабочая папка разговора: без неё строка общего списка не знает,
                     # в каком проекте открывать сессию
-                    sessions.append({**read_session_meta(file), "harness": HARNESS_PI, "path": str(folder)})
+                    sessions.append({**cached_meta(file, read_session_meta), "harness": HARNESS_PI, "path": str(folder)})
             if asked in ("", HARNESS_CLAUDE):
                 for file in claude_session_files(folder):
-                    sessions.append({**read_claude_meta(file), "harness": HARNESS_CLAUDE, "path": str(folder)})
+                    sessions.append({**cached_meta(file, read_claude_meta), "harness": HARNESS_CLAUDE, "path": str(folder)})
         # по дате создания, новые сверху: два списка складываются в один, и порядок в нём не
         # должен меняться от того, что в каком-то разговоре только что что-то произошло — иначе
         # строки прыгали бы под пальцем. Что разговор жив, видно по значку работы

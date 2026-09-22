@@ -54,11 +54,16 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// Контроллер списка проектов (он же отдаёт состояние моста).
   late final AgentProjectsController _projects;
 
-  /// Обновление списка и снимка работы, пока экран открыт.
-  ///
-  /// Раз в пять секунд: этого хватает, чтобы увидеть чужой прогон (с телефона или из терминала)
-  /// и что разговор дописался, а лишних запросов к маку не плодит.
+  /// Снимок работы на каждом такте: он лёгкий (сервер отвечает им из своей памяти, не ходя к
+  /// маку), поэтому частый опрос здесь не стоит ничего.
   Timer? _ticker;
+
+  /// Подписка на возврат приложения на передний план: она и заменяет прежний частый опрос списка.
+  AppLifecycleListener? _lifecycle;
+
+  /// Сколько тактов таймера прошло: по нему решается, когда перечитывать список разговоров
+  /// (см. [_refresh]).
+  int _ticks = 0;
 
   /// Какие разговоры были «готовы» на прошлом проходе — чтобы показать про новые один раз.
   Set<String> _finishedBefore = const {};
@@ -109,6 +114,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       _sessions.load();
       ref.read(agentActivityProvider.notifier).load();
       _ticker = Timer.periodic(const Duration(seconds: 5), (_) => _refresh());
+      // Вернулись на экран или в приложение — перечитываем список сразу: пока его не было,
+      // разговоры могли дописаться, а на экране осталось старое.
+      _lifecycle = AppLifecycleListener(onResume: _refresh);
       // О новых готовых ответах сообщаем один раз: сравниваем с прошлым снимком
       ref.listen(agentActivityProvider, (_, next) {
         final fresh = next.activity.finished.difference(_finishedBefore);
@@ -125,16 +133,23 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     });
   }
 
-  /// Перечитывает список и снимок работы, не мигая спиннером.
+  /// Перечитывает список разговоров и снимок работы, не мигая спиннером.
+  ///
+  /// Список пересчитывается на маке обходом всей истории агентов (с `stat` по каждому файлу
+  /// сессии), поэтому в таймере он обновляется редко: часто — только на первых тактах после
+  /// открытия экрана, потом в четыре раза реже снимка. Всё остальное свежее приходит по
+  /// действию: возврат из разговора, из мастера или из фона.
   void _refresh() {
     if (!mounted) return;
-    _sessions.load(silent: true);
+    _ticks += 1;
+    if (_ticks <= 4 || _ticks % 4 == 0) _sessions.load(silent: true);
     ref.read(agentActivityProvider.notifier).load();
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _lifecycle?.dispose();
     super.dispose();
   }
 
