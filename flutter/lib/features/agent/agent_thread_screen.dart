@@ -87,6 +87,12 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Показаны ли подробные сведения о сессии (токены, счётчики, время, путь к файлу).
   bool _details = false;
 
+  /// Ключи раскрытых служебных сообщений («размышлений», вызовов инструментов, команд).
+  ///
+  /// По ключу, а не по индексу в списке: пока ответ дописывается, пункты добавляются в конец,
+  /// и нумерация уже раскрытых сообщений поехала бы. Ключ даёт [_entryKey].
+  final _open = <String>{};
+
   /// Показан ли разговор с конца.
   ///
   /// Первый прыжок вниз — не «следование за новым текстом», а показ истории с конца: до него
@@ -505,21 +511,31 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Все виды — текст, «размышления», карточка команды и прямая команда оболочки — рисуются
   /// одинаково: тот же пузырь, тот же кегль текста. Служебное содержимое отличается только
   /// приглушёнными цветами ([muted]): оно поясняет работу агента, а не является ответом.
+  ///
+  /// Свёрнутым по умолчанию идёт служебное: «размышления», карточка вызова инструмента и
+  /// прямая команда оболочки. В переписке важны ответы, а не то, как агент к ним шёл; в
+  /// свёрнутом виде у них видна первая строка — по ней узнаётся, о чём речь.
   Widget _entry(_Entry entry) => switch (entry.kind) {
     _EntryKind.note => _note(entry.text),
     _EntryKind.bash => _message(
       muted: true,
       copyText: entry.copyText,
+      expandKey: _entryKey(entry),
+      collapsedPreview: _firstLine('\$ ${entry.command}'),
       child: _BashCard(command: entry.command, output: entry.text),
     ),
     _EntryKind.tool => _message(
       muted: true,
       copyText: entry.copyText,
+      expandKey: _entryKey(entry),
+      collapsedPreview: _firstLine(entry.tool!.output),
       child: _ToolCard(tool: entry.tool!),
     ),
     _EntryKind.reasoning => _message(
       muted: true,
       copyText: entry.copyText,
+      expandKey: _entryKey(entry),
+      collapsedPreview: _firstLine(entry.text),
       child: _ReasoningBlock(text: entry.text),
     ),
     _EntryKind.user || _EntryKind.text || _EntryKind.waiting => _message(
@@ -528,6 +544,29 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       child: _bubbleContent(entry),
     ),
   };
+
+  /// Первая непустая строка текста — то, что видно у свёрнутого служебного сообщения.
+  ///
+  /// Обрезается по длине: одна строка вывода команды или «размышлений» может быть хоть на
+  /// весь экран, а в свёрнутом виде она — только намёк на содержимое.
+  String _firstLine(String text) {
+    final line = _compactLines(text).split('\n').first.trim();
+    return line.length <= _collapsedChars
+        ? line
+        : '${line.substring(0, _collapsedChars).trimRight()}…';
+  }
+
+  /// Ключ состояния раскрытия для пункта переписки.
+  ///
+  /// Ключ обязан быть стабильным, а не «пункт №5 в списке»: пока ответ дописывается, пункты
+  /// добавляются в конец, и номер позиции у уже раскрытого сообщения не менялся бы только по
+  /// случайности. Для вызова инструмента годится его идентификатор от харнесса, для остальных —
+  /// первые символы текста: двух одинаковых кусков в одной переписке не бывает.
+  String _entryKey(_Entry entry) {
+    final id = entry.tool?.id ?? '';
+    if (id.isNotEmpty) return 'tool:$id';
+    return '${entry.kind.name}:${entry.text.hashCode}:${entry.command.hashCode}';
+  }
 
   /// Содержимое текстового сообщения: сам текст, ожидание ответа и ошибка прогона.
   Widget _bubbleContent(_Entry entry) {
@@ -582,21 +621,28 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   double _bubbleMax(BuildContext context) =>
       (widget.paneWidth ?? MediaQuery.sizeOf(context).width) * 0.8;
 
-  /// Одно сообщение переписки: пузырь и кнопка «скопировать» рядом с ним.
+  /// Одно сообщение переписки: пузырь и кнопки «скопировать» и «раскрыть» рядом с ним.
   ///
-  /// Кнопка стоит вне пузыря — внутри она отнимала бы место у текста и читалась бы как часть
+  /// Кнопки стоят вне пузыря — внутри они отнимали бы место у текста и читались бы как часть
   /// содержимого. Чтобы пара поместилась в отведённую ширину, предел пузыря уменьшается на
-  /// ширину кнопки. У сообщения без текста (например, ожидания ответа) кнопки нет: копировать
-  /// нечего.
+  /// ширину кнопок. У сообщения без текста (например, ожидания ответа) кнопок нет: ни
+  /// копировать, ни раскрывать нечего.
+  ///
+  /// Раскрытие вынесено к кнопке копирования, а не спрятано внутри служебного сообщения: там
+  /// его пришлось бы искать взглядом в тексте вывода, а рядом с копированием обе кнопки стоят
+  /// на одном месте у каждого сообщения и не зависят от того, что внутри.
   Widget _message({
     required String copyText,
     required Widget child,
     bool isUser = false,
     bool muted = false,
+    String? expandKey,
+    String collapsedPreview = '',
   }) {
+    final expanded = expandKey != null && _open.contains(expandKey);
     final bubble = ConstrainedBox(
       constraints: BoxConstraints(
-        maxWidth: _bubbleMax(context) - _copyButtonWidth,
+        maxWidth: _bubbleMax(context) - _togglesWidth,
       ),
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 4),
@@ -611,25 +657,43 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           // самое заметное в переписке.
           border: Border.all(color: isUser ? C.accent : C.brd),
         ),
-        child: child,
+        // свёрнутое служебное сообщение — одна строка вместо всего текста: тап по строке
+        // раскрывает её (хитбокс шире самой строки, чтобы попадать по ней пальцем)
+        child: expanded || expandKey == null
+            ? child
+            : GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => _toggle(expandKey),
+                child: CollapsedLine(text: collapsedPreview),
+              ),
       ),
     );
-    final button = copyText.trim().isEmpty
-        ? null
-        : _CopyButton(text: copyText);
+    final buttons = <Widget>[
+      if (copyText.trim().isNotEmpty) _CopyButton(text: copyText),
+      if (expandKey != null)
+        _ExpandButton(expanded: expanded, onPressed: () => _toggle(expandKey)),
+    ];
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Row(
         mainAxisSize: MainAxisSize.min,
-        // кнопка стоит по центру пузыря по вертикали: у высокого сообщения она не уезжает
-        // к нижнему краю и не выглядит приклеенной к тексту
+        // кнопки стоят по центру пузыря по вертикали: у высокого сообщения они не уезжают
+        // к нижнему краю и не выглядят приклеенными к тексту
         crossAxisAlignment: CrossAxisAlignment.center,
         children: isUser
-            ? [?button, bubble]
-            : [bubble, ?button],
+            ? [...buttons.reversed, bubble]
+            : [bubble, ...buttons],
       ),
     );
   }
+
+  /// Раскрывает или сворачивает служебное сообщение пункта переписки.
+  ///
+  /// Состояние живёт по ключу пункта ([_entryKey]) и переживает перерисовки: ответ
+  /// дописывается по кускам, и без этого раскрытое сообщение схлопывалось бы на каждом кадре.
+  void _toggle(String key) => setState(() {
+    if (!_open.remove(key)) _open.add(key);
+  });
 
   /// Служебная строка: автоответ на подтверждение, которого человек не давал.
   ///
@@ -1129,6 +1193,76 @@ const _textSize = 14.0;
 /// Ширина кнопки «скопировать» вместе с её полями: на неё уменьшается предел ширины пузыря,
 /// потому что кнопка стоит вне пузыря и пара должна целиком влезать в отведённое место.
 const _copyButtonWidth = 30.0;
+
+/// Ширина пары кнопок у служебного сообщения — «скопировать» и «раскрыть».
+///
+/// Кнопок может быть две, и предел ширины пузыря считается по обеим сразу: иначе у
+/// раскрытого служебного сообщения пара кнопок вылезла бы за предел ширины переписки.
+const _togglesWidth = 2 * _copyButtonWidth;
+
+/// Сколько символов первой строки видно у свёрнутого служебного сообщения.
+///
+/// Строка всё равно режется по ширине экрана: числом ограничивается только то, что попадает
+/// в виджет — рвать на нём километровую строку вывода команды нечего.
+const _collapsedChars = 160;
+
+/// Кнопка «раскрыть сообщение» — у «размышлений», вызовов инструментов и прямых команд.
+///
+/// Стоит рядом с кнопкой копирования: обе — действия над сообщением, и искать их разбросанными
+/// по тексту не приходится. Стрелка вниз — раскрыть, вверх — свернуть.
+class _ExpandButton extends StatelessWidget {
+  /// Раскрыто ли сообщение сейчас: от этого зависит направление стрелки и подсказка.
+  final bool expanded;
+
+  /// Что делать при нажатии.
+  final VoidCallback onPressed;
+
+  /// Кнопка раскрытия.
+  const _ExpandButton({required this.expanded, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) => IconButton(
+    tooltip: expanded ? 'Свернуть' : 'Показать целиком',
+    onPressed: onPressed,
+    // вид тот же, что у копирования: две кнопки в одном ряду не должны выглядеть по-разному
+    icon: Icon(
+      expanded ? Icons.unfold_less : Icons.unfold_more,
+      size: 14,
+      color: C.fg3.withValues(alpha: 0.45),
+    ),
+    visualDensity: VisualDensity.compact,
+    padding: EdgeInsets.zero,
+    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+  );
+}
+
+/// Свёрнутое служебное сообщение: одна строка — первое, что в нём есть.
+///
+/// Моноширинный шрифт и приглушённый цвет — те же, что у вывода, который строка заменяет:
+/// по виду понятно, что это не ответ агента, а его работа.
+class CollapsedLine extends StatelessWidget {
+  /// Первая строка содержимого (обрезанная по длине).
+  final String text;
+
+  /// Свёрнутая строка.
+  const CollapsedLine({required this.text, super.key});
+
+  @override
+  Widget build(BuildContext context) => Text(
+    text.trim().isEmpty ? 'пусто' : text,
+    maxLines: 1,
+    overflow: TextOverflow.ellipsis,
+    style: TextStyle(
+      color: C.fg3,
+      fontSize: _textSize,
+      fontFamily: 'monospace',
+      height: 1.35,
+      // пустая строка вывода не должна выглядеть как щель в пузыре: место по высоте остаётся
+      // тем же, что у настоящей строки
+      fontStyle: text.trim().isEmpty ? FontStyle.italic : FontStyle.normal,
+    ),
+  );
+}
 
 /// Кнопка «скопировать сообщение» — одна и та же у пузырей и у карточек команд.
 ///
