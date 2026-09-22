@@ -1,0 +1,131 @@
+name: macOS app (build + publish)
+
+# Сборка и публикация настольного клиента: архив с Cloudly.app уезжает в S3, откуда его всегда
+# отдаёт https://files.iq-factura.com/macos. Приложение на маке обновляется кнопкой в
+# «Настройках»: скачивает архив, проверяет размер и sha256 и подменяет свою сборку (см.
+# flutter/lib/features/settings/macos_update.dart).
+#
+# Запускается сам — push в main, тронувший `flutter/**`. Пути здесь не украшение, а экономия:
+# настольная сборка пересобирается только тогда, когда менялся клиент, а push в `src/**`
+# поднимает `deploy.yml` (бекенд). Если в одном коммите и то и другое — запускаются все четыре.
+#
+# Ручной запуск (пересобрать тот же номер для проверки):
+#   gh workflow run macos.yml -f force=true
+#
+# Номер версии обязателен. Push, тронувший `flutter/**`, но не поднявший `version:` в
+# `flutter/pubspec.yaml`, уронит публикацию: номер сборки общий с Android и iOS, и скрипт не даёт
+# положить сборку с тем же или меньшим номером.
+#
+# Про подпись. Сборка здесь не подписана Developer ID и не нотаризуется: приложение качает её
+# само обычным HTTP-клиентом, карантинного флага на файле не появляется, и Gatekeeper заменённую
+# сборку не блокирует. Но если сборку понадобится отдавать кому-то ещё (или качать браузером),
+# её придётся подписать сертификатом Developer ID и нотаризовать — иначе система откажется её
+# запускать. Это отдельная работа: сертификат в секретах + `notarytool submit`.
+#
+# Секреты: только S3_FILES_ACCESS_KEY / S3_FILES_SECRET_KEY (те же, что у автодеплоя).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flutter/**'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Опубликовать поверх того же номера сборки
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: cloudlyru-macos
+  # Новый push отменяет предыдущую сборку: две одновременные сборки одного номера не должны
+  # доходить до публикации вдвоём.
+  cancel-in-progress: true
+
+env:
+  # Тот же Flutter, что локально: новая stable может поменять Xcode-шаблон и сломать сборку
+  # в самый неподходящий момент, а релиз должен собираться воспроизводимо.
+  FLUTTER_VERSION: 3.47.4
+
+jobs:
+  macos:
+    # Настольную сборку можно собрать только на маке: нужен Xcode. macos-latest — Apple Silicon,
+    # то есть сборка под arm64; для x86_64 понадобился бы отдельный раннер (macos-13).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Версия из pubspec
+        id: version
+        working-directory: flutter
+        run: |
+          # version: 1.0.0+51 → name=1.0.0, code=51. Номер общий с Android и iOS: из него же
+          # собирается versionCode для APK и CFBundleVersion для .ipa.
+          raw="$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -1)"
+          name="${raw%%+*}"
+          code="${raw##*+}"
+          test -n "$name" || { echo "в pubspec.yaml нет version"; exit 1; }
+          test "$code" != "$raw" || { echo "в version нет номера сборки после «+»: $raw"; exit 1; }
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "собираю $name (номер $code)"
+
+      - name: Анализ и сборка релиза
+        working-directory: flutter
+        # Ключей в сборке нет и быть не должно: ко всем внешним API приложение ходит через сервер.
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter build macos --release
+
+      - name: Архив со сборкой
+        working-directory: flutter/build/macos/Build/Products/Release
+        run: |
+          # ditto, а не zip: он сохраняет права и символические ссылки внутри бандла — обычный
+          # zip их теряет, и распакованное приложение не запускается.
+          ditto -c -k --keepParent Cloudly.app Cloudly.zip
+          ls -lh Cloudly.zip
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Зависимости для публикации (только @aws-sdk/client-s3)
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Публикация сборки в /macos
+        env:
+          S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
+          S3_FILES_SECRET_KEY: ${{ secrets.S3_FILES_SECRET_KEY }}
+          S3_FILES_ENDPOINT: https://nbg1.your-objectstorage.com
+          S3_FILES_REGION: nbg1
+          S3_FILES_BUCKET: cloudlyru
+          S3_FILES_FORCE_PATH_STYLE: 'true'
+          S3_FILES_PREFIX: ''
+          CLOUDLY_BASE_URL: https://files.iq-factura.com
+        run: |
+          FORCE_ARGS=()
+          if [ "${{ inputs.force }}" = "true" ]; then FORCE_ARGS+=(--force); fi
+          node scripts/publish-macos.mjs \
+            flutter/build/macos/Build/Products/Release/Cloudly.zip \
+            --version-name "${{ steps.version.outputs.name }}" \
+            --version-code "${{ steps.version.outputs.code }}" \
+            ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}
+
+      - name: Итог в summary
+        if: always()
+        run: |
+          {
+            echo "### Настольное приложение (macOS)"
+            echo "- версия: ${{ steps.version.outputs.name }} (номер ${{ steps.version.outputs.code }})"
+            echo "- постоянная ссылка: https://files.iq-factura.com/macos"
+            echo "- сборка без подписи: годится для обновления кнопкой из приложения,"
+            echo "  но не для передачи на другой мак (там нужен Developer ID и нотаризация)"
+          } >> "$GITHUB_STEP_SUMMARY"

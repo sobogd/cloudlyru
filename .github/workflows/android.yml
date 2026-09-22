@@ -1,0 +1,143 @@
+name: Android APK (build + publish)
+
+# Сборка и публикация Android-клиента: релизный APK уезжает в S3, откуда его всегда отдаёт
+# https://files.iq-factura.com/apk.
+#
+# Запускается сам — push в main, тронувший `flutter/**`. Пути здесь не украшение, а экономия:
+# клиент пересобирается только тогда, когда менялся клиент, а push в `src/**` поднимает
+# `deploy.yml` (бекенд). Если в одном коммите и то и другое — запускаются все четыре workflow.
+#
+# Ручной запуск (пересобрать тот же номер для проверки на устройстве):
+#   gh workflow run android.yml -f force=true
+#
+# Номер версии обязателен. Push, тронувший `flutter/**`, но не поднявший `version:` в
+# `flutter/pubspec.yaml`, уронит публикацию: скрипт не даёт положить сборку с тем же или меньшим
+# номером. Это защита, а не ошибка — телефон узнаёт об обновлении только по выросшему номеру.
+#
+# Тестов в проекте нет намеренно: прогоняется только сборка, а работу приложения проверяет
+# владелец на телефоне.
+#
+# Секреты: ANDROID_KEYSTORE_BASE64 (файл keystore в base64), ANDROID_KEYSTORE_PASSWORD,
+# ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD, S3_FILES_ACCESS_KEY / S3_FILES_SECRET_KEY
+# (последние два — те же, что у автодеплоя).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flutter/**'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Опубликовать поверх того же номера сборки
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: cloudlyru-android
+  # Новый push отменяет предыдущую сборку: так две одновременные сборки одного номера не
+  # доходят до публикации вдвоём, а на устройство попадает только свежий коммит.
+  cancel-in-progress: true
+
+env:
+  # Тот же Flutter, что локально: новая stable может поменять Gradle/AGP и сломать сборку
+  # в самый неподходящий момент, а релиз должен собираться воспроизводимо.
+  FLUTTER_VERSION: 3.47.4
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # android-actions/setup-android тут больше не используется: на текущем образе раннера
+      # действие тянет устаревший пакет `tools`, не находит его и падает («Failed to find
+      # package 'tools'»). SDK в образе уже стоит — принимаем лицензии, нужные компоненты
+      # доставляем по возможности, а остальное Gradle добирает сам.
+      - name: Android SDK (platform 36, build-tools 36)
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1)"
+          test -n "$SDKMANAGER" || { echo "нет sdkmanager в $SDK"; ls "$SDK"; exit 1; }
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" \
+            || echo "компоненты SDK не доустановились — собираем на том, что есть в образе"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # Подпись читает flutter/android/app/build.gradle.kts — путь ../keystore.properties,
+      # то есть этот файл. Ключ обязан быть тем же, что у уже установленного приложения:
+      # с другой подписью APK поверх не встанет, потребуется удалять приложение.
+      - name: Ключ подписи из секретов
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+          test -n "$KEYSTORE_BASE64" || { echo "нет секрета ANDROID_KEYSTORE_BASE64"; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          cat > flutter/android/keystore.properties <<EOF
+          storeFile=$RUNNER_TEMP/release.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          chmod 600 flutter/android/keystore.properties
+
+      - name: Анализ и сборка релиза
+        working-directory: flutter
+        # Ключей в сборке нет и быть не должно: APK лежит на публичной ссылке, и ключ из него
+        # извлекается. Ко всем внешним API приложение ходит не само, а через наш сервер.
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter build apk --release
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Зависимости для публикации (только @aws-sdk/client-s3)
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Публикация сборки в /apk
+        env:
+          S3_FILES_ACCESS_KEY: ${{ secrets.S3_FILES_ACCESS_KEY }}
+          S3_FILES_SECRET_KEY: ${{ secrets.S3_FILES_SECRET_KEY }}
+          S3_FILES_ENDPOINT: https://nbg1.your-objectstorage.com
+          S3_FILES_REGION: nbg1
+          S3_FILES_BUCKET: cloudlyru
+          S3_FILES_FORCE_PATH_STYLE: 'true'
+          S3_FILES_PREFIX: ''
+          CLOUDLY_BASE_URL: https://files.iq-factura.com
+        run: |
+          FORCE_ARGS=()
+          if [ "${{ inputs.force }}" = "true" ]; then FORCE_ARGS+=(--force); fi
+          node scripts/publish-apk.mjs \
+            flutter/build/app/outputs/apk/release/app-release.apk \
+            ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}
+
+      - name: Итог в summary
+        if: always()
+        run: |
+          {
+            echo "### Android-клиент (Flutter)"
+            if [ -f flutter/build/app/outputs/apk/release/output-metadata.json ]; then
+              node -e "const m=require('./flutter/build/app/outputs/apk/release/output-metadata.json');const e=m.elements[0];console.log('- собрано: '+e.versionName+' (versionCode '+e.versionCode+')');"
+            else
+              echo "- сборка не дошла до APK"
+            fi
+            echo "- постоянная ссылка: https://files.iq-factura.com/apk"
+          } >> "$GITHUB_STEP_SUMMARY"
