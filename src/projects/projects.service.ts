@@ -122,11 +122,12 @@ export class ProjectsService {
       new Blob([new Uint8Array(audio)], { type: mime || 'application/octet-stream' }),
       'voice',
     );
-    // `json` — самый простой ответ whisper-server (`{text}`); `language` добавляем только
-    // когда он задан явно: пустая строка означает автоопределение (см. STT_LANGUAGE).
+    // `json` — самый простой ответ whisper-server (`{text}`). Язык отправляем всегда, и при
+    // пустой настройке это `auto`: у whisper-server дефолт — `en`, поэтому запрос без поля
+    // модель читает как «переведи на английский» и возвращает русскую речь английским
+    // пересказом. Явное `auto` и есть автоопределение (см. STT_LANGUAGE).
     form.append('response_format', 'json');
-    const language = env.STT_LANGUAGE.trim();
-    if (language) form.append('language', language);
+    form.append('language', env.STT_LANGUAGE.trim() || 'auto');
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), STT_TIMEOUT_MS);
