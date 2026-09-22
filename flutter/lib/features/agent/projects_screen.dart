@@ -578,36 +578,44 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
   /// Меню действий над разговором, которое открывает длинное нажатие.
   ///
-  /// Меню выезжает снизу — так же, как выбор папки в почте: попасть в строку меню пальцем
-  /// проще, чем в иконку внутри строки списка, и строке разговора не приходится отдавать
-  /// место под кнопки. Имя разговора стоит в меню заголовком: по строке, которую нажали,
-  /// не всегда видно, что именно переименовываешь или удаляешь.
+  /// Показывается карточкой по центру экрана, а не полосой снизу: полоса прижималась к
+  /// нижнему краю и растягивалась во всю ширину, так что на телефоне действия читались
+  /// отдельно от строки, которую ими правят. Центрированная карточка держит имя разговора и
+  /// действия рядом друг с другом и не упирается в края экрана; ширина ограничена, иначе на
+  /// планшете и маке карточка расползлась бы во весь экран.
+  ///
+  /// Имя разговора стоит в меню заголовком: по строке, которую нажали, не всегда видно, что
+  /// именно переименовываешь или удаляешь.
   Future<void> _actions(AgentSession session) async {
-    final action = await showModalBottomSheet<String>(
+    final action = await showDialog<String>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              title: Text(
-                _title(session),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: C.fg3, fontSize: 13),
+      builder: (ctx) => Dialog(
+        backgroundColor: C.surface,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 320),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                title: Text(
+                  _title(session),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: C.fg3, fontSize: 13),
+                ),
               ),
-            ),
-            ListTile(
-              leading: const Icon(Icons.drive_file_rename_outline, color: C.fg2),
-              title: const Text('Переименовать'),
-              onTap: () => Navigator.pop(ctx, 'rename'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline, color: C.danger),
-              title: const Text('Удалить сессию'),
-              onTap: () => Navigator.pop(ctx, 'delete'),
-            ),
-          ],
+              ListTile(
+                leading: const Icon(Icons.drive_file_rename_outline, color: C.fg2),
+                title: const Text('Переименовать'),
+                onTap: () => Navigator.pop(ctx, 'rename'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: C.danger),
+                title: const Text('Удалить сессию'),
+                onTap: () => Navigator.pop(ctx, 'delete'),
+              ),
+            ],
+          ),
         ),
       ),
     );
