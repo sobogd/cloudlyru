@@ -977,35 +977,45 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         _contextBorder(state),
         Stack(
           children: [
-            TextField(
-              controller: _input,
-              // Поле доступно и во время работы: дописанное сообщение уходит в очередь и
-              // доезжает до агента, как только он освободится, — ждать с пустым полем незачем
-              enabled: true,
-              minLines: 1,
-              maxLines: 6,
-              textInputAction: TextInputAction.newline,
-              keyboardType: TextInputType.multiline,
-              style: const TextStyle(color: C.fg, fontSize: 15),
-              decoration: InputDecoration(
-                hintText: state.sending
-                    ? 'Дописать — уйдёт в очередь'
-                    : 'Что сделать в проекте?',
-                hintStyle: const TextStyle(color: C.fg3, fontSize: 15),
-                border: InputBorder.none,
-                enabledBorder: InputBorder.none,
-                focusedBorder: InputBorder.none,
-                // справа — место под кнопку отправки (и «Стоп» рядом с ней во время работы),
-                // слева — обычный отступ текста от края экрана
-                // const здесь нельзя: правый отступ зависит от состояния отправки
-                contentPadding: EdgeInsets.fromLTRB(
-                  14,
-                  10,
-                  state.sending ? 100 : 52,
-                  10,
+            // Cmd+Enter (Ctrl+Enter там, где Cmd нет) отправляет набранное: в многострочном
+            // поле Enter — это перенос строки, и без отдельного сочетания отправить сообщение
+            // с клавиатуры нечем. Модификаторы сверяются точно, поэтому Shift+Cmd+Enter под
+            // сочетание не попадает и оставляет в поле обычный перенос строки.
+            CallbackShortcuts(
+              bindings: {
+                const SingleActivator(LogicalKeyboardKey.enter, meta: true): _send,
+                const SingleActivator(LogicalKeyboardKey.enter, control: true): _send,
+              },
+              child: TextField(
+                controller: _input,
+                // Поле доступно и во время работы: дописанное сообщение уходит в очередь и
+                // доезжает до агента, как только он освободится, — ждать с пустым полем незачем
+                enabled: true,
+                minLines: 1,
+                maxLines: 6,
+                textInputAction: TextInputAction.newline,
+                keyboardType: TextInputType.multiline,
+                style: const TextStyle(color: C.fg, fontSize: 15),
+                decoration: InputDecoration(
+                  hintText: state.sending
+                      ? 'Дописать — уйдёт в очередь'
+                      : 'Что сделать в проекте?',
+                  hintStyle: const TextStyle(color: C.fg3, fontSize: 15),
+                  border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                  // справа — место под кнопку отправки (и «Стоп» рядом с ней во время работы),
+                  // слева — обычный отступ текста от края экрана
+                  // const здесь нельзя: правый отступ зависит от состояния отправки
+                  contentPadding: EdgeInsets.fromLTRB(
+                    14,
+                    10,
+                    state.sending ? 100 : 52,
+                    10,
+                  ),
                 ),
+                onChanged: (_) => setState(() {}),
               ),
-              onChanged: (_) => setState(() {}),
             ),
             // Кнопки у правого нижнего края: отправка доступна и во время работы агента —
             // сообщение встанет в очередь. «Стоп» рядом, потому что остановить прогон и
@@ -1322,6 +1332,7 @@ class _ExpandButton extends StatelessWidget {
       minWidth: _actionSize,
       minHeight: _actionSize,
     ),
+    style: _actionButtonStyle,
   );
 }
 
@@ -1354,8 +1365,20 @@ class _CopyButton extends StatelessWidget {
       minWidth: _actionSize,
       minHeight: _actionSize,
     ),
+    style: _actionButtonStyle,
   );
 }
+
+/// Стиль кнопок действий в строке журнала: «скопировать» и «раскрыть».
+///
+/// Без него строка вырастает до двух строк текста: Android требует область нажатия не меньше
+/// 48 пунктов ([MaterialTapTargetSize.padded]) и этой областью растягивает весь ряд, в котором
+/// стоит кнопка, — хотя текст в ряду один. На десктопе та же кнопка идёт без этой области, и
+/// журнал там читается как надо; здесь она снята, чтобы мобильная и настольная вёрстка
+/// совпадали.
+const _actionButtonStyle = ButtonStyle(
+  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+);
 
 /// Подробности шага журнала: вывод команды или текст «размышлений».
 ///
