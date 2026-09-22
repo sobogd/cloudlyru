@@ -6,7 +6,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../features/agent/projects_screen.dart';
-import '../features/chat/chat_screen.dart';
 import '../features/files/files_screen.dart';
 import '../features/mail/mail_screen.dart';
 import '../features/map/map_screen.dart';
@@ -26,7 +25,7 @@ import '../theme.dart';
 /// молча остаётся на «Файлах». Список открытый: новый раздел — новое значение здесь и строка
 /// в [_tabLook], больше менять нечего. Порядок значений = порядок разделов в баре, поэтому
 /// новый раздел вставляется в нужное место, а не в конец списка: «Заметки» стоят после «Карты».
-enum AppTab { files, mail, media, map, notes, invoices, chat, projects, trash, settings }
+enum AppTab { files, mail, media, map, notes, invoices, projects, trash, settings }
 
 /// Название раздела для человека и его иконка.
 ///
@@ -58,7 +57,6 @@ const Map<AppTab, _TabLook> _tabLook = {
     icon: Icons.receipt_long_outlined,
     activeIcon: Icons.receipt_long,
   ),
-  AppTab.chat: (label: 'Чат', icon: Icons.chat_bubble_outline, activeIcon: Icons.chat_bubble),
   AppTab.projects: (label: 'Проекты', icon: Icons.terminal_outlined, activeIcon: Icons.terminal),
   AppTab.trash: (label: 'Корзина', icon: Icons.delete_outline, activeIcon: Icons.delete),
   AppTab.settings: (
@@ -172,7 +170,6 @@ class _ShellState extends ConsumerState<Shell> {
         AppTab.map => const MapScreen(),
         AppTab.notes => const NotesScreen(),
         AppTab.invoices => const InvoicesScreen(),
-        AppTab.chat => const ChatScreen(),
         AppTab.projects => const ProjectsScreen(),
         AppTab.trash => const TrashScreen(),
         AppTab.settings => const SettingsScreen(),

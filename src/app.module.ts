@@ -23,7 +23,6 @@ import { ReleaseModule } from './release/release.module';
 import { ClipboardModule } from './clipboard/clipboard.module';
 import { MailModule } from './mail/mail.module';
 import { FacturaModule } from './factura/factura.module';
-import { ChatModule } from './chat/chat.module';
 import { ProjectsModule } from './projects/projects.module';
 import { NotesModule } from './notes/notes.module';
 
@@ -69,7 +68,6 @@ import { NotesModule } from './notes/notes.module';
     ClipboardModule,
     MailModule,
     FacturaModule,
-    ChatModule,
     ProjectsModule,
     NotesModule,
   ],
