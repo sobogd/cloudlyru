@@ -621,6 +621,19 @@ def claude_sessions_dir(cwd):
     return claude_projects_dir() / ("-" + encoded)
 
 
+def claude_session_env_dir(session_id):
+    """Папка окружения сессии Claude Code: `<профиль>/session-env/<id>`.
+
+    Claude Code складывает сюда окружение запущенного разговора и сам её не убирает: у папки нет
+    своего журнала, поэтому после удаления сессии она оставалась мусором (274 папки к 22.09.26).
+    Профиль берём тем же способом, что и [claude_projects_dir]: `~/.claude`, если `claude_config_dir`
+    не задан.
+    """
+    if not session_id:
+        return None
+    return Path(claude_profile() or (Path.home() / ".claude")) / "session-env" / str(session_id)
+
+
 def session_cwd(harness, session_id):
     """Рабочая папка сессии по её файлу: нужна, чтобы открыть разговор заново.
 
@@ -1477,8 +1490,9 @@ def remove_session_files(key):
     """Удаляет файлы сессии с диска и возвращает путь файла истории (или `None`).
 
     Харнесс берётся из идентификатора, потому что хранилищ два. У Claude Code рядом с файлом
-    истории лежит папка с тем же именем (результаты инструментов, служебные пометки) — без неё
-    удаление оставляло мусор, который копился сотнями.
+    истории лежит папка с тем же именем (результаты инструментов, служебные пометки), а ещё
+    отдельно от неё — папка окружения в профиле (`session-env/<id>`): без них удаление
+    оставляло мусор, который копился сотнями.
 
     Проверки «файл вернулся» здесь нет намеренно: она стоит 0.4 секунды ожидания, а уборка
     удаляет сотни сессий. Разбирается с этим вызывающий — один раз, после всей пачки.
@@ -1494,6 +1508,12 @@ def remove_session_files(key):
         if workdir.is_dir():
             shutil.rmtree(workdir, ignore_errors=True)
             log("удалил папку сессии %s" % workdir)
+        # Окружение сессии лежит в профиле, а не рядом с журналом, поэтому путь считается по id
+        # и удаляется отдельно: у pi такой папки нет, у Claude Code — есть у каждой сессии
+        envdir = claude_session_env_dir(session_id) if harness == HARNESS_CLAUDE else None
+        if envdir is not None and envdir.is_dir():
+            shutil.rmtree(envdir, ignore_errors=True)
+            log("удалил окружение сессии %s" % envdir)
     except OSError as e:
         raise PiError("не смог удалить файл сессии %s: %s" % (file, e))
     return file

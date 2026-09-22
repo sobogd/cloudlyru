@@ -80,12 +80,14 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
   /// Харнессы определяют, чьи модели показывать, поэтому модели читаются только после них. Если
   /// про харнессы узнать не удалось (мост недоступен), предлагаем хотя бы pi: его список моделей
   /// всё равно вернёт ошибку словами, и она покажется в диалоге.
+  ///
+  /// Проекты перечитываются всегда, а не берутся из экрана: в них лежит число разговоров в
+  /// папке, и после удаления сессии оно расходилось с самим списком («5 разговоров» при четырёх
+  /// строках), потому что экран обновляет только список сессий, а проекты читает один раз.
   Future<void> _prepare() async {
     if (_started) return;
     _started = true;
-    if (ref.read(agentProjectsProvider).projects.isEmpty) {
-      await ref.read(agentProjectsProvider.notifier).load();
-    }
+    await ref.read(agentProjectsProvider.notifier).load();
     var available = ref.read(agentHarnessesProvider).available;
     if (available.isEmpty) {
       await ref.read(agentHarnessesProvider.notifier).load();

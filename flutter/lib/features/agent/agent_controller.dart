@@ -615,6 +615,10 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
   /// Необратимо, поэтому вызывающий сначала спрашивает подтверждение. Строка убирается сразу, а
   /// затем список перечитывается с мака: если файл вернул живой процесс, разговор останется в
   /// списке — и это правильнее, чем показать его удалённым.
+  ///
+  /// Вместе со списком перечитываются проекты: в них лежит число разговоров в папке, и без этого
+  /// мастер новой сессии показывал старый счётчик (открывается он редко, а счётчик снимается при
+  /// загрузке раздела).
   Future<AgentDeleteResult?> remove(String sessionId) async {
     try {
       final result = await _api.deleteSession(sessionId);
@@ -625,6 +629,7 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
         ],
       );
       await load();
+      await ref.read(agentProjectsProvider.notifier).load();
       return result;
     } on AgentApiException catch (e) {
       showError(e.message);
