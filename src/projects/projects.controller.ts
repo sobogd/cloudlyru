@@ -309,6 +309,33 @@ export class ProjectsController {
   }
 
   /**
+   * Дописывает сообщение в занятую сессию: оно уйдёт агенту по завершении текущего прогона.
+   *
+   * Отдельная ручка от `prompt` нужна приложению, у которого уже открыт поток: второй поток
+   * дал бы двойной текст на экране. Ответ моста передаётся как есть — `{queued, position}`,
+   * причём `queued: false` означает, что сессия успела освободиться и сообщение надо отправить
+   * обычным `prompt`; решает это приложение.
+   */
+  @Post('sessions/:id/queue')
+  @RateLimit(20, 60_000)
+  async queue(@Param('id') id: string, @Body() body: Record<string, unknown> = {}) {
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) throw badRequest('text обязателен');
+    // Потолок длины тот же, что у prompt: он общий с мостом (MAX_MESSAGE_CHARS), и отказ с
+    // текстом лучше отдать здесь, не гоняя запрос через туннель.
+    if (text.length > MAX_PROMPT_CHARS) {
+      throw badRequest(`сообщение длиннее ${MAX_PROMPT_CHARS} символов`);
+    }
+    return this.wrap(() =>
+      this.projects.call<Record<string, unknown>>(
+        'POST',
+        `/sessions/${encodeURIComponent(id)}/queue`,
+        { body: { text } },
+      ),
+    );
+  }
+
+  /**
    * Подключает приложение к уже идущему прогону агента.
    *
    * Нужно, когда разговор идёт (его начали с другого устройства или экран открыли заново во
