@@ -27,10 +27,10 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/python3</string>
-    <string>/Users/sobogd/work/iq-rest/cloudlyru/agents/pi-bridge/server.py</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/pi-bridge/server.py</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/sobogd/work/iq-rest/cloudlyru/agents/pi-bridge</string>
+  <string>/Users/sobogd/work/cloudlyru/agents/pi-bridge</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
