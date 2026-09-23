@@ -729,6 +729,14 @@ class CloudlyApi {
       _m(await _req('/mac/github-actions/rerun',
           method: 'POST', body: {'run_id': runId, 'repo': repo}));
 
+  /// Открытые пул-реквесты настроенных репозиториев (без фильтров — фильтрует экран).
+  Future<Map<String, dynamic>> macPullRequests({bool refresh = false}) async =>
+      _m(await _req('/mac/pull-requests${refresh ? '?refresh=1' : ''}'));
+
+  /// Добавляет или убирает репозиторий из списка пул-реквестов на маке.
+  Future<Map<String, dynamic>> macPullRequestsConfig(String op, String repo) async =>
+      _m(await _req('/mac/pull-requests/config', method: 'POST', body: {'op': op, 'repo': repo}));
+
   /// Список `.env`-файлов под `~/work` на маке.
   Future<Map<String, dynamic>> macEnvs() async => _m(await _req('/mac/envs'));
 

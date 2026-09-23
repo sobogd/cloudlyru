@@ -1,0 +1,11 @@
+{
+  "owner": "tangem-developments",
+  "repos": [
+    "store-api-forja",
+    "tangem-admin-service",
+    "tangem-checkout-api",
+    "tangem-checkout-web",
+    "tangem-monitoring-service",
+    "tangem-store"
+  ]
+}

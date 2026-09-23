@@ -139,7 +139,7 @@ def edit_config(data):
         return {"ok": False, "msg": str(exc)}
 
 
-def _load_token():
+def load_token():
     """Read only the work-token line without sourcing or exposing the env file."""
     try:
         with open(TOKEN_FILE, "r", encoding="utf-8") as handle:
@@ -164,7 +164,7 @@ def _load_token():
 
 def _github(method, path, payload=None):
     """Call GitHub REST with the private work token and return decoded JSON."""
-    token = _load_token()
+    token = load_token()
     if not token:
         raise RuntimeError("work GitHub token is not configured")
     body = None if payload is None else json.dumps(payload).encode("utf-8")

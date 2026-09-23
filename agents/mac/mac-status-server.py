@@ -9,6 +9,7 @@ and requiring the X-Mac-Token header when MAC_SERVICE_TOKEN is set):
   POST /api/action        -> {"action": name} from the ACTIONS whitelist below
   POST /api/warp          -> {"op": connect|disconnect|reconnect|status} — Cloudflare WARP
   /api/github-actions/*   -> file-backed GitHub Actions dashboard
+  /api/pull-requests/*    -> open pull requests of the configured repositories
   /api/envs*              -> list/read/write .env files under ~/work
   /api/term/*             -> console over a pty (poll-based)
 
@@ -38,6 +39,7 @@ import select
 import signal
 
 import github_actions
+import pull_requests
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18810
 UID = subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip() or "501"
@@ -1008,6 +1010,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith("/api/github-actions"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._send(200, github_actions.dashboard(bool(q.get("refresh"))))
+        elif self.path.startswith("/api/pull-requests"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._send(200, pull_requests.board(bool(q.get("refresh"))))
         elif self.path.startswith("/api/envs/list"):
             self._send(200, {"ok": True, "root": ENV_ROOT, "count": len(_env_scan()),
                              "files": _env_scan()})
@@ -1044,6 +1049,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, github_actions.rerun(data))
         elif self.path.startswith("/api/github-actions/config"):
             self._send(200, github_actions.edit_config(data))
+        elif self.path.startswith("/api/pull-requests/config"):
+            self._send(200, pull_requests.edit_config(data))
         elif self.path.startswith("/api/envs/write"):
             self._send(200, _env_write(data.get("path", ""), data.get("content", "")))
         elif self.path.startswith("/api/claude/login"):

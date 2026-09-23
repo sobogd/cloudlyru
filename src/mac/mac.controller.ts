@@ -112,6 +112,19 @@ export class MacController {
     return this.wrap(() => this.mac.call('POST', '/api/github-actions/config', { body }));
   }
 
+  /** Открытые пул-реквесты настроенных репозиториев: без фильтров, фильтрует приложение. */
+  @Get('pull-requests')
+  async pullRequests(@Query('refresh') refresh?: string) {
+    const q = refresh ? `?refresh=${encodeURIComponent(refresh)}` : '';
+    return this.wrap(() => this.mac.call('GET', `/api/pull-requests${q}`, { timeoutMs: 40_000 }));
+  }
+
+  /** Правка списка репозиториев в `pull-requests.json` на маке. */
+  @Post('pull-requests/config')
+  async pullRequestsConfig(@Body() body: Record<string, unknown> = {}) {
+    return this.wrap(() => this.mac.call('POST', '/api/pull-requests/config', { body }));
+  }
+
   /**
    * Список `.env`-файлов под `~/work` на маке.
    *

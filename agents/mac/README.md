@@ -28,6 +28,7 @@ Cloudly. Статус-панель (`mac-status-server.py`) — **только A
 | POST | `/api/warp` | `{op: connect\|disconnect\|reconnect\|status}` |
 | GET/POST | `/api/claude`, `/api/claude/login`, `/api/claude/code` | статус и вход Claude |
 | GET/POST | `/api/github-actions*` | дашборд и запуск workflow |
+| GET/POST | `/api/pull-requests*` | открытые PR настроенных репозиториев и правка их списка |
 | GET/POST | `/api/envs*` | список/чтение/запись `.env` под `~/work` |
 | GET/POST | `/api/term/*` | консоль (опрос по HTTP) |
 
@@ -39,5 +40,9 @@ Cloudly. Статус-панель (`mac-status-server.py`) — **только A
 ./install.sh                                            # plist-ы из этой папки → ~/Library/LaunchAgents
 launchctl kickstart -k gui/$(id -u)/com.agent.<label>   # перезапуск конкретного агента
 ```
+
+Списки настраиваются рядом с кодом: workflow — в `github-actions.json`, репозитории
+пул-реквестов — в `pull-requests.json`. Обе ручки `*/config` правят те же файлы.
+Токен GitHub для обеих — `GH_BSOKOLOV_TANGEM` из `~/work/.env`.
 
 Токен панели: `MAC_SERVICE_TOKEN` (в `~/work/.env` или в окружении). Пусто — проверка выключена.
