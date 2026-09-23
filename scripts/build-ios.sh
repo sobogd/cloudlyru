@@ -22,6 +22,11 @@
 # с тем же номером иначе отказала бы, а страница /ios/install всё равно отдаёт последнюю
 # загруженную сборку. Кнопкой «Обновить» такое обновление не увидит никто — номер не вырос.
 #
+# Упало на «Your account has reached the maximum number of certificates» — это не сборка, а
+# лимит Apple на сертификаты: Xcode под автоподписью выпускает себе новый на каждом прогоне
+# (в CI — на каждом раннере), и аккаунт однажды полон. Хвосты убирает scripts/asc-certs.mjs:
+#   node --env-file=$HOME/work/.env scripts/asc-certs.mjs cleanup
+#
 # Ключ из файла (ASC_KEY_FILE) нужен там, где p8 лежит не в ~/.appstoreconnect/private_keys.
 set -euo pipefail
 

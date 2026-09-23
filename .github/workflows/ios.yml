@@ -22,6 +22,14 @@ name: iOS app (build + publish)
 # здесь не подходит и зачем xcodebuild-у ключ передаётся флагами. Шаги воркфлоу только
 # готовят ключ и переменные, чтобы локальная сборка и CI шли одним и тем же путём.
 #
+# Про сертификаты. Подпись автоматическая, поэтому сертификат Xcode выпускает себе сам, а
+# переиспользовать на одноразовом раннере нечего — каждый прогон заводит в аккаунте новый
+# development-сертификат («Apple Development: Created via API») и оставляет его там. Лимит
+# Apple на сертификаты не бесконечный: когда он выбран, сборка падает ещё до компиляции, с
+# «Your account has reached the maximum number of certificates», и лечится это только чисткой
+# аккаунта. Поэтому воркфлоу убирает хвосты прошлых прогонов до сборки — scripts/asc-certs.mjs
+# cleanup; он трогает только такие «Created via API», сертификаты машины разработки целы.
+#
 # Секреты:
 #   ASC_KEY_ID, ASC_ISSUER_ID, APPLE_TEAM_ID — из кабинета разработчика (ключ App Store Connect);
 #   ASC_KEY_P8 — сам файл .p8 в base64 (`base64 -i AuthKey_XXXX.p8 | gh secret set ASC_KEY_P8`);
@@ -91,6 +99,15 @@ jobs:
           printf '%s' "$KEY_P8" | base64 -d > "$RUNNER_TEMP/asc/AuthKey.p8"
           chmod 600 "$RUNNER_TEMP/asc/AuthKey.p8"
           echo "ASC_KEY_FILE=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
+
+      # Чистим до сборки, а не после: иначе мусор от прошлых прогонов копится и однажды выборка
+      # лимита Apple останавливает сборку на подписи (см. про сертификаты в шапке и в скрипте).
+      - name: Чистка сертификатов прошлых прогонов
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        # Путь к ключу скрипт берёт из ASC_KEY_FILE, который выставил предыдущий шаг.
+        run: node scripts/asc-certs.mjs cleanup
 
       - name: Сборка, подпись и публикация в /ios
         env:
