@@ -46,10 +46,10 @@ class AgentApiException implements Exception {
 /// адреса моста, ни порта туннеля, ни ключей.
 class AgentApi {
   /// Клиент раздела поверх облачного: адрес и сессия — из него.
-  AgentApi(this.cloudly) {
+  AgentApi(this._cloudly) {
     _http = Dio(
       BaseOptions(
-        baseUrl: cloudly.baseUrl,
+        baseUrl: _cloudly().baseUrl,
         connectTimeout: const Duration(seconds: 20),
         // Ответ приходит потоком, и между порциями бывают минуты: агент читает файлы, выполняет
         // команды, а локальная модель думает молча. Таймаут на чтение поэтому не задаём —
@@ -60,6 +60,11 @@ class AgentApi {
     _http.interceptors.add(
       InterceptorsWrapper(
         onRequest: (o, h) {
+          // Адрес и сессию берём у ТЕКУЩЕГО облачного клиента: `AppState.logout` заменяет
+          // его целиком, и захваченный однажды экземпляр после выхода/входа остался бы без
+          // сессии — раздел «Проекты» отвечал бы 401, тогда как вкладка «MacBook» работает.
+          final cloudly = _cloudly();
+          o.baseUrl = cloudly.baseUrl;
           o.headers.addAll(cloudly.authHeaders);
           o.headers['Accept'] = 'application/json';
           h.next(o);
@@ -68,8 +73,9 @@ class AgentApi {
     );
   }
 
-  /// Облачный клиент, у которого взяты адрес и сессия.
-  final CloudlyApi cloudly;
+  /// Отдаёт ТЕКУЩИЙ облачный клиент (адрес и сессию). Функция, а не поле: клиент живёт
+  /// в `AppState` и заменяется при выходе, поэтому хранить его экземпляр нельзя.
+  final CloudlyApi Function() _cloudly;
 
   /// HTTP-клиент раздела.
   late final Dio _http;

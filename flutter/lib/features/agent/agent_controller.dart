@@ -13,7 +13,7 @@ import 'agent_types.dart';
 /// смена сервера в настройках), и каждый следующий запрос должен уходить с текущими — поэтому
 /// клиент читается заново, а не хранится. Так же устроен чат.
 final agentApiProvider = Provider<AgentApi>(
-  (ref) => AgentApi(ref.read(appStateProvider).api),
+  (ref) => AgentApi(() => ref.read(appStateProvider).api),
 );
 
 // --- харнессы ---
