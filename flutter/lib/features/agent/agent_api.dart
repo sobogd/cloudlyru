@@ -638,6 +638,10 @@ class AgentApi {
         return item is Map
             ? AgentEvent(snapshot: AgentItem.fromJson(item.cast<String, dynamic>()))
             : null;
+      case 'ping':
+        // Пульс связи: содержимого нет, но по нему видно, что поток жив (см. сторож в
+        // agent_controller.dart: без пульса тишина в 40 с означала бы обрыв)
+        return const AgentEvent(ping: true);
       case 'idle':
         return const AgentEvent(idle: true);
       case 'queued_started':

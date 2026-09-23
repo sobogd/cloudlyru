@@ -3701,13 +3701,15 @@ class Handler(BaseHTTPRequestHandler):
                     if not session.alive():
                         self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
                         break
-                    # Пока агент молчит (модель думает, инструмент работает), шлём комментарий
-                    # SSE: без трафика мобильный NAT и промежуточные прокси рвут соединение
-                    # молча, и приложение не отличает такую смерть от долгой работы
+                    # Пока агент молчит (модель думает, инструмент работает), шлём событие-пульс:
+                    # без трафика мобильный NAT и промежуточные прокси рвут соединение молча, и
+                    # приложение не отличает такую смерть от долгой работы. Пульс идёт обычным
+                    # событием, а не комментарием SSE: по нему приложение видит, что связь жива,
+                    # и не считает молчание обрывом (см. сторож в agent_controller.dart).
                     silent += 1
                     if silent >= HEARTBEAT_SECONDS:
                         silent = 0
-                        self._event_raw(": ping")
+                        self._event({"type": "ping"})
                     continue
                 for ours in translated:
                     self._event(ours)
@@ -3811,14 +3813,14 @@ class Handler(BaseHTTPRequestHandler):
                     silent = 0
                 except queue.Empty:
                     # пустой такт — проверка, жив ли ещё процесс; заодно держим соединение
-                    # живым комментарием SSE (см. _events)
+                    # живым пульсом (см. _events)
                     if not session.alive():
                         self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
                         break
                     silent += 1
                     if silent >= HEARTBEAT_SECONDS:
                         silent = 0
-                        self._event_raw(": ping")
+                        self._event({"type": "ping"})
                     continue
                 for ours in translated:
                     self._event(ours)
@@ -3853,11 +3855,6 @@ class Handler(BaseHTTPRequestHandler):
     def _event(self, payload):
         """Пишет одно событие в поток SSE."""
         self.wfile.write(("data: %s\n\n" % json.dumps(payload, ensure_ascii=False)).encode("utf-8"))
-        self.wfile.flush()
-
-    def _event_raw(self, line):
-        """Пишет в поток строку как есть — для комментариев SSE (`: ping`) и keep-alive."""
-        self.wfile.write((line + "\n\n").encode("utf-8"))
         self.wfile.flush()
 
 

@@ -1203,9 +1203,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     unawaited(_reconnect(session.id, null));
   }
 
-  /// Сторож молчания: если от сервера нет ни событий, ни heartbeat дольше 40 с, поток мёртв.
+  /// Сторож молчания: если от сервера нет ни событий, ни пульса дольше 40 с, поток мёртв.
   ///
-  /// Мост шлёт комментарий SSE каждые 15 с, пока агент молчит, поэтому тишина в 40 с — это уже
+  /// Мост шлёт событие `ping` каждые 15 с, пока агент молчит, поэтому тишина в 40 с — это уже
   /// не «модель думает», а оборванное соединение, о котором иначе никто не узнает.
   void _startWatchdog() {
     _stopWatchdog();
@@ -1243,6 +1243,8 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// разговор читался бы не в порядке работы агента.
   void _applyEvent(AgentEvent event) {
     _lastEventAt = DateTime.now();
+    // Пульс связи: сторожа он сбросил выше, а состояние экрана не меняет
+    if (event.ping) return;
     if (event.text != null || event.reasoning != null) {
       _pendingText += event.text ?? '';
       _pendingReasoning += event.reasoning ?? '';
