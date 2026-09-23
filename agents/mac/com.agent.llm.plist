@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd-агент локального сервера моделей (llama.cpp) на маке.
+
+  Ставится копированием и загрузкой:
+    cp /Users/sobogd/work/cloudlyru/agents/mac/com.agent.llm.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.agent.llm.plist
+
+  Заменил com.agent.lmstudio: LM Studio снесён, модель считает llama-server с GGUF-файла.
+  Порт тот же (127.0.0.1:1234), поэтому обратный SSH туннель мака (VPS 18812 -> 1234) и
+  сервер CloudlyRu не менялись.
+
+  KeepAlive: скрипт — вечный сторож, который сам ничего не выходит; если он всё же умрёт,
+  launchd обязан поднять его заново, иначе модель останется без присмотра до следующего
+  входа в систему.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.llm</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/run-llm.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/llm-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/llm-agent.err.log</string>
+</dict>
+</plist>

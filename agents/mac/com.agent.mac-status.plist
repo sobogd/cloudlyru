@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.mac-status</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/mac-status-server.py</string>
+    <string>18810</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MAC_STATUS_ACCESS_LOG</key>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/logs/access.log</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/sobogd/work/cloudlyru/agents/mac/logs/mac-status.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/sobogd/work/cloudlyru/agents/mac/logs/mac-status.err.log</string>
+</dict>
+</plist>

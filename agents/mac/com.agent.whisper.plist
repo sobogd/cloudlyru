@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd-агент локального распознавания речи (whisper.cpp) на маке.
+
+  Ставится копированием и загрузкой:
+    cp /Users/sobogd/work/cloudlyru/agents/mac/com.agent.whisper.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.agent.whisper.plist
+
+  Второй движок рядом с com.agent.llm: модель перевода текстовая, поэтому голос
+  обслуживает отдельный whisper-server на 127.0.0.1:1238. Обратный SSH туннель мака
+  отдаёт этот порт на VPS как 18818 (STT_BASE_URL в деплое переводчика).
+
+  KeepAlive: скрипт — вечный сторож, который сам ничего не выходит; если он всё же умрёт,
+  launchd обязан поднять его заново, иначе голосовой перевод останется без присмотра до
+  следующего входа в систему.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.whisper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/run-whisper.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/whisper-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/whisper-agent.err.log</string>
+</dict>
+</plist>

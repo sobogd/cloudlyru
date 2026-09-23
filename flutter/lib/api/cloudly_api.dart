@@ -701,6 +701,62 @@ class CloudlyApi {
   Future<Map<String, dynamic>> macWarp(String op) async =>
       _m(await _req('/mac/warp', method: 'POST', body: {'op': op}));
 
+  /// Состояние Claude (tangem) на маке: запущен ли агент, авторизован ли.
+  Future<Map<String, dynamic>> macClaude() async => _m(await _req('/mac/claude'));
+
+  /// Начинает вход в Claude: возвращает authorize URL, который человек открывает сам.
+  Future<Map<String, dynamic>> macClaudeLogin() async =>
+      _m(await _req('/mac/claude/login', method: 'POST', body: {}));
+
+  /// Завершает вход в Claude кодом после авторизации.
+  Future<Map<String, dynamic>> macClaudeCode(String code) async =>
+      _m(await _req('/mac/claude/code', method: 'POST', body: {'code': code}));
+
+  /// Дашборд GitHub Actions: настроенные workflow с последним запуском.
+  Future<Map<String, dynamic>> macGithubActions({bool refresh = false}) async =>
+      _m(await _req('/mac/github-actions${refresh ? '?refresh=1' : ''}'));
+
+  /// Ветки и теги репозитория для формы запуска.
+  Future<Map<String, dynamic>> macGithubRefs(String repo) async =>
+      _m(await _req('/mac/github-actions/refs?repo=${Uri.encodeQueryComponent(repo)}'));
+
+  /// Запуск workflow с веткой/тегом и inputs.
+  Future<Map<String, dynamic>> macGithubRun(Map<String, dynamic> body) async =>
+      _m(await _req('/mac/github-actions/run', method: 'POST', body: body));
+
+  /// Перезапуск существующего запуска по run_id.
+  Future<Map<String, dynamic>> macGithubRerun(int runId, String repo) async =>
+      _m(await _req('/mac/github-actions/rerun',
+          method: 'POST', body: {'run_id': runId, 'repo': repo}));
+
+  /// Список `.env`-файлов под `~/work` на маке.
+  Future<Map<String, dynamic>> macEnvs() async => _m(await _req('/mac/envs'));
+
+  /// Содержимое одного `.env`-файла (отдаёт секреты — показывать только в разделе «Mac»).
+  Future<Map<String, dynamic>> macEnvRead(String path) async =>
+      _m(await _req('/mac/envs/read?path=${Uri.encodeQueryComponent(path)}'));
+
+  /// Атомарная запись `.env`-файла (бэкап панель делает сама).
+  Future<Map<String, dynamic>> macEnvWrite(String path, String content) async =>
+      _m(await _req('/mac/envs/write',
+          method: 'POST', body: {'path': path, 'content': content}));
+
+  /// Открывает (или переиспользует) постоянную сессию `bash` на маке.
+  Future<Map<String, dynamic>> macTermOpen() async =>
+      _m(await _req('/mac/term/open', method: 'POST', body: {}));
+
+  /// Хвост вывода терминала после смещения `after`.
+  Future<Map<String, dynamic>> macTermPoll(int after) async =>
+      _m(await _req('/mac/term/poll?after=$after'));
+
+  /// Отправляет строку ввода в терминал.
+  Future<Map<String, dynamic>> macTermInput(String data) async =>
+      _m(await _req('/mac/term/input', method: 'POST', body: {'data': data}));
+
+  /// Сбрасывает сессию терминала, начиная новую.
+  Future<Map<String, dynamic>> macTermReset() async =>
+      _m(await _req('/mac/term/reset', method: 'POST', body: {}));
+
   // ---------- медиа ----------
 
   /// Сколько кадров в медиатеке. Галерея им не пользуется: её список курсорный, и полной

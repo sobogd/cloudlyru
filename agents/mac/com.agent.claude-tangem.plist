@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agent.claude-tangem</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/run-claude-tangem.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>WorkingDirectory</key><string>/Users/sobogd/work/tangem</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/sobogd/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>CLAUDE_CONFIG_DIR</key><string>/Users/sobogd/.claude-work</string>
+  </dict>
+  <key>StandardOutPath</key><string>/tmp/claude-tangem.log</string>
+  <key>StandardErrorPath</key><string>/tmp/claude-tangem.err.log</string>
+</dict>
+</plist>

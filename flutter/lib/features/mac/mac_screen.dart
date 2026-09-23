@@ -2,6 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers.dart';
+import 'claude_screen.dart';
+import 'env_screen.dart';
+import 'github_actions_screen.dart';
+import 'terminal_screen.dart';
 
 /// Экран раздела «Mac»: состояние домашнего MacBook и базовое управление.
 ///
@@ -153,6 +157,7 @@ class _MacScreenState extends ConsumerState<MacScreen> {
           _systemCard(s),
           _warpCard(s),
           _actionsCard(),
+          _linksCard(),
           const SizedBox(height: 24),
         ],
       ),
@@ -279,6 +284,28 @@ class _MacScreenState extends ConsumerState<MacScreen> {
                 style: Theme.of(context).textTheme.bodySmall),
           ],
         ),
+      ),
+    );
+  }
+
+  /// Карточка-навигация к остальным экранам раздела.
+  Widget _linksCard() {
+    Widget tile(IconData icon, String title, String subtitle, WidgetBuilder b) => ListTile(
+          leading: Icon(icon),
+          title: Text(title),
+          subtitle: Text(subtitle),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: b)),
+        );
+    return Card(
+      child: Column(
+        children: [
+          tile(Icons.smart_toy_outlined, 'Claude', 'Статус и вход', (_) => const ClaudeScreen()),
+          tile(Icons.play_circle_outline, 'GitHub Actions', 'Workflow и запуск',
+              (_) => const GithubActionsScreen()),
+          tile(Icons.description_outlined, 'Env-файлы', 'Список и редактор .env', (_) => const EnvScreen()),
+          tile(Icons.terminal, 'Терминал', 'Shell на MacBook', (_) => const TerminalScreen()),
+        ],
       ),
     );
   }

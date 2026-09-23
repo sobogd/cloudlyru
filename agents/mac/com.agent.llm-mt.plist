@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd-агент локальной модели перевода (TranslateGemma-4B) на маке.
+
+  Ставится копированием и загрузкой:
+    cp /Users/sobogd/work/cloudlyru/agents/mac/com.agent.llm-mt.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.agent.llm-mt.plist
+
+  Третий движок рядом с com.agent.llm (поиск и чат на 1234) и com.agent.whisper
+  (распознавание речи на 1238): translate-модель отдаёт 127.0.0.1:1235. Порт держится
+  только на loopback — снаружи он не смотрит, поэтому ни TLS, ни авторизации здесь нет;
+  доступ к нему получает только тот, кто уже внутри мака.
+
+  Память: 2,9 ГБ весов в Q5 плюс KV на 4K контекста. Вместе с 4B-моделью поиска (3,8 ГБ)
+  и Whisper (0,75 ГБ) это оставляет на 16 ГБ ещё около четырёх гигабайт под систему и
+  агентов — поэтому модель и держится резидентной, а не подгружается под задачу.
+
+  KeepAlive: скрипт — вечный сторож, который сам не выходит; если он всё же умрёт,
+  launchd обязан поднять его заново, иначе перевод останется без присмотра до следующего
+  входа в систему.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.llm-mt</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/run-llm-mt.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/llm-mt-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/llm-mt-agent.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,1295 @@
+{
+  "owner": "tangem-developments",
+  "workflows": [
+    {
+      "repo": "referral-cms",
+      "path": "dev.yaml",
+      "name": "[DEV] Deploy referral-cms",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "referral-cms",
+      "path": "prod.yaml",
+      "name": "[PROD] Deploy referral-cms",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "dev.yaml",
+      "name": "[DEV] Deploy store-api-forja to EKS",
+      "inputs": {
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3"
+          ],
+          "description": "Target dev environment"
+        }
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "prod.yaml",
+      "name": "[PROD] Deploy store-api-forja to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "build.yml",
+      "name": "build",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "docs.yml",
+      "name": "docs",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "lint.yml",
+      "name": "lint",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "test.yml",
+      "name": "unit tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "old-dev.yaml",
+      "name": "🛠️ DEV admin",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "old-prod.yaml",
+      "name": "🛠️ PROD admin",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "store-api-forja",
+      "path": "old-stage.yaml",
+      "name": "🛠️ STAGE admin",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "build.yml",
+      "name": "build",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "docs.yml",
+      "name": "docs",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "lint.yml",
+      "name": "lint",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "test.yml",
+      "name": "unit tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "paera-prod.yaml",
+      "name": "🏢 [prod] forja-paera",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "tangem-prod.yaml",
+      "name": "🏢 [prod] forja-tangem-eks",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "paera-dev.yaml",
+      "name": "🏭 [dev] forja-paera",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "tangem-dev.yaml",
+      "name": "🏭 [dev] forja-tangem-eks",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-admin-service",
+      "path": "paera-stage.yaml",
+      "name": "🏭 [stage] forja-paera",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout",
+      "path": "frontend-integration-tests.yml",
+      "name": "Integration tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout",
+      "path": "playwright_tests.yaml",
+      "name": "Playwright Tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout",
+      "path": "deploy_dev.yml",
+      "name": "⚙️ Deploy dev",
+      "inputs": {
+        "environment": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "stage"
+          ],
+          "description": "Environment"
+        }
+      }
+    },
+    {
+      "repo": "tangem-checkout",
+      "path": "deploy_prod.yml",
+      "name": "🦊 Deploy prod",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "dev.yaml",
+      "name": "[DEV] Deploy store-checkout-api to EKS",
+      "inputs": {
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3"
+          ],
+          "description": "Target dev environment"
+        }
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "prod.yaml",
+      "name": "[PROD] Deploy store-checkout-api to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "build.yml",
+      "name": "build",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "docs.yml",
+      "name": "docs",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "integration.yml",
+      "name": "integration",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "lint.yml",
+      "name": "lint",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-api",
+      "path": "test.yml",
+      "name": "unit tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-web",
+      "path": "dev.yaml",
+      "name": "[DEV] Deploy store-checkout-web to EKS",
+      "inputs": {
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3"
+          ],
+          "description": "Target dev environment"
+        }
+      }
+    },
+    {
+      "repo": "tangem-checkout-web",
+      "path": "prod.yaml",
+      "name": "[PROD] Deploy store-checkout-web to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-web",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-web",
+      "path": "frontend-integration-tests.yml",
+      "name": "Integration tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-checkout-web",
+      "path": "playwright_tests.yaml",
+      "name": "Playwright Tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "dev-adminadapter.yaml",
+      "name": "[DEV] Deploy Express AdminAdapter to EKS",
+      "inputs": {
+        "deploy_environment": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "dev4",
+            "dev5",
+            "dev6"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "dev-explorer.yaml",
+      "name": "[DEV] Deploy Express Explorer to EKS",
+      "inputs": {
+        "deploy_environment": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "dev4",
+            "dev5",
+            "dev6"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "dev-frontadapter.yaml",
+      "name": "[DEV] Deploy Express FrontAdapter to EKS",
+      "inputs": {
+        "deploy_environment": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "dev4",
+            "dev5",
+            "dev6"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "dev-private-api.yaml",
+      "name": "[DEV] Deploy Express Private-API to EKS",
+      "inputs": {
+        "deploy_environment": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "dev4",
+            "dev5",
+            "dev6"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "prod-adminadapter.yaml",
+      "name": "[PROD] Deploy Express AdminAdapter to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "prod-explorer.yaml",
+      "name": "[PROD] Deploy Express Explorer to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "prod-frontadapter.yaml",
+      "name": "[PROD] Deploy Express FrontAdapter to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "prod-private-api.yaml",
+      "name": "[PROD] Deploy Express Private-API to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy-cloudwatch-logger-lambda-dev.yml",
+      "name": "Deploy cloudwatch logger lambda",
+      "inputs": {
+        "environment": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "stage",
+            "stage2",
+            "stage3",
+            "prod"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_dev_tangem-express-explorer_to_aws_ecs.yml",
+      "name": "Deploy dev tangem-express-explorer to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_dev2_tangem-express-explorer_to_aws_ecs.yml",
+      "name": "Deploy dev2 tangem-express-explorer to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_dev3_tangem-express-explorer_to_aws_ecs.yml",
+      "name": "Deploy dev3 tangem-express-explorer to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_dev_tangem-express-admin-service_to_aws_ecs.yml",
+      "name": "Deploy develop tangem-express-admin to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_prod_tangem-express-admin-service_to_aws_ecs.yml",
+      "name": "Deploy prod tangem-express-admin to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_prod_tangem-express-explorer_to_aws_ecs.yml",
+      "name": "Deploy prod tangem-express-explorer to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_stage_tangem-express-admin-service_to_aws_ecs.yml",
+      "name": "Deploy stage tangem-express-admin to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_stage_tangem-express-adminadapter-mono-service_to_aws_ecs.yml",
+      "name": "Deploy stage tangem-express-adminadapter to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_stage_tangem-express-explorer_to_aws_ecs.yml",
+      "name": "Deploy stage tangem-express-explorer to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_stage_tangem-express-frontadapter-mono-service_to_aws_ecs.yml",
+      "name": "Deploy stage tangem-express-frontadapter to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_stage2_tangem-express-explorer_to_aws_ecs.yml",
+      "name": "Deploy stage2 tangem-express-explorer to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_stage3_tangem-express-explorer_to_aws_ecs.yml",
+      "name": "Deploy stage3 tangem-express-explorer to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_dev3_tangem-express-adminadapter-mono-service_to_aws_ecs.yml",
+      "name": "Deploy tangem-express-adminadapter to Amazon ECS",
+      "inputs": {
+        "environment": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "stage",
+            "stage2",
+            "stage3",
+            "prod"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_dev3_tangem-express-frontadapter-mono-service_to_aws_ecs.yml",
+      "name": "Deploy tangem-express-frontadapter to Amazon ECS",
+      "inputs": {
+        "environment": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "stage",
+            "stage2",
+            "stage3",
+            "prod"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_tangem-express-private-api_to_aws_ecs.yml",
+      "name": "Deploy tangem-express-private-api to Amazon ECS",
+      "inputs": {
+        "environment": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "stage",
+            "stage2",
+            "stage3",
+            "prod"
+          ],
+          "description": "Environment to deploy"
+        }
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "deploy_prod_tangem_express_monitoring_service.yaml",
+      "name": "Deploy tngexpress-prod-monitoring-service to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-express",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-gitops",
+      "path": "cf-ips-sync.yaml",
+      "name": "cf-ips-sync",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-gitops",
+      "path": "publish-docs.yaml",
+      "name": "publish-docs",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-monitoring-service",
+      "path": "deploy-dev-eks.yml",
+      "name": "[DEV] Deploy monitoring-service to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-monitoring-service",
+      "path": "deploy-prod-eks.yml",
+      "name": "[PROD] Deploy monitoring-service to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-monitoring-service",
+      "path": "ci.yml",
+      "name": "ci",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-monitoring-service",
+      "path": "deploy_dev_monitoring_service.yaml",
+      "name": "Deploy develop tangem-monitoring-service to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-monitoring-service",
+      "path": "deploy_prod_monitroing_service.yaml",
+      "name": "Deploy prod tangem-monitoring-service to Amazon ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-referral",
+      "path": "dev-eks.yaml",
+      "name": "[DEV] Deploy referral to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-referral",
+      "path": "prod-eks.yaml",
+      "name": "[PROD] Deploy referral to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-referral",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-referral",
+      "path": "pr-checks.yml",
+      "name": "PR Checks",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "deploy-dev-eks.yml",
+      "name": "[DEV] Deploy store service to EKS",
+      "inputs": {
+        "SERVICE": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "api",
+            "admin"
+          ],
+          "description": "Service to deploy"
+        },
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3"
+          ],
+          "description": "Target dev environment"
+        }
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "playwright_tests.yaml",
+      "name": "Playwright Tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "deploy_dev2.yml",
+      "name": "🐝 Deploy dev2",
+      "inputs": {
+        "SERVICE": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "admin",
+            "api"
+          ],
+          "description": "Service"
+        }
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "deploy_dev3.yml",
+      "name": "🐧 Deploy dev3",
+      "inputs": {
+        "SERVICE": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "admin",
+            "api"
+          ],
+          "description": "Service"
+        }
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "deploy_stage.yml",
+      "name": "🐬 Deploy stage",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "deploy_dev.yml",
+      "name": "🐼 Deploy dev",
+      "inputs": {
+        "SERVICE": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "admin",
+            "api"
+          ],
+          "description": "Service"
+        }
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "deploy_stage-new.yml",
+      "name": "🐼 Deploy stage-new",
+      "inputs": {
+        "SERVICE": {
+          "type": "choice",
+          "required": true,
+          "options": [
+            "admin",
+            "api"
+          ],
+          "description": "Service"
+        }
+      }
+    },
+    {
+      "repo": "tangem-store",
+      "path": "deploy_prod.yml",
+      "name": "🦊 Deploy prod",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "dev.yaml",
+      "name": "[DEV] Deploy store-api-forja to EKS",
+      "inputs": {
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3"
+          ],
+          "description": "Target dev environment"
+        }
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "prod.yaml",
+      "name": "[PROD] Deploy store-api-forja to EKS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "build.yml",
+      "name": "build",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "docs.yml",
+      "name": "docs",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "lint.yml",
+      "name": "lint",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "test.yml",
+      "name": "unit tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "old-dev.yaml",
+      "name": "🛠️ DEV admin",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "old-prod.yaml",
+      "name": "🛠️ PROD admin",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-store-api",
+      "path": "old-stage.yaml",
+      "name": "🛠️ STAGE admin",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "dev.yaml",
+      "name": "[DEV] Deploy Web",
+      "inputs": {
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "dev",
+          "options": [
+            "dev",
+            "dev2",
+            "dev3",
+            "dev4",
+            "dev5",
+            "dev6"
+          ],
+          "description": "Environment (only dev has web manifests in tangem-gitops so far)"
+        },
+        "CMS_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "development"
+          ],
+          "description": "CMS Environment"
+        },
+        "STORE_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development",
+            "dev1",
+            "dev2"
+          ],
+          "description": "Store Environment"
+        },
+        "API_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development"
+          ],
+          "description": "Api Environment"
+        },
+        "PUBLIC_DISABLE_TURNSTILE": {
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Disable Turnstile"
+        }
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "prod.yaml",
+      "name": "[PROD] Deploy Web",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "deploy-prod-to-dev.yml",
+      "name": "Build prod to dev stand",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "code-quality-orchestrator.yml",
+      "name": "Code quality",
+      "inputs": {
+        "dry_run": {
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Detect and report only — skip branch pushes, commits, and PRs"
+        }
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "create-release.yml",
+      "name": "Create Release",
+      "inputs": {
+        "bump": {
+          "type": "choice",
+          "required": true,
+          "default": "patch",
+          "options": [
+            "patch",
+            "minor",
+            "major"
+          ],
+          "description": "Semver part to bump the latest release tag by"
+        }
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "deploy-all-cobrands-from-strapi.yml",
+      "name": "Deploy all Cobrands from Strapi",
+      "inputs": {
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "development",
+          "options": [
+            "production",
+            "staging",
+            "development"
+          ],
+          "description": "Environment"
+        },
+        "CMS_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "development"
+          ],
+          "description": "CMS Environment"
+        },
+        "STORE_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development",
+            "dev1",
+            "dev2"
+          ],
+          "description": "Store Environment"
+        },
+        "API_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development"
+          ],
+          "description": "Api Environment"
+        },
+        "FILTER_ACTIVE_ONLY": {
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Deploy only active cobrands"
+        }
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "deploy-cobrand.yml",
+      "name": "Deploy Cobrand",
+      "inputs": {
+        "COBRAND_NAME": {
+          "type": "string",
+          "required": true,
+          "description": "Enter the COBRAND_NAME (required)"
+        },
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "development",
+          "options": [
+            "production",
+            "staging",
+            "development"
+          ],
+          "description": "Environment"
+        },
+        "CMS_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "development"
+          ],
+          "description": "CMS Environment"
+        },
+        "STORE_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development",
+            "dev1",
+            "dev2"
+          ],
+          "description": "Store Environment"
+        },
+        "API_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development"
+          ],
+          "description": "Api Environment"
+        }
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "deploy_dev_tangem-web_to_aws_S3.yml",
+      "name": "Deploy develop tangem-web to S3",
+      "inputs": {
+        "DOMAIN": {
+          "type": "choice",
+          "required": true,
+          "default": "default",
+          "options": [
+            "default",
+            "hotfix-1",
+            "hotfix-2",
+            "staging",
+            "development",
+            "dev1",
+            "dev2"
+          ],
+          "description": "domain"
+        },
+        "CMS_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "development",
+          "options": [
+            "production",
+            "development"
+          ],
+          "description": "CMS Environment"
+        },
+        "STORE_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development",
+            "dev1",
+            "dev2"
+          ],
+          "description": "Store Environment"
+        },
+        "API_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development"
+          ],
+          "description": "Api Environment"
+        }
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "deploy-prod-subdomains.yml",
+      "name": "Deploy production Subdomains to ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "deploy-dev-tangem-web-dynamic.yml",
+      "name": "Dev Deploy Tangem-WEB (SSG+SSR) to ECS",
+      "inputs": {
+        "ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "development",
+          "options": [
+            "staging",
+            "dev",
+            "dev1",
+            "dev2",
+            "dev3",
+            "dev4",
+            "dev5"
+          ],
+          "description": "Environment"
+        },
+        "CMS_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "development"
+          ],
+          "description": "CMS Environment"
+        },
+        "STORE_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development",
+            "dev1",
+            "dev2"
+          ],
+          "description": "Store Environment"
+        },
+        "API_ENVIRONMENT": {
+          "type": "choice",
+          "required": true,
+          "default": "production",
+          "options": [
+            "production",
+            "staging",
+            "development"
+          ],
+          "description": "Api Environment"
+        },
+        "PUBLIC_DISABLE_TURNSTILE": {
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Disable Turnstile"
+        }
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "dependabot_export.yml",
+      "name": "Export SBOM from dependabot",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "deploy-prod-tangem-web-dynamic.yml",
+      "name": "Prod Deploy Tangem-WEB (SSG+SSR) to ECS",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "run-integration-tests.yml",
+      "name": "Run integration tests",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "linter.yml",
+      "name": "Run linter",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "stale-prs-notifier.yml",
+      "name": "Stale PRs Notifier",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "trigger_dev_deploy_for_store.yml",
+      "name": "Trigger Deploy For All Store Environments",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "update-browserslist.yml",
+      "name": "Update Browserslist DB",
+      "inputs": {
+      }
+    },
+    {
+      "repo": "tangem-web",
+      "path": "update-translates.yml",
+      "name": "Update Translates",
+      "inputs": {
+      }
+    }
+  ]
+}

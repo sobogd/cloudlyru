@@ -115,7 +115,7 @@ gh secret set MAIL_PURGE_ENABLED  --body true    # затем само удал�
 # 1) мост
 cp agents/pi-bridge/com.agent.pi-bridge.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.agent.pi-bridge.plist
-# 2) порт в туннеле: в jevel.ai/agents/run-tunnel.sh строка -R 127.0.0.1:18820
+# 2) порт в туннеле: в cloudlyru/agents/mac/run-tunnel.sh строка -R 127.0.0.1:18820
 #    и порт в очистке залипших слушателей, затем перезапуск туннеля
 launchctl kickstart -k gui/$(id -u)/com.agent.mac-tunnel
 # 3) проверка: порт слушает loopback VPS и мост отвечает
