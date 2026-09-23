@@ -379,17 +379,35 @@ class AgentApi {
     return _sessionOf(data);
   }
 
-  /// Переписка сессии в виде элементов экрана.
-  Future<List<AgentItem>> messages(String id) async {
+  /// Страница переписки: последние [limit] сообщений до индекса [before] (`null` — до конца).
+  ///
+  /// История отдаётся страницами, а не целиком: у длинной сессии это мегабайты JSON по туннелю,
+  /// и тянуть их при каждом открытии разговора незачем. Приложение берёт последнюю страницу, а
+  /// предыдущие догружает по [before] — индексу первого из уже показанных сообщений.
+  Future<AgentHistoryPage> messagesPage(
+    String id, {
+    int limit = 200,
+    int? before,
+  }) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _get('/projects/sessions/$id/messages'),
+      () => _get(
+        '/projects/sessions/$id/messages',
+        queryParameters: <String, dynamic>{
+          'limit': '$limit',
+          if (before != null) 'before': '$before',
+        },
+      ),
     );
     final raw = data?['items'];
-    return <AgentItem>[
-      if (raw is List)
-        for (final m in raw)
-          if (m is Map) AgentItem.fromJson(m.cast<String, dynamic>()),
-    ];
+    return AgentHistoryPage(
+      items: <AgentItem>[
+        if (raw is List)
+          for (final m in raw)
+            if (m is Map) AgentItem.fromJson(m.cast<String, dynamic>()),
+      ],
+      total: data?['total'] is num ? (data!['total'] as num).toInt() : 0,
+      hasMore: data?['hasMore'] == true,
+    );
   }
 
   /// Отправляет сообщение агенту и отдаёт поток событий ответа.

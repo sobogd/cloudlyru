@@ -122,7 +122,10 @@ BUILTIN_PROVIDERS = [
 COMMAND_TIMEOUT = 60.0     # ожидание ответа на команду (get_state, prompt-подтверждение)
 IDLE_STOP_SECONDS = 1800.0  # простой, после которого процесс pi закрывается
 MAX_MESSAGE_CHARS = 20_000  # потолок сообщения, чтобы одним запросом не забить контекст
-HEARTBEAT_SECONDS = 15      # как часто поток SSE шлёт `: ping`, пока агент молчит
+HEARTBEAT_SECONDS = 15      # как часто поток SSE шлёт `ping`, пока агент молчит
+DELTA_FLUSH_SECONDS = 0.08  # за сколько склеивать куски текста в одно событие
+EVENT_TICK = 0.05           # шаг ожидания событий: по нему же считаются пульс и склейка
+SESSIONS_CACHE_SECONDS = 5.0  # короткий кэш списка разговоров (его спрашивают регулярно)
 MAX_BODY_BYTES = 4 * 1024 * 1024  # потолок тела запроса: сообщение в 20k символов меньше на порядки
 MAX_NAME_CHARS = 120        # потолок имени сессии: в списке оно всё равно режется одной строкой
 # Наши собственные события в общем потоке с событиями харнесса: очередь, простой сессии и наши
@@ -3123,6 +3126,112 @@ class Pool:
 POOL = Pool()
 
 
+class DeltaBundle:
+    """Копит куски текста ответа и отдаёт их одним событием.
+
+    Зачем: модель печатает по слову, и каждое слово уходило отдельным кадром SSE, отдельным
+    TCP-сегментом через reverse-SSH туннель и отдельным разбором в приложении. Склейка за 80 мс
+    сокращает и трафик, и число пробуждений экрана, не меняя порядка: перед любым не-текстовым
+    событием (карточка инструмента, конец прогона) пачка отдаётся вперёд него.
+    """
+
+    def __init__(self):
+        """Заводит пустую пачку."""
+        self.reset()
+
+    def reset(self):
+        """Очищает пачку и снимает срок ближайшей отправки."""
+        self.text = ""
+        self.reasoning = ""
+        self.due = 0.0
+
+    def feed(self, translated):
+        """Раскладывает события на текстовые (в пачку) и остальные (их отдают сразу).
+
+        Возвращает события, которые обязаны уйти не вместе с пачкой, а в своём месте: карточка
+        инструмента между двумя кусками текста задаёт порядок ответа, и текст из-за неё не должен
+        оказаться выше или ниже, чем он был у харнесса.
+        """
+        rest = []
+        for event in translated:
+            kind = event.get("type")
+            if kind == "delta":
+                self.text += str(event.get("text") or "")
+            elif kind == "reasoning":
+                self.reasoning += str(event.get("text") or "")
+            else:
+                rest.append(event)
+        if (self.text or self.reasoning) and not self.due:
+            self.due = time.time() + DELTA_FLUSH_SECONDS
+        return rest
+
+    def due_now(self):
+        """Пора ли отдавать накопленное: пачка не пуста и срок вышел."""
+        return bool((self.text or self.reasoning) and time.time() >= self.due)
+
+    def take(self):
+        """Забирает накопленное событиями экрана в исходном порядке."""
+        events = []
+        if self.text:
+            events.append({"type": "delta", "text": self.text})
+        if self.reasoning:
+            events.append({"type": "reasoning", "text": self.reasoning})
+        self.reset()
+        return events
+
+
+# Кэш списка разговоров: список пересчитывается обходом истории на маке (stat по каждому файлу
+# сессии), а приложение спрашивает его регулярно и не одним экраном. Пяти секунд хватает, чтобы
+# несколько запросов подряд получили один и тот же ответ; инвалидировать вручную не нужно —
+# список приходит из файлов, и его свежесть задаётся этим сроком.
+_sessions_cache = {}
+_sessions_cache_lock = threading.Lock()
+
+
+def cached_sessions(key, build):
+    """Список разговоров из короткого кэша; [build] вызывается только при промахе."""
+    now = time.time()
+    with _sessions_cache_lock:
+        entry = _sessions_cache.get(key)
+        if entry is not None and now - entry[0] < SESSIONS_CACHE_SECONDS:
+            return entry[1]
+    value = build()
+    with _sessions_cache_lock:
+        # Ключей мало (папка + харнесс), но растущий без предела словарь всё равно лишний
+        if len(_sessions_cache) > 32:
+            _sessions_cache.clear()
+        _sessions_cache[key] = (now, value)
+    return value
+
+
+def page_items(items, params):
+    """Отдаёт последние [limit] элементов истории до индекса [before].
+
+    Приложение открывает разговор с конца: у длинной сессии история — это мегабайты JSON по
+    туннелю, и тянуть её целиком при каждом открытии незачем. `before` — индекс в полной истории
+    (не включая): по нему запрашивается предыдущая страница, без него пагинация «вверх» была бы
+    невозможна. Без `limit` отдаётся всё — так работает сборка приложения, которая о страницах
+    ещё не знает.
+
+    Отвечает `items`, `total` (сколько всего сообщений) и `hasMore` (есть ли что-то выше).
+    """
+    total = len(items)
+    before = max(0, min(_int_param(params, "before", total), total))
+    limit = _int_param(params, "limit", 0)
+    start = max(0, before - limit) if limit > 0 else 0
+    window = items[start:before]
+    return {"items": window, "total": total, "hasMore": start > 0}
+
+
+def _int_param(params, name, default):
+    """Целое из параметров строки запроса; [default] — если параметра нет или он не число."""
+    raw = (params.get(name) or [""])[0]
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 class Handler(BaseHTTPRequestHandler):
     """Разбор ручек, авторизация и ответы. Логика — в пуле и сессиях."""
 
@@ -3229,18 +3338,18 @@ class Handler(BaseHTTPRequestHandler):
                 # чтобы агент был запущен (процесс гасится по простою, мост перезапускается).
                 session = POOL.maybe(parts[2])
                 if len(parts) == 4 and parts[3] == "messages":
+                    # Историю отдаём страницей: последние [limit] сообщений до индекса [before]
                     if session is not None:
-                        self._json(200, {"session": self._session_brief(session),
-                                         "items": session.messages()})
+                        brief = self._session_brief(session)
+                        items = session.messages()
                     else:
                         harness, native_id = split_key(parts[2])
                         file = find_session_file(harness, native_id)
                         if file is None:
                             raise PiError("сессия не найдена: %s" % parts[2])
-                        self._json(200, {
-                            "session": self._file_brief(harness, native_id, file),
-                            "items": read_file_messages(harness, file),
-                        })
+                        brief = self._file_brief(harness, native_id, file)
+                        items = read_file_messages(harness, file)
+                    self._json(200, {"session": brief, **page_items(items, params)})
                 elif len(parts) == 4 and parts[3] == "events":
                     if session is None:
                         raise PiError("сессия не открыта: подключиться к её ответу нельзя")
@@ -3464,6 +3573,15 @@ class Handler(BaseHTTPRequestHandler):
             # и обход истории на маке здесь нужен только чтобы узнать, какие папки показывать.
             folders = [Path(str(p["path"])) for p in list_projects_cached()]
 
+        sessions = cached_sessions((tuple(str(f) for f in folders), asked), lambda: self._build_sessions(folders, asked))
+        self._json(200, {"path": str(folders[0]) if raw else "", "sessions": sessions})
+
+    def _build_sessions(self, folders, asked):
+        """Собирает список разговоров по папкам — та работа, которую кэширует [_list_sessions].
+
+        Отдельным методом, а не телом выше: кэш должен хранить готовый ответ, а не повторять
+        обход истории и `stat` по каждому файлу на каждый запрос приложения.
+        """
         sessions = []
         for folder in folders:
             if asked in ("", HARNESS_PI):
@@ -3484,7 +3602,7 @@ class Handler(BaseHTTPRequestHandler):
             # это видно значком, иначе кажется, что разговор стоит
             running = POOL.maybe(session["id"])
             session["busy"] = bool(running and running.busy)
-        self._json(200, {"path": str(folders[0]) if raw else "", "sessions": sessions})
+        return sessions
 
     def _open_session(self, body):
         """Открывает сессию в выбранной папке (или продолжает существующую по id).
@@ -3692,11 +3810,16 @@ class Handler(BaseHTTPRequestHandler):
             # напечатанный между его снимком истории и подпиской, больше не теряется
             if snapshot is not None:
                 self._event({"type": "snapshot", "item": snapshot})
-            silent = 0
+            bundle = DeltaBundle()
+            silent_since = time.time()
             while True:
+                # Пачка отдаётся не реже, чем раз в EVENT_TICK, даже если поток не прерывается:
+                # иначе при непрерывном выводе она росла бы до первой паузы
+                if bundle.due_now():
+                    self._send_bundle(bundle)
+                    silent_since = time.time()
                 try:
-                    translated, done = events.get(timeout=1.0)
-                    silent = 0
+                    translated, done = events.get(timeout=EVENT_TICK)
                 except queue.Empty:
                     if not session.alive():
                         self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
@@ -3706,15 +3829,22 @@ class Handler(BaseHTTPRequestHandler):
                     # приложение не отличает такую смерть от долгой работы. Пульс идёт обычным
                     # событием, а не комментарием SSE: по нему приложение видит, что связь жива,
                     # и не считает молчание обрывом (см. сторож в agent_controller.dart).
-                    silent += 1
-                    if silent >= HEARTBEAT_SECONDS:
-                        silent = 0
+                    if time.time() - silent_since >= HEARTBEAT_SECONDS:
+                        silent_since = time.time()
                         self._event({"type": "ping"})
                     continue
-                for ours in translated:
-                    self._event(ours)
+                rest = bundle.feed(translated)
+                if rest:
+                    # Порядок: накопленный текст уходит до карточки инструмента, иначе новый
+                    # текст оказался бы выше неё и разговор читался бы не по порядку
+                    self._send_bundle(bundle)
+                    for ours in rest:
+                        self._event(ours)
+                    silent_since = time.time()
                 if done:
+                    self._send_bundle(bundle)
                     self._event({"type": "done", "session": self._settled_brief(session)})
+                    silent_since = time.time()
                     # Есть очередь — прогон начнётся сразу после этого (занятость уже поднята в
                     # _deliver_queued): закрывать поток значило бы заставить приложение
                     # переподключаться к следующему ответу. Закрываем, только когда работы нет.
@@ -3806,28 +3936,37 @@ class Handler(BaseHTTPRequestHandler):
                 self._event({"type": "error", "message": str(e)})
                 return
             self._event({"type": "accepted"})
-            silent = 0
+            bundle = DeltaBundle()
+            silent_since = time.time()
             while True:
+                # Пачка отдаётся не реже, чем раз в EVENT_TICK (см. пояснение в _events)
+                if bundle.due_now():
+                    self._send_bundle(bundle)
+                    silent_since = time.time()
                 try:
-                    translated, done = events.get(timeout=1.0)
-                    silent = 0
+                    translated, done = events.get(timeout=EVENT_TICK)
                 except queue.Empty:
                     # пустой такт — проверка, жив ли ещё процесс; заодно держим соединение
                     # живым пульсом (см. _events)
                     if not session.alive():
                         self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
                         break
-                    silent += 1
-                    if silent >= HEARTBEAT_SECONDS:
-                        silent = 0
+                    if time.time() - silent_since >= HEARTBEAT_SECONDS:
+                        silent_since = time.time()
                         self._event({"type": "ping"})
                     continue
-                for ours in translated:
-                    self._event(ours)
+                rest = bundle.feed(translated)
+                if rest:
+                    self._send_bundle(bundle)
+                    for ours in rest:
+                        self._event(ours)
+                    silent_since = time.time()
                 if done:
+                    self._send_bundle(bundle)
                     # описание сессии собираем только теперь: расход и контекст обновляются
                     # ровно в конце прогона, и раньше этих чисел просто нет
                     self._event({"type": "done", "session": self._settled_brief(session)})
+                    silent_since = time.time()
                     # Есть очередь — прогон начнётся сразу после этого (занятость уже поднята в
                     # _deliver_queued), и поток продолжается: закрывать его значило бы заставить
                     # приложение переподключаться к ответу, который оно уже смотрит.
@@ -3851,6 +3990,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._event({"type": "closed"})
             except (BrokenPipeError, ConnectionResetError, ValueError):
                 pass
+
+    def _send_bundle(self, bundle):
+        """Отдаёт накопленные куски ответа одним кадром (см. DeltaBundle)."""
+        for event in bundle.take():
+            self._event(event)
 
     def _event(self, payload):
         """Пишет одно событие в поток SSE."""

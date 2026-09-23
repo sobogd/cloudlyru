@@ -238,13 +238,30 @@ export class ProjectsController {
     );
   }
 
-  /** Переписка сессии в виде, готовом для экрана. */
+  /**
+   * Переписка сессии в виде, готовом для экрана, — страницей от конца.
+   *
+   * `limit` и `before` уходят на мост как есть: он отдаёт последние `limit` сообщений до
+   * индекса `before`, а вместе с ними — общее число сообщений и признак «выше есть ещё». Без
+   * параметров мост отдаёт историю целиком: так работает сборка приложения, которая о страницах
+   * ещё не знает.
+   */
   @Get('sessions/:id/messages')
-  async messages(@Param('id') id: string) {
+  async messages(
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+    @Query('before') before?: string,
+  ) {
+    const query = new URLSearchParams();
+    const size = Number.parseInt((limit ?? '').trim(), 10);
+    const from = Number.parseInt((before ?? '').trim(), 10);
+    if (Number.isFinite(size) && size > 0) query.set('limit', String(size));
+    if (Number.isFinite(from) && from >= 0) query.set('before', String(from));
+    const suffix = query.toString() ? `?${query}` : '';
     return this.wrap(() =>
       this.projects.call<Record<string, unknown>>(
         'GET',
-        `/sessions/${encodeURIComponent(id)}/messages`,
+        `/sessions/${encodeURIComponent(id)}/messages${suffix}`,
       ),
     );
   }

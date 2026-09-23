@@ -576,14 +576,54 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     }
     // элементы разворачиваются в сообщения один раз на сборку: от них же зависит и их число
     final entries = _entries(state.items, streaming: state.sending);
+    // Над перепиской — строка «показать более раннее»: история приходит страницами, и разговор
+    // открывается последними сообщениями
+    final older = state.hasOlder;
     return ListView.builder(
       controller: _scroll,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
       // ответ агента показывается несколькими сообщениями: команда и текст — разные шаги
       // работы, и в одном пузыре они читаются как одна реплика модели
-      itemCount: entries.length,
-      itemBuilder: (context, i) => _entry(entries[i]),
+      itemCount: entries.length + (older ? 1 : 0),
+      itemBuilder: (context, i) {
+        if (older && i == 0) return _olderRow();
+        return _entry(entries[older ? i - 1 : i]);
+      },
     );
+  }
+
+  /// Строка «показать более раннее» в начале переписки.
+  ///
+  /// Нажимается, а не подгружается при прокрутке: у переписки нет конца, за который можно
+  /// потянуть вверх без риска догрузить пол-разговора на плохой связи.
+  Widget _olderRow() => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 6),
+    child: Center(
+      child: TextButton(
+        onPressed: _loadOlder,
+        child: const Text('Показать более раннее'),
+      ),
+    ),
+  );
+
+  /// Догружает страницу выше и оставляет на экране то, что человек видел.
+  ///
+  /// Без этой поправки вставленные сверху сообщения сдвигают список, и нажатие выглядит
+  /// прыжком в неизвестное место: список стоит на той же позиции, а содержимое под ней другое.
+  Future<void> _loadOlder() async {
+    if (!_scroll.hasClients) {
+      await _thread.loadOlder();
+      return;
+    }
+    final before = _scroll.position.maxScrollExtent;
+    _selfScroll = true;
+    await _thread.loadOlder();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scroll.hasClients) return;
+      final after = _scroll.position.maxScrollExtent;
+      _scroll.jumpTo(_scroll.position.pixels + (after - before));
+      _selfScroll = false;
+    });
   }
 
   /// Уже разобранный журнал переписки и список, из которого он собран.

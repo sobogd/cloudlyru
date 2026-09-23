@@ -695,6 +695,9 @@ class AgentThreadState {
   /// идёт работа. Живёт в состоянии, а не в виджете, потому что перерисовок за прогон много.
   final DateTime? runStartedAt;
 
+  /// Выше показанного есть ещё история: разговор открывается последними сообщениями.
+  final bool hasOlder;
+
   /// Состояние разговора.
   const AgentThreadState({
     this.session,
@@ -706,6 +709,7 @@ class AgentThreadState {
     this.error,
     this.queued = 0,
     this.runStartedAt,
+    this.hasOlder = false,
   });
 
   /// Копия состояния; ошибку и расход трогают только явные методы.
@@ -718,6 +722,7 @@ class AgentThreadState {
     AgentUsage? usage,
     int? queued,
     DateTime? runStartedAt,
+    bool? hasOlder,
   }) => AgentThreadState(
     session: session ?? this.session,
     items: items ?? this.items,
@@ -727,6 +732,7 @@ class AgentThreadState {
     usage: usage ?? this.usage,
     error: error,
     runStartedAt: runStartedAt ?? this.runStartedAt,
+    hasOlder: hasOlder ?? this.hasOlder,
   );
 
   /// Копия с проставленной ошибкой.
@@ -740,6 +746,7 @@ class AgentThreadState {
     error: message,
     queued: queued,
     runStartedAt: runStartedAt,
+    hasOlder: hasOlder,
   );
 
   /// Копия без ошибки.
@@ -752,6 +759,7 @@ class AgentThreadState {
     usage: usage,
     queued: queued,
     runStartedAt: runStartedAt,
+    hasOlder: hasOlder,
   );
 
   /// Последний элемент переписки (в него дописывается текущий ответ), либо `null`.
@@ -785,6 +793,15 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// уходили после обрыва связи и по кнопке «Повторить», и каждый из них прогонял всю работу
   /// заново вместе с расходом токенов.
   String _runningText = '';
+
+  /// Сколько сообщений истории подгружается за раз.
+  ///
+  /// 200 — это примерно экран-два прокрутки на телефоне: хватает, чтобы открыть разговор и
+  /// понять, о чём он, и при этом не тянуть всю сессию целиком.
+  static const _pageSize = 200;
+
+  /// Индекс первого показанного сообщения в полной истории: по нему грузится страница выше.
+  int _oldestIndex = 0;
 
   /// Время последнего события от сервера: по нему сторож решает, что поток замолчал.
   DateTime? _lastEventAt;
@@ -844,14 +861,44 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   Future<void> attach(AgentSessionInfo session) async {
     state = AgentThreadState(session: session, loading: true);
     try {
-      final items = await _api.messages(session.id);
+      // Последняя страница истории: разговор открывается с конца, остальное догружается выше
+      final page = await _api.messagesPage(session.id, limit: _pageSize);
       if (state.session?.id != session.id) {
         return; // сессию успели сменить, пока шёл ответ
       }
-      state = state.copyWith(items: items, loading: false);
+      _oldestIndex = page.total - page.items.length;
+      state = state.copyWith(
+        items: page.items,
+        loading: false,
+        hasOlder: page.hasMore,
+      );
       if (session.busy) await _followRunning(session.id);
     } on AgentApiException catch (e) {
       state = state.copyWith(loading: false).withError(e.message);
+    }
+  }
+
+  /// Догружает предыдущую страницу истории.
+  ///
+  /// Разговор открывается последними сообщениями, и выше остаётся всё остальное: без этого в
+  /// длинной сессии было бы видно только её конец.
+  Future<void> loadOlder() async {
+    final session = state.session;
+    if (session == null || state.loading || !state.hasOlder) return;
+    try {
+      final page = await _api.messagesPage(
+        session.id,
+        limit: _pageSize,
+        before: _oldestIndex,
+      );
+      // Страница идёт выше уже показанного, поэтому её сообщения встают перед ними
+      _oldestIndex -= page.items.length;
+      state = state.copyWith(
+        items: [...page.items, ...state.items],
+        hasOlder: page.hasMore,
+      );
+    } on AgentApiException catch (e) {
+      state = state.withError(e.message);
     }
   }
 
@@ -1384,7 +1431,11 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final sessionId = state.session?.id;
     if (sessionId != null) {
       try {
-        state = state.copyWith(items: await _api.messages(sessionId));
+        // Перечитываем последнюю страницу целиком: после обрыва важнее показать точный ответ,
+        // чем сохранить уже догруженные вверх страницы — их можно догрузить заново
+        final page = await _api.messagesPage(sessionId, limit: _pageSize);
+        _oldestIndex = page.total - page.items.length;
+        state = state.copyWith(items: page.items, hasOlder: page.hasMore);
       } on AgentApiException catch (e) {
         state = state.withError(e.message);
         _finish();
