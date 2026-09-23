@@ -201,7 +201,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     String? sessionName,
   }) async {
     if (sessionName != null && sessionName.isNotEmpty) {
-      final existing = findSessionByName(ref, sessionName);
+      final existing = findReviewSession(ref, sessionName);
       if (existing != null) {
         await _open(
           AgentProject.fromPath(existing.path),
@@ -228,6 +228,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       prompt: prompt,
       // Имя, названное человеком в мастере, важнее предложенного доской пул-реквестов.
       nameIt: choice.name.isNotEmpty ? choice.name : sessionName,
+      // А связь «этот PR ведёт этот разговор» держится за ключом доски, а не за именем:
+      // своё имя человек волен поменять, и ревью от этого не должно потеряться.
+      reviewKey: sessionName,
     );
   }
 
@@ -245,6 +248,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     required bool embedded,
     String? prompt,
     String? nameIt,
+    String? reviewKey,
   }) async {
     // Текст и имя переживают открытие: пока мост поднимает процесс, показать их негде, а панель
     // разговора строится уже после ответа.
@@ -320,6 +324,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     final pendingName = sessionId == null && nameIt != null
         ? await applySessionName(ref, session.id, nameIt)
         : null;
+    if (sessionId == null && reviewKey != null && reviewKey.isNotEmpty) {
+      await rememberReviewSession(ref, reviewKey, session.id);
+    }
     _openName = pendingName;
     if (!mounted) return;
     if (embedded) {

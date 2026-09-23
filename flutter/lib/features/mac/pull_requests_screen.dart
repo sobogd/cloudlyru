@@ -4,7 +4,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../providers.dart';
+import '../agent/agent_controller.dart';
 import '../agent/agent_launch.dart';
+import '../agent/agent_types.dart';
 
 /// Состояние пул-реквеста, по которому фильтруется список.
 enum _State {
@@ -232,8 +234,8 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
 
   /// Готовая команда ревью для этого PR.
   String _reviewPrompt(Map<String, dynamic> row) =>
-      '/pr-review ${row['url'] ?? ''} без оверинжиниринга, если есть замечания review all '
-      'и ченж реквест если нет замечаний аппрув';
+      '/pr-review ${row['url'] ?? ''} без оверинжиниринга, если есть замечания то автоматически '
+      'review all и ченж реквест если нет замечаний аппрув ставить автоматом';
 
   /// Копирует готовую команду ревью для этого PR.
   Future<void> _copyReview(Map<String, dynamic> row) async {
@@ -278,7 +280,9 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
           children: [
             ListTile(
               leading: const Icon(Icons.smart_toy_outlined),
-              title: Text('Ревью агентом · ${_sessionName(row)}'),
+              title: Text(_review(row) == null
+                  ? 'Ревью агентом · ${_sessionName(row)}'
+                  : 'Вернуться в разговор · ${_sessionName(row)}'),
               onTap: () {
                 Navigator.pop(sheet);
                 _reviewWithAgent(row);
@@ -391,6 +395,8 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Список разговоров нужен строкам: по нему видно, заведено ли ревью и работает ли агент
+    ref.watch(agentSessionsProvider);
     if (widget.embedded) return _body();
     return Scaffold(
       appBar: AppBar(
@@ -574,12 +580,17 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
     );
   }
 
+  /// Разговор ревью этого PR, если он уже заведён.
+  AgentSession? _review(Map<String, dynamic> row) =>
+      findReviewSession(ref, _sessionName(row));
+
   /// Строка одного PR: задача, заголовок, состояние и обсуждение.
   Widget _rowTile(Map<String, dynamic> row) {
     final decision = '${row['review_decision'] ?? 'NONE'}';
     final task = '${row['task'] ?? ''}';
     final afterCr = row['comments_after_cr'] as int? ?? 0;
     final total = row['comments_total'] as int? ?? 0;
+    final review = _review(row);
     final theme = Theme.of(context);
     return ListTile(
       dense: true,
@@ -602,6 +613,11 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
             if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
             if (total > 0) Text('💬 $total', style: theme.textTheme.bodySmall),
             if (afterCr > 0) _badge('+$afterCr после ЧР', Colors.orange),
+            if (review != null)
+              _badge(
+                review.busy ? 'агент работает' : 'ревью · ${review.messages} сообщ.',
+                review.busy ? const Color(0xFF26C6DA) : const Color(0xFF9CCC65),
+              ),
           ],
         ),
       ),
@@ -609,10 +625,14 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
         mainAxisSize: MainAxisSize.min,
         children: [
           IconButton(
-            tooltip: 'Отдать на ревью агенту',
+            tooltip: review == null ? 'Отдать на ревью агенту' : 'Вернуться в разговор ревью',
             visualDensity: VisualDensity.compact,
             onPressed: () => _reviewWithAgent(row),
-            icon: const Icon(Icons.smart_toy_outlined, size: 18),
+            icon: Icon(
+              review == null ? Icons.smart_toy_outlined : Icons.smart_toy,
+              size: 18,
+              color: review == null ? null : const Color(0xFF9CCC65),
+            ),
           ),
           const Icon(Icons.open_in_new, size: 18),
         ],

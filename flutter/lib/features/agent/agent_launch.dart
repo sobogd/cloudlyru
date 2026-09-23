@@ -8,16 +8,29 @@ import 'agent_new_session.dart';
 import 'agent_thread_screen.dart';
 import 'agent_types.dart';
 
-/// Разговор с таким именем, если он уже есть на маке.
+/// Разговор ревью пул-реквеста [key] (`repo#123`), если он уже есть на маке.
 ///
-/// Имя — это ключ повторного захода: доска пул-реквестов зовёт разговор `repo#123`, и второе
-/// нажатие робота должно вернуть в тот же разговор, а не завести рядом второй.
-AgentSession? findSessionByName(WidgetRef ref, String name) {
-  for (final session in ref.read(agentSessionsProvider).sessions) {
-    if (session.name == name) return session;
+/// Ищем сперва по запомненному идентификатору, и только потом по имени: имя разговора
+/// переписывает сам харнесс — Claude Code ставит свой заголовок по первому вопросу, — поэтому
+/// «разговор с таким именем» находился только до первого ответа, и робот заводил второй
+/// разговор поверх уже идущего ревью.
+AgentSession? findReviewSession(WidgetRef ref, String key) {
+  final sessions = ref.read(agentSessionsProvider).sessions;
+  final saved = ref.read(settingsProvider).ui.reviewSession(key);
+  if (saved != null) {
+    for (final session in sessions) {
+      if (session.id == saved) return session;
+    }
+  }
+  for (final session in sessions) {
+    if (session.name == key) return session;
   }
   return null;
 }
+
+/// Запоминает, какой разговор ведёт ревью пул-реквеста [key].
+Future<void> rememberReviewSession(WidgetRef ref, String key, String sessionId) =>
+    ref.read(settingsProvider).ui.setReviewSession(key, sessionId);
 
 /// Ставит имя только что открытому разговору; возвращает имя, которое осталось поставить.
 ///
@@ -54,7 +67,7 @@ Future<void> startAgentSession(
   if (sessionName != null && sessionName.isNotEmpty) {
     // Список разговоров в этом разделе могли ещё не читать: без него «уже есть» не проверить.
     if (ref.read(agentSessionsProvider).sessions.isEmpty) await sessions.load();
-    final existing = findSessionByName(ref, sessionName);
+    final existing = findReviewSession(ref, sessionName);
     if (existing != null) {
       if (!context.mounted) return;
       final project = AgentProject.fromPath(existing.path);
@@ -102,6 +115,9 @@ Future<void> startAgentSession(
   // Имя, названное человеком в мастере, важнее предложенного разделом.
   final name = choice.name.isNotEmpty ? choice.name : (sessionName ?? '');
   final pending = await applySessionName(ref, session.id, name);
+  if (sessionName != null && sessionName.isNotEmpty) {
+    await rememberReviewSession(ref, sessionName, session.id);
+  }
   if (!context.mounted) return;
   await Navigator.of(context).push(
     CupertinoPageRoute<void>(

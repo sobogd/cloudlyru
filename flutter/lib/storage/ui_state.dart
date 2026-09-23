@@ -126,6 +126,37 @@ class UiStateStore {
   Future<void> setAgentEffort(String harness, String effort) =>
       patch({'agent_effort_$harness': effort});
 
+  /// Идентификатор разговора, заведённого для ревью пул-реквеста ([key] вида `repo#123`).
+  ///
+  /// Связь хранится по идентификатору, а не по имени разговора: имя переписывает сам харнесс
+  /// (Claude Code ставит свой заголовок по первому вопросу), и поиск «разговор с таким именем»
+  /// после первого же ответа переставал находить начатое ревью.
+  String? reviewSession(String key) {
+    final map = read()['review_sessions'];
+    if (map is! Map) return null;
+    final id = map[key];
+    return (id is String && id.isNotEmpty) ? id : null;
+  }
+
+  /// Запоминает разговор ревью для пул-реквеста (см. [reviewSession]).
+  Future<void> setReviewSession(String key, String sessionId) async {
+    final map = _reviewSessions()..[key] = sessionId;
+    await patch({'review_sessions': map});
+  }
+
+  /// Забывает разговор ревью: его удалили на маке или он потерялся.
+  Future<void> forgetReviewSession(String key) async {
+    final map = _reviewSessions();
+    if (map.remove(key) == null) return;
+    await patch({'review_sessions': map});
+  }
+
+  /// Текущая карта «пул-реквест → разговор»; мусор в записи считается пустой картой.
+  Map<String, dynamic> _reviewSessions() {
+    final map = read()['review_sessions'];
+    return map is Map ? map.cast<String, dynamic>() : <String, dynamic>{};
+  }
+
   /// Дописывает поля к сохранённому состоянию: читает текущий объект, накладывает [patch]
   /// и записывает обратно.
   ///
