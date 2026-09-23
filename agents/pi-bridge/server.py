@@ -122,6 +122,8 @@ BUILTIN_PROVIDERS = [
 COMMAND_TIMEOUT = 60.0     # ожидание ответа на команду (get_state, prompt-подтверждение)
 IDLE_STOP_SECONDS = 1800.0  # простой, после которого процесс pi закрывается
 MAX_MESSAGE_CHARS = 20_000  # потолок сообщения, чтобы одним запросом не забить контекст
+HEARTBEAT_SECONDS = 15      # как часто поток SSE шлёт `: ping`, пока агент молчит
+MAX_BODY_BYTES = 4 * 1024 * 1024  # потолок тела запроса: сообщение в 20k символов меньше на порядки
 MAX_NAME_CHARS = 120        # потолок имени сессии: в списке оно всё равно режется одной строкой
 # Наши собственные события в общем потоке с событиями харнесса: очередь, простой сессии и наши
 # отказы (например, сообщение из очереди не удалось отдать агенту).
@@ -1329,6 +1331,27 @@ def is_local_model(model):
     return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 
+def provider_base_url(provider):
+    """Адрес провайдера из `models.json`; пустая строка, если такой провайдер неизвестен.
+
+    Нужен, чтобы у закрытой сессии (процесс погашен по простою, мост перезапускался) правильно
+    подписать, где считалась модель: признак «локальная» выводится из адреса, а в журнале
+    сессии адреса нет — в нём только имя провайдера.
+    """
+    name = str(provider or "").strip()
+    if not name:
+        return ""
+    try:
+        data = json.loads(PI_MODELS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    providers = data.get("providers") if isinstance(data, dict) else None
+    entry = providers.get(name) if isinstance(providers, dict) else None
+    if isinstance(entry, dict):
+        return str(entry.get("baseUrl") or "")
+    return ""
+
+
 def list_models(harness=HARNESS_PI):
     """Список моделей харнесса для выбора в приложении.
 
@@ -1858,6 +1881,111 @@ class PiError(Exception):
     """Ошибка работы с харнессом: текст пригоден и для лога, и для показа в приложении."""
 
 
+class RunUi:
+    """Накопленное состояние текущего прогона — то же, что показывает экран приложения.
+
+    Зачем: поток ответа нельзя продолжить с середины. Приложение подключается к идущему
+    прогону (вернулось на экран, порвалась связь), а между его снимком истории и подпиской
+    терялись дельты — в переписке появлялась дырка, и часть ответа пропадала навсегда.
+    Поэтому мост при каждой подписке отдаёт не только будущие события, но и снимок уже
+    накопленного: приложение заменяет им хвост ответа, и пропусков не остаётся.
+
+    Разбор событий повторяет клиентский: текст, «размышления», порядок блоков (текст, карточка
+    инструмента, снова текст) и вывод инструментов.
+    """
+
+    def __init__(self):
+        """Заводит пустое состояние прогона."""
+        self.reset()
+
+    def reset(self):
+        """Начинает прогон с пустого состояния; вызывается перед отправкой сообщения."""
+        self.text = ""
+        self.reasoning = ""
+        self.blocks = []   # порядок кусков ответа и карточек инструментов
+        self.tools = {}    # id вызова -> карточка
+
+    def empty(self):
+        """Пусто ли накопленное: снимок нужен, только когда агенту уже есть что показать."""
+        return not (self.text or self.reasoning or self.blocks)
+
+    def feed(self, events):
+        """Добавляет готовые события экрана в накопленное состояние."""
+        for event in events:
+            kind = event.get("type")
+            if kind == "delta":
+                text = str(event.get("text") or "")
+                self.text += text
+                self._block("text", text)
+            elif kind == "reasoning":
+                text = str(event.get("text") or "")
+                self.reasoning += text
+                self._block("reasoning", text)
+            elif kind == "tool_call":
+                self._tool(event, running=True)
+            elif kind == "tool_start":
+                self._tool(event, running=True)
+            elif kind == "tool_update":
+                self._tool(event, running=True, keep_args=True)
+            elif kind == "tool_end":
+                self._tool(event, running=False, keep_args=True)
+
+    def _block(self, kind, text):
+        """Дописывает кусок текста в последний блок того же вида или заводит новый.
+
+        Порядок блоков — это порядок работы агента. Если между двумя текстами встала карточка
+        инструмента, начинается новый блок: иначе новый текст оказался бы выше карточки и
+        разговор читался бы не в том порядке, в каком шёл.
+        """
+        if not text:
+            return
+        if self.blocks and self.blocks[-1].get("type") == kind:
+            self.blocks[-1]["text"] += text
+            return
+        self.blocks.append({"type": kind, "text": text})
+
+    def _tool(self, event, running, keep_args=False):
+        """Добавляет или обновляет карточку вызова инструмента и ссылку на неё в блоках."""
+        call_id = str(event.get("id") or "")
+        if not call_id:
+            return
+        card = self.tools.get(call_id)
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        if card is None:
+            card = {
+                "id": call_id,
+                "name": str(event.get("name") or ""),
+                "args": args,
+                "output": "",
+                "isError": False,
+                "running": running,
+            }
+            self.tools[call_id] = card
+            # Карточка встаёт в блоки на своё место — там, где инструмент вызван по ходу ответа
+            self.blocks.append({"type": "tool", "id": call_id})
+            return
+        if not card["name"] and event.get("name"):
+            card["name"] = str(event["name"])
+        if args and not keep_args:
+            card["args"] = args
+        # У прогресса и завершения вывод накопленный целиком, поэтому заменяем, а не дописываем
+        if event.get("text"):
+            card["output"] = str(event["text"])
+        card["isError"] = bool(event.get("isError"))
+        card["running"] = running
+
+    def item(self):
+        """Снимок накопленного в том же виде, в каком приходит история сессии."""
+        return {
+            "kind": "assistant",
+            "text": self.text,
+            "reasoning": self.reasoning,
+            "blocks": [dict(block) for block in self.blocks],
+            "tools": [dict(card) for card in self.tools.values()],
+            "error": "",
+        }
+
+
 class AgentSession:
     """Общая часть сессии любого харнесса: один процесс, одна папка проекта, один разговор.
 
@@ -1889,9 +2017,15 @@ class AgentSession:
         self.stderr_tail = []       # хвост stderr процесса — попадает в текст ошибки
         self.counters = {"userMessages": 0, "assistantMessages": 0, "toolCalls": 0}
         self.partial_seen = False   # пришли ли частичные куски текущего ответа (у Claude)
-        # Текст сообщения, которое агент выполняет прямо сейчас: по нему отсекаются повторные
-        # отправки того же вопроса (см. is_duplicate). Снимается на конце прогона.
+        # Текст и идентификатор сообщения, которое агент выполняет прямо сейчас: по ним
+        # отсекаются повторные отправки того же вопроса (см. is_duplicate). Снимается на конце
+        # прогона. Идентификатор присылает приложение, и он точнее сравнения текста: два
+        # осознанно одинаковых сообщения («продолжай», «продолжай») различимы.
         self.current_prompt = None
+        self.current_id = ""
+        # Накопленное состояние текущего прогона: уходит подписчику снимком, чтобы он не терял
+        # куски ответа при подключении к идущей работе (см. RunUi и subscribe).
+        self.run_ui = RunUi()
         # Сообщения, присланные пока агент работал: их не отклоняем, а ставим в очередь и
         # отправляем по завершении текущего прогона. Это и есть «общая сессия» между
         # устройствами: телефон дописывает «и поправь тесты», пока мак считает, и это доезжает.
@@ -1903,38 +2037,51 @@ class AgentSession:
         return session_key(self.harness, self.id)
 
     def subscribe(self):
-        """Подписывает поток SSE на события сессии и отдаёт очередь этих событий.
+        """Подписывает поток SSE и вместе с подпиской отдаёт снимок идущего прогона.
+
+        Очередь и снимок берутся под одним замком: событие попадает либо в снимок (если
+        обработано до подписки), либо в очередь (если после) — но не в оба места и не в никуда.
+        Без этого между «прочитать состояние ответа» и «подписаться» терялись дельты, и в
+        переписке появлялась дырка (см. RunUi).
 
         Подписка ставится ДО отправки сообщения: события первого шага иначе можно потерять.
+        Возвращает пару «очередь событий», «снимок прогона или None».
         """
         events = queue.Queue()
-        self.subscribers.append(events)
-        return events
+        with self.lock:
+            self.subscribers.append(events)
+            # Снимок нужен только у идущего прогона: у законченного история есть в /messages
+            snapshot = None if (not self.busy or self.run_ui.empty()) else self.run_ui.item()
+        return events, snapshot
 
     def unsubscribe(self, events):
         """Снимает подписку: клиент ушёл или ответ закончился."""
-        if events in self.subscribers:
-            self.subscribers.remove(events)
+        with self.lock:
+            if events in self.subscribers:
+                self.subscribers.remove(events)
 
-    def enqueue(self, text):
+    def enqueue(self, text, message_id=""):
         """Ставит сообщение в очередь сессии и возвращает его номер в очереди.
 
         Номер нужен приложению, чтобы показать «в очереди: 2», а не молчать: человек должен
-        видеть, что его сообщение принято и ждёт своей очереди.
+        видеть, что его сообщение принято и ждёт своей очереди. [message_id] присылает
+        приложение — по нему повтор узнаётся точно, без сравнения текста.
         """
-        self.queue.append({"text": text, "at": time.time()})
+        self.queue.append({"text": text, "at": time.time(), "id": str(message_id or "")})
         self.touched = time.time()
         log("сессия %s: сообщение поставлено в очередь (%d-е)" % (self.id, len(self.queue)))
         return len(self.queue)
 
-    def start_run(self, text):
-        """Запоминает текст, ушедший агенту: пока прогон идёт, такой же вопрос не повторяем.
+    def start_run(self, text, message_id=""):
+        """Запоминает ушедшее агенту сообщение и начинает с чистого снимка прогона.
 
         Ставится перед записью сообщения в процесс, снимается на завершающем событии прогона
         (см. _finish_run). Отдельным методом, а не внутри prompt наследника: сообщение уходит
         агенту из двух мест (ручка prompt и очередь), и знать про повторы должно каждое.
         """
         self.current_prompt = text
+        self.current_id = str(message_id or "")
+        self.run_ui.reset()
 
     def forget_run(self):
         """Снимает отметку о текущем прогоне: его либо закончили, либо он не состоялся.
@@ -1943,8 +2090,9 @@ class AgentSession:
         следующая попытка того же вопроса считалась бы повтором, хотя агенту ничего не ушло.
         """
         self.current_prompt = None
+        self.current_id = ""
 
-    def is_duplicate(self, text):
+    def is_duplicate(self, text, message_id=""):
         """Повторяет ли сообщение то, что уже выполняется или ждёт очереди.
 
         Зачем: приложение слало один и тот же вопрос по нескольку раз — после обрыва потока
@@ -1955,16 +2103,27 @@ class AgentSession:
         Как только прогон закончился, такой же вопрос снова проходит: повторить его осознанно
         человек вправе, и мешать этому нельзя.
         """
+        if message_id:
+            if self.current_id and self.current_id == message_id:
+                return True
+            return any(item.get("id") == message_id for item in self.queue)
+        # Идентификатора нет (старая сборка приложения) — сравниваем текст, как раньше
         if self.current_prompt is not None and self.current_prompt == text:
             return True
         return any(item.get("text") == text for item in self.queue)
 
-    def queue_position(self, text):
-        """Место в очереди у сообщения с таким же текстом; 0 — оно и есть текущий прогон.
+    def queue_position(self, text, message_id=""):
+        """Место в очереди у того же сообщения; 0 — оно и есть текущий прогон.
 
         Нужно ответу ручки queue: приложение показывает «в очереди: N», и для повтора это число
-        должно указывать на настоящее место его сообщения, а не на конец очереди.
+        должно указывать на настоящее место его сообщения, а не на конец очереди. Сообщение
+        ищется по идентификатору, а если его нет — по тексту (старая сборка приложения).
         """
+        for index, item in enumerate(self.queue, start=1):
+            if message_id and item.get("id") == message_id:
+                return index
+        if message_id:
+            return 0
         for index, item in enumerate(self.queue, start=1):
             if item.get("text") == text:
                 return index
@@ -1986,7 +2145,7 @@ class AgentSession:
         # Текст прогона отмечаем тоже здесь: между «взял из очереди» и записью в процесс мост
         # успевает принять запрос, и по этому признаку он тоже должен увидеть повтор.
         self.busy = True
-        self.start_run(item["text"])
+        self.start_run(item["text"], item.get("id") or "")
         threading.Thread(target=self._send_queued, args=(item,), daemon=True).start()
 
     def _send_queued(self, item):
@@ -2021,6 +2180,9 @@ class AgentSession:
         разбором служебного (расход, счётчики, идентификатор модели).
         """
         translated, done = translate(self, event)
+        # Накопление снимка идёт до рассылки: подписчику, который подключится сразу после
+        # события, этот кусок должен быть уже виден в снимке, а не потеряться между ними
+        self.run_ui.feed(translated)
         if done:
             self._finish_run(event)
         self._publish(translated, done)
@@ -2049,8 +2211,11 @@ class AgentSession:
         приложения успевал увидеть «свободна» раньше, чем мост успевал отдать из очереди
         следующее сообщение.
         """
-        for q in list(self.subscribers):
-            q.put((translated, done))
+        # Под тем же замком, что и subscribe: иначе событие могло попасть и в снимок
+        # подписчика, и в его очередь сразу — тогда клиент показал бы текст дважды
+        with self.lock:
+            for q in list(self.subscribers):
+                q.put((translated, done))
 
     def _write(self, payload):
         """Отправляет одну команду процессу; сбой записи означает смерть процесса."""
@@ -2994,8 +3159,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
-        """Читает тело запроса как JSON-объект (пустое тело — пустой объект)."""
+        """Читает тело запроса как JSON-объект (пустое тело — пустой объект).
+
+        Потолок размера проверяется по `Content-Length` до чтения: сообщение человеку отдаёт
+        ручка, а тело в сотни мегабайт успело бы занять память раньше, чем сработала бы
+        проверка длины текста.
+        """
         length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY_BYTES:
+            raise PiError("тело запроса больше %d МБ" % (MAX_BODY_BYTES // (1024 * 1024)))
         if length <= 0:
             return {}
         raw = self.rfile.read(length)
@@ -3129,6 +3301,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Сообщение в занятую сессию: не отказ, а очередь. Приложение шлёт сюда, когда
                     # у него уже открыт поток текущего прогона: второй поток дал бы двойной текст.
                     text = str(body.get("text") or "").strip()
+                    message_id = str(body.get("id") or "").strip()
                     if not text:
                         raise PiError("пустое сообщение")
                     if len(text) > MAX_MESSAGE_CHARS:
@@ -3143,18 +3316,18 @@ class Handler(BaseHTTPRequestHandler):
                         # вопросом (ручка prompt), и там оно уходит агенту.
                         self._json(200, {"queued": False, "position": 0})
                         return
-                    if session.is_duplicate(text):
-                        # Такой же вопрос уже в работе или в очереди: второй раз не кладём, а
-                        # говорим об этом прямо. Место считаем по такому же тексту: подпись
+                    if session.is_duplicate(text, message_id):
+                        # Такое же сообщение уже в работе или в очереди: второй раз не кладём, а
+                        # говорим об этом прямо. Место считаем по тому же сообщению: подпись
                         # «в очереди: N» на экране должна указывать на настоящее место.
                         log("сессия %s: повтор того же сообщения — в очередь не ставлю" % session.id)
                         self._json(200, {
                             "queued": True,
                             "duplicate": True,
-                            "position": session.queue_position(text),
+                            "position": session.queue_position(text, message_id),
                         })
                         return
-                    self._json(200, {"queued": True, "position": session.enqueue(text)})
+                    self._json(200, {"queued": True, "position": session.enqueue(text, message_id)})
                     return
                 # Переименование обрабатывается до поиска в пуле: имя лежит в журнале сессии, а не
                 # в процессе, и переименовать можно в том числе закрытый разговор
@@ -3426,6 +3599,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         reader = read_claude_meta if harness == HARNESS_CLAUDE else read_session_meta
         meta = reader(file)
+        provider_name = str(meta.get("provider") or "")
         return {
             "id": session_key(harness, native_id),
             "harness": harness,
@@ -3436,7 +3610,9 @@ class Handler(BaseHTTPRequestHandler):
             "model": str(meta.get("model") or ""),
             "modelName": str(meta.get("model") or ""),
             "provider": str(meta.get("provider") or ""),
-            "local": harness != HARNESS_CLAUDE and is_local_model({"provider": str(meta.get("provider") or ""), "baseUrl": ""}),
+            "local": harness != HARNESS_CLAUDE and is_local_model(
+                {"provider": provider_name, "baseUrl": provider_base_url(provider_name)}
+            ),
             "thinkingLevel": "",
             "busy": False,
             "messages": int(meta.get("messages") or 0),
@@ -3483,9 +3659,14 @@ class Handler(BaseHTTPRequestHandler):
         писался. Здесь мы просто смотрим со стороны: разрыв соединения работу НЕ прерывает — за
         это отвечает ручка `prompt`, у которой своя семантика.
         """
-        if not session.busy and not queued:
-            # Свободна: говорить нечего, и держать поток открытым значило бы показывать вечную
-            # загрузку. Приложение по этому событию остаётся в обычном состоянии.
+        # Подписка и снимок берутся одним действием и до решения «свободна»: иначе между
+        # проверкой занятости и подпиской прогон мог завершиться, его `done` ушёл бы в пустоту,
+        # и поток остался бы открытым до смерти процесса — приложение вечно показывало бы работу
+        events, snapshot = session.subscribe()
+        if not session.busy and not queued and snapshot is None:
+            # Свободна и снимка нет: говорить нечего, и держать поток открытым значило бы
+            # показывать вечную загрузку. Приложение по этому событию остаётся в обычном состоянии.
+            session.unsubscribe(events)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Connection", "close")
@@ -3494,7 +3675,6 @@ class Handler(BaseHTTPRequestHandler):
             self._event({"type": "idle"})
             return
 
-        events = session.subscribe()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-transform")
@@ -3508,23 +3688,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._event({"type": "duplicate"})
             if queued:
                 self._event({"type": "queued", "position": queued})
+            # Снимок идущего прогона: приложение заменяет им хвост ответа, поэтому кусок,
+            # напечатанный между его снимком истории и подпиской, больше не теряется
+            if snapshot is not None:
+                self._event({"type": "snapshot", "item": snapshot})
+            silent = 0
             while True:
                 try:
                     translated, done = events.get(timeout=1.0)
+                    silent = 0
                 except queue.Empty:
                     if not session.alive():
                         self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
                         break
+                    # Пока агент молчит (модель думает, инструмент работает), шлём комментарий
+                    # SSE: без трафика мобильный NAT и промежуточные прокси рвут соединение
+                    # молча, и приложение не отличает такую смерть от долгой работы
+                    silent += 1
+                    if silent >= HEARTBEAT_SECONDS:
+                        silent = 0
+                        self._event_raw(": ping")
                     continue
                 for ours in translated:
                     self._event(ours)
                 if done:
                     self._event({"type": "done", "session": self._settled_brief(session)})
-                    # Есть очередь — прогон начнётся сразу после этого: закрывать поток значило бы
-                    # заставить приложение переподключаться к следующему ответу
-                    # Та же секунда запаса, что и в ручке prompt: см. пояснение там
-                    if not (session.busy or session.queue):
-                        time.sleep(1.0)
+                    # Есть очередь — прогон начнётся сразу после этого (занятость уже поднята в
+                    # _deliver_queued): закрывать поток значило бы заставить приложение
+                    # переподключаться к следующему ответу. Закрываем, только когда работы нет.
                     if not (session.busy or session.queue):
                         log("наблюдатель сессии %s отключён: прогон завершён, очередь пуста" % session.id)
                         break
@@ -3556,28 +3747,32 @@ class Handler(BaseHTTPRequestHandler):
         отказ, а не подвесит второй запрос.
         """
         text = str(body.get("text") or "").strip()
+        # Идентификатор сообщения от приложения: по нему повтор узнаётся точно, без сравнения
+        # текста. Пустой — старая сборка приложения, тогда работает прежнее сравнение
+        message_id = str(body.get("id") or "").strip()
         if not text:
             raise PiError("пустое сообщение")
         if len(text) > MAX_MESSAGE_CHARS:
             raise PiError("сообщение длиннее %d символов" % MAX_MESSAGE_CHARS)
-        if session.is_duplicate(text):
-            # Такой же вопрос уже выполняется или ждёт очереди — второй прогон не запускаем, а
+        if session.is_duplicate(text, message_id):
+            # Такое же сообщение уже выполняется или ждёт очереди — второй прогон не запускаем, а
             # подключаем приложение к идущему. Раньше повтор принимался и отрабатывался целиком:
             # после обрыва связи приложение шло в эту ручку снова и снова, и один и тот же
             # вопрос прогонялся несколько раз.
             log("сессия %s: повтор того же сообщения — прогон не запускаю" % session.id)
-            # Место в очереди передаём вместе с повтором: если такой же вопрос там уже стоит,
+            # Место в очереди передаём вместе с повтором: если такое же сообщение там уже стоит,
             # приложение показывает его настоящее место, а не молчит про очередь.
-            self._events(session, queued=session.queue_position(text), duplicate=True)
+            self._events(session, queued=session.queue_position(text, message_id), duplicate=True)
             return
         if session.busy:
             # Занятую сессию больше не отклоняем: сообщение встаёт в очередь, а этот поток
             # показывает, что происходит сейчас, и продолжается, когда дойдёт до очереди.
-            self._events(session, queued=session.enqueue(text))
+            self._events(session, queued=session.enqueue(text, message_id))
             return
 
-        events = queue.Queue()
-        session.subscribers.append(events)
+        # Подписка и снимок — одним действием: отказ принять сообщение виден событием, а
+        # подключившийся поток не теряет ни одного события между снимком и подпиской
+        events, _ = session.subscribe()
         session.busy = True
         session.touched = time.time()
 
@@ -3596,24 +3791,34 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 # Текст прогона отмечаем до записи в процесс: между отметкой и записью мост может
                 # принять ещё один такой же вопрос, и он должен быть виден как повтор
-                session.start_run(text)
+                session.start_run(text, message_id)
                 session.prompt(text)
             except PiError as e:
                 # Заголовки потока уже отправлены, поэтому ответить кодом нельзя — отказ
                 # уходит событием. Так приходит, например, отказ харнесса принять второй вопрос
-                # в занятую сессию, если её занял кто-то помимо моста.
+                # в занятую сессию, если её занял кто-то помимо моста. Занятость при этом
+                # снимаем: без этого сессия осталась бы «занятой» навсегда, и каждый следующий
+                # вопрос уходил бы в очередь, которую никто не разбирает.
                 session.forget_run()
+                session.busy = False
                 self._event({"type": "error", "message": str(e)})
                 return
             self._event({"type": "accepted"})
+            silent = 0
             while True:
                 try:
                     translated, done = events.get(timeout=1.0)
+                    silent = 0
                 except queue.Empty:
-                    # пустой такт — проверка, жив ли ещё клиент и не оборвался ли процесс
+                    # пустой такт — проверка, жив ли ещё процесс; заодно держим соединение
+                    # живым комментарием SSE (см. _events)
                     if not session.alive():
                         self._event({"type": "error", "message": "процесс %s завершился" % session.harness})
                         break
+                    silent += 1
+                    if silent >= HEARTBEAT_SECONDS:
+                        silent = 0
+                        self._event_raw(": ping")
                     continue
                 for ours in translated:
                     self._event(ours)
@@ -3621,14 +3826,9 @@ class Handler(BaseHTTPRequestHandler):
                     # описание сессии собираем только теперь: расход и контекст обновляются
                     # ровно в конце прогона, и раньше этих чисел просто нет
                     self._event({"type": "done", "session": self._settled_brief(session)})
-                    # Есть очередь — прогон начнётся сразу после этого, и поток продолжается:
-                    # закрывать его значило бы заставить приложение переподключаться к ответу
-                    # Секунда запаса перед закрытием: следующее сообщение уходит из очереди в
-                    # тот же миг, когда прогон завершается, и без этой паузы поток закрывался бы
-                    # ровно перед началом следующего ответа. Пауза дешевле, чем заставить
-                    # приложение переподключаться к работе, которую оно уже начало смотреть.
-                    if not (session.busy or session.queue):
-                        time.sleep(1.0)
+                    # Есть очередь — прогон начнётся сразу после этого (занятость уже поднята в
+                    # _deliver_queued), и поток продолжается: закрывать его значило бы заставить
+                    # приложение переподключаться к ответу, который оно уже смотрит.
                     if not (session.busy or session.queue):
                         log("поток сессии %s закрыт: прогон завершён (занята=%s, очередь=%d)" % (
                             session.id, session.busy, len(session.queue)))
@@ -3653,6 +3853,11 @@ class Handler(BaseHTTPRequestHandler):
     def _event(self, payload):
         """Пишет одно событие в поток SSE."""
         self.wfile.write(("data: %s\n\n" % json.dumps(payload, ensure_ascii=False)).encode("utf-8"))
+        self.wfile.flush()
+
+    def _event_raw(self, line):
+        """Пишет в поток строку как есть — для комментариев SSE (`: ping`) и keep-alive."""
+        self.wfile.write((line + "\n\n").encode("utf-8"))
         self.wfile.flush()
 
 

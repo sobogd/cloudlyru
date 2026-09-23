@@ -77,7 +77,7 @@ class AgentApi {
   /// Состояние моста: версия pi, выбранная модель, разрешённые корни.
   Future<AgentHealth> health() async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects/health'),
+      () => _get('/projects/health'),
     );
     return AgentHealth.fromJson(data ?? const {});
   }
@@ -85,7 +85,7 @@ class AgentApi {
   /// Что считается на маке и что закончилось, пока приложения не было.
   Future<AgentActivity> activity() async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects/activity'),
+      () => _get('/projects/activity'),
     );
     return AgentActivity.fromJson(data ?? const {});
   }
@@ -93,7 +93,7 @@ class AgentApi {
   /// Харнессы, стоящие на маке: pi и Claude Code — с версиями и признаком «есть».
   Future<List<AgentHarness>> harnesses() async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects/harnesses'),
+      () => _get('/projects/harnesses'),
     );
     final raw = data?['harnesses'];
     return <AgentHarness>[
@@ -118,7 +118,7 @@ class AgentApi {
     String harness = 'pi',
   }) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get(
+      () => _get(
         '/projects/models',
         queryParameters: <String, dynamic>{'harness': harness},
       ),
@@ -143,7 +143,7 @@ class AgentApi {
   /// Ключи сюда не приходят: только признак «задан» и длина. Сам ключ лежит на маке.
   Future<List<AgentProvider>> providers() async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects/providers'),
+      () => _get('/projects/providers'),
     );
     final raw = data?['providers'];
     return <AgentProvider>[
@@ -166,7 +166,7 @@ class AgentApi {
     required List<AgentModel> models,
   }) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/providers',
         data: <String, dynamic>{
           'key': key,
@@ -193,7 +193,7 @@ class AgentApi {
   /// Удаляет своего провайдера.
   Future<List<AgentProvider>> deleteProvider(String key) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.delete('/projects/providers/${Uri.encodeComponent(key)}'),
+      () => _delete('/projects/providers/${Uri.encodeComponent(key)}'),
     );
     return _providersOf(data);
   }
@@ -208,7 +208,7 @@ class AgentApi {
     String apiKey = '',
   }) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/providers/probe',
         data: <String, dynamic>{
           'baseUrl': baseUrl,
@@ -231,7 +231,7 @@ class AgentApi {
     String apiKey,
   ) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/providers/key',
         data: <String, dynamic>{'provider': provider, 'apiKey': apiKey},
       ),
@@ -252,7 +252,7 @@ class AgentApi {
   /// Проекты: папки внутри разрешённых корней, в которых можно работать.
   Future<List<AgentProject>> projects() async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects'),
+      () => _get('/projects'),
     );
     final raw = data?['projects'];
     return <AgentProject>[
@@ -270,7 +270,7 @@ class AgentApi {
   Future<List<AgentSession>> sessions([String? path]) async {
     final dir = (path ?? '').trim();
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get(
+      () => _get(
         '/projects/sessions',
         queryParameters: dir.isEmpty ? null : <String, dynamic>{'path': dir},
       ),
@@ -297,7 +297,7 @@ class AgentApi {
   }) async {
     final split = _splitModel(modelKey);
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/sessions',
         data: <String, dynamic>{
           'path': path,
@@ -319,7 +319,7 @@ class AgentApi {
     final split = _splitModel(modelKey);
     if (split == null) throw const AgentApiException(0, 'модель не выбрана');
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/sessions/$id/model',
         data: <String, dynamic>{'provider': split.$1, 'modelId': split.$2},
       ),
@@ -333,7 +333,7 @@ class AgentApi {
   /// меняется на ходу. У pi такого выбора нет — мост ответит отказом.
   Future<AgentSessionInfo> setEffort(String id, String effort) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/sessions/$id/effort',
         data: <String, dynamic>{'effort': effort},
       ),
@@ -348,7 +348,7 @@ class AgentApi {
   /// харнесса, поэтому открытый процесс для переименования не нужен.
   Future<String> renameSession(String id, String name) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/sessions/$id/name',
         data: <String, dynamic>{'name': name},
       ),
@@ -374,7 +374,7 @@ class AgentApi {
   /// из потока ответа они приходят только к концу прогона.
   Future<AgentSessionInfo> session(String id) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects/sessions/$id'),
+      () => _get('/projects/sessions/$id'),
     );
     return _sessionOf(data);
   }
@@ -382,7 +382,7 @@ class AgentApi {
   /// Переписка сессии в виде элементов экрана.
   Future<List<AgentItem>> messages(String id) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.get('/projects/sessions/$id/messages'),
+      () => _get('/projects/sessions/$id/messages'),
     );
     final raw = data?['items'];
     return <AgentItem>[
@@ -394,15 +394,21 @@ class AgentApi {
 
   /// Отправляет сообщение агенту и отдаёт поток событий ответа.
   ///
-  /// Прерывание потока (кнопка «Стоп», уход с экрана) рвёт и HTTP-запрос: сервер по разрыву
-  /// соединения гасит работу агента на маке, поэтому команды не продолжают выполняться «в
-  /// никуда» и не занимают единственный процесс pi с его контекстом.
-  Stream<AgentEvent> prompt(String id, String text) async* {
+  /// Прерывание потока (кнопка «Стоп», уход с экрана) рвёт и HTTP-запрос: мост по обрыву
+  /// работу агента НЕ гасит (останавливает только явный [abort]), но поток событий закрывает,
+  /// и экран при возврате подключается к идущему прогону заново.
+  ///
+  /// [messageId] уходит на мост вместе с текстом: по нему он отличает повтор от нового
+  /// вопроса, поэтому два осознанно отправленных одинаковых сообщения не теряются.
+  Stream<AgentEvent> prompt(String id, String text, [String messageId = '']) async* {
     final Response<ResponseBody> res;
     try {
       res = await _http.post<ResponseBody>(
         '/projects/sessions/$id/prompt',
-        data: <String, dynamic>{'text': text},
+        data: <String, dynamic>{
+          'text': text,
+          if (messageId.isNotEmpty) 'id': messageId,
+        },
         // тело читаем сами как поток байтов: Dio не должен пытаться разобрать SSE как JSON
         options: Options(responseType: ResponseType.stream),
       );
@@ -414,16 +420,24 @@ class AgentApi {
 
   /// Ставит сообщение в очередь занятой сессии.
   ///
-  /// Возвращает место сообщения в очереди и признак «такой же вопрос уже отправлен»: мост
+  /// Возвращает место сообщения в очереди и признак «такое же сообщение уже отправлено»: мост
   /// отсекает повторы, и тогда место указывает на уже отправленное сообщение, а второй раз
   /// агенту ничего не уходит. `position == 0` без `duplicate` означает, что сессия успела
   /// освободиться — тогда сообщение надо отправить обычным вопросом ([prompt]), иначе оно
-  /// потерялось бы.
-  Future<({int position, bool duplicate})> queueMessage(String id, String text) async {
+  /// потерялось бы. [messageId] — тот же идентификатор, что у [prompt]: по нему мост отличает
+  /// повтор от осознанно повторённого сообщения.
+  Future<({int position, bool duplicate})> queueMessage(
+    String id,
+    String text, [
+    String messageId = '',
+  ]) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post(
+      () => _post(
         '/projects/sessions/$id/queue',
-        data: <String, dynamic>{'text': text},
+        data: <String, dynamic>{
+          'text': text,
+          if (messageId.isNotEmpty) 'id': messageId,
+        },
       ),
     );
     return (
@@ -487,7 +501,7 @@ class AgentApi {
   /// Останавливает генерацию: сервер просит мост прервать работу агента.
   Future<void> abort(String id) async {
     await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/sessions/$id/abort'),
+      () => _post('/projects/sessions/$id/abort'),
     );
   }
 
@@ -498,10 +512,13 @@ class AgentApi {
   /// через ffmpeg, — поэтому уходит ровно то, что записала платформа.
   Future<String> transcribe(Uint8List audio) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post<Map<String, dynamic>>(
+      () => _post<Map<String, dynamic>>(
         '/projects/transcribe',
         data: audio,
-        options: Options(contentType: 'application/octet-stream'),
+        contentType: 'application/octet-stream',
+        // whisper считает запись целиком: минута диктовки может занять заметно больше
+        // пятнадцати секунд, поэтому у этой ручки свой таймаут
+        timeout: const Duration(minutes: 2),
       ),
     );
     return data?['text']?.toString().trim() ?? '';
@@ -510,7 +527,7 @@ class AgentApi {
   /// Сжимает контекст сессии: длинная работа иначе перестанет влезать в окно модели.
   Future<String> compact(String id) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.post('/projects/sessions/$id/compact'),
+      () => _post('/projects/sessions/$id/compact'),
     );
     return data?['summary']?.toString() ?? '';
   }
@@ -520,7 +537,7 @@ class AgentApi {
   /// Необратимо — в приложении это действие с подтверждением.
   Future<AgentDeleteResult> deleteSession(String id) async {
     final data = await _send<Map<String, dynamic>>(
-      () => _http.delete('/projects/sessions/$id'),
+      () => _delete('/projects/sessions/$id'),
     );
     return AgentDeleteResult(
       deleted: data?['deleted'] is num ? (data!['deleted'] as num).toInt() : 0,
@@ -614,6 +631,13 @@ class AgentApi {
         return const AgentEvent(
           note: 'этот вопрос уже отправлен — показываю идущий ответ',
         );
+      case 'snapshot':
+        // Снимок идущего прогона: экран заменяет им хвост переписки, поэтому куски ответа,
+        // вышедшие между его снимком истории и подпиской, не теряются
+        final item = json['item'];
+        return item is Map
+            ? AgentEvent(snapshot: AgentItem.fromJson(item.cast<String, dynamic>()))
+            : null;
       case 'idle':
         return const AgentEvent(idle: true);
       case 'queued_started':
@@ -650,6 +674,40 @@ class AgentApi {
     }
   }
 
+  /// Обычный GET с таймаутом чтения.
+  ///
+  /// Таймаут здесь принципиален: `BaseOptions` не задаёт его вовсе (поток ответа живёт
+  /// минутами), а без него при отвалившемся туннеле экран крутит спиннер до серверного
+  /// таймаута (20–120 с) и человек не может ни отменить, ни понять, что случилось.
+  Future<Response<T>> _get<T>(
+    String path, {
+    Map<String, dynamic>? queryParameters,
+    Duration timeout = _defaultTimeout,
+  }) => _http.get<T>(path, queryParameters: queryParameters, options: _timeout(timeout));
+
+  /// Обычный POST с телом и таймаутом.
+  Future<Response<T>> _post<T>(
+    String path, {
+    Object? data,
+    String? contentType,
+    Duration timeout = _defaultTimeout,
+  }) => _http.post<T>(
+    path,
+    data: data,
+    options: Options(
+      contentType: contentType,
+      receiveTimeout: timeout,
+      sendTimeout: timeout,
+    ),
+  );
+
+  /// Обычный DELETE с таймаутом.
+  Future<Response<T>> _delete<T>(String path, {Duration timeout = _defaultTimeout}) =>
+      _http.delete<T>(path, options: _timeout(timeout));
+
+  /// Настройки запроса с одним и тем же таймаутом на чтение и отправку.
+  Options _timeout(Duration timeout) => Options(receiveTimeout: timeout, sendTimeout: timeout);
+
   /// Выполняет запрос и переводит сбой в [AgentApiException] с текстом сервера.
   Future<T?> _send<T>(Future<Response<T>> Function() request) async {
     try {
@@ -660,10 +718,18 @@ class AgentApi {
     }
   }
 
+  /// Сколько ждать ответа обычной ручки по умолчанию.
+  ///
+  /// 15 с — это с запасом больше, чем мост отвечает здоровым (проверка списка, открытие сессии),
+  /// и заметно меньше серверного таймаута: человек быстрее видит причину и кнопку повтора.
+  static const _defaultTimeout = Duration(seconds: 15);
+
   /// Сбой клиента → ошибка раздела с причиной, которую уже сформулировал сервер.
   ///
   /// Текст берём из тела ответа (`{statusCode, message, code}` от `AllExceptionsFilter`): сервер
-  /// отдаёт причину моста как есть. Свои тексты остаются на случай, когда ответа нет вовсе.
+  /// отдаёт причину моста как есть. Свои тексты остаются на случай, когда ответа нет вовсе, и
+  /// они разные для разных причин: «нет связи» после пробуждения радио и «сервер не ответил
+  /// вовремя» лечатся по-разному, и показывать одно вместо другого — врать человеку.
   static AgentApiException _error(DioException e) {
     final status = e.response?.statusCode ?? 0;
     final data = e.response?.data;
@@ -675,13 +741,20 @@ class AgentApi {
       if (m is List && m.isNotEmpty) message = m.first.toString();
       final c = data['code'];
       if (c is String) code = c;
+      // Сервер может отдать признак «подожди N секунд» — показываем его в тексте, иначе
+      // отказ по частоте выглядит как обычная ошибка без объяснения
+      final retry = data['retryAfterSec'];
+      if (retry is num && retry > 0) {
+        message = '${message ?? 'Слишком часто'} — повтор через ${retry.toInt()} с';
+      }
     }
     message ??= switch (e.type) {
-      DioExceptionType.connectionError ||
+      DioExceptionType.connectionError =>
+        'Нет связи с сервером. Проверьте интернет и повторите.',
       DioExceptionType.connectionTimeout ||
       DioExceptionType.receiveTimeout ||
       DioExceptionType.sendTimeout =>
-        'Нет связи с сервером. Проверьте интернет и повторите.',
+        'Сервер не ответил вовремя. Попробуйте ещё раз.',
       DioExceptionType.cancel => 'Запрос отменён.',
       _ =>
         status == 0

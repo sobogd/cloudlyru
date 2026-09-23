@@ -32,6 +32,17 @@ const MAX_PROMPT_CHARS = 20_000;
  */
 const MAX_AUDIO_BYTES = 16 * 1024 * 1024;
 
+/** Сколько распознаваний речи может идти одновременно: каждое держит запись в памяти. */
+const MAX_TRANSCRIBE_PARALLEL = 2;
+
+/**
+ * Код «клиент ушёл»: запрос оборвал сам человек (ушёл с экрана, нажал «Стоп»).
+ *
+ * В стандарте HTTP такого кода нет — это общепринятое расширение nginx. Приложению он нужен
+ * как признак «это не сбой»: по нему отмена не показывается ошибкой.
+ */
+const CLIENT_GONE = 499;
+
 /**
  * Раздел «Проекты»: выбор папки проекта на домашнем маке и работа с агентом pi внутри неё.
  *
@@ -50,6 +61,9 @@ const MAX_AUDIO_BYTES = 16 * 1024 * 1024;
 @Controller('projects')
 export class ProjectsController {
   private readonly logger = new Logger(ProjectsController.name);
+
+  /** Сколько распознаваний речи идёт прямо сейчас (см. MAX_TRANSCRIBE_PARALLEL). */
+  private transcribing = 0;
 
   constructor(
     private readonly projects: ProjectsService,
@@ -288,6 +302,9 @@ export class ProjectsController {
     @Res() res: Response,
   ) {
     const text = typeof body.text === 'string' ? body.text.trim() : '';
+    // Идентификатор сообщения от приложения: мост по нему отличает повтор от осознанно
+    // повторённого вопроса, а не сравнивает текст (два «продолжай» подряд — разные сообщения).
+    const messageId = str(body.id);
     if (!text) throw badRequest('text обязателен');
     if (text.length > MAX_PROMPT_CHARS) {
       throw badRequest(`сообщение длиннее ${MAX_PROMPT_CHARS} символов`);
@@ -299,7 +316,11 @@ export class ProjectsController {
     // Запрос к мосту делается ДО отправки заголовков потока: отказ (занятая сессия, мост
     // недоступен) должен прийти обычным HTTP-кодом с текстом, а не молчанием в потоке.
     const upstream = await this.wrap(() =>
-      this.projects.stream(`/sessions/${encodeURIComponent(id)}/prompt`, { text }, { signal: abort.signal }),
+      this.projects.stream(
+        `/sessions/${encodeURIComponent(id)}/prompt`,
+        { text, ...(messageId ? { id: messageId } : {}) },
+        { signal: abort.signal },
+      ),
     );
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -310,11 +331,11 @@ export class ProjectsController {
     res.flushHeaders?.();
 
     const body_ = Readable.fromWeb(upstream as Parameters<typeof Readable.fromWeb>[0]);
-    // Ошибки чтения (обрыв туннеля, отмена) закрывают ответ: клиент увидит конец потока и
-    // покажет причину из своего же состояния, а не «вечный спиннер».
+    // Ошибки чтения (обрыв туннеля, отмена) закрывают ответ событием ошибки: без него клиент
+    // видит просто конец потока и остаётся в состоянии ожидания, пока не сработает watchdog.
     body_.on('error', (e) => {
       this.logger.warn(`поток агента прерван: ${String(e)}`);
-      res.end();
+      this.closeStream(res, 'связь с агентом прервалась');
     });
     body_.pipe(res);
   }
@@ -331,6 +352,7 @@ export class ProjectsController {
   @RateLimit(20, 60_000)
   async queue(@Param('id') id: string, @Body() body: Record<string, unknown> = {}) {
     const text = typeof body.text === 'string' ? body.text.trim() : '';
+    const messageId = str(body.id);
     if (!text) throw badRequest('text обязателен');
     // Потолок длины тот же, что у prompt: он общий с мостом (MAX_MESSAGE_CHARS), и отказ с
     // текстом лучше отдать здесь, не гоняя запрос через туннель.
@@ -341,7 +363,7 @@ export class ProjectsController {
       this.projects.call<Record<string, unknown>>(
         'POST',
         `/sessions/${encodeURIComponent(id)}/queue`,
-        { body: { text } },
+        { body: { text, ...(messageId ? { id: messageId } : {}) } },
       ),
     );
   }
@@ -373,7 +395,7 @@ export class ProjectsController {
     res.flushHeaders?.();
 
     const body = Readable.fromWeb(upstream as Parameters<typeof Readable.fromWeb>[0]);
-    body.on('error', () => res.end());
+    body.on('error', () => this.closeStream(res, 'связь с агентом прервалась'));
     body.pipe(res);
   }
 
@@ -506,10 +528,24 @@ export class ProjectsController {
     }
     if (total === 0) throw badRequest('пустая запись');
 
-    const text = await this.wrap(() =>
-      this.projects.transcribe(Buffer.concat(chunks), mime),
-    );
-    return { text };
+    // Параллельные распознавания ограничены: каждое держит всю запись в памяти (до 16 МБ),
+    // и десяток одновременных диктовок съел бы память сервера вместе с загрузками и файлами.
+    if (this.transcribing >= MAX_TRANSCRIBE_PARALLEL) {
+      throw new ApiError(
+        HttpStatus.SERVICE_UNAVAILABLE,
+        'распознавание речи занято, попробуйте ещё раз',
+        'stt_busy',
+      );
+    }
+    this.transcribing += 1;
+    try {
+      const text = await this.wrap(() =>
+        this.projects.transcribe(Buffer.concat(chunks), mime),
+      );
+      return { text };
+    } finally {
+      this.transcribing -= 1;
+    }
   }
 
   /**
@@ -524,11 +560,31 @@ export class ProjectsController {
       return await run();
     } catch (e) {
       if (!(e instanceof ProjectsError)) throw e;
-      // 499 — внутренний признак «человек ушёл»; в HTTP такого кода нет, отдаём 400
-      const status = e.status === 499 ? HttpStatus.BAD_REQUEST : (e.status as HttpStatus);
-      if (status >= 500) this.logger.warn(`проекты: ${status} ${e.message}`);
-      throw new ApiError(status, e.message, codeFor(status));
+      // 499 — внутренний признак «человек ушёл» (клиент оборвал запрос). Это не ошибка клиента
+      // и не сбой сервера: отдаём код как есть, чтобы приложение не показывало отмену как сбой
+      // и не предлагало «Повторить» там, где повторять нечего.
+      const status = e.status;
+      if (status >= 500 && status !== CLIENT_GONE) {
+        this.logger.warn(`проекты: ${status} ${e.message}`);
+      }
+      throw new ApiError(status as HttpStatus, e.message, codeFor(status));
     }
+  }
+
+  /**
+   * Закрывает поток событий, отправив причину событием `error`.
+   *
+   * Просто `res.end()` клиент видит как «поток закончился сам»: у него нет ни `done`, ни
+   * ошибки, и экран остаётся в состоянии ожидания до срабатывания watchdog'а. Событие ошибки
+   * доводит причину до человека, не дописывая в переписку пустой ответ.
+   */
+  private closeStream(res: Response, message: string): void {
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'error', message })}\n\n`);
+    } catch {
+      // соединение уже мертво — писать некуда, молчание тут честнее исключения
+    }
+    res.end();
   }
 }
 
@@ -549,6 +605,9 @@ function codeFor(status: number): string {
       return 'bad_request';
     case HttpStatus.CONFLICT:
       return 'busy';
+    case CLIENT_GONE:
+      // Отмена человеком: приложение по этому коду не показывает ошибку и не предлагает повтор
+      return 'cancelled';
     case HttpStatus.SERVICE_UNAVAILABLE:
     case HttpStatus.BAD_GATEWAY:
     case HttpStatus.GATEWAY_TIMEOUT:

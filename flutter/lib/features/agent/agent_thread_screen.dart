@@ -120,6 +120,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// прогон на локальной модели занимает минуты.
   Timer? _ticker;
 
+  /// Подписка на возврат приложения на передний план (см. [initState]).
+  AppLifecycleListener? _lifecycle;
+
   /// Контроллер разговора, взятый один раз в `initState`.
   late final AgentThreadController _thread;
 
@@ -143,6 +146,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     super.initState();
     _thread = ref.read(agentThreadProvider.notifier);
     _scroll.addListener(_trackScroll);
+    // Возврат приложения на передний план: свернутое приложение ОС усыпляет вместе с сокетами,
+    // и о смерти потока никто не сообщает. Контроллер по этому сигналу переподключится и
+    // получит снимок идущего прогона — ответ не потеряется.
+    _lifecycle = AppLifecycleListener(onResume: _thread.resume);
     // историю запрашиваем после первого кадра: провайдеры трогать в initState нельзя
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -166,6 +173,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     // экран при возврате подключится к идущему прогону и покажет ответ целиком. Останавливает
     // только «Стоп», закрывает процесс — «Закрыть на маке» в меню.
     _ticker?.cancel();
+    _lifecycle?.dispose();
     _thread.detach();
     _input.dispose();
     _scroll.dispose();
@@ -567,7 +575,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       );
     }
     // элементы разворачиваются в сообщения один раз на сборку: от них же зависит и их число
-    final entries = _entries(state.items);
+    final entries = _entries(state.items, streaming: state.sending);
     return ListView.builder(
       controller: _scroll,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
@@ -578,13 +586,39 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     );
   }
 
+  /// Уже разобранный журнал переписки и список, из которого он собран.
+  ///
+  /// Сборка кадра случается и тогда, когда переписка не менялась: секундный таймер работы,
+  /// снимок работы на маке, перерисовка от родителя. Разбор блоков и карточек — это обход всей
+  /// переписки, поэтому результат запоминается по идентичности списка сообщений.
+  List<_Entry>? _entriesCache;
+  List<AgentItem>? _entriesFor;
+  bool _entriesStreaming = false;
+
   /// Разворачивает элементы разговора в плоский список сообщений.
   ///
   /// Один ответ агента приходит одним [AgentItem] с блоками внутри (текст, карточка команды,
   /// снова текст), и порядок этих блоков — это порядок работы агента. Рисовать их одним
   /// пузырём значит перемешивать команды и текст в одном сообщении, поэтому блок становится
   /// отдельным сообщением, а порядок блоков задаёт порядок списка.
-  List<_Entry> _entries(List<AgentItem> items) {
+  ///
+  /// [streaming] — ответ пишется прямо сейчас: его хвост показывается простым текстом (см.
+  /// [_entryContent]), чтобы markdown не разбирался заново на каждую пачку дельт.
+  List<_Entry> _entries(List<AgentItem> items, {required bool streaming}) {
+    if (_entriesCache != null &&
+        identical(_entriesFor, items) &&
+        _entriesStreaming == streaming) {
+      return _entriesCache!;
+    }
+    final entries = _buildEntries(items, streaming);
+    _entriesFor = items;
+    _entriesStreaming = streaming;
+    _entriesCache = entries;
+    return entries;
+  }
+
+  /// Разбирает переписку в сообщения журнала (без кэша — см. [_entries]).
+  List<_Entry> _buildEntries(List<AgentItem> items, bool streaming) {
     final entries = <_Entry>[];
     for (final item in items) {
       // блоки разбираем в свой список: ошибку прогона надо привязать к последнему сообщению
@@ -611,13 +645,16 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           mine.add(_Entry(_EntryKind.tool, tool: tool));
         }
       } else {
+        // Карточки инструментов ищутся по идентификатору: список вызовов обходится один раз,
+        // а не заново для каждого блока ответа (у длинного прогона и блоков, и вызовов десятки)
+        final byId = <String, AgentTool>{
+          for (final tool in item.tools) tool.id: tool,
+        };
         for (final block in item.blocks) {
           if (block.isTool) {
             // карточка адресуется идентификатором: сам вывод лежит в [AgentItem.tools], и
             // ссылка без него означала бы сообщение из ничего
-            final tool = item.tools
-                .where((t) => t.id == block.toolId)
-                .firstOrNull;
+            final tool = byId[block.toolId];
             if (tool != null) mine.add(_Entry(_EntryKind.tool, tool: tool));
           } else if (block.isReasoning) {
             mine.add(_Entry(_EntryKind.reasoning, text: block.text));
@@ -637,6 +674,11 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         mine[mine.length - 1] = mine.last.copyWith(error: item.error);
       }
       entries.addAll(mine);
+    }
+    // Ответ дописывается прямо сейчас: его последний кусок показывается простым текстом —
+    // разбор markdown всего сообщения на каждую пачку дельт и есть та самая «тупеж» вывода
+    if (streaming && entries.isNotEmpty && items.isNotEmpty && items.last.isAssistant) {
+      entries[entries.length - 1] = entries.last.copyWith(streaming: true);
     }
     return entries;
   }
@@ -734,6 +776,18 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       children: [
         if (entry.text.isNotEmpty)
           isUser
+              ? SelectableText(
+                  entry.text,
+                  style: const TextStyle(
+                    color: C.fg,
+                    fontSize: _textSize,
+                    height: 1.35,
+                  ),
+                )
+              // Пока ответ пишется, он идёт простым текстом: markdown всего сообщения
+              // разбирается заново при каждом изменении строки, и на длинном ответе это не
+              // влезает в бюджет кадра. Разметка включается, как только прогон закончился.
+              : entry.streaming
               ? SelectableText(
                   entry.text,
                   style: const TextStyle(
@@ -1120,7 +1174,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                   // отступ текста от края экрана
                   contentPadding: const EdgeInsets.fromLTRB(14, 10, 52, 10),
                 ),
-                onChanged: (_) => setState(() {}),
               ),
             ),
             // Кнопка у правого нижнего края — одна, и что она делает, решает состояние:
@@ -1136,38 +1189,43 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
             Positioned(
               right: 4,
               bottom: 2,
-              child: _transcribing
-                  ? const Padding(
-                      padding: EdgeInsets.all(12),
-                      child: SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+              // Кнопка зависит только от текста в поле: подписка на контроллер вместо setState
+              // на каждое нажатие клавиши не даёт переписывать всю переписку при вводе
+              child: ValueListenableBuilder<TextEditingValue>(
+                valueListenable: _input,
+                builder: (context, value, _) => _transcribing
+                    ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      )
+                    : _recording
+                    ? IconButton(
+                        tooltip: 'Остановить запись',
+                        onPressed: _stopRecordingAndTranscribe,
+                        icon: const Icon(
+                          Icons.stop_circle_outlined,
+                          color: C.danger,
+                          size: 32,
+                        ),
+                      )
+                    : value.text.trim().isEmpty
+                    ? IconButton(
+                        tooltip: 'Голосовой ввод',
+                        onPressed: _startRecording,
+                        icon: const Icon(Icons.mic_none, size: 28, color: C.fg3),
+                      )
+                    : IconButton(
+                        tooltip: state.sending
+                            ? 'Отправить в очередь'
+                            : 'Отправить',
+                        onPressed: _send,
+                        icon: const Icon(Icons.send, size: 28, color: C.accent),
                       ),
-                    )
-                  : _recording
-                  ? IconButton(
-                      tooltip: 'Остановить запись',
-                      onPressed: _stopRecordingAndTranscribe,
-                      icon: const Icon(
-                        Icons.stop_circle_outlined,
-                        color: C.danger,
-                        size: 32,
-                      ),
-                    )
-                  : _input.text.trim().isEmpty
-                  ? IconButton(
-                      tooltip: 'Голосовой ввод',
-                      onPressed: _startRecording,
-                      icon: const Icon(Icons.mic_none, size: 28, color: C.fg3),
-                    )
-                  : IconButton(
-                      tooltip: state.sending
-                          ? 'Отправить в очередь'
-                          : 'Отправить',
-                      onPressed: _send,
-                      icon: const Icon(Icons.send, size: 28, color: C.accent),
-                    ),
+              ),
             ),
           ],
         ),
@@ -1290,6 +1348,9 @@ class _Entry {
   /// Ошибка прогона, показываемая под текстом этого сообщения.
   final String error;
 
+  /// Ответ пишется прямо сейчас: рисуется простым текстом, без разбора markdown.
+  final bool streaming;
+
   /// Пункт переписки.
   const _Entry(
     this.kind, {
@@ -1297,6 +1358,7 @@ class _Entry {
     this.tool,
     this.command = '',
     this.error = '',
+    this.streaming = false,
   });
 
   /// Что уйдёт в буфер по кнопке «скопировать».
@@ -1315,12 +1377,13 @@ class _Entry {
   };
 
   /// Копия с добавленной ошибкой прогона (остальные поля не меняются).
-  _Entry copyWith({String? error}) => _Entry(
+  _Entry copyWith({String? error, bool? streaming}) => _Entry(
     kind,
     text: text,
     tool: tool,
     command: command,
     error: error ?? this.error,
+    streaming: streaming ?? this.streaming,
   );
 }
 
@@ -1503,7 +1566,7 @@ const _actionButtonStyle = ButtonStyle(
 ///
 /// Шрифт и кегль — те же, что у ответа агента, поэтому служебное отличается от него только
 /// цветом. Пустые строки выкидываются: команды печатают их пачками, а несут они только высоту.
-class _OutputText extends StatelessWidget {
+class _OutputText extends StatefulWidget {
   /// Текст как он пришёл.
   final String text;
 
@@ -1514,8 +1577,37 @@ class _OutputText extends StatelessWidget {
   const _OutputText(this.text, {this.color = C.fg3});
 
   @override
+  State<_OutputText> createState() => _OutputTextState();
+}
+
+/// Состояние показа вывода: хранит очищенный от пустых строк текст.
+///
+/// Очистка — это `split` + `map` + `join` по всему выводу команды, а кадров за один прогон
+/// немало; пересчитывать её на каждый кадр — заметная работа впустую.
+class _OutputTextState extends State<_OutputText> {
+  /// Текст без пустых строк.
+  String _compact = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  @override
+  void didUpdateWidget(_OutputText old) {
+    super.didUpdateWidget(old);
+    if (!identical(old.text, widget.text)) _refresh();
+  }
+
+  /// Пересчитывает очищенный текст — только когда изменился исходный.
+  void _refresh() {
+    _compact = _compactLines(widget.text);
+  }
+
+  @override
   Widget build(BuildContext context) => SelectableText(
-    _compactLines(text),
-    style: TextStyle(color: color, fontSize: _textSize, height: 1.35),
+    _compact,
+    style: TextStyle(color: widget.color, fontSize: _textSize, height: 1.35),
   );
 }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -785,21 +786,52 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// заново вместе с расходом токенов.
   String _runningText = '';
 
-  /// Уже пробовали подключиться к оборвавшемуся прогону.
+  /// Время последнего события от сервера: по нему сторож решает, что поток замолчал.
+  DateTime? _lastEventAt;
+
+  /// Когда началась полоса неудачных переподключений: паузы растут по этому времени, а через
+  /// минуту попытки прекращаются, и причина показывается человеку.
+  DateTime? _failingSince;
+
+  /// Идёт переподключение: второй цикл поверх первого не запускается.
+  bool _reconnecting = false;
+
+  /// Сторож молчания: пока идёт прогон, раз в пять секунд проверяет, живы ли события.
+  Timer? _watchdog;
+
+  /// Накопленный, но ещё не показанный текст ответа и «размышлений».
   ///
-  /// Одна попытка на прогон: если и она не удалась, дальше только ошибка, иначе при мёртвом
-  /// соединении приложение уходило бы в бесконечный круг переподключений.
-  bool _resumed = false;
+  /// Дельты приходят десятками в секунду; применять каждую сразу — значит пересобирать
+  /// состояние и перерисовывать markdown по тридцать-пятьдесят раз в секунду. Поэтому куски
+  /// копятся здесь и показываются не чаще десяти раз в секунду (см. [_flushSoon]).
+  String _pendingText = '';
+  String _pendingReasoning = '';
+
+  /// Таймер показа накопленного: срабатывает один раз на пачку дельт.
+  Timer? _flushTimer;
+
+  /// Поток дошёл до конца прогона (`done`, `idle`) или до ошибки: закрытие потока после этого
+  /// уже не считается обрывом.
+  bool _sawTerminal = false;
+
+  /// Начатый прогон ещё не завёл свой пузырь ответа.
+  ///
+  /// Нужно потому, что история с мака не обязана содержать незавершённый ответ: у одного
+  /// харнесса он пишется в файл сразу, у другого — только по завершении хода. Без этого
+  /// признака первый же кусок нового ответа приклеился бы к прошлому сообщению агента.
+  bool _newAnswerPending = false;
 
   /// Клиент моста.
   AgentApi get _api => ref.read(agentApiProvider);
 
   @override
   AgentThreadState build() {
-    // уход с экрана не должен оставлять висящий запрос: разрыв соединения гасит и работу
-    // агента на маке (мост шлёт abort), а не только поток в приложении
+    // Уход с экрана отпускает поток и сторожей, но НЕ останавливает агента: работа продолжается
+    // на маке, а при возврате экран подключится к идущему прогону и получит снимок ответа.
     ref.onDispose(() {
       _sub?.cancel();
+      _stopWatchdog();
+      _flushTimer?.cancel();
       _finish();
     });
     return const AgentThreadState();
@@ -834,18 +866,10 @@ class AgentThreadController extends Notifier<AgentThreadState> {
       runStartedAt: DateTime.now(),
     );
     _cancelledByUser = false;
+    _newAnswerPending = true;
     final done = Completer<void>();
     _done = done;
-    _sub = _api
-        .running(sessionId)
-        .listen(
-          _applyEvent,
-          onError: (Object e) {
-            if (!_cancelledByUser) _fail(e);
-            _finish();
-          },
-          onDone: _finish,
-        );
+    _hold(_api.running(sessionId), sessionId);
     await done.future;
   }
 
@@ -854,10 +878,17 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final prompt = text.trim();
     final session = state.session;
     if (prompt.isEmpty || session == null) return;
-    // Такой же вопрос, пока на него не ответили, второй раз не отправляем: отправка стоит
+    // Тот же вопрос, пока на него не ответили, второй раз не отправляем: отправка стоит
     // целого прогона, а ответ придёт и без неё. Строкой в переписке объясняем, почему отправки
-    // не произошло, — молчать про нажатую кнопку хуже.
-    if (state.sending && _runningText == prompt) {
+    // не произошло, — молчать про нажатую кнопку хуже. Совпадение текста считаем случайным
+    // только в первые секунды: осознанно повторённый вопрос должен уехать к агенту.
+    final since = state.runStartedAt;
+    final accidental =
+        state.sending &&
+        _runningText == prompt &&
+        since != null &&
+        DateTime.now().difference(since) < const Duration(seconds: 3);
+    if (accidental) {
       state = state.copyWith(
         items: [
           ...state.items,
@@ -880,7 +911,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     if (state.sending) {
       // Агент занят — сообщение встаёт в очередь на маке и уедет, как только он освободится.
       // Отказывать нельзя: человек дописывает уточнение, пока агент ещё работает.
-      await _queue(session.id, prompt);
+      await _queue(session.id, prompt, _newMessageId());
       return;
     }
     await _run(session.id, prompt);
@@ -892,9 +923,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// обычным путём: иначе он остался бы висеть в очереди, которой уже нет. Если мост узнал
   /// такой же вопрос в работе или в очереди, он повтор не принимает — тогда показываем это
   /// строкой и настоящее место, а второй раз не отправляем.
-  Future<void> _queue(String sessionId, String prompt) async {
+  Future<void> _queue(String sessionId, String prompt, String messageId) async {
     try {
-      final result = await _api.queueMessage(sessionId, prompt);
+      final result = await _api.queueMessage(sessionId, prompt, messageId);
       if (result.duplicate) {
         state = state.copyWith(
           queued: result.position,
@@ -918,17 +949,32 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     }
   }
 
-  /// Повторяет последний вопрос после ошибки.
+  /// Повторяет работу после ошибки: сначала пробует вернуться к идущему прогону и только
+  /// если на маке ничего не считается — отправляет последний вопрос заново.
   ///
-  /// Ничего не дописывает: вопрос уже в переписке, а ответ на него не пришёл.
+  /// Раньше здесь всегда была повторная отправка, и после любого обрыва связи тот же вопрос
+  /// уезжал агенту второй раз: два полных прогона и двойной расход токенов на один вопрос.
   Future<void> retry() async {
     final session = state.session;
+    if (session == null || state.sending) return;
+    state = state.clearError();
+    // Свежее состояние сессии отвечает на главный вопрос: считается ли там что-то сейчас
+    try {
+      final fresh = await _api.session(session.id);
+      state = state.copyWith(session: fresh);
+      if (fresh.busy) {
+        await _followRunning(session.id);
+        return;
+      }
+    } on AgentApiException {
+      // Состояние не спросили (мост недоступен) — пробуем отправить вопрос: если прогон всё же
+      // идёт, мост отсечёт повтор и подключит экран к ответу
+    }
     final lastUser = state.items.lastWhere(
       (i) => i.isUser,
       orElse: () => const AgentItem(kind: 'user'),
     );
-    if (session == null || state.sending || lastUser.text.isEmpty) return;
-    state = state.clearError();
+    if (lastUser.text.isEmpty) return;
     await _run(session.id, lastUser.text);
   }
 
@@ -946,11 +992,16 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// Отпускает поток, не трогая агента: экран закрыли, а работа на маке продолжается.
   ///
   /// Так и должно быть: человек ушёл с экрана — не то же самое, что «останови работу». Ответ
-  /// продолжает писаться (мост его сохранит), а при возврате экран подключится к идущему прогону
-  /// и покажет его целиком. Останавливает агента только «Стоп».
+  /// продолжает писаться (мост его сохранит), а при возврате экран подключится к идущему
+  /// прогону и получит снимок накопленного — целиком, без пропущенных кусков.
   void detach() {
     _sub?.cancel();
     _sub = null;
+    _stopWatchdog();
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _pendingText = '';
+    _pendingReasoning = '';
     _cancelledByUser = false;
     _finish();
   }
@@ -968,7 +1019,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     await sub.cancel();
     _finish();
     if (!wasSending) return;
-    // Отдельный abort, а не только разрыв соединения: мост гасит работу и по обрыву, но явная
+    // Отдельный abort, а не только разрыв соединения: разрыв поток только закрывает, а явная
     // команда снимает занятость сессии сразу, и следующий вопрос не упрётся в 409. Для
     // закрытой сессии мост отвечает «нечего останавливать» — это не ошибка.
     try {
@@ -1046,8 +1097,11 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     }
   }
 
-  /// Запускает поток ответа на [prompt], который уже лежит в состоянии последним вопросом.
+  /// Запускает прогон: отправляет [prompt] агенту и показывает ответ потоком.
   Future<void> _run(String sessionId, String prompt) async {
+    // Идентификатор у каждого сообщения свой: по нему мост отличает новый вопрос от повтора
+    // того же текста, поэтому осознанно отправленные два «продолжай» больше не теряются
+    final messageId = _newMessageId();
     state = state.copyWith(
       sending: true,
       step: '',
@@ -1055,94 +1109,179 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     );
     _cancelledByUser = false;
     _runningText = prompt;
-    _resumed = false;
+    _newAnswerPending = true;
     final done = Completer<void>();
     _done = done;
-
-    _sub = _api
-        .prompt(sessionId, prompt)
-        .listen(
-          _applyEvent,
-          onError: (Object e) => _onStreamBroken(sessionId, e),
-          onDone: _finish,
-        );
-
+    _hold(_api.prompt(sessionId, prompt, messageId), sessionId);
     await done.future;
   }
 
-  /// Поток ответа оборвался: подключаемся к идущему прогону, а не показываем ошибку.
+  /// Подписывает экран на поток прогона и заводит сторожей молчания.
   ///
-  /// Обрыв потока не значит, что прогон кончился: работу на маке мост не гасит (сеть мигнула,
-  /// экран свернули, приложение перезапустили), и ответ продолжает писаться. Раньше здесь сразу
-  /// появлялась ошибка с кнопкой «Повторить», человек по ней отправлял тот же вопрос, и агент
-  /// прогонял ту же работу заново — по нескольку раз на один вопрос. Теперь сначала идём в /events
-  /// (ручка для наблюдения за идущим прогоном), а ошибку показываем, только если прогона там уже
-  /// нет или повторное подключение тоже оборвалось: тогда «Повторить» осмысленно.
-  void _onStreamBroken(String sessionId, Object error) {
-    if (_cancelledByUser || _resumed) {
-      _fail(error);
-      _finish();
-      return;
-    }
-    _resumed = true;
-    state = state.copyWith(step: 'связь прервалась — продолжаю смотреть ответ');
-    _sub = _api
-        .running(sessionId)
-        .listen(
-          (event) {
-            // Прогона нет: пока связи не было, он либо дописался, либо оборвался. Что именно —
-            // видно только по истории на маке, её и перечитываем.
-            if (event.idle) {
-              unawaited(_reloadAfterBreak(error));
-              return;
-            }
-            _applyEvent(event);
-          },
-          onError: (Object e) {
-            _fail(e);
-            _finish();
-          },
-          onDone: _finish,
-        );
+  /// Один вход для обоих сценариев: своё сообщение (ручка `prompt`) и наблюдение за идущим
+  /// прогоном (ручка `events`). Поток может оборваться в любой момент — это не конец работы,
+  /// поэтому обрыв ведёт не к ошибке, а к переподключению (см. [_reconnect]).
+  void _hold(Stream<AgentEvent> stream, String sessionId) {
+    _failingSince = null;
+    _lastEventAt = DateTime.now();
+    _startWatchdog();
+    _listen(stream, sessionId);
   }
 
-  /// Перечитывает переписку после обрыва и решает, показать ли ошибку.
+  /// Подписывается на поток и разводит его конец на «прогон закончился» и «связь оборвалась».
   ///
-  /// История приходит с мака, и в ней уже есть всё, что агент успел написать без нас: если
-  /// ответ там есть, показываем его и ошибки не показываем. Если последним стоит вопрос без
-  /// ответа, значит ответ потерян вместе со связью — тогда причина видна, а вопрос на месте,
-  /// и его можно повторить.
-  Future<void> _reloadAfterBreak(Object error) async {
-    final sessionId = state.session?.id;
-    if (sessionId != null) {
-      try {
-        state = state.copyWith(items: await _api.messages(sessionId));
-      } on AgentApiException {
-        // Историю не отдали — ниже показываем причину обрыва: она честнее молчания
+  /// Разница принципиальна: `done`/`idle` — нормальный конец, а закрытие потока без них значит,
+  /// что связь пропала (свернули приложение, мигнула сеть, мост перезапускается), и к прогону
+  /// надо вернуться, а не показывать ошибку.
+  void _listen(Stream<AgentEvent> stream, String sessionId) {
+    _sub?.cancel();
+    _sawTerminal = false;
+    _sub = stream.listen(
+      _applyEvent,
+      onError: (Object e) => unawaited(_reconnect(sessionId, e)),
+      onDone: () {
+        if (_sawTerminal || _cancelledByUser) {
+          _finish();
+          return;
+        }
+        unawaited(_reconnect(sessionId, null));
+      },
+    );
+  }
+
+  /// Возвращается к идущему прогону после обрыва связи.
+  ///
+  /// Раньше на месте этой функции стояла одна попытка и кнопка «Повторить»: человек по ней
+  /// отправлял тот же вопрос, и агент прогонял ту же работу заново — по нескольку раз на один
+  /// вопрос. Теперь попытки идут сами с растущей паузой (0,3 → 5 с), а причина показывается,
+  /// только если за минуту связь так и не вернулась или прогон на маке закончился без нас.
+  Future<void> _reconnect(String sessionId, Object? error) async {
+    if (_reconnecting || _cancelledByUser || !state.sending) return;
+    if (state.session?.id != sessionId) return;
+    _reconnecting = true;
+    try {
+      _failingSince ??= DateTime.now();
+      final failing = DateTime.now().difference(_failingSince!);
+      if (error != null && failing > const Duration(seconds: 60)) {
+        _fail(error);
+        _finish();
+        return;
       }
+      state = state.copyWith(step: 'связь прервалась — продолжаю смотреть ответ');
+      await Future<void>.delayed(_retryDelay());
+      if (_cancelledByUser || !state.sending) return;
+      if (state.session?.id != sessionId) return;
+      _listen(_api.running(sessionId), sessionId);
+    } finally {
+      _reconnecting = false;
     }
-    final items = state.items;
-    if (items.isNotEmpty && items.last.isUser) {
-      state = state.withError(_messageOf(error));
-    }
-    _finish();
+  }
+
+  /// Пауза перед следующей попыткой: 0,3 / 0,8 / 1,5 / 3 / 5 с.
+  ///
+  /// Растёт по времени с начала полосы неудач, а не по номеру попытки: переподключения
+  /// запускаются и событиями потока, и сторожем, а считать их общим числом — значит гадать.
+  Duration _retryDelay() {
+    final failing = DateTime.now().difference(_failingSince ?? DateTime.now());
+    if (failing < const Duration(seconds: 1)) return const Duration(milliseconds: 300);
+    if (failing < const Duration(seconds: 3)) return const Duration(milliseconds: 800);
+    if (failing < const Duration(seconds: 7)) return const Duration(milliseconds: 1500);
+    if (failing < const Duration(seconds: 15)) return const Duration(seconds: 3);
+    return const Duration(seconds: 5);
+  }
+
+  /// Возврат приложения на передний план: переподключается, если поток мог умереть.
+  ///
+  /// Свернутое приложение ОС усыпляет вместе с сокетами, и о смерти соединения никто не
+  /// сообщает: TCP рвётся молча. Поэтому на возврате поток пересоздаётся сразу — мост отдаст
+  /// снимок прогона, и ни один кусок ответа не потеряется.
+  void resume() {
+    final session = state.session;
+    if (!state.sending || session == null) return;
+    _failingSince = null;
+    _reconnecting = false;
+    unawaited(_reconnect(session.id, null));
+  }
+
+  /// Сторож молчания: если от сервера нет ни событий, ни heartbeat дольше 40 с, поток мёртв.
+  ///
+  /// Мост шлёт комментарий SSE каждые 15 с, пока агент молчит, поэтому тишина в 40 с — это уже
+  /// не «модель думает», а оборванное соединение, о котором иначе никто не узнает.
+  void _startWatchdog() {
+    _stopWatchdog();
+    _watchdog = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!state.sending || _cancelledByUser) return;
+      final last = _lastEventAt;
+      if (last == null) return;
+      if (DateTime.now().difference(last) < const Duration(seconds: 40)) return;
+      _lastEventAt = DateTime.now();
+      final session = state.session;
+      if (session != null) unawaited(_reconnect(session.id, null));
+    });
+  }
+
+  /// Останавливает сторож молчания.
+  void _stopWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = null;
+  }
+
+  /// Идентификатор нового сообщения: мост по нему отличает повтор от нового вопроса.
+  String _newMessageId() {
+    final random = Random();
+    final now = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    final tail = random.nextInt(1 << 32).toRadixString(36);
+    return '$now-$tail';
   }
 
   /// Дописывает полученное событие в состояние экрана.
   ///
-  /// Каждый вид события меняет ровно свою часть: текст дописывается в последний ответ,
-  /// инструменты — в его же карточки, состояние — в строку под перепиской. Список
-  /// пересобирается целиком (состояние неизменяемое), но экран перестраивает только хвост.
+  /// Текст и «размышления» не применяются сразу: они копятся и показываются пачкой не чаще
+  /// десяти раз в секунду (см. [_flushSoon]) — иначе markdown хвостового ответа перепарсивался
+  /// бы на каждую дельту, и вывод «тупил». Всё остальное применяется сразу и — важно — после
+  /// показа накопленного: иначе новый текст после карточки инструмента оказался бы выше неё, и
+  /// разговор читался бы не в порядке работы агента.
   void _applyEvent(AgentEvent event) {
+    _lastEventAt = DateTime.now();
+    if (event.text != null || event.reasoning != null) {
+      _pendingText += event.text ?? '';
+      _pendingReasoning += event.reasoning ?? '';
+      _flushSoon();
+      return;
+    }
+    _flushPending();
+
     if (event.error != null) {
+      _sawTerminal = true;
       state = state.withError(event.error!);
+      return;
+    }
+    if (event.snapshot != null) {
+      _applySnapshot(event.snapshot!);
+      return;
+    }
+    if (event.idle) {
+      // Прогона нет: пока связи не было, он либо дописался, либо оборвался. Что именно —
+      // видно только по истории на маке, её и перечитываем
+      _sawTerminal = true;
+      unawaited(_reloadAfterIdle());
       return;
     }
     if (event.status != null) state = state.copyWith(step: event.status!);
     if (event.queued != null) state = state.copyWith(queued: event.queued);
-    if (event.queuedStarted) state = state.copyWith(queued: 0);
+    if (event.queuedStarted) {
+      // Сообщение из очереди ушло агенту: это начало нового ответа, а не продолжение прошлого —
+      // без этого его текст приклеился бы к предыдущему сообщению агента
+      state = state.copyWith(queued: 0);
+      _newAnswerPending = true;
+    }
     if (event.usage != null) state = state.copyWith(usage: event.usage);
     if (event.session != null) state = state.copyWith(session: event.session);
+    if (event.done) {
+      _sawTerminal = true;
+      _finish();
+      return;
+    }
     if (event.note != null) {
       state = state.copyWith(
         items: [
@@ -1169,23 +1308,92 @@ class AgentThreadController extends Notifier<AgentThreadState> {
       _upsertTool(event.toolEnd!, keepArgs: true, finished: true);
       return;
     }
-    if (event.text == null && event.reasoning == null) return;
+  }
 
-    // Текст ответа: инструменты приходят до него, поэтому нужен пустой ответ-контейнер,
-    // если последний элемент переписки — не ответ агента (например, это был вопрос).
+  /// Показывает накопленный текст в ближайшие 100 мс.
+  ///
+  /// Таймер, а не отложенный кадр: дельты приходят пачками по несколько штук подряд, и один
+  /// таймер склеивает всю пачку в одну перерисовку.
+  void _flushSoon() {
+    _flushTimer ??= Timer(const Duration(milliseconds: 100), () {
+      _flushTimer = null;
+      _flushPending();
+    });
+  }
+
+  /// Переносит накопленные дельты в состояние разговора.
+  ///
+  /// Хвост ответа дописывается на месте: куски одного ответа — это одно сообщение, и заводить
+  /// на каждую пачку новый элемент значило бы показывать дельты отдельными репликами.
+  void _flushPending() {
+    final text = _pendingText;
+    final reasoning = _pendingReasoning;
+    _pendingText = '';
+    _pendingReasoning = '';
+    if (text.isEmpty && reasoning.isEmpty) return;
     final items = [...state.items];
-    if (items.isEmpty || !items.last.isAssistant) {
+    if (items.isEmpty || !items.last.isAssistant || _newAnswerPending) {
       items.add(const AgentItem(kind: 'assistant'));
+      _newAnswerPending = false;
     }
     final last = items.last;
     items[items.length - 1] = last.copyWith(
-      text: event.text == null ? null : last.text + event.text!,
-      reasoning: event.reasoning == null
-          ? null
-          : last.reasoning + event.reasoning!,
-      blocks: _appendText(last.blocks, event.text, event.reasoning),
+      text: text.isEmpty ? null : last.text + text,
+      reasoning: reasoning.isEmpty ? null : last.reasoning + reasoning,
+      blocks: _appendText(
+        last.blocks,
+        text.isEmpty ? null : text,
+        reasoning.isEmpty ? null : reasoning,
+      ),
     );
     state = state.copyWith(items: items);
+  }
+
+  /// Заменяет хвост переписки снимком идущего прогона, полученным от моста.
+  ///
+  /// Снимок — это всё, что агент уже написал в текущем ответе. Подключиться к потоку с
+  /// середины нельзя: дельты, вышедшие между снимком истории и подпиской, потерялись бы.
+  /// Поэтому хвост заменяется целиком, а дальше дописываются обычные дельты.
+  ///
+  /// Заменяется только тот самый ответ: если в истории текущего ответа не было (её хвост —
+  /// прошлое сообщение агента), снимок добавляется новым, и прошлое не затирается.
+  void _applySnapshot(AgentItem item) {
+    final items = [...state.items];
+    final last = items.isEmpty ? null : items.last;
+    final same = last != null &&
+        last.isAssistant &&
+        (last.text.isEmpty || item.text.startsWith(last.text));
+    if (same) {
+      items[items.length - 1] = item;
+    } else {
+      items.add(item);
+    }
+    _newAnswerPending = false;
+    state = state.copyWith(items: items);
+  }
+
+  /// Перечитывает переписку, когда прогона на маке больше нет.
+  ///
+  /// История приходит с мака, и в ней уже есть всё, что агент успел написать без нас: если
+  /// ответ там есть, показываем его и ошибки не показываем. Если последним стоит вопрос без
+  /// ответа, значит ответ потерян вместе со связью — тогда причина видна, а вопрос на месте,
+  /// и его можно повторить.
+  Future<void> _reloadAfterIdle() async {
+    final sessionId = state.session?.id;
+    if (sessionId != null) {
+      try {
+        state = state.copyWith(items: await _api.messages(sessionId));
+      } on AgentApiException catch (e) {
+        state = state.withError(e.message);
+        _finish();
+        return;
+      }
+    }
+    final items = state.items;
+    if (items.isNotEmpty && items.last.isUser) {
+      state = state.withError('Ответ не пришёл: связь прервалась. Повторите вопрос.');
+    }
+    _finish();
   }
 
   /// Дописывает кусок текста (или «размышлений») в блоки ответа, сохраняя порядок.
@@ -1299,9 +1507,15 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final done = _done;
     _done = null;
     _sub = null;
+    _stopWatchdog();
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _pendingText = '';
+    _pendingReasoning = '';
     // Прогон закончился: повторять его текст уже некому, а новый вопрос вправе быть таким же
     _runningText = '';
-    _resumed = false;
+    _failingSince = null;
+    _newAnswerPending = false;
     if (state.sending) {
       final items = [...state.items];
       if (items.isNotEmpty && items.last.isAssistant && items.last.isEmpty) {

@@ -101,6 +101,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   Widget? _thread;
   String? _threadKey;
 
+  /// Повтор последнего неудавшегося действия — для кнопки «Повторить» над списком.
+  ///
+  /// Без него повтор всегда перечитывал список, даже когда упало открытие разговора или
+  /// удаление: человек жал кнопку и не получал ни того, что просил, ни объяснения.
+  Future<void> Function()? _retry;
+
   @override
   void initState() {
     super.initState();
@@ -142,7 +148,10 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   void _refresh() {
     if (!mounted) return;
     _ticks += 1;
-    if (_ticks <= 4 || _ticks % 4 == 0) _sessions.load(silent: true);
+    // Снимок работы лёгкий (сервер отдаёт его из памяти), а список пересчитывается на маке
+    // обходом всей истории: поэтому часто он читается только на первых тактах и при действиях,
+    // а дальше раз в 30 секунд
+    if (_ticks <= 4 || _ticks % 6 == 0) _sessions.load(silent: true);
     ref.read(agentActivityProvider.notifier).load();
   }
 
@@ -196,7 +205,30 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       ref.read(agentActivityProvider.notifier).markSeen(sessionId);
     }
     final seq = ++_openSeq;
-    if (embedded) {
+    // Существующий разговор показывается сразу по строке списка: его история лежит в файле на
+    // маке и процесса не требует, а подъём процесса занимает секунду-две. Раньше всё это время
+    // экран оставался пустым — отсюда и ощущение задержки при каждом нажатии на разговор.
+    final fast = sessionId == null
+        ? null
+        : _brief(sessionId, project, harness);
+    if (fast != null) {
+      if (embedded) {
+        setState(() {
+          _starting = false;
+          _selectedId = sessionId;
+          _opened = fast;
+          _openProject = project;
+        });
+      } else {
+        await Navigator.of(context).push(
+          CupertinoPageRoute<void>(
+            builder: (_) => AgentThreadScreen(session: fast, project: project),
+          ),
+        );
+        if (mounted) await _sessions.load();
+        return;
+      }
+    } else if (embedded) {
       setState(() {
         _starting = true;
         _selectedId = sessionId;
@@ -220,10 +252,19 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     // ответ уже никому не нужен, и показывать его нельзя
     if (seq != _openSeq) return;
     if (session == null) {
-      // Причина отказа уже лежит в состоянии списка, а выбранным при этом ничего не остаётся
+      // Причина отказа уже лежит в состоянии списка, а выбранным при этом ничего не остаётся.
+      // Повтор кнопкой над списком должен открыть тот же разговор, а не перечитать список.
+      _retry = () => _open(
+        project,
+        harness: harness,
+        sessionId: sessionId,
+        modelKey: modelKey,
+        embedded: embedded,
+      );
       if (embedded && mounted) _clearSelection();
       return;
     }
+    _retry = null;
     if (!mounted) return;
     if (embedded) {
       setState(() {
@@ -244,6 +285,38 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       ),
     );
     if (mounted) await _sessions.load();
+  }
+
+  /// Краткое описание разговора из строки списка: с ним экран открывается, не дожидаясь моста.
+  ///
+  /// Модель, имя и время берутся из строки (их мост отдаёт в общем списке), а числа контекста и
+  /// расхода остаются пустыми: их знает только живой процесс, и придумывать нули вместо них
+  /// значило бы показывать неправду. По первому же ответу моста описание уточнится.
+  AgentSessionInfo _brief(
+    String sessionId,
+    AgentProject project,
+    String harness,
+  ) {
+    AgentSession? row;
+    for (final s in ref.read(agentSessionsProvider).sessions) {
+      if (s.id == sessionId) {
+        row = s;
+        break;
+      }
+    }
+    return AgentSessionInfo(
+      id: sessionId,
+      path: row?.path.isNotEmpty == true ? row!.path : project.path,
+      name: row?.name ?? '',
+      model: row?.model ?? '',
+      provider: row?.provider ?? '',
+      harness: (row?.harness.isNotEmpty ?? false) ? row!.harness : harness,
+      harnessName: row?.harnessName ?? '',
+      busy: row?.busy ?? false,
+      messages: row?.messages ?? 0,
+      startedAt: row?.startedAt,
+      updatedAt: row?.updatedAt,
+    );
   }
 
   /// Сбрасывает выбор в двухпанельном виде: правая панель возвращается к заглушке.
@@ -649,6 +722,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   }
 
   /// Сообщение об ошибке над списком: «мост недоступен» — состояние раздела, а не сбой строки.
+  ///
+  /// Кнопка повторяет то действие, которое упало ([_retry]); если такого нет — просто
+  /// перечитывает список и снимок работы.
   Widget _errorBar(String message) => Container(
     width: double.infinity,
     margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -670,7 +746,15 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
           ),
         ),
         TextButton(
-          onPressed: () => _sessions.load(),
+          onPressed: () {
+            final retry = _retry;
+            _retry = null;
+            if (retry != null) {
+              retry();
+              return;
+            }
+            _refresh();
+          },
           child: const Text('Повторить'),
         ),
       ],
