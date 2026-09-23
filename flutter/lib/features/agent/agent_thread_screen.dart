@@ -52,6 +52,13 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
   /// именно уйдёт агенту, и жмёт отправку сам — как с распознанным голосом.
   final String? initialPrompt;
 
+  /// Имя, которое получит разговор после первого отправленного сообщения.
+  ///
+  /// Раньше первого сообщения имя не поставить: харнесс держит его записью в журнале сессии, а
+  /// журнала у только что открытого разговора ещё нет — мост на такое переименование отвечает
+  /// «сессия не найдена».
+  final String? pendingName;
+
   /// Уход из панели: сброс выбранного разговора в списке.
   ///
   /// Назван отдельно от возврата назад, потому что панель — не маршрут: `Navigator.pop` здесь
@@ -67,6 +74,7 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
     this.paneWidth,
     this.onDismiss,
     this.initialPrompt,
+    this.pendingName,
   });
 
   @override
@@ -129,6 +137,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
   /// Подписка на возврат приложения на передний план (см. [initState]).
   AppLifecycleListener? _lifecycle;
+
+  /// Имя из [AgentThreadScreen.pendingName] уже поставлено — второй раз не переименовываем.
+  bool _named = false;
 
   /// Контроллер разговора, взятый один раз в `initState`.
   late final AgentThreadController _thread;
@@ -214,6 +225,18 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     // принудительно, даже если он перед этим читал середину переписки
     _follow = true;
     await _thread.send(text);
+    await _applyPendingName();
+  }
+
+  /// Ставит разговору имя, с которым его открыли (например, `repo#123` из доски PR).
+  ///
+  /// После первого сообщения, а не при открытии: журнал сессии появляется только вместе с ним,
+  /// а имя харнесс хранит именно в журнале.
+  Future<void> _applyPendingName() async {
+    final name = widget.pendingName;
+    if (_named || name == null || name.isEmpty) return;
+    _named = true;
+    await ref.read(agentSessionsProvider.notifier).rename(widget.session.id, name);
   }
 
   /// Начинает запись голосового ввода.

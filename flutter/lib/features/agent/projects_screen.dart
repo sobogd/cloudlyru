@@ -10,6 +10,7 @@ import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/widgets.dart';
 import 'agent_controller.dart';
+import 'agent_launch.dart';
 import 'agent_new_session.dart';
 import 'agent_thread_screen.dart';
 import 'agent_types.dart';
@@ -66,6 +67,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
   /// Текст, с которым открывается следующий разговор (просьба о ревью из доски PR).
   String? _openPrompt;
+
+  /// Имя, которое получит следующий открытый разговор (`repo#123` из доски PR).
+  String? _openName;
 
   /// Контроллер списка проектов (он же отдаёт состояние моста).
   late final AgentProjectsController _projects;
@@ -188,7 +192,26 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// списка (телефон): режим выбирает раскладка ([build]), а не сам мастер.
   /// [prompt] — текст, который ляжет в поле ввода открытого разговора (просьба о ревью из
   /// доски пул-реквестов). Отправку делает человек сам.
-  Future<void> _newSession({required bool wide, String? prompt}) async {
+  ///
+  /// [sessionName] — имя разговора (`repo#123` из доски PR). Разговор с таким именем уже есть —
+  /// открывается он, без мастера: ревью одного пул-реквеста живёт в одной переписке.
+  Future<void> _newSession({
+    required bool wide,
+    String? prompt,
+    String? sessionName,
+  }) async {
+    if (sessionName != null && sessionName.isNotEmpty) {
+      final existing = findSessionByName(ref, sessionName);
+      if (existing != null) {
+        await _open(
+          AgentProject.fromPath(existing.path),
+          harness: existing.harness,
+          sessionId: existing.id,
+          embedded: wide,
+        );
+        return;
+      }
+    }
     final choice = await showNewSessionWizard(context, ref);
     if (choice == null || !mounted) return;
     if (choice.modelKey != null) {
@@ -203,6 +226,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       modelKey: choice.modelKey,
       embedded: wide,
       prompt: prompt,
+      nameIt: sessionName,
     );
   }
 
@@ -219,10 +243,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     String? modelKey,
     required bool embedded,
     String? prompt,
+    String? nameIt,
   }) async {
-    // Текст переживает открытие: пока мост поднимает процесс, показать его негде, а панель
+    // Текст и имя переживают открытие: пока мост поднимает процесс, показать их негде, а панель
     // разговора строится уже после ответа.
     _openPrompt = prompt;
+    _openName = nameIt;
     // Разговор, который открывают, больше не «готов»: человек увидит его сам
     if (sessionId != null) {
       ref.read(agentActivityProvider.notifier).markSeen(sessionId);
@@ -308,10 +334,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
           session: session,
           project: project,
           initialPrompt: prompt,
+          pendingName: nameIt,
         ),
       ),
     );
     _openPrompt = null;
+    _openName = null;
     if (mounted) await _sessions.load();
   }
 
@@ -466,7 +494,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
               ? _body(state, wide: wide)
               : PullRequestsScreen(
                   embedded: true,
-                  onReview: (prompt) => _newSession(wide: wide, prompt: prompt),
+                  onReview: (name, prompt) =>
+                      _newSession(wide: wide, prompt: prompt, sessionName: name),
                 ),
         ),
       ],
@@ -544,7 +573,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     if (_threadKey != key || _thread == null) {
       _threadKey = key;
       final prompt = _openPrompt;
+      final pendingName = _openName;
       _openPrompt = null;
+      _openName = null;
       _thread = AgentThreadScreen(
         // Ключ по сессии: смена разговора обязана выбросить состояние прежнего — прокрутку,
         // черновик в поле ввода и раскрытые карточки инструментов
@@ -555,6 +586,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         paneWidth: width,
         onDismiss: _clearSelection,
         initialPrompt: prompt,
+        pendingName: pendingName,
       );
     }
     return _thread!;

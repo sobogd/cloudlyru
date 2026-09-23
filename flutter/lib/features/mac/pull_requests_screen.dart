@@ -137,7 +137,9 @@ class PullRequestsScreen extends ConsumerStatefulWidget {
   ///
   /// Нужно, чтобы в «Проектах» разговор открывался в правой панели рядом со списком, а не
   /// экраном поверх него. `null` — доска поднимает сессию сама ([startAgentSession]).
-  final Future<void> Function(String prompt)? onReview;
+  ///
+  /// Первым аргументом идёт имя разговора (`repo#123`), вторым — текст просьбы.
+  final Future<void> Function(String sessionName, String prompt)? onReview;
 
   @override
   ConsumerState<PullRequestsScreen> createState() => _PullRequestsScreenState();
@@ -225,6 +227,9 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
     }
   }
 
+  /// Имя разговора для этого PR: по нему второе нажатие робота возвращает в ту же переписку.
+  String _sessionName(Map<String, dynamic> row) => '${row['repo']}#${row['number']}';
+
   /// Готовая команда ревью для этого PR.
   String _reviewPrompt(Map<String, dynamic> row) =>
       '/pr-review ${row['url'] ?? ''} без оверинжиниринга, если есть замечания review all '
@@ -245,15 +250,21 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   ///
   /// Мастер выбора папки и модели — тот же, что в «Проектах»: ревью просят у агента в той папке,
   /// где лежит репозиторий, и выбор харнесса/модели остаётся за человеком.
+  /// Открывает разговор ревью для этого PR: уже начатый — продолжает, нового — заводит.
   Future<void> _reviewWithAgent(Map<String, dynamic> row) async {
     final url = '${row['url'] ?? ''}';
     if (url.isEmpty) return;
     final host = widget.onReview;
     if (host != null) {
-      await host(_reviewPrompt(row));
+      await host(_sessionName(row), _reviewPrompt(row));
       return;
     }
-    await startAgentSession(context, ref, prompt: _reviewPrompt(row));
+    await startAgentSession(
+      context,
+      ref,
+      prompt: _reviewPrompt(row),
+      sessionName: _sessionName(row),
+    );
   }
 
   /// Меню строки: что можно сделать с этим пул-реквестом.
@@ -267,7 +278,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
           children: [
             ListTile(
               leading: const Icon(Icons.smart_toy_outlined),
-              title: const Text('Отдать на ревью агенту'),
+              title: Text('Ревью агентом · ${_sessionName(row)}'),
               onTap: () {
                 Navigator.pop(sheet);
                 _reviewWithAgent(row);
