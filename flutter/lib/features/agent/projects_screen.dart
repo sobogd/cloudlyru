@@ -34,6 +34,15 @@ class ProjectsScreen extends ConsumerStatefulWidget {
   ConsumerState<ProjectsScreen> createState() => _ProjectsScreenState();
 }
 
+/// Что показывает левая колонка раздела.
+enum _Tab {
+  /// Разговоры с агентами.
+  sessions,
+
+  /// Доска открытых пул-реквестов.
+  pulls,
+}
+
 /// Состояние экрана: контроллеры, снимок работы, выбранный разговор и его панель.
 class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// Минимальная ширина раздела, с которой список разговоров и сам разговор показываются рядом.
@@ -51,6 +60,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
   /// Контроллер общего списка разговоров.
   late final AgentSessionsController _sessions;
+
+  /// Что показано в левой колонке: разговоры или пул-реквесты.
+  _Tab _tab = _Tab.sessions;
+
+  /// Текст, с которым открывается следующий разговор (просьба о ревью из доски PR).
+  String? _openPrompt;
 
   /// Контроллер списка проектов (он же отдаёт состояние моста).
   late final AgentProjectsController _projects;
@@ -171,7 +186,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   ///
   /// [wide] — открывать разговор в правой панели (широкий экран) или отдельным экраном поверх
   /// списка (телефон): режим выбирает раскладка ([build]), а не сам мастер.
-  Future<void> _newSession({required bool wide}) async {
+  /// [prompt] — текст, который ляжет в поле ввода открытого разговора (просьба о ревью из
+  /// доски пул-реквестов). Отправку делает человек сам.
+  Future<void> _newSession({required bool wide, String? prompt}) async {
     final choice = await showNewSessionWizard(context, ref);
     if (choice == null || !mounted) return;
     if (choice.modelKey != null) {
@@ -185,6 +202,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       harness: choice.harness,
       modelKey: choice.modelKey,
       embedded: wide,
+      prompt: prompt,
     );
   }
 
@@ -200,7 +218,11 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     String? sessionId,
     String? modelKey,
     required bool embedded,
+    String? prompt,
   }) async {
+    // Текст переживает открытие: пока мост поднимает процесс, показать его негде, а панель
+    // разговора строится уже после ответа.
+    _openPrompt = prompt;
     // Разговор, который открывают, больше не «готов»: человек увидит его сам
     if (sessionId != null) {
       ref.read(agentActivityProvider.notifier).markSeen(sessionId);
@@ -282,9 +304,14 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       // идёт на композиторе и ничего не перестраивает: список остаётся жив под экраном вместе
       // с прокруткой, поэтому возврат мгновенный.
       CupertinoPageRoute<void>(
-        builder: (_) => AgentThreadScreen(session: session, project: project),
+        builder: (_) => AgentThreadScreen(
+          session: session,
+          project: project,
+          initialPrompt: prompt,
+        ),
       ),
     );
+    _openPrompt = null;
     if (mounted) await _sessions.load();
   }
 
@@ -434,7 +461,14 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       children: [
         _sidebarHeader(),
         if (state.error != null) _errorBar(state.error!),
-        Expanded(child: _body(state, wide: wide)),
+        Expanded(
+          child: _tab == _Tab.sessions
+              ? _body(state, wide: wide)
+              : PullRequestsScreen(
+                  embedded: true,
+                  onReview: (prompt) => _newSession(wide: wide, prompt: prompt),
+                ),
+        ),
       ],
     ),
   );
@@ -451,22 +485,25 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       padding: const EdgeInsets.only(left: 16, right: 4),
       child: Row(
         children: [
-          const Expanded(
-            child: Text('Проекты', style: TextStyle(color: C.fg, fontSize: 18)),
+          Expanded(
+            child: Text(_tab == _Tab.sessions ? 'Проекты' : 'Пул-реквесты',
+                style: const TextStyle(color: C.fg, fontSize: 18)),
           ),
-          // Пул-реквесты стоят здесь, а не только в разделе «Mac»: смотрят их затем же, зачем
-          // открывают проект — чтобы отдать работу агенту, и путь от строки PR до разговора
-          // должен быть в один экран.
-          IconButton(
-            tooltip: 'Пул-реквесты',
-            onPressed: () => Navigator.of(context).push(
-              CupertinoPageRoute<void>(builder: (_) => const PullRequestsScreen()),
-            ),
-            icon: const Icon(Icons.merge_type, color: C.fg2, size: 20),
-          ),
+          // Пул-реквесты живут здесь, а не в разделе «Mac»: смотрят их затем же, зачем
+          // открывают проект — чтобы отдать работу агенту. Вкладкой, а не отдельным экраном,
+          // чтобы на широком экране список PR стоял слева, а разговор открывался справа.
+          _tabButton(_Tab.sessions, Icons.forum_outlined, 'Разговоры'),
+          _tabButton(_Tab.pulls, Icons.merge_type, 'Пул-реквесты'),
         ],
       ),
     ),
+  );
+
+  /// Кнопка переключения вкладки левой колонки.
+  Widget _tabButton(_Tab tab, IconData icon, String tooltip) => IconButton(
+    tooltip: tooltip,
+    onPressed: _tab == tab ? null : () => setState(() => _tab = tab),
+    icon: Icon(icon, size: 20, color: _tab == tab ? C.fg : C.fg2),
   );
 
   /// Правая панель: выбранный разговор, заглушка или спиннер, пока мост поднимает процесс.
@@ -506,6 +543,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     final key = '${session.id}@$width';
     if (_threadKey != key || _thread == null) {
       _threadKey = key;
+      final prompt = _openPrompt;
+      _openPrompt = null;
       _thread = AgentThreadScreen(
         // Ключ по сессии: смена разговора обязана выбросить состояние прежнего — прокрутку,
         // черновик в поле ввода и раскрытые карточки инструментов
@@ -515,6 +554,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         embedded: true,
         paneWidth: width,
         onDismiss: _clearSelection,
+        initialPrompt: prompt,
       );
     }
     return _thread!;

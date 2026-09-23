@@ -124,8 +124,20 @@ final _boardCacheProvider = Provider<_BoardCache>((ref) => _BoardCache());
 /// заголовка ключ задачи и счётчики обсуждения. Группировка, сортировка и фильтры считаются
 /// здесь: переключение не стоит запроса к GitHub и не тратит лимит API.
 class PullRequestsScreen extends ConsumerStatefulWidget {
-  /// Экран пул-реквестов.
-  const PullRequestsScreen({super.key});
+  /// Доска пул-реквестов.
+  const PullRequestsScreen({super.key, this.embedded = false, this.onReview});
+
+  /// Доска показана колонкой внутри другого раздела, а не отдельным экраном.
+  ///
+  /// В этом виде своих `Scaffold` и `AppBar` у неё нет — их рисует раздел, — а группировка,
+  /// сортировка и обновление уезжают в строку фильтров.
+  final bool embedded;
+
+  /// Отдать пул-реквест агенту силами раздела, в который встроена доска.
+  ///
+  /// Нужно, чтобы в «Проектах» разговор открывался в правой панели рядом со списком, а не
+  /// экраном поверх него. `null` — доска поднимает сессию сама ([startAgentSession]).
+  final Future<void> Function(String prompt)? onReview;
 
   @override
   ConsumerState<PullRequestsScreen> createState() => _PullRequestsScreenState();
@@ -236,6 +248,11 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   Future<void> _reviewWithAgent(Map<String, dynamic> row) async {
     final url = '${row['url'] ?? ''}';
     if (url.isEmpty) return;
+    final host = widget.onReview;
+    if (host != null) {
+      await host(_reviewPrompt(row));
+      return;
+    }
     await startAgentSession(context, ref, prompt: _reviewPrompt(row));
   }
 
@@ -363,38 +380,48 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final all = _all;
-    final rows = _filtered();
+    if (widget.embedded) return _body();
     return Scaffold(
       appBar: AppBar(
         title: const Text('Пул-реквесты'),
-        actions: [
-          PopupMenuButton<_Group>(
-            tooltip: 'Группировка',
-            initialValue: _group,
-            icon: const Icon(Icons.segment),
-            onSelected: (v) => setState(() => _group = v),
-            itemBuilder: (_) => [
-              for (final g in _Group.values) PopupMenuItem(value: g, child: Text(g.label)),
-            ],
-          ),
-          PopupMenuButton<_Sort>(
-            tooltip: 'Сортировка',
-            initialValue: _sort,
-            icon: const Icon(Icons.sort),
-            onSelected: (v) => setState(() => _sort = v),
-            itemBuilder: (_) => [
-              for (final s in _Sort.values) PopupMenuItem(value: s, child: Text(s.label)),
-            ],
-          ),
-          IconButton(
-            tooltip: 'Обновить',
-            onPressed: _busy ? null : _load,
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
+        actions: _actionButtons(),
       ),
-      body: _err != null && all == null
+      body: _body(),
+    );
+  }
+
+  /// Кнопки управления списком: группировка, сортировка, обновление.
+  List<Widget> _actionButtons({double size = 24}) => [
+        PopupMenuButton<_Group>(
+          tooltip: 'Группировка',
+          initialValue: _group,
+          icon: Icon(Icons.segment, size: size),
+          onSelected: (v) => setState(() => _group = v),
+          itemBuilder: (_) => [
+            for (final g in _Group.values) PopupMenuItem(value: g, child: Text(g.label)),
+          ],
+        ),
+        PopupMenuButton<_Sort>(
+          tooltip: 'Сортировка',
+          initialValue: _sort,
+          icon: Icon(Icons.sort, size: size),
+          onSelected: (v) => setState(() => _sort = v),
+          itemBuilder: (_) => [
+            for (final s in _Sort.values) PopupMenuItem(value: s, child: Text(s.label)),
+          ],
+        ),
+        IconButton(
+          tooltip: 'Обновить',
+          onPressed: _busy ? null : _load,
+          icon: Icon(Icons.refresh, size: size),
+        ),
+      ];
+
+  /// Содержимое доски: фильтры, счётчик и список.
+  Widget _body() {
+    final all = _all;
+    final rows = _filtered();
+    return _err != null && all == null
           ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text('Мак недоступен: $_err')))
           : all == null
               ? const Center(child: CircularProgressIndicator())
@@ -452,8 +479,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
                       ),
                     ),
                   ],
-                ),
-    );
+                );
   }
 
   /// Заголовок группы; для задачи — ссылка в Jira.
@@ -486,6 +512,10 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       child: Row(
         children: [
+          if (widget.embedded) ...[
+            ..._actionButtons(size: 20),
+            const SizedBox(width: 6),
+          ],
           _repoChip(),
           const SizedBox(width: 12),
           for (final a in _Author.values) ...[
