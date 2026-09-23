@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -85,6 +86,37 @@ enum _Sort {
   final String label;
 }
 
+/// Снимок доски, переживающий уход с экрана.
+///
+/// Экран открывают несколько раз за день и почти всегда чтобы посмотреть глазами, а не чтобы
+/// увидеть изменения за минуту: запрос на маке идёт ~20 секунд и стоит лимита GitHub, поэтому
+/// список загружается один раз и живёт до явного «Обновить».
+class _Board {
+  /// Снимок доски.
+  const _Board(this.pulls, this.repos, this.error, this.loadedAt);
+
+  /// Все открытые PR из ответа мака.
+  final List<Map<String, dynamic>> pulls;
+
+  /// Репозитории из конфига мака.
+  final List<String> repos;
+
+  /// Текст неудачи, если мак ответил ошибкой.
+  final String? error;
+
+  /// Когда снимок приехал — показывается в шапке списка.
+  final DateTime loadedAt;
+}
+
+/// Держатель снимка: живёт в контейнере Riverpod, то есть столько же, сколько само приложение.
+class _BoardCache {
+  /// Последний загруженный снимок; `null` — за сеанс ещё не загружали.
+  _Board? value;
+}
+
+/// Кэш доски пул-реквестов на время жизни приложения.
+final _boardCacheProvider = Provider<_BoardCache>((ref) => _BoardCache());
+
 /// Экран «Пул-реквесты»: открытые PR настроенных репозиториев с фильтрами.
 ///
 /// Мак отдаёт снимок целиком и без фильтров (`/mac/pull-requests`), включая разобранный из
@@ -130,30 +162,67 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   /// Текущая сортировка.
   _Sort _sort = _Sort.updated;
 
+  /// Когда приехал показанный снимок; `null` — данных ещё нет.
+  DateTime? _loadedAt;
+
   @override
   void initState() {
     super.initState();
-    _load();
+    final cached = ref.read(_boardCacheProvider).value;
+    if (cached != null) {
+      _all = cached.pulls;
+      _repos = cached.repos;
+      _err = cached.error;
+      _loadedAt = cached.loadedAt;
+    } else {
+      _load();
+    }
   }
 
-  /// Перечитывает снимок с мака.
-  Future<void> _load({bool refresh = false}) async {
+  /// Загружает снимок с мака и кладёт его в кэш.
+  ///
+  /// Вызывается только руками — при первом открытии за сеанс и по кнопке «Обновить»; каждый
+  /// такой вызов просит мак сходить в GitHub заново (`refresh=1`), иначе кнопка обновления
+  /// возвращала бы тот же ответ из минутного кэша панели.
+  Future<void> _load() async {
     if (_busy) return;
     setState(() => _busy = true);
     try {
-      final d = await ref.read(appStateProvider).api.macPullRequests(refresh: refresh);
+      final d = await ref.read(appStateProvider).api.macPullRequests(refresh: true);
       final list = (d['pulls'] is List) ? (d['pulls'] as List) : const [];
       final repos = (d['repos'] is List) ? (d['repos'] as List) : const [];
+      final board = _Board(
+        list.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList(),
+        repos.whereType<String>().toList(),
+        d['ok'] == false ? '${d['msg'] ?? 'ошибка на маке'}' : null,
+        DateTime.now(),
+      );
+      ref.read(_boardCacheProvider).value = board;
       if (!mounted) return;
       setState(() {
-        _all = list.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
-        _repos = repos.whereType<String>().toList();
-        _err = d['ok'] == false ? '${d['msg'] ?? 'ошибка на маке'}' : null;
+        _all = board.pulls;
+        _repos = board.repos;
+        _err = board.error;
+        _loadedAt = board.loadedAt;
       });
     } catch (e) {
       if (mounted) setState(() => _err = '$e');
     } finally {
       if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// Копирует готовую команду ревью для этого PR.
+  Future<void> _copyReview(Map<String, dynamic> row) async {
+    final url = '${row['url'] ?? ''}';
+    if (url.isEmpty) return;
+    await Clipboard.setData(ClipboardData(
+      text: '/pr-review $url без оверинжиниринга, если есть замечания review all '
+          'и ченж реквест если нет замечаний аппрув',
+    ));
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Команда ревью скопирована: #${row['number']}')));
     }
   }
 
@@ -259,7 +328,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
           ),
           IconButton(
             tooltip: 'Обновить',
-            onPressed: _busy ? null : () => _load(refresh: true),
+            onPressed: _busy ? null : _load,
             icon: const Icon(Icons.refresh),
           ),
         ],
@@ -280,7 +349,9 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
                       padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
                       child: Row(
                         children: [
-                          Text('${rows.length} из ${all.length}',
+                          Text(
+                              '${rows.length} из ${all.length}'
+                              '${_loadedAt == null ? '' : ' · ${_time(_loadedAt!)}'}',
                               style: Theme.of(context).textTheme.bodySmall),
                           const Spacer(),
                           if (_busy)
@@ -291,7 +362,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
                     ),
                     Expanded(
                       child: RefreshIndicator(
-                        onRefresh: () => _load(refresh: true),
+                        onRefresh: _load,
                         child: rows.isEmpty
                             ? ListView(
                                 children: const [
@@ -426,26 +497,45 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
             Text('${row['repo']} · ${row['mine'] == true ? 'я' : row['author']}',
                 style: theme.textTheme.bodySmall),
             _badge(_decisionLabel(decision), _decisionColor(decision)),
-            if (row['draft'] == true) _badge('draft', theme.colorScheme.outline),
+            if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
             if (total > 0) Text('💬 $total', style: theme.textTheme.bodySmall),
             if (afterCr > 0) _badge('+$afterCr после ЧР', Colors.orange),
           ],
         ),
       ),
-      trailing: const Icon(Icons.open_in_new, size: 18),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: 'Скопировать команду ревью',
+            visualDensity: VisualDensity.compact,
+            onPressed: () => _copyReview(row),
+            icon: const Icon(Icons.copy_all_outlined, size: 18),
+          ),
+          const Icon(Icons.open_in_new, size: 18),
+        ],
+      ),
       onTap: () => _open('${row['url'] ?? ''}'),
       onLongPress: task.isEmpty ? null : () => _open('${row['task_url']}'),
     );
   }
 
   /// Короткий цветной ярлык.
+  ///
+  /// Подложка и рамка одного цвета с текстом: на тёмной теме приглушённый серый ярлык
+  /// сливался с фоном, и «без ревью» читалось хуже всех — а это как раз то, что ищут глазами.
   Widget _badge(String text, Color color) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
         decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.15),
+          color: color.withValues(alpha: 0.22),
+          border: Border.all(color: color.withValues(alpha: 0.7)),
           borderRadius: BorderRadius.circular(6),
         ),
-        child: Text(text, style: Theme.of(context).textTheme.labelSmall?.copyWith(color: color)),
+        child: Text(text,
+            style: Theme.of(context)
+                .textTheme
+                .labelSmall
+                ?.copyWith(color: color, fontWeight: FontWeight.w600)),
       );
 
   /// Подпись состояния ревью по-русски и коротко.
@@ -456,13 +546,18 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
         _ => 'без ревью',
       };
 
-  /// Цвет состояния ревью.
+  /// Цвет состояния ревью: у каждого состояния свой, серых среди них нет.
   Color _decisionColor(String decision) {
     final scheme = Theme.of(context).colorScheme;
     return switch (decision) {
-      'APPROVED' => Colors.green,
+      'APPROVED' => const Color(0xFF4CAF50),
       'CHANGES_REQUESTED' => scheme.error,
-      _ => scheme.outline,
+      'REVIEW_REQUIRED' => const Color(0xFF42A5F5),
+      _ => const Color(0xFFFFB300),
     };
   }
+
+  /// Время снимка в виде `ЧЧ:ММ` — на телефоне дата не нужна, список живёт часы.
+  String _time(DateTime at) =>
+      '${at.hour.toString().padLeft(2, '0')}:${at.minute.toString().padLeft(2, '0')}';
 }
