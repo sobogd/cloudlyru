@@ -20,11 +20,15 @@ class NewSessionChoice {
   /// Модель в виде `провайдер/идентификатор`; `null` — модель по умолчанию харнесса.
   final String? modelKey;
 
+  /// Имя разговора, если человек его задал; пусто — имя поставит сам харнесс по первому вопросу.
+  final String name;
+
   /// Выбор новой сессии.
   const NewSessionChoice({
     required this.project,
     required this.harness,
     this.modelKey,
+    this.name = '',
   });
 }
 
@@ -36,20 +40,26 @@ class NewSessionChoice {
 ///
 /// Список моделей берётся у всех харнессов сразу: в этом выборе рядом стоят локальные модели pi,
 /// удалённые по API и модели Claude Code, и человек должен видеть их одним списком.
+/// [suggestedName] — имя, предложенное разделом, который позвал мастер (доска PR предлагает
+/// `repo#123`). Человек его правит или стирает: поле необязательное.
 Future<NewSessionChoice?> showNewSessionWizard(
   BuildContext context,
-  WidgetRef ref,
-) {
+  WidgetRef ref, {
+  String suggestedName = '',
+}) {
   return showDialog<NewSessionChoice>(
     context: context,
-    builder: (_) => const _NewSessionWizard(),
+    builder: (_) => _NewSessionWizard(suggestedName: suggestedName),
   );
 }
 
 /// Диалог-мастер: два шага в одном виджете, чтобы шаг назад не терял выбранную папку.
 class _NewSessionWizard extends ConsumerStatefulWidget {
   /// Диалог мастера новой сессии.
-  const _NewSessionWizard();
+  const _NewSessionWizard({this.suggestedName = ''});
+
+  /// Имя, с которым поле открывается заполненным.
+  final String suggestedName;
 
   @override
   ConsumerState<_NewSessionWizard> createState() => _NewSessionWizardState();
@@ -65,6 +75,19 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
 
   /// Загружаем ли мы данные (используется, чтобы не запускать загрузку дважды).
   bool _started = false;
+
+  /// Имя будущего разговора: необязательное, живёт на обоих шагах.
+  ///
+  /// Полем, а не отдельным шагом: имя нужно далеко не всегда, и лишний экран между выбором
+  /// модели и разговором стоил бы нажатия в каждой новой сессии.
+  late final TextEditingController _name =
+      TextEditingController(text: widget.suggestedName);
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -273,6 +296,7 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
                 project: _project!,
                 harness: harness,
                 modelKey: model.key,
+                name: _name.text.trim(),
               ),
             )
           : null,
@@ -323,6 +347,28 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
 
   /// Кнопки внизу: добавить провайдера и закрыть.
   Widget _actions() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+          child: TextField(
+            controller: _name,
+            style: const TextStyle(color: C.fg, fontSize: 14),
+            decoration: const InputDecoration(
+              isDense: true,
+              labelText: 'Название разговора (необязательно)',
+              labelStyle: TextStyle(color: C.fg3, fontSize: 12.5),
+            ),
+          ),
+        ),
+        _buttons(),
+      ],
+    );
+  }
+
+  /// Кнопки мастера: провайдеры и отмена.
+  Widget _buttons() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
       child: Row(

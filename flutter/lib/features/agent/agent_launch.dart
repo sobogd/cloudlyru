@@ -19,6 +19,17 @@ AgentSession? findSessionByName(WidgetRef ref, String name) {
   return null;
 }
 
+/// Ставит имя только что открытому разговору; возвращает имя, которое осталось поставить.
+///
+/// Мост помнит имя и до появления журнала сессии, поэтому обычный ответ — `null`: имя уже
+/// принято. Если мост отказал (например, его перезапустили между открытием и этим вызовом),
+/// имя уезжает экрану разговора и ставится после первого сообщения.
+Future<String?> applySessionName(WidgetRef ref, String sessionId, String name) async {
+  if (name.isEmpty) return null;
+  final saved = await ref.read(agentSessionsProvider.notifier).rename(sessionId, name);
+  return saved == null ? name : null;
+}
+
 /// Поднимает новую сессию агента из любого раздела приложения.
 ///
 /// Тот же путь, что и по кнопке «+» в «Проектах»: мастер выбора папки и модели → открытие
@@ -68,7 +79,7 @@ Future<void> startAgentSession(
   }
 
   if (!context.mounted) return;
-  final choice = await showNewSessionWizard(context, ref);
+  final choice = await showNewSessionWizard(context, ref, suggestedName: sessionName ?? '');
   if (choice == null || !context.mounted) return;
   if (choice.modelKey != null) {
     await ref.read(settingsProvider).ui.setAgentModel(choice.harness, choice.modelKey!);
@@ -88,13 +99,17 @@ Future<void> startAgentSession(
     snack(context, ref.read(agentSessionsProvider).error ?? 'Мост не поднял сессию');
     return;
   }
+  // Имя, названное человеком в мастере, важнее предложенного разделом.
+  final name = choice.name.isNotEmpty ? choice.name : (sessionName ?? '');
+  final pending = await applySessionName(ref, session.id, name);
+  if (!context.mounted) return;
   await Navigator.of(context).push(
     CupertinoPageRoute<void>(
       builder: (_) => AgentThreadScreen(
         session: session,
         project: choice.project,
         initialPrompt: prompt,
-        pendingName: sessionName,
+        pendingName: pending,
       ),
     ),
   );

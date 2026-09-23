@@ -35,7 +35,8 @@ stdio и умеет ровно то, что нужно разделу «Прое
   POST   /sessions/<id>/compact       — сжать контекст;
   POST   /sessions/<id>/model         — сменить модель;
   POST   /sessions/<id>/effort        — сменить уровень усилия (только Claude Code);
-  POST   /sessions/<id>/name          — переименовать разговор (записью в его журнал);
+  POST   /sessions/<id>/name          — переименовать разговор (записью в его журнал; до
+                                        первого сообщения имя ждёт журнала в памяти сессии);
   POST   /sessions/<id>/ui            — ответ на диалог расширения (по умолчанию не нужен);
   DELETE /sessions/<id>               — удалить сессию: процесс гасится, файл стирается.
 
@@ -1574,28 +1575,8 @@ def last_journal_id(file, tail_bytes=64 * 1024):
     return None
 
 
-def set_session_name(key, name):
-    """Ставит разговору новое имя — записью в его собственный журнал.
-
-    Имя харнессы хранят сами, в журнале сессии, а не в отдельном хранилище моста: у pi это
-    запись `session_info`, у Claude Code — `custom-title` (её же пишут его `/rename` и флаг
-    `--name`). Пишем одну строку в конец файла и ничего не переписываем: журнал только растёт,
-    а живой процесс сессии от этого не сбивается. Оба харнесса читают такие записи по принципу
-    «побеждает последняя», поэтому новое имя сразу видно и в приложении, и в `/resume` на маке.
-
-    `parentId` у записи pi — id последней записи журнала: так имя остаётся записью того же
-    разговора, а не вторым корнем дерева. Возвращает сохранённое имя.
-    """
-    harness, session_id = split_key(key)
-    file = find_session_file(harness, session_id)
-    if file is None:
-        raise PiError("сессия не найдена: %s" % key)
-    # Переводы строк в имени сломали бы разбор журнала: запись — это одна строка
-    clean = " ".join(str(name or "").split())
-    if not clean:
-        raise PiError("пустое имя")
-    if len(clean) > MAX_NAME_CHARS:
-        raise PiError("имя длиннее %d символов" % MAX_NAME_CHARS)
+def write_session_name(file, harness, session_id, clean):
+    """Дописывает имя в журнал сессии: одна строка в конец файла."""
     if harness == HARNESS_CLAUDE:
         entry = {"type": "custom-title", "customTitle": clean, "sessionId": session_id}
     else:
@@ -1613,6 +1594,64 @@ def set_session_name(key, name):
         raise PiError("не смог записать имя сессии %s: %s" % (file, e))
     log("переименовал сессию %s (%s): %s" % (file, harness, clean))
     return clean
+
+
+def clean_session_name(name):
+    """Проверяет имя разговора и приводит его к одной строке."""
+    # Переводы строк в имени сломали бы разбор журнала: запись — это одна строка
+    clean = " ".join(str(name or "").split())
+    if not clean:
+        raise PiError("пустое имя")
+    if len(clean) > MAX_NAME_CHARS:
+        raise PiError("имя длиннее %d символов" % MAX_NAME_CHARS)
+    return clean
+
+
+def flush_pending_name(session):
+    """Дописывает отложенное имя, как только у сессии появился журнал.
+
+    Имя может прийти раньше первого сообщения — например, разговор заводят из доски
+    пул-реквестов и сразу зовут его `repo#123`. Журнала в этот момент ещё нет, поэтому имя
+    лежит в памяти сессии и уезжает в файл при первой же возможности.
+    """
+    if not session or not session.pending_name:
+        return
+    file = session_file(session)
+    if file is None:
+        return
+    try:
+        write_session_name(file, session.harness, session.id, session.pending_name)
+    except PiError as e:
+        log("отложенное имя не записалось (%s): %s" % (session.key, e))
+        return
+    session.pending_name = ""
+
+
+def set_session_name(key, name):
+    """Ставит разговору новое имя — записью в его собственный журнал.
+
+    Имя харнессы хранят сами, в журнале сессии, а не в отдельном хранилище моста: у pi это
+    запись `session_info`, у Claude Code — `custom-title` (её же пишут его `/rename` и флаг
+    `--name`). Пишем одну строку в конец файла и ничего не переписываем: журнал только растёт,
+    а живой процесс сессии от этого не сбивается. Оба харнесса читают такие записи по принципу
+    «побеждает последняя», поэтому новое имя сразу видно и в приложении, и в `/resume` на маке.
+
+    `parentId` у записи pi — id последней записи журнала: так имя остаётся записью того же
+    разговора, а не вторым корнем дерева. Возвращает сохранённое имя.
+    """
+    harness, session_id = split_key(key)
+    clean = clean_session_name(name)
+    file = find_session_file(harness, session_id)
+    if file is None:
+        # Журнала ещё нет — сессию только что открыли и в ней не было ни одного сообщения.
+        # Имя не теряем: живая сессия помнит его и запишет сама (см. flush_pending_name).
+        live = POOL.maybe(key)
+        if live is None:
+            raise PiError("сессия не найдена: %s" % key)
+        live.pending_name = clean
+        log("запомнил имя сессии %s до появления журнала: %s" % (key, clean))
+        return clean
+    return write_session_name(file, harness, session_id, clean)
 
 
 def purge_session(key):
@@ -2017,6 +2056,10 @@ class AgentSession:
         self.state = {}             # снимок состояния в общем для обоих виде (см. _session_brief)
         self.start_meta = None      # заголовок файла сессии (время старта) — читается один раз
         self.file_cache = None      # путь к файлу сессии: ищем один раз по идентификатору
+        # Имя, поставленное до появления журнала: у только что открытой сессии файла ещё нет, а
+        # имя харнессы хранят записью в нём. Запись уходит в журнал, как только он появится
+        # (см. flush_pending_name), а до тех пор имя отдаётся приложению из памяти.
+        self.pending_name = ""
         self.stderr_tail = []       # хвост stderr процесса — попадает в текст ошибки
         self.counters = {"userMessages": 0, "assistantMessages": 0, "toolCalls": 0}
         self.partial_seen = False   # пришли ли частичные куски текущего ответа (у Claude)
@@ -3673,6 +3716,8 @@ class Handler(BaseHTTPRequestHandler):
         `local` — признак того, что модель считает на этом маке, а не по API: по нему
         приложение подписывает сессию, чтобы удалённая модель не выглядела как локальная.
         """
+        # Журнал мог появиться с последнего обращения: тогда отложенное имя уезжает в него
+        flush_pending_name(session)
         state = session.state if isinstance(session.state, dict) else {}
         model = state.get("model") if isinstance(state.get("model"), dict) else {}
         context = state.get("contextUsage") if isinstance(state.get("contextUsage"), dict) else {}
@@ -3688,7 +3733,9 @@ class Handler(BaseHTTPRequestHandler):
             "path": session.cwd,
             # имя: у живого pi оно в состоянии, а если человек его не задавал, падает на
             # имя/заголовок из файла сессии — иначе шапка показывала бы папку вместо разговора
-            "name": str(state.get("sessionName") or meta.get("name") or ""),
+            "name": str(
+                session.pending_name or state.get("sessionName") or meta.get("name") or ""
+            ),
             "model": str(model.get("id") or ""),
             "modelName": str(model.get("name") or ""),
             "provider": str(model.get("provider") or ""),

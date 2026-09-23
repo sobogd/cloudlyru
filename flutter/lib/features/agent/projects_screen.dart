@@ -212,7 +212,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         return;
       }
     }
-    final choice = await showNewSessionWizard(context, ref);
+    final choice = await showNewSessionWizard(context, ref, suggestedName: sessionName ?? '');
     if (choice == null || !mounted) return;
     if (choice.modelKey != null) {
       await ref
@@ -226,7 +226,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       modelKey: choice.modelKey,
       embedded: wide,
       prompt: prompt,
-      nameIt: sessionName,
+      // Имя, названное человеком в мастере, важнее предложенного доской пул-реквестов.
+      nameIt: choice.name.isNotEmpty ? choice.name : sessionName,
     );
   }
 
@@ -314,6 +315,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       return;
     }
     _retry = null;
+    // Имя принимает сам мост — он помнит его и до появления журнала сессии. Остаток (если мост
+    // отказал) уезжает экрану разговора и ставится после первого сообщения.
+    final pendingName = sessionId == null && nameIt != null
+        ? await applySessionName(ref, session.id, nameIt)
+        : null;
+    _openName = pendingName;
     if (!mounted) return;
     if (embedded) {
       setState(() {
@@ -334,7 +341,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
           session: session,
           project: project,
           initialPrompt: prompt,
-          pendingName: nameIt,
+          pendingName: pendingName,
         ),
       ),
     );
