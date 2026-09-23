@@ -28,7 +28,7 @@ Cloudly. Статус-панель (`mac-status-server.py`) — **только A
 | POST | `/api/warp` | `{op: connect\|disconnect\|reconnect\|status}` |
 | GET/POST | `/api/claude`, `/api/claude/login`, `/api/claude/code` | статус и вход Claude |
 | GET/POST | `/api/github-actions*` | дашборд и запуск workflow |
-| GET/POST | `/api/pull-requests*` | открытые PR настроенных репозиториев и правка их списка |
+| GET/POST | `/api/pull-requests*` | открытые PR: задача из заголовка, статус ревью, обсуждение после ЧР |
 | GET/POST | `/api/envs*` | список/чтение/запись `.env` под `~/work` |
 | GET/POST | `/api/term/*` | консоль (опрос по HTTP) |
 

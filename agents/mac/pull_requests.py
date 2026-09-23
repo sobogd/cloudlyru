@@ -17,9 +17,23 @@ CONFIG_PATH = os.environ.get("MAC_STATUS_PULL_REQUESTS_CONFIG") or os.path.join(
     BASE_DIR, "pull-requests.json"
 )
 GITHUB_GRAPHQL = "https://api.github.com/graphql"
+JIRA_BROWSE = "https://tangem.atlassian.net/browse/"
 CACHE_SECONDS = 60
-PAGE_SIZE = 100
-MAX_PAGES = 5
+PAGE_SIZE = 50
+MAX_PAGES = 20
+
+# How deep the discussion is read. Only the tail matters: the board answers "is there anything
+# new after the last change request", not "show the whole thread". Overflow is reported as such.
+RECENT_COMMENTS = 30
+RECENT_THREADS = 30
+THREAD_REPLIES = 3
+RECENT_REVIEWS = 30
+
+# Titles carry the task key in three shapes: "JS-7383: ...", "[IT-2416] ..." and "Js 6546 ...".
+# The strict form wins; the loose one is tried only at the beginning of the title, so version
+# numbers and stray words in the middle cannot pass for a task.
+JIRA_STRICT = re.compile(r"\b([A-Z][A-Z0-9]{1,9})-(\d{1,6})\b")
+JIRA_LOOSE = re.compile(r"^\W*([A-Za-z]{2,6})[-_\s](\d{2,6})\b")
 
 _CACHE_LOCK = threading.Lock()
 _CACHE = {"at": 0, "value": None}
@@ -37,17 +51,39 @@ query($q: String!, $size: Int!, $cursor: String) {
         isDraft
         createdAt
         updatedAt
+        totalCommentsCount
         author { login }
         repository { name }
         reviewDecision
-        changesRequested: reviews(states: CHANGES_REQUESTED) { totalCount }
         approvals: reviews(states: APPROVED) { totalCount }
-        comments { totalCount }
+        changeRequests: reviews(states: CHANGES_REQUESTED) { totalCount }
+        reviews(last: %(reviews)d) {
+          nodes { state submittedAt author { login } }
+        }
+        comments(last: %(comments)d) {
+          nodes { createdAt author { login } }
+        }
+        reviewThreads(last: %(threads)d) {
+          nodes {
+            isResolved
+            comments(last: %(replies)d) {
+              nodes { createdAt author { login } }
+            }
+          }
+        }
+        commits(last: 1) {
+          nodes { commit { committedDate } }
+        }
       }
     }
   }
 }
-"""
+""" % {
+    "reviews": RECENT_REVIEWS,
+    "comments": RECENT_COMMENTS,
+    "threads": RECENT_THREADS,
+    "replies": THREAD_REPLIES,
+}
 
 
 def _validate_config(config):
@@ -145,7 +181,7 @@ def _graphql(variables):
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=25) as response:
+        with urllib.request.urlopen(request, timeout=40) as response:
             payload = json.loads(response.read() or b"{}")
     except urllib.error.HTTPError as exc:
         raise RuntimeError("GitHub API %s" % exc.code)
@@ -158,22 +194,96 @@ def _graphql(variables):
     return payload.get("data") or {}
 
 
+def task_key(title):
+    """Extract the Jira key from a pull request title, or an empty string."""
+    strict = JIRA_STRICT.search(title or "")
+    if strict:
+        return "%s-%s" % (strict.group(1), strict.group(2))
+    loose = JIRA_LOOSE.match(title or "")
+    if loose:
+        return "%s-%s" % (loose.group(1).upper(), loose.group(2))
+    return ""
+
+
+def _discussion(node, author):
+    """Collect every recent comment of a pull request except the author's own replies.
+
+    Self-replies are dropped on purpose: the board exists to show what other people said, and
+    an answer of mine to a review is not a reason to look at the pull request again.
+    """
+    items = []
+    for comment in (node.get("comments") or {}).get("nodes") or []:
+        if not comment:
+            continue
+        login = ((comment.get("author") or {}).get("login")) or ""
+        if login and login != author:
+            items.append((comment.get("createdAt") or "", login))
+    for thread in (node.get("reviewThreads") or {}).get("nodes") or []:
+        for comment in ((thread or {}).get("comments") or {}).get("nodes") or []:
+            if not comment:
+                continue
+            login = ((comment.get("author") or {}).get("login")) or ""
+            if login and login != author:
+                items.append((comment.get("createdAt") or "", login))
+    items.sort()
+    return items
+
+
+def _last_change_request(node):
+    """Return the timestamp and author of the most recent change request."""
+    last_at, last_by = "", ""
+    for review in (node.get("reviews") or {}).get("nodes") or []:
+        if not review or review.get("state") != "CHANGES_REQUESTED":
+            continue
+        at = review.get("submittedAt") or ""
+        if at >= last_at:
+            last_at, last_by = at, ((review.get("author") or {}).get("login")) or ""
+    return last_at, last_by
+
+
 def _row(node, viewer):
     """Flatten one GraphQL pull request node into the shape the app renders."""
     author = ((node.get("author") or {}).get("login")) or ""
     decision = node.get("reviewDecision") or "NONE"
+    title = node.get("title") or ""
+    key = task_key(title)
+    comments = _discussion(node, author)
+    cr_at, cr_by = _last_change_request(node)
+    after_cr = [item for item in comments if cr_at and item[0] > cr_at]
+    commits = (node.get("commits") or {}).get("nodes") or []
+    pushed_at = (((commits[0] or {}).get("commit") or {}).get("committedDate")) if commits else ""
+    after_push = [item for item in comments if pushed_at and item[0] > pushed_at]
+
+    def logins(items):
+        seen = []
+        for _, login in items:
+            if login not in seen:
+                seen.append(login)
+        return seen
+
     return {
         "repo": (node.get("repository") or {}).get("name") or "",
         "number": node.get("number"),
-        "title": node.get("title") or "",
+        "title": title,
         "url": node.get("url") or "",
+        "task": key,
+        "task_url": (JIRA_BROWSE + key) if key else "",
         "author": author,
         "mine": bool(viewer) and author == viewer,
         "draft": bool(node.get("isDraft")),
         "review_decision": decision,
-        "changes_requested": (node.get("changesRequested") or {}).get("totalCount") or 0,
         "approvals": (node.get("approvals") or {}).get("totalCount") or 0,
-        "comments": (node.get("comments") or {}).get("totalCount") or 0,
+        "change_requests": (node.get("changeRequests") or {}).get("totalCount") or 0,
+        "changes_requested_at": cr_at,
+        "changes_requested_by": cr_by,
+        "comments_total": node.get("totalCommentsCount") or 0,
+        "comments_recent": len(comments),
+        "comments_after_cr": len(after_cr),
+        "comments_after_cr_by": logins(after_cr),
+        "comments_after_push": len(after_push),
+        "comments_after_push_by": logins(after_push),
+        "comments_truncated": len(comments) >= RECENT_COMMENTS + RECENT_THREADS * THREAD_REPLIES,
+        "pushed_at": pushed_at or "",
         "created_at": node.get("createdAt"),
         "updated_at": node.get("updatedAt"),
     }
@@ -182,8 +292,9 @@ def _row(node, viewer):
 def board(refresh=False):
     """Return every open pull request of the configured repositories, unfiltered.
 
-    Filtering (mine, drafts, review state, repository) belongs to the client: the board is
-    cheap to filter locally and one shared snapshot keeps the GitHub rate limit low.
+    Grouping, sorting and filtering (task, repository, author, review state, drafts) belong to
+    the client: one shared snapshot keeps the GitHub rate limit low and makes switching a
+    filter free.
     """
     now = time.time()
     with _CACHE_LOCK:
@@ -229,6 +340,7 @@ def board(refresh=False):
         "viewer": viewer,
         "pulls": rows,
         "count": len(rows),
+        "tasks": sorted({row["task"] for row in rows if row["task"]}),
         "updated_at": int(now),
         "config_path": os.path.basename(CONFIG_PATH),
     }
