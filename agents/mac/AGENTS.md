@@ -6,31 +6,22 @@
 > «AEAT/налоговая Испании» — начинай с этого файла.
 
 ## Что это за проект
-Удалённое управление личным Mac'ом (unattended, auto-login, macOS 26.6.2 Tahoe,
-build 25G83) через веб-панель + локальный инструментарий действий для агента.
-Публичный адрес: `https://status.iq-factura.com` (статус-панель, nginx basic auth
-`sobogd`/пароль из `.env` `MY_PASSWORD`), через reverse-SSH-туннель на VPS
-`46.225.143.221` (nginx). Домены/прод трогать нельзя.
+Удалённый доступ к личному Mac'у (unattended, auto-login, macOS 26.6.2 Tahoe,
+build 25G83) для приложения Cloudly: reverse-SSH туннель + API-панель. Браузерный UI
+удалён; панель отдаёт только `/api/*` и доступна лишь бэкенду Cloudly через loopback
+VPS `46.225.143.221`. Домены/прод трогать нельзя.
 
 ## Структура
 ```
-cloudlyru/agents/mac/                     ← git-репозиторий (единый источник ВСЕГО)
-├── mac-status-server.py      ← код статус-панели (127.0.0.1:18810, stdlib-only)
-│                               + стр. /envs: список+редактор .env под ~/work
-│                                 (/api/envs, /api/envs/read, /api/envs/write,
-│                                 бэкапы до записи: ~/.mac-status-env-backups)
-│                               + стр. /term: простая консоль — одна строка ввода,
-│                                 вывод текстом (bash --norc -i на pty, без эмулятора;
-│                                 /api/term/poll, /api/term/input, кнопка ^C, reset)
-├── README.md                 ← описание панели, endpoint'ы (/api/status, /api/action…)
+cloudlyru/agents/mac/                     ← всё, что живёт на маке
+├── mac-status-server.py      ← API-панель (127.0.0.1:18810, stdlib-only, только /api/*)
+├── README.md                 ← описание сервисов и ручек
 ├── AGENTS.md                 ← этот файл
-├── install.sh                ← деплой всех plist из agents/ в ~/Library/LaunchAgents
-├── agents/                   ← ВСЕ launchd-агенты (plist-исходники + обёртки)
-│   ├── com.agent.*.plist     ← 6 агентов (mac-status, mac-tunnel, claude-tangem,
-│   │                           whisper, llm, llm-mt)
-│   ├── run-*.sh              ← обёртки запуска, на которые ссылаются plist
-├── nginx/                    ← reference VPS-конфиг статус-панели
-│                               (status.iq-factura.conf)
+├── install.sh                ← раскатка plist-ов в ~/Library/LaunchAgents
+├── com.agent.*.plist         ← 6 агентов (mac-status, mac-tunnel, claude-tangem,
+│                               whisper, llm, llm-mt)
+├── run-*.sh                  ← обёртки запуска, на которые ссылаются plist
+├── docs/VPS-RESTORE.md       ← runbook восстановления VPS
 └── logs/
 ```
 
@@ -66,22 +57,14 @@ cloudlyru/agents/mac/                     ← git-репозиторий (еди
 - **Логин-пароль Mac'а = `2208`** (= `MACOS_PASSWORD` в `/Users/sobogd/work/iq-rest/.env`; он же пароль
   свежесозданного login keychain). kcpassword тоже 2208.
 - **Сервис-токен панели**: `/api/*` требует `X-Mac-Token`, если задан `MAC_SERVICE_TOKEN`
-  (env или `~/work/.env`). Значение знают только бэкенд Cloudly и панель; браузерный путь
-  nginx подставляет заголовок сам (`nginx/status.iq-factura.conf`). Не задан — проверка выключена.
+  (env или `~/work/.env`). Значение знают только бэкенд Cloudly и панель. Не задан — проверка
+  выключена.
 - **Инфраструктура**: статус-панель :18810, reverse-туннель самовосстанавливается
   (WARP tangem рвёт TCP). Auto-login включён, FileVault off, WARP Zero Trust tangem включён.
-  WARP (Cloudflare One, org tangem) управляется из панели статуса: карточка WARP —
+  WARP (Cloudflare One, org tangem) управляется через API панели:
   connect/disconnect/reconnect через `/usr/local/bin/warp-cli` (POST /api/warp),
   состояние — в `/api/status`.warp. Reconnect рвёт сеть на пару секунд
   (reverse-туннель переживает); CLI не требует sudo из gui-сессии.
-- **Статус-панель = PWA**: `/manifest.json` + `/sw.js` + иконки (base64 встроены в
-  mac-status-server.py) → ставится с Android Chrome как приложение (standalone-окно,
-  без вкладок). `/api/*` service worker не кеширует. **ВАЖНО**: Chrome НЕ регистрирует
-  service worker за HTTP basic auth (скрипт SW приходит с 401) → на VPS nginx пути
-  `/sw.js`, `/manifest.json`, `/icon-192.png`, `/icon-512.png` отключены от auth
-  (`auth_basic off`, секретов там нет), страницы и `/api/*` под паролем. Из-за
-  basic-auth окно приложения может снова спросить пароль после очистки кеша
-  авторизации Chrome.
 - **Полезные пути**: login keychain старые версии — `~/Library/Keychains/login_renamed_*.keychain-db`
   (бэкапы, не удалять без нужды). `.env` секретов — `/Users/sobogd/work/iq-rest/.env`.
 

@@ -2,24 +2,21 @@
 """
 mac-status-server.py — remote management panel for the (VPS-style) Mac.
 
-Endpoints (all bound to 127.0.0.1, reached via nginx basic auth + reverse SSH):
-  GET  /                  -> HTML panel (cards, history charts, action buttons)
+Endpoints (all bound to 127.0.0.1; reached by the Cloudly backend over a reverse-SSH tunnel,
+and requiring the X-Mac-Token header when MAC_SERVICE_TOKEN is set):
   GET  /api/status        -> JSON: cpu/ram/disk/top/ip/services/security/battery/warp
   GET  /api/history       -> JSON: {t:[...], cpu:[...], mem:[...]} last ~100 min
   POST /api/action        -> {"action": name} from the ACTIONS whitelist below
-  POST /api/warp          -> {"op": connect|disconnect|reconnect|status} — Cloudflare
-                             WARP corporate tunnel (card on the main page)
-  GET  /manifest.json     -> PWA web app manifest (Android Chrome install)
-  GET  /sw.js             -> service worker (cache shell, never cache /api/*)
-  GET  /icon-192.png /icon-512.png -> PWA icons (PNG8, embedded base64)
-  /actions + /api/github-actions/* -> file-backed GitHub Actions dashboard
-  /term + /api/term/*     -> plain console over a pty (poll-based); "↑ rerun"
-                             re-executes the previous command from server-side
-                             history (POST /api/term/again, GET /api/term/history)
+  POST /api/warp          -> {"op": connect|disconnect|reconnect|status} — Cloudflare WARP
+  /api/github-actions/*   -> file-backed GitHub Actions dashboard
+  /api/envs*              -> list/read/write .env files under ~/work
+  /api/term/*             -> console over a pty (poll-based)
+
+Anything outside /api/* returns 404: the browser UI and PWA were removed — the Cloudly app
+is the only client.
 
 Stdlib only.
 """
-import base64
 import calendar
 import http.server
 import json
@@ -87,64 +84,6 @@ ACTIONS = {
 _CACHES = {"ip": {"t": 0, "v": None}, "sec": {"t": 0, "v": None},
            "warp": {"t": 0, "v": None}, "worg": {"t": 0, "v": None}}
 _HIST = collections.deque(maxlen=400)  # ~100 min at 15s
-
-
-# ---- PWA (installable app: Android Chrome "Add to Home screen") ------------
-# https://status.iq-factura.com is HTTPS, so a web app manifest + a service
-# worker with a fetch handler + PNG icons make Chrome offer installing this
-# panel as an app. API routes are never cached; the shell page is cached on
-# the fly for offline. Icons are flat PNG8 (regenerate with ImageMagick).
-
-PWA_MANIFEST = {
-    "id": "/",
-    "name": "Mac control",
-    "short_name": "Mac",
-    "description": "Remote status and control panel for the Mac",
-    "start_url": "/",
-    "scope": "/",
-    "display": "standalone",
-    "background_color": "#0d1117",
-    "theme_color": "#0d1117",
-    "icons": [
-        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
-    ],
-}
-
-PWA_SW = r'''/* mac-status service worker: makes the panel installable as a PWA. */
-const CACHE = 'mac-status-v1';
-self.addEventListener('install', (e) => self.skipWaiting());
-self.addEventListener('activate', (e) => {
-  e.waitUntil(
-    caches.keys().then((ks) => Promise.all(
-      ks.filter((k) => k !== CACHE).map((k) => caches.delete(k))
-    )).then(() => self.clients.claim())
-  );
-});
-self.addEventListener('fetch', (e) => {
-  const req = e.request;
-  if (req.method !== 'GET') return;
-  const u = new URL(req.url);
-  if (u.origin !== self.location.origin) return;
-  if (u.pathname.indexOf('/api/') === 0) {      /* live data: never cache */
-    e.respondWith(fetch(req));
-    return;
-  }
-  e.respondWith(
-    fetch(req).then((res) => {
-      if (res && res.ok) {
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(req, copy));
-      }
-      return res;
-    }).catch(() => caches.match(req).then((hit) => hit || caches.match('/')))
-  );
-});
-'''
-
-_ICON_192 = base64.b64decode('''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''')
-_ICON_512 = base64.b64decode('''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''')
 
 
 def sh(cmd, timeout=8):
@@ -668,287 +607,6 @@ def _claude_code(code):
     return {"ok": False, "msg": "still finishing — refresh status", "log": c["log"][-4:]}
 
 
-PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Mac control</title>
-<meta name="theme-color" content="#0d1117"><meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="manifest" href="/manifest.json">
-<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png"><link rel="apple-touch-icon" href="/icon-192.png">
-<script>if('serviceWorker'in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){})}</script>
-<style>
-:root{color-scheme:dark}body{font-family:ui-monospace,Menlo,monospace;background:#0d1117;color:#e6edf3;margin:0;padding:20px;max-width:1080px;margin:0 auto}
-h1{font-size:18px;margin:0 0 2px}h2{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e;margin:0 0 10px}
-.sub{color:#8b949e;font-size:12px;margin-bottom:14px}
-.sec{color:#8b949e;font-size:13px;font-weight:700;letter-spacing:.1em;margin:22px 0 10px;border-bottom:1px solid #21262d;padding-bottom:6px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px}
-.big{font-size:26px;font-weight:700}.row{display:flex;justify-content:space-between;font-size:12px;padding:1px 0}
-.row span:first-child{color:#8b949e}.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}
-.bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:6px}.bar>div{height:100%;background:#58a6ff}
-table{width:100%;border-collapse:collapse;font-size:12px}td,th{text-align:left;padding:2px 6px 2px 0}td.num{text-align:right}
-.twrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-@media(max-width:480px){body{padding:10px}.row{font-size:11px}button{padding:5px 8px;font-size:11px}}
-button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer;margin:2px}
-button:hover{border-color:#58a6ff}button.danger{border-color:#f85149;color:#f85149}
-.hsec{background:#0b1420;border:1px solid #1f6feb;border-radius:12px;padding:14px;margin-top:16px}
-.hsec h2{color:#58a6ff}
-canvas{width:100%;height:70px}
-#log,#toast{font-size:12px;color:#8b949e;margin-top:10px;white-space:pre-wrap}
-</style></head><body>
-<h1 id="host">Mac</h1><div style="font-size:10px;color:#8b949e;margin-bottom:2px">build v11</div>
-<div style="display:flex;justify-content:space-between;align-items:baseline">
-  <div id="dbanner" style="background:#1c2128;border:1px solid #30363d;color:#8b949e;border-radius:8px;padding:6px 10px;font-size:12px">data: waiting for script…</div>
-  <div style="white-space:nowrap;margin-left:10px">
-    <a href="/actions" style="font-size:12px;color:#d29922;margin-right:12px">github actions →</a>
-    <a href="/term" style="font-size:12px;color:#3fb950;margin-right:12px">console →</a>
-    <a href="/envs" style="font-size:12px;color:#58a6ff">env files (.env) →</a>
-  </div>
-</div>
-<div class="sub" id="meta"></div>
-
-<div class="sec">SYSTEM</div>
-<div class="grid">
-  <div class="card"><h2>CPU</h2><div class="big" id="cpu">—</div>
-    <div class="row"><span>load</span><span id="cpu-load"></span></div>
-    <div class="bar"><div id="cpu-bar" style="width:0%"></div></div></div>
-  <div class="card"><h2>Memory</h2><div class="big" id="mem">—</div>
-    <div class="row"><span>used</span><span id="mem-detail"></span></div>
-    <div class="bar"><div id="mem-bar" style="width:0%"></div></div></div>
-  <div class="card"><h2>Power</h2><div class="big" id="batt">—</div>
-    <div id="batt-detail" style="font-size:12px;color:#8b949e"></div>
-    <div class="bar"><div id="batt-bar" style="width:0%;background:#3fb950"></div></div></div>
-  <div class="card"><h2>Public IP</h2><div class="big" id="pubip" style="font-size:20px">—</div>
-    <div class="row"><span>lan</span><span id="lan"></span></div></div>
-</div>
-<div class="grid" style="margin-top:12px">
-  <div class="card"><h2>Disk</h2><table id="disk"><tr><th>mount</th><th class="num">used</th><th class="num">free</th><th class="num"></th></tr></table></div>
-  <div class="card"><h2>Top processes</h2><table id="top"><tr><th>proc</th><th class="num">cpu%</th><th class="num">mem</th></tr></table></div>
-</div>
-<div class="grid" style="margin-top:12px">
-  <div class="card"><h2>History</h2><canvas id="ch"></canvas>
-    <div style="font-size:11px;color:#8b949e"><span style="color:#58a6ff">— CPU</span> <span style="color:#3fb950">— RAM</span> (last ~100 min)</div></div>
-  <div class="card"><h2>Security</h2>
-    <div class="row"><span>Firewall</span><span id="fw"></span></div>
-    <div class="row"><span>Remote login</span><span id="rl"></span></div>
-    <div style="margin-top:6px"><b style="font-size:11px;color:#8b949e">last logins</b>
-      <table id="logins"></table></div></div>
-</div>
-<div class="card" style="grid-column:1/-1;margin-top:12px"><h2>System actions</h2>
-  <button onclick="act('restart-status')">restart status</button>
-  <button onclick="act('firewall-on')">firewall ON</button>
-  <button onclick="act('sleep-off')">sleep OFF</button>
-  <button class="danger" onclick="act('reboot')">reboot mac</button>
-  <button class="danger" onclick="act('sleep')">sleep now</button>
-  <div id="toast"></div></div>
-
-<div class="hsec">
-  <h2>REVERSE TUNNEL · VPS→mac</h2>
-  <div class="row"><span>tunnel</span><span id="htun"></span></div>
-  <div style="margin-top:10px">
-    <button onclick="act('restart-tunnel')">restart tunnel</button>
-  </div>
-</div>
-
-<div class="hsec" style="border-color:#6e7681">
-  <h2 style="color:#8b949e">WARP · Cloudflare One (corporate)</h2>
-  <div class="row"><span>connection</span><span id="wst">—</span></div>
-  <div class="row"><span>organization</span><span id="worg">—</span></div>
-  <div style="margin-top:10px">
-    <button id="wb-c" onclick="warpop('connect')">connect</button>
-    <button id="wb-d" class="danger" onclick="warpop('disconnect')">disconnect</button>
-    <button id="wb-r" onclick="warpop('reconnect')">reconnect</button>
-    <span id="wmsg" style="font-size:11px;color:#8b949e;margin-left:6px"></span>
-  </div>
-</div>
-
-<div class="hsec" style="border-color:#c8a14b">
-  <h2 style="color:#d29922">CLAUDE · tangem (~/.claude-work)</h2>
-  <div class="row"><span>remote agent (launchd)</span><span id="clagent"></span></div>
-  <div class="row"><span>subscription auth</span><span id="clauth"></span></div>
-  <div class="row"><span>account</span><span id="clemail"></span></div>
-  <div class="row"><span>login flow</span><span id="clstate"></span></div>
-  <div style="margin-top:10px">
-    <button id="clstart" onclick="act('claude-start')">start agent</button>
-    <button id="clrestart" onclick="act('claude-restart')">restart agent</button>
-    <button id="clgo" style="background:#9a6700;border-color:#9a6700;padding:8px 14px" onclick="cllogin()">start login (get URL)</button>
-    <span id="clmsg" style="font-size:12px;color:#8b949e"></span>
-  </div>
-  <div id="clurlwrap" style="display:none;margin-top:8px">
-    <div style="font-size:11px;color:#8b949e;margin-bottom:4px">1 · authorize with tangem (opens in a new tab):</div>
-    <button id="clopen" style="background:#1f6feb;border-color:#1f6feb;padding:8px 16px;font-size:13px" onclick="var u=document.getElementById('clurl').textContent.trim();if(u)window.open(u,'_blank')">open authorize URL in browser</button>
-    <div style="font-size:10px;color:#8b949e;margin-top:5px">tap the button; if nothing opens, copy this:</div>
-    <code id="clurl" style="color:#58a6ff;font-size:10px;word-break:break-all;display:block;margin-top:2px"></code>
-    <div style="font-size:11px;color:#8b949e;margin:8px 0 2px">2 · after authorizing, paste the code here and submit:</div>
-    <input id="clcode" type="text" autocomplete="off" spellcheck="false" placeholder="paste code…" style="width:70%;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px;font-family:ui-monospace,monospace">
-    <button id="clsubmit" onclick="clcode()">submit code</button>
-    <div id="cllog" style="font-size:11px;color:#8b949e;margin-top:6px;white-space:pre-wrap"></div>
-  </div>
-</div>
-  <div class="sec" style="margin-top:20px">CRON · scheduled jobs</div>
-  <div class="card">
-    <div class="row"><span>cron daemon</span><span id="crondaemon"></span></div>
-    <div class="row"><span>crontab</span><span id="cronctab"></span></div>
-    <div class="twrap"><table id="crontab" style="margin-top:8px">
-      <tr><th>job</th><th>on</th><th>tick</th><th>24h</th><th style="text-align:right"></th></tr>
-    </table></div>
-    <div style="margin-top:8px"><button onclick="cronop(null,'install')">install/repair crontab</button></div>
-    <div id="cronlog" style="font-size:11px;color:#8b949e;margin-top:5px"></div>
-  </div>
-<div class="sec" style="margin-top:20px">GITHUB ACTIONS · Tangem</div>
-<div class="card">
-  <div class="row"><span>source</span><span>github-actions.json</span></div>
-  <div style="margin-top:8px"><button onclick="location.href='/actions'">open workflows, status and controls</button></div>
-  <div style="font-size:10px;color:#6e7681;margin-top:5px">live status, recent average duration, branch/tag inputs, run and rerun</div>
-</div>
-<div id="log"></div>
-<script>
-const $=id=>document.getElementById(id);
-const FMT=bytes=>bytes.toFixed(1)+' GB';
-async function act(a){if((a==='reboot'||a==='sleep')&&!confirm(a+'?'))return;
-  try{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});
-    $('toast').textContent=(await r.json()).msg;}
-  catch(e){$('toast').textContent='err '+e;}}
-function wmsg(t){const m=$('wmsg');if(m)m.textContent=t;}
-function wbusy(b){['wb-c','wb-d','wb-r'].forEach(i=>{const el=$(i);if(el)el.disabled=b;});}
-async function warpop(op){
-  wbusy(true);wmsg('starting '+op+' — corporate tunnel may drop for a few seconds…');
-  try{const r=await fetch('/api/warp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op})});
-    const d=await r.json();
-    wmsg((d.ok?'✓ ':'✗ ')+(d.msg||op+' done'));
-  }catch(e){wmsg('err '+e);}
-  finally{wbusy(false);setTimeout(tick,1500);}
-}
-function chart(cpu,mem){const c=$('ch'),x=c.getContext('2d');const W=c.width=320,H=c.height=70;
-  x.clearRect(0,0,W,H);const n=cpu.length;if(!n)return;
-  const mx=i=>Math.max(5,...i);const px=a=>a.map((v,idx)=>[W*(idx/(n-1||1)),H-(H*v/mx(a))]);
-  const line=(pts,col)=>{x.strokeStyle=col;x.lineWidth=1.5;x.beginPath();pts.forEach((p,i)=>i?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]));x.stroke();};
-  line(px(mem),'#3fb950');line(px(cpu),'#58a6ff');}
-let _busy=false;
-async function jget(url,ms){const ac=new AbortController();const to=setTimeout(()=>ac.abort(),ms||8000);
-  try{return await fetch(url,{cache:'no-store',signal:ac.signal});}finally{clearTimeout(to);}}
-async function tick(){
-  if(_busy)return;_busy=true;
-  try{const r=await jget('/api/status');
-    if(!r.ok||!(r.headers.get('content-type')||'').includes('json'))throw new Error('upstream '+r.status);
-    const s=await r.json();
-    $('host').textContent=s.host;$('meta').textContent='uptime '+s.uptime+' · '+new Date(s.ts*1000).toLocaleString();
-    $('cpu').textContent=(s.cpu.busy==null?'?':s.cpu.busy+'%');$('cpu-load').textContent=s.cpu.load1+' / '+s.cpu.load5+' / '+s.cpu.load15;
-    $('cpu-bar').style.width=Math.min(100,s.cpu.busy??0)+'%';
-    $('mem').textContent=(s.mem.used_pct==null?'?':s.mem.used_pct+'%');
-    $('mem-detail').textContent=(s.mem.used_gb!=null?FMT(s.mem.used_gb)+' / '+FMT(s.mem.total_gb):'');
-    $('mem-bar').style.width=Math.min(100,s.mem.used_pct??0)+'%';
-    const b=s.battery;if(b.present){$('batt').textContent=(b.percent==null?'?':b.percent+'%');
-      $('batt-detail').textContent=(b.source==='Battery'?'🔋 ':'🔌 ')+b.state;
-      $('batt-bar').style.width=(b.percent??0)+'%';
-      $('batt').className='big '+(b.source==='Battery'&&b.percent<20?'bad':'');
-    }else{$('batt').textContent='—';$('batt-detail').textContent='no battery';$('batt-bar').style.width='0%';}
-    $('pubip').textContent=s.public_ip||'—';$('lan').textContent=(s.net.ip||'')+' ('+(s.net.iface||'')+')';
-    let dh='';s.disk.forEach(d=>{dh+='<tr><td>'+d.mount+'</td><td class="num">'+FMT(d.used_gb)+'</td><td class="num">'+FMT(d.avail_gb)+'</td><td class="num">'+(d.pct||'')+'</td></tr>';});
-    $('disk').innerHTML='<tr><th>mount</th><th class="num">used</th><th class="num">free</th><th class="num"></th></tr>'+dh;
-    let th='';s.top.forEach(t=>{th+='<tr><td>'+t.comm+'</td><td class="num">'+t.cpu.toFixed(0)+'</td><td class="num">'+t.rss_mb+'MB</td></tr>';});
-    $('top').innerHTML='<tr><th>proc</th><th class="num">cpu%</th><th class="num">mem</th></tr>'+th;
-    const sec=s.security||{};$('fw').textContent=sec.firewall;$('fw').className=(sec.firewall==='on'?'ok':'bad');
-    $('rl').textContent=sec.remote_login;
-    let lh='';(sec.logins||[]).forEach(l=>{lh+='<tr><td>'+l.user+'</td><td>'+l.day+' '+l.time+'</td><td>'+l.host+'</td></tr>';});
-    $('logins').innerHTML=lh;
-    const w=s.warp||{};
-    $('worg').textContent=w.org||'—';
-    const wst=$('wst');
-    if(w.ok){const wt=(w.state||'').toLowerCase();
-      let cls='warn',txt=w.state||'unknown';
-      if(wt==='connected')cls='ok';else if(wt==='disconnected')cls='bad';
-      wst.innerHTML='<span class="'+cls+'">'+txt+'</span>'+(w.reason?' <span style="color:#8b949e">· '+w.reason+'</span>':'');
-    }else{wst.innerHTML='<span class="bad">unavailable</span>'+(w.error?' <span style="color:#8b949e">· '+String(w.error).slice(0,80)+'</span>':'');}
-    const sv=s.services||{};
-    const tun=sv['com.agent.mac-tunnel'];
-    $('htun').innerHTML=tun&&tun.running?'<span class="ok">up</span>':'<span class="bad">down</span>';
-    $('log').textContent='✓ '+new Date().toLocaleTimeString()+' · data ok';
-    $('dbanner').innerHTML='<span class="ok">data: OK</span> · '+new Date().toLocaleTimeString();
-  }catch(e){$('log').textContent='⚠ no data '+new Date().toLocaleTimeString()+' · '+((e&&e.name==='AbortError')?'timeout':((e&&e.message)||e));
-    $('dbanner').innerHTML='<span class="bad">data: error</span> · '+((e&&e.name==='AbortError')?'timeout':((e&&e.message)||e));}
-  finally{_busy=false;}
-}
-async function hist(){try{const r=await jget('/api/history',6000);if(!r.ok)return;const h=await r.json();chart(h.cpu,h.mem);}catch(e){}}
-async function clrefresh(){
-  try{const r=await jget('/api/claude',6000);
-    if(!r.ok||!(r.headers.get('content-type')||'').includes('json'))return;
-    const c=await r.json();
-    $('clagent').innerHTML=c.agentRunning?('<span class="ok">running</span>'+(c.agentPid&&c.agentPid!=='-'?' pid '+c.agentPid:'')):'<span class="bad">stopped</span>';
-    $('clstart').style.display=c.agentRunning?'none':'';
-    $('clauth').innerHTML=c.loggedIn?'<span class="ok">logged in</span> ('+c.authMethod+')':'<span class="bad">logged OUT</span>';
-    $('clemail').textContent=c.email||'—';
-    if(c.loginRunning){$('clstate').innerHTML='<span class="warn">login in progress…</span>';
-      if(c.url){$('clurlwrap').style.display='block';$('clurl').textContent=c.url;$('clstate').innerHTML='<span class="warn">waiting for your code…</span>';}
-    }else{$('clstate').textContent=c.loggedIn?'idle':'needs login';}
-  }catch(e){}
-}
-async function cllogin(){
-  $('clmsg').textContent='starting…';$('cllog').textContent='';
-  try{const r=await fetch('/api/claude/login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const d=await r.json();
-    $('clmsg').textContent=d.msg;
-    if(d.url){$('clurlwrap').style.display='block';$('clurl').textContent=d.url;}
-    await clrefresh();
-  }catch(e){$('clmsg').textContent='err '+e;}
-}
-async function clcode(){
-  const code=$('clcode').value.trim();if(!code)return;
-  $('cllog').textContent='submitting…';
-  try{const r=await fetch('/api/claude/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
-    const d=await r.json();
-    $('cllog').textContent=(d.log||[]).join('\\n');
-    $('clmsg').textContent=d.msg;
-    if(d.ok){$('clcode').value='';$('clurlwrap').style.display='none';}
-    await clrefresh();
-  }catch(e){$('cllog').textContent='err '+e;}
-}
-function ago(iso){
-  if(!iso)return null;
-  const t=Date.parse(iso);if(isNaN(t))return iso;
-  const s=Math.max(0,(Date.now()-t)/1000);
-  if(s<90)return Math.round(s)+'s ago';
-  if(s<5400)return Math.round(s/60)+'m ago';
-  return Math.round(s/3600)+'h ago';
-}
-async function cronrefresh(){
-  try{const r=await jget('/api/cron',6000);
-    if(!r.ok)return;const d=await r.json();
-    $('crondaemon').innerHTML=d.daemon_running?'<span class="ok">running</span>':'<span class="bad">not running</span>';
-    $('cronctab').innerHTML=d.crontab_ok?'<span class="ok">readable</span>':'<span class="bad" title="'+(d.crontab_error||'').replace(/"/g,'&quot;')+'">error</span>';
-    const tb=$('crontab');
-    while(tb.rows.length>1)tb.deleteRow(1);
-    (d.jobs||[]).forEach(j=>{
-      const tr=tb.insertRow();
-      const c0=tr.insertCell();c0.textContent=j.name;
-      if(j.running)c0.innerHTML+=' <span class="warn" title="сейчас выполняется">●</span>';
-      const c1=tr.insertCell();c1.innerHTML=j.installed?'<span class="ok">yes</span>':'<span class="bad">no</span>';
-      const c2=tr.insertCell();
-      c2.innerHTML=j.last_tick?((j.stale?'<span class="warn">':'')+ago(j.last_tick)+(j.stale?'</span>':'')):'<span class="bad">never</span>';
-      const c3=tr.insertCell();
-      const a=j.attempts_24h;
-      if(a){
-        const cls=a.fail>0?'warn':'ok';
-        let title=a.last_fail_reason?String(a.last_fail_reason):'';
-        if(a.last_run_duration_s!=null)title+=(title?' · ':'')+'last run '+a.last_run_duration_s+'s, '+(a.last_run_failed||0)+' failed';
-        c3.innerHTML='<span class="'+cls+'"'+(title?(' title="'+title.replace(/"/g,'&quot;')+'"'):'')+'>'+a.ok+'/'+a.fail+'</span>';
-      }else c3.textContent='—';
-      const c4=tr.insertCell();c4.style.textAlign='right';
-      const b=document.createElement('button');b.textContent='run';
-      b.onclick=function(){cronop(j.name,'run');};
-      c4.appendChild(b);
-    });
-  }catch(e){$('cronlog').textContent='err '+e;}
-}
-async function cronop(job,op){
-  $('cronlog').textContent=(job||'crontab')+' '+op+'…';
-  try{const r=await fetch('/api/cron',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job,op})});
-    const d=await r.json();$('cronlog').textContent=d.msg||(job||'crontab')+' '+op;
-    setTimeout(cronrefresh,1500);
-  }catch(e){$('cronlog').textContent='err '+e;}
-}
-clrefresh();tick();hist();cronrefresh();
-setInterval(tick,3000);setInterval(hist,15000);setInterval(clrefresh,5000);setInterval(cronrefresh,10000);
-</script></body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -1084,118 +742,6 @@ def _env_write(rel, content):
             "size": len(content.encode("utf-8")), "mtime": int(time.time())}
 
 
-ENV_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Env files</title>
-<meta name="theme-color" content="#0d1117"><link rel="manifest" href="/manifest.json">
-<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png"><link rel="apple-touch-icon" href="/icon-192.png">
-<script>if('serviceWorker'in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){})}</script>
-<style>
-:root{color-scheme:dark}*{box-sizing:border-box}
-body{font-family:ui-monospace,Menlo,monospace;background:#0d1117;color:#e6edf3;margin:0;padding:16px;max-width:1200px;margin:0 auto}
-h1{font-size:18px;margin:0 0 2px}.sub{color:#8b949e;font-size:12px}
-a{color:#58a6ff;text-decoration:none;font-size:12px}
-.top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px}
-button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer}
-button:hover{border-color:#58a6ff}button:disabled{opacity:.5;cursor:default}
-button.ok{background:#238636;border-color:#238636;color:#fff}
-input[type=text]{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 8px;font-size:12px;width:220px;font-family:inherit}
-.layout{display:flex;gap:12px;align-items:stretch}
-.pane{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px}
-#list{width:44%;min-width:300px;overflow:auto;max-height:calc(100vh - 170px)}
-#edit{flex:1;display:flex;flex-direction:column}
-@media(max-width:900px){.layout{flex-direction:column}#list{width:100%;max-height:35vh}}
-#head{font-size:12px;color:#8b949e;border-bottom:1px solid #21262d;padding-bottom:6px;margin-bottom:6px}
-.row{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:6px;cursor:pointer;font-size:12px;border:1px solid transparent}
-.row:hover{background:#1c2128}.row.sel{background:#1f6feb22;border-color:#1f6feb}
-.rpath{word-break:break-all;flex:1}.rsize{color:#8b949e;font-size:10px;white-space:nowrap}
-.b{font-size:9px;padding:1px 6px;border-radius:8px;white-space:nowrap}
-.b.live{background:#3fb95022;color:#3fb950;border:1px solid #3fb95066}
-.b.sample{background:#8b949e22;color:#8b949e;border:1px solid #30363d}
-textarea{flex:1;width:100%;min-height:46vh;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:10px;font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical;white-space:pre;tab-size:2}
-textarea:disabled{opacity:.6}
-#status{font-size:11px;color:#8b949e;margin-top:6px;white-space:pre-wrap;min-height:14px}
-#cur{font-size:11px;color:#58a6ff;word-break:break-all;margin-bottom:6px;min-height:14px}
-.bar{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
-#rootline{color:#8b949e;font-size:11px;margin-bottom:8px}
-</style></head><body>
-<div class="top">
-  <div><h1>ENV files</h1><div class="sub">edit .env files anywhere under ~/work</div></div>
-  <div><a href="/">← back to status</a></div>
-</div>
-<div id="rootline"></div>
-<div class="layout">
-  <div class="pane" id="list">
-    <div id="head" style="display:flex;gap:6px;align-items:center">
-      <input type="text" id="q" placeholder="filter…" oninput="render()">
-      <span style="margin-left:auto" id="cnt"></span>
-      <button onclick="load(true)" title="rescan">↻</button>
-    </div>
-    <div id="rows"></div>
-  </div>
-  <div class="pane" id="edit">
-    <div id="cur">select a file from the list →</div>
-    <textarea id="ta" placeholder="…" disabled spellcheck="false"></textarea>
-    <div class="bar">
-      <button class="ok" id="saveb" onclick="save()" disabled>save</button>
-      <button onclick="reloadf()" disabled id="reloadb">reload from disk</button>
-      <span id="hint" style="font-size:10px;color:#8b949e">before every save a backup is kept in ~/.mac-status-env-backups</span>
-    </div>
-    <div id="status"></div>
-  </div>
-</div>
-<script>
-let FILES=[],cur=null,orig='';
-const $=id=>document.getElementById(id);
-const esc=s=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function load(force){
-  try{const r=await fetch('/api/envs'+(force?'?refresh=1':''),{cache:'no-store'});
-    const d=await r.json();if(!d.ok)throw new Error(d.msg);
-    FILES=d.files;render();$('rootline').textContent='root: '+d.root+' · '+d.count+' files';
-  }catch(e){st('list error: '+e);}
-}
-function kind(k){return '<span class="b '+k+'">'+k+'</span>';}
-function render(){
-  const q=($('q').value||'').toLowerCase();
-  const rows=$('rows');rows.innerHTML='';
-  let shown=0;
-  FILES.forEach(f=>{
-    if(q&&!f.path.toLowerCase().includes(q))return;shown++;
-    const r=document.createElement('div');r.className='row'+(cur&&f.path===cur?' sel':'');
-    r.innerHTML=kind(f.kind)+'<span class="rpath">'+esc(f.path)+'</span><span class="rsize">'+
-      (f.size>1048576?(f.size/1048576).toFixed(1)+'M':f.size>1024?(f.size/1024).toFixed(1)+'k':f.size)+
-      ' · '+new Date(f.mtime*1000).toLocaleDateString()+'</span>';
-    r.onclick=()=>open(f.path);
-    rows.appendChild(r);
-  });
-  $('cnt').textContent=shown+'/'+FILES.length;
-}
-async function open(p){
-  cur=p;orig='';$('ta').disabled=true;$('ta').value='';$('cur').textContent=p;render();st('loading…');
-  try{const r=await fetch('/api/envs/read?path='+encodeURIComponent(p),{cache:'no-store'});
-    const d=await r.json();
-    if(!d.ok){st('error: '+d.msg);return;}
-    orig=d.content;$('ta').value=d.content;$('ta').disabled=false;$('saveb').disabled=false;$('reloadb').disabled=false;
-    $('cur').textContent=p+' · '+d.size+' bytes · '+new Date(d.mtime*1000).toLocaleString();
-    st('loaded — edit and press save');
-  }catch(e){st('error: '+e);}
-}
-function reloadf(){if(cur)open(cur);}
-async function save(){
-  if(!cur)return;st('saving…');
-  try{const r=await fetch('/api/envs/write',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({path:cur,content:$('ta').value})});
-    const d=await r.json();
-    if(d.ok){orig=$('ta').value;st('✓ '+d.msg);load(true);}
-    else st('✗ '+d.msg);
-  }catch(e){st('✗ '+e);}
-}
-function st(m){$('status').textContent=m;}
-document.addEventListener('keydown',e=>{
-  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='s'){e.preventDefault();save();}
-  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='r'&&cur){e.preventDefault();reloadf();}
-});
-load();
-</script></body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -1418,152 +964,6 @@ def _term_reset():
     return _term_start()
 
 
-TERM_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Console</title>
-<meta name="theme-color" content="#0d1117"><link rel="manifest" href="/manifest.json">
-<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png"><link rel="apple-touch-icon" href="/icon-192.png">
-<script>if('serviceWorker'in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){})}</script>
-<style>
-:root{color-scheme:dark}*{box-sizing:border-box}
-body{font-family:ui-monospace,Menlo,monospace;background:#0d1117;color:#e6edf3;margin:0;padding:14px;max-width:1100px;margin:0 auto}
-.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
-button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 11px;font-size:12px;cursor:pointer}
-button:hover{border-color:#58a6ff}button.go{background:#238636;border-color:#238636;color:#fff}
-button.up{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
-button.up:hover{background:#388bfd;border-color:#388bfd}
-#out{height:62dvh;background:#010409;border:1px solid #30363d;border-radius:10px;padding:10px;
-  overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.45}
-.row{display:flex;gap:8px;margin-top:8px;align-items:stretch}
-#inp{flex:1;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:9px 10px;
-  font-family:ui-monospace,Menlo,monospace;font-size:13px;outline:none}
-#inp:focus{border-color:#58a6ff}
-.ctr{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
-</style></head><body>
-<div class="top">
-  <button onclick="location.href='/'">← status</button>
-  <button onclick="location.href='/envs'">env files</button>
-  <button class="up" onclick="again()" title="re-run the previous command">↑ rerun</button>
-  <button onclick="sendKey('\\x03')" title="SIGINT (Ctrl-C)">^C</button>
-  <button onclick="resetSess()" title="kill the shell and start a new one">reset</button>
-  <button onclick="clearScr()" title="clear the output pane">clear</button>
-</div>
-<div id="out"></div>
-<div class="row">
-  <input id="inp" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="command…">
-  <button class="go" onclick="run()">enter ↵</button>
-</div>
-<div class="ctr">
-  <button onclick="histMove(1)" title="previous command into the input (↑)">↑ prev</button>
-  <button onclick="histMove(-1)" title="next command into the input (↓)">↓ next</button>
-  <button onclick="sendKey('\\x03')" title="interrupt the running command">^C interrupt</button>
-  <button onclick="sendKey('\\x04')" title="end of input / exit the shell">^D</button>
-</div>
-<script>
-const $=id=>document.getElementById(id),out=$('out'),inp=$('inp');
-let after=0,polling=false,dead=false,logText='',pollTimer=null;
-// The page chrome is buttons only: diagnostics go into the output pane itself,
-// in the same [bracketed] style as the shell-lifecycle notices.
-const note=m=>append('\\n['+m+']\\n');
-function clean(s){
-  s=s.replace(/\\x1b\\[[0-9;?]*[ -/]*[@-~]/g,'').replace(/\\x1b\\][^\\x07]*?(?:\\x07|\\x1b\\\\)/g,'');
-  s=s.replace(/\\r\\n/g,'\\n').replace(/\\r/g,'\\n').replace(/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]/g,'');
-  return s;
-}
-function append(s){
-  if(!s)return;
-  logText+=s;
-  if(logText.length>600000){logText=logText.slice(-400000);}
-  out.textContent=logText;
-  out.scrollTop=out.scrollHeight;
-}
-async function openSess(){
-  try{const r=await fetch('/api/term/open',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const d=await r.json();
-    dead=!d.ok;
-    if(!d.ok)note('shell error: '+(d.msg||'?'));
-    else if(!d.already)note('shell ready (pid '+(d.pid||'?')+')');
-    if(d.ok&&!polling){polling=true;if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval(poll,250);}
-  }catch(e){note('err '+e);}
-}
-let q=Promise.resolve();
-function send(s){
-  q=q.then(()=>fetch('/api/term/input',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({data:s})}).catch(()=>{}));
-}
-// Dead shell (server restarted / shell exited) -> start a fresh one instead of
-// making the user hunt for "reset session"; history is server-side, so it lives on.
-async function ensureShell(){
-  if(!dead)return true;
-  append('\\n[shell gone — starting a new session]\\n');
-  await resetSess();
-  return !dead;
-}
-async function sendKey(k){if(!await ensureShell()){append('\\n[no shell — check the server]\\n');return;}send(k);}
-async function run(){
-  const c=inp.value;inp.value='';
-  if(!c.trim())return;
-  if(!await ensureShell()){inp.value=c;return;}
-  send(c+'\\r');
-  histReset();
-  q=q.then(loadHist);   // refresh after the input POST lands server-side
-  inp.focus();
-}
-async function poll(){
-  try{const r=await fetch('/api/term/poll?after='+after,{cache:'no-store'});
-    if(!r.ok)return;
-    const d=await r.json();
-    if(d.out){append(clean(d.out));after=d.after;}
-    if(d.dead&&!dead){dead=true;polling=false;if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
-      note('shell exited — the next command starts a new one');}
-  }catch(e){}
-}
-async function resetSess(){
-  logText='';out.textContent='';after=0;polling=false;dead=true;
-  if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
-  try{const r=await fetch('/api/term/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const d=await r.json();
-    if(d.ok)await openSess();else note('reset failed: '+(d.msg||'?'));
-  }catch(e){note('err '+e);}
-}
-function clearScr(){logText='';out.textContent='';}
-// ---- command history (server-side, newest first) -------------------------
-let hist=[],hidx=-1,draft='';
-async function loadHist(){
-  try{const r=await fetch('/api/term/history',{cache:'no-store'});
-    const d=await r.json();if(d.ok)hist=d.hist||[];
-  }catch(e){}
-}
-function histReset(){hidx=-1;draft='';}
-function histMove(dir){                       // +1 = older (↑), -1 = newer (↓)
-  if(!hist.length){loadHist();return;}
-  if(dir>0){if(hidx<0)draft=inp.value;hidx=Math.min(hidx+1,hist.length-1);}
-  else{if(hidx<0)return;hidx--;}
-  inp.value=hidx<0?draft:hist[hidx];
-  // No autofocus: on a phone that pops the on-screen keyboard over the output.
-  // The caret still goes to the end so an already-focused field stays usable.
-  try{inp.setSelectionRange(inp.value.length,inp.value.length);}catch(e){}
-}
-async function again(){                        // ↑ rerun: re-execute last command
-  if(!await ensureShell())return;
-  try{const r=await fetch('/api/term/again',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const d=await r.json();
-    histReset();
-    if(!d.ok)note('cannot rerun: '+(d.msg||'?'));
-    if(d.ok)q=q.then(loadHist);
-  }catch(e){note('err '+e);}
-}
-inp.addEventListener('keydown',e=>{
-  if(e.key==='Enter'){e.preventDefault();run();}
-  else if(e.key==='ArrowUp'){e.preventDefault();histMove(1);}
-  else if(e.key==='ArrowDown'){e.preventDefault();histMove(-1);}
-  else{histReset();}
-});
-window.addEventListener('keydown',e=>{
-  if(e.ctrlKey&&e.key.toLowerCase()==='c'&&document.activeElement!==inp){sendKey('\\x03');}
-});
-openSess();
-loadHist();
-</script></body></html>"""
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1576,14 +976,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_raw(self, code, body, ctype, cache="no-store"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", cache)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
     def _authorized(self):
         """True if the request may touch /api/*: disabled until a token is configured."""
         if not SERVICE_TOKEN:
@@ -1591,20 +983,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.headers.get("X-Mac-Token", "") == SERVICE_TOKEN
 
     def do_GET(self):
-        if self.path.startswith("/api/") and not self._authorized():
+        # Панель теперь только API: с ней говорит исключительно бэкенд Cloudly через
+        # loopback-туннель, поэтому любой не-/api путь не найден (браузерный UI и PWA удалены).
+        if not self.path.startswith("/api/"):
+            self._send(404, {"ok": False, "msg": "not found"})
+            return
+        if not self._authorized():
             self._send(401, {"ok": False, "msg": "unauthorized"})
             return
-        p = self.path.split("?", 1)[0]
-        if p in ("/manifest.json", "/manifest.webmanifest"):
-            self._send_raw(200, json.dumps(PWA_MANIFEST).encode(),
-                           "application/manifest+json", "public, max-age=600")
-        elif p == "/sw.js":
-            self._send_raw(200, PWA_SW.encode(),
-                           "application/javascript; charset=utf-8", "no-cache")
-        elif p in ("/icon-192.png", "/icon-512.png", "/favicon.ico"):
-            icon = _ICON_512 if p == "/icon-512.png" else _ICON_192
-            self._send_raw(200, icon, "image/png", "public, max-age=86400")
-        elif self.path.startswith("/api/status"):
+        if self.path.startswith("/api/status"):
             self._send(200, collect())
         elif self.path.startswith("/api/history"):
             ts, cpu, mem = [], [], []
@@ -1621,9 +1008,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith("/api/github-actions"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._send(200, github_actions.dashboard(bool(q.get("refresh"))))
-        elif self.path == "/actions" or self.path.startswith("/actions?"):
-            self._send_raw(200, github_actions.ACTIONS_PAGE.encode(),
-                           "text/html; charset=utf-8")
         elif self.path.startswith("/api/envs/list"):
             self._send(200, {"ok": True, "root": ENV_ROOT, "count": len(_env_scan()),
                              "files": _env_scan()})
@@ -1633,37 +1017,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith("/api/envs"):
             self._send(200, {"ok": True, "root": ENV_ROOT, "count": len(_env_scan()),
                              "files": _env_scan()})
-        elif self.path == "/envs" or self.path.startswith("/envs?"):
-            body = ENV_PAGE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
         elif self.path.startswith("/api/term/history"):
             self._send(200, _term_history())
         elif self.path.startswith("/api/term/poll"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._send(200, _term_poll((q.get("after") or ["0"])[0]))
-        elif self.path == "/term" or self.path.startswith("/term?"):
-            body = TERM_PAGE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
         elif self.path.startswith("/api/term/open"):
             self._send(200, _term_start())
         else:
-            body = PAGE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send(404, {"ok": False, "msg": "not found"})
 
     def do_POST(self):
         if self.path.startswith("/api/") and not self._authorized():
