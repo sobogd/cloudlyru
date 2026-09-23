@@ -13,6 +13,7 @@ import 'agent_controller.dart';
 import 'agent_new_session.dart';
 import 'agent_thread_screen.dart';
 import 'agent_types.dart';
+import '../mac/pull_requests_screen.dart';
 
 /// Раздел «Проекты»: общий список разговоров с агентами на домашнем маке.
 ///
@@ -444,13 +445,26 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   /// панели в двухпанельном виде): обе шапки стоят на одной линии и читаются одной полосой над
   /// списком и перепиской. Отступы по краям — как у строк списка, чтобы заголовок был с ними
   /// на одной вертикали.
-  Widget _sidebarHeader() => const SizedBox(
+  Widget _sidebarHeader() => SizedBox(
     height: 56,
     child: Padding(
-      padding: EdgeInsets.symmetric(horizontal: 16),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: Text('Проекты', style: TextStyle(color: C.fg, fontSize: 18)),
+      padding: const EdgeInsets.only(left: 16, right: 4),
+      child: Row(
+        children: [
+          const Expanded(
+            child: Text('Проекты', style: TextStyle(color: C.fg, fontSize: 18)),
+          ),
+          // Пул-реквесты стоят здесь, а не только в разделе «Mac»: смотрят их затем же, зачем
+          // открывают проект — чтобы отдать работу агенту, и путь от строки PR до разговора
+          // должен быть в один экран.
+          IconButton(
+            tooltip: 'Пул-реквесты',
+            onPressed: () => Navigator.of(context).push(
+              CupertinoPageRoute<void>(builder: (_) => const PullRequestsScreen()),
+            ),
+            icon: const Icon(Icons.merge_type, color: C.fg2, size: 20),
+          ),
+        ],
       ),
     ),
   );

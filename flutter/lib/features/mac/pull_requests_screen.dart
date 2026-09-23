@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../providers.dart';
+import '../agent/agent_launch.dart';
 
 /// Состояние пул-реквеста, по которому фильтруется список.
 enum _State {
@@ -212,18 +213,78 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
     }
   }
 
+  /// Готовая команда ревью для этого PR.
+  String _reviewPrompt(Map<String, dynamic> row) =>
+      '/pr-review ${row['url'] ?? ''} без оверинжиниринга, если есть замечания review all '
+      'и ченж реквест если нет замечаний аппрув';
+
   /// Копирует готовую команду ревью для этого PR.
   Future<void> _copyReview(Map<String, dynamic> row) async {
     final url = '${row['url'] ?? ''}';
     if (url.isEmpty) return;
-    await Clipboard.setData(ClipboardData(
-      text: '/pr-review $url без оверинжиниринга, если есть замечания review all '
-          'и ченж реквест если нет замечаний аппрув',
-    ));
+    await Clipboard.setData(ClipboardData(text: _reviewPrompt(row)));
     if (mounted) {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text('Команда ревью скопирована: #${row['number']}')));
     }
+  }
+
+  /// Открывает новую сессию агента с готовой командой ревью в поле ввода.
+  ///
+  /// Мастер выбора папки и модели — тот же, что в «Проектах»: ревью просят у агента в той папке,
+  /// где лежит репозиторий, и выбор харнесса/модели остаётся за человеком.
+  Future<void> _reviewWithAgent(Map<String, dynamic> row) async {
+    final url = '${row['url'] ?? ''}';
+    if (url.isEmpty) return;
+    await startAgentSession(context, ref, prompt: _reviewPrompt(row));
+  }
+
+  /// Меню строки: что можно сделать с этим пул-реквестом.
+  Future<void> _actions(Map<String, dynamic> row) async {
+    final task = '${row['task'] ?? ''}';
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (sheet) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.smart_toy_outlined),
+              title: const Text('Отдать на ревью агенту'),
+              onTap: () {
+                Navigator.pop(sheet);
+                _reviewWithAgent(row);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.copy_all_outlined),
+              title: const Text('Скопировать команду ревью'),
+              onTap: () {
+                Navigator.pop(sheet);
+                _copyReview(row);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.open_in_new),
+              title: Text('Открыть PR #${row['number']}'),
+              onTap: () {
+                Navigator.pop(sheet);
+                _open('${row['url'] ?? ''}');
+              },
+            ),
+            if (task.isNotEmpty)
+              ListTile(
+                leading: const Icon(Icons.task_alt),
+                title: Text('Открыть $task в Jira'),
+                onTap: () {
+                  Navigator.pop(sheet);
+                  _open('${row['task_url']}');
+                },
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   /// Применяет фильтры и сортировку к снимку.
@@ -507,16 +568,16 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
         mainAxisSize: MainAxisSize.min,
         children: [
           IconButton(
-            tooltip: 'Скопировать команду ревью',
+            tooltip: 'Отдать на ревью агенту',
             visualDensity: VisualDensity.compact,
-            onPressed: () => _copyReview(row),
-            icon: const Icon(Icons.copy_all_outlined, size: 18),
+            onPressed: () => _reviewWithAgent(row),
+            icon: const Icon(Icons.smart_toy_outlined, size: 18),
           ),
           const Icon(Icons.open_in_new, size: 18),
         ],
       ),
       onTap: () => _open('${row['url'] ?? ''}'),
-      onLongPress: task.isEmpty ? null : () => _open('${row['task_url']}'),
+      onLongPress: () => _actions(row),
     );
   }
 

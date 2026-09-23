@@ -46,6 +46,12 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
   /// всего окна, и пузырь вылез бы за край панели.
   final double? paneWidth;
 
+  /// Текст, с которым разговор открывают из другого раздела.
+  ///
+  /// Подставляется в поле ввода один раз при открытии и не отправляется: человек видит, что
+  /// именно уйдёт агенту, и жмёт отправку сам — как с распознанным голосом.
+  final String? initialPrompt;
+
   /// Уход из панели: сброс выбранного разговора в списке.
   ///
   /// Назван отдельно от возврата назад, потому что панель — не маршрут: `Navigator.pop` здесь
@@ -60,6 +66,7 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
     this.embedded = false,
     this.paneWidth,
     this.onDismiss,
+    this.initialPrompt,
   });
 
   @override
@@ -145,6 +152,8 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   void initState() {
     super.initState();
     _thread = ref.read(agentThreadProvider.notifier);
+    final prompt = widget.initialPrompt;
+    if (prompt != null && prompt.isNotEmpty) _input.text = prompt;
     _scroll.addListener(_trackScroll);
     // Возврат приложения на передний план: свернутое приложение ОС усыпляет вместе с сокетами,
     // и о смерти потока никто не сообщает. Контроллер по этому сигналу переподключится и
