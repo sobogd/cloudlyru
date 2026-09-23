@@ -2362,6 +2362,12 @@ class PiSession(AgentSession):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,  # построчно: протокол pi — это JSON-строки
+                # Своя сессия процесса: `launchctl kickstart -k` (перезапуск моста) гасит мост
+                # вместе с его группой процессов, и без этого флага туда попадают живые сессии —
+                # ответ агента обрывался прямо посреди работы. Отделившись, pi перезапуск
+                # переживает и завершается сам: stdin закрывается, а RPC-режим на конце ввода
+                # гасит себя штатно, дописав состояние сессии.
+                start_new_session=True,
             )
         except OSError as e:
             raise PiError("не удалось запустить pi (%s): %s" % (CONFIG.get("pi"), e))
@@ -2626,6 +2632,8 @@ class ClaudeSession(AgentSession):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,  # построчно: протокол Claude Code — тоже JSON-строки
+                # Причина та же, что у pi выше: перезапуск моста не должен убивать идущий ответ.
+                start_new_session=True,
             )
         except OSError as e:
             raise PiError("не удалось запустить claude (%s): %s" % (CONFIG.get("claude"), e))
