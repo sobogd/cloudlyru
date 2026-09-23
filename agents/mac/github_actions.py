@@ -176,7 +176,7 @@ def _github(method, path, payload=None):
             "Accept": "application/vnd.github+json",
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
-            "User-Agent": "jevel-mac-status",
+            "User-Agent": "cloudlyru-mac-status",
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )

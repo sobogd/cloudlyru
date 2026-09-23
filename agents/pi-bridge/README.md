@@ -16,7 +16,7 @@
 телефон / мак (приложение CloudlyRu)
    │ HTTPS + SSE, сессия приложения
 сервер CloudlyRu (VPS, src/projects)  →  http://127.0.0.1:18820
-   │ reverse-SSH туннель мака (jevel.ai/agents/run-dsh-tunnel.sh, ком.agent.dsh-reverse-tunnel)
+   │ reverse-SSH туннель мака (cloudlyru/agents/mac/run-tunnel.sh, com.agent.mac-tunnel)
 мост  agents/pi-bridge/server.py, 127.0.0.1:18820
    │ JSON-строки по stdio, процесс на сессию
 pi    pi --mode rpc  (cwd = папка проекта)
@@ -104,13 +104,13 @@ curl -s http://127.0.0.1:18820/health
 curl -s http://127.0.0.1:18820/projects | head -c 400
 ```
 
-На VPS порт появляется из reverse-SSH туннеля мака: в `jevel.ai/agents/run-dsh-tunnel.sh`
+На VPS порт появляется из reverse-SSH туннеля мака: в `cloudlyru/agents/mac/run-tunnel.sh`
 для него есть строка `-R 127.0.0.1:18820:127.0.0.1:18820` (и порт перечислен в очистке
 залипших слушателей — без этого туннель не переподнимется после обрыва). После правки
 скрипта туннель перезапускается:
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.agent.dsh-reverse-tunnel
+launchctl kickstart -k gui/$(id -u)/com.agent.mac-tunnel
 ssh root@<VPS> 'ss -ltn | grep 18820'          # порт должен слушать loopback
 ssh root@<VPS> 'curl -s http://127.0.0.1:18820/health'
 ```
