@@ -79,6 +79,12 @@ export class MacService {
       });
       const text = await res.text();
       if (!res.ok) {
+        // Панель отвечает 401, когда на бэкенде нет/неверен MAC_SERVICE_TOKEN. Наружу этот
+        // 401 отдавать нельзя: приложение трактует любой 401 как «сессия протухла» и
+        // разлогинивает человека. Поэтому «панель не пустила» — это 502 (мак недоступен).
+        if (res.status === 401 || res.status === 403) {
+          throw new MacError(502, 'панель отклонила сервис-токен (проверь MAC_SERVICE_TOKEN)');
+        }
         throw new MacError(res.status, text.slice(0, 200) || `панель ответила ${res.status}`);
       }
       if (!text) return {} as T;

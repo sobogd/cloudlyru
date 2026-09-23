@@ -136,11 +136,14 @@ jobs:
           STT_URL: ${{ secrets.STT_URL || 'http://127.0.0.1:18818' }}
           # Пусто — whisper определяет язык сам: в русской речи бывают английские вставки.
           STT_LANGUAGE: ${{ secrets.STT_LANGUAGE }}
+          # Сервис-токен панели мака (`X-Mac-Token`): то же значение, что MAC_SERVICE_TOKEN
+          # в ~/work/.env на маке. Без него панель отвечает 401 и раздел «Mac» недоступен.
+          MAC_SERVICE_TOKEN: ${{ secrets.MAC_SERVICE_TOKEN }}
         with:
           host: ${{ secrets.SERVER_IP }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
-          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,PI_BRIDGE_URL,STT_URL,STT_LANGUAGE
+          envs: DATABASE_URL,ADMIN_LOGIN,ADMIN_PASSWORD,S3_FILES_ACCESS_KEY,S3_FILES_SECRET_KEY,CONVERT_PHOTO_PARALLEL,MAIL_SECRET_KEY,MAIL_SYNC_ENABLED,MAIL_INBOUND_TOKEN,MAIL_PURGE_ENABLED,MAIL_PURGE_DRY_RUN,MAIL_MAX_MESSAGE_MB,FACTURA_COMPANY_ID,S3_INVOICES_BUCKET,VERIFACTU_MODE,VERIFACTU_ENV,VERIFACTU_MASTER_KEY,GEMINI_API_KEY,PI_BRIDGE_URL,STT_URL,STT_LANGUAGE,MAC_SERVICE_TOKEN
           script: |
             set -e
             cd /home/deploy/apps/cloudlyru
@@ -245,6 +248,8 @@ jobs:
             # Локальное распознавание речи для голосового ввода — тем же туннелем мака.
             STT_URL=$STT_URL
             STT_LANGUAGE=$STT_LANGUAGE
+            # Панель мака: сервис-токен для ручек /mac/*
+            MAC_SERVICE_TOKEN=$MAC_SERVICE_TOKEN
             EOF
             chmod 600 .env
             pm2 reload cloudlyru --update-env --cwd /home/deploy/apps/cloudlyru \
