@@ -94,7 +94,7 @@ gh secret set MAIL_PURGE_ENABLED  --body true    # затем само удал�
 | Слой | Где живёт | Что делает |
 |---|---|---|
 | Мост `agents/pi-bridge/server.py` | мак, `127.0.0.1:18820` | HTTP+SSE наружу, `pi --mode rpc` по stdio внутрь; пул процессов, allowlist корней |
-| Туннель `com.agent.dsh-reverse-tunnel` | мак → VPS | пробрасывает `VPS 127.0.0.1:18820 -> мак 127.0.0.1:18820` |
+| Туннель `com.agent.mac-tunnel` | мак → VPS | пробрасывает `VPS 127.0.0.1:18820 -> мак 127.0.0.1:18820` |
 | Сервер `src/projects` | VPS | проксирует `/projects/*` к мосту, поток событий отдаёт как есть; раз в 5 с спрашивает `/health` и держит снимок работы (`/projects/activity`) |
 | Раздел в приложении | телефон и мак | список проектов, сессии, переписка с карточками инструментов, выбор харнесса и модели |
 
@@ -115,9 +115,9 @@ gh secret set MAIL_PURGE_ENABLED  --body true    # затем само удал�
 # 1) мост
 cp agents/pi-bridge/com.agent.pi-bridge.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.agent.pi-bridge.plist
-# 2) порт в туннеле: в jevel.ai/agents/run-dsh-tunnel.sh строка -R 127.0.0.1:18820
+# 2) порт в туннеле: в jevel.ai/agents/run-tunnel.sh строка -R 127.0.0.1:18820
 #    и порт в очистке залипших слушателей, затем перезапуск туннеля
-launchctl kickstart -k gui/$(id -u)/com.agent.dsh-reverse-tunnel
+launchctl kickstart -k gui/$(id -u)/com.agent.mac-tunnel
 # 3) проверка: порт слушает loopback VPS и мост отвечает
 ssh root@46.225.143.221 'ss -ltn | grep 18820; curl -s http://127.0.0.1:18820/health'
 ```
