@@ -5,7 +5,6 @@ import '../../providers.dart';
 import 'claude_screen.dart';
 import 'env_screen.dart';
 import 'github_actions_screen.dart';
-import 'pull_requests_screen.dart';
 import 'terminal_screen.dart';
 
 /// Экран раздела «Mac»: состояние домашнего MacBook и базовое управление.
@@ -304,8 +303,6 @@ class _MacScreenState extends ConsumerState<MacScreen> {
           tile(Icons.smart_toy_outlined, 'Claude', 'Статус и вход', (_) => const ClaudeScreen()),
           tile(Icons.play_circle_outline, 'GitHub Actions', 'Workflow и запуск',
               (_) => const GithubActionsScreen()),
-          tile(Icons.merge_type, 'Пул-реквесты', 'Открытые PR с фильтрами',
-              (_) => const PullRequestsScreen()),
           tile(Icons.description_outlined, 'Env-файлы', 'Список и редактор .env', (_) => const EnvScreen()),
           tile(Icons.terminal, 'Терминал', 'Shell на MacBook', (_) => const TerminalScreen()),
         ],
