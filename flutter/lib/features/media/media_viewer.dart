@@ -277,14 +277,13 @@ class _MediaViewerState extends State<MediaViewer> {
     return InteractiveViewer(
       minScale: 1,
       maxScale: 8,
-      child: Center(
-        child: CachedNetworkImage(
-          imageUrl: widget.api.previewUrl(sha, w: 1080),
-          httpHeaders: widget.api.authHeaders,
-          fit: BoxFit.contain,
-          placeholder: (_, _) => const CircularProgressIndicator(color: Colors.white),
-          errorWidget: (_, _, _) => const Center(child: Text('Превью не открылось — файл мог быть удалён', style: TextStyle(color: Colors.white70))),
-        ),
+      alignment: Alignment.center,
+      child: CachedNetworkImage(
+        imageUrl: widget.api.previewUrl(sha, w: 1080),
+        httpHeaders: widget.api.authHeaders,
+        fit: BoxFit.contain,
+        placeholder: (_, _) => const CircularProgressIndicator(color: Colors.white),
+        errorWidget: (_, _, _) => const Center(child: Text('Превью не открылось — файл мог быть удалён', style: TextStyle(color: Colors.white70))),
       ),
     );
   }
