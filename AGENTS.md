@@ -47,8 +47,8 @@ git worktree. Законченная работа уезжает прямо в `
 `agents/pi-bridge/`. Старый `scripts/push-to-main.sh` (тоже пуш в main, но без перезапуска
 моста) оставлен лежать; в новых сессиях берите `gh-push.sh`.
 
-Mac-агенты (статус-панель, туннель, LLM, whisper, claude) переехали сюда в `agents/mac/`
-(раньше — отдельный репозиторий jevel.ai). Панель слушает `127.0.0.1:18810`; её ручки
+Mac-агенты (статус-панель, туннель, LLM, whisper, claude) живут в `agents/mac/`.
+Панель слушает `127.0.0.1:18810`; её ручки
 проксирует `src/mac/`, заголовок `X-Mac-Token` берётся из `MAC_SERVICE_TOKEN`. Перезапуск
 агентов: `agents/mac/install.sh` или `launchctl kickstart -k gui/$(id -u)/com.agent.<label>`.
 

@@ -15,7 +15,7 @@
 ## Цепочка целиком
 
 1. **Обрыв туннеля убивает процесс моста.** Туннель поднимается скриптом
-   `jevel.ai/agents/run-dsh-tunnel.sh` (launchd `com.agent.dsh-reverse-tunnel`), а мост —
+   `agents/mac/run-tunnel.sh` (launchd `com.agent.mac-tunnel`), а мост —
    отдельным launchd-агентом `com.agent.pi-bridge` (`agents/pi-bridge/com.agent.pi-bridge.plist`).
    Связи между ними нет: скрипт туннеля мост не перезапускает.
 2. **launchd поднимает мост заново** (`KeepAlive` + `ThrottleInterval` 5 с) — с пустым пулом:
