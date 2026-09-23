@@ -65,10 +65,16 @@ export class MacService {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? REQUEST_TIMEOUT_MS);
     try {
+      const headers: Record<string, string> = {};
+      if (options.body !== undefined) headers['Content-Type'] = 'application/json';
+      // Сервис-токен панели: без него панель отвечает 401 на /api/* (если он у неё заведён).
+      const token = env.MAC_SERVICE_TOKEN.trim();
+      if (token) headers['X-Mac-Token'] = token;
+
       const res = await fetch(`${this.base()}${path}`, {
         method,
         signal: controller.signal,
-        headers: options.body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        headers: Object.keys(headers).length ? headers : undefined,
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
       });
       const text = await res.text();
