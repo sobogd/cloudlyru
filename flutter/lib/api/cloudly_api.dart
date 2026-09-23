@@ -681,6 +681,26 @@ class CloudlyApi {
   /// Удаление заметки — насовсем, без корзины.
   Future<void> deleteNote(String id) async => _req('/notes/$id', method: 'DELETE');
 
+  // ---------- Mac ----------
+
+  /// Состояние домашнего мака: CPU/RAM/диски/батарея, WARP, службы, безопасность.
+  ///
+  /// Сервер сам ходит к панели мака по reverse-SSH туннелю, поэтому приложение адреса
+  /// туннеля не знает. Нет ответа — значит мак спит или туннель отключился (код ошибки
+  /// `mac_unreachable`/`mac_timeout`).
+  Future<Map<String, dynamic>> macStatus() async => _m(await _req('/mac/status'));
+
+  /// История CPU/RAM за ~100 минут (семпл каждые 15 с) для графика.
+  Future<Map<String, dynamic>> macHistory() async => _m(await _req('/mac/history'));
+
+  /// Действие над маком из белого списка панели (`reboot`, `sleep`, `firewall-on`, …).
+  Future<Map<String, dynamic>> macAction(String action) async =>
+      _m(await _req('/mac/action', method: 'POST', body: {'action': action}));
+
+  /// WARP: `connect` | `disconnect` | `reconnect` | `status`.
+  Future<Map<String, dynamic>> macWarp(String op) async =>
+      _m(await _req('/mac/warp', method: 'POST', body: {'op': op}));
+
   // ---------- медиа ----------
 
   /// Сколько кадров в медиатеке. Галерея им не пользуется: её список курсорный, и полной

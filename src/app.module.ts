@@ -24,6 +24,7 @@ import { ClipboardModule } from './clipboard/clipboard.module';
 import { MailModule } from './mail/mail.module';
 import { FacturaModule } from './factura/factura.module';
 import { ProjectsModule } from './projects/projects.module';
+import { MacModule } from './mac/mac.module';
 import { NotesModule } from './notes/notes.module';
 
 /**
@@ -69,6 +70,7 @@ import { NotesModule } from './notes/notes.module';
     MailModule,
     FacturaModule,
     ProjectsModule,
+    MacModule,
     NotesModule,
   ],
   providers: [
