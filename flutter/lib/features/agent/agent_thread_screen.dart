@@ -1084,6 +1084,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   Widget _detailsPanel(AgentThreadState state) {
     final session = state.session!;
     final rows = <(String, String)>[
+      // Идентификатор первым: по нему разговор ищется в списке и продолжается в терминале
+      // (`pi -r`), и именно его не хватало, чтобы отличить одну сессию от другой.
+      ('Идентификатор', session.id),
       ('Проект', session.path),
       ('Харнесс', session.harnessName.isEmpty ? 'pi' : session.harnessName),
       ('Модель', session.modelLabel),

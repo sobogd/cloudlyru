@@ -872,9 +872,34 @@ class AgentThreadController extends Notifier<AgentThreadState> {
         loading: false,
         hasOlder: page.hasMore,
       );
-      if (session.busy) await _followRunning(session.id);
+      // Полное описание сессии мост знает точнее строки списка: там есть путь к файлу истории и
+      // заполнение контекста, которых в строке нет вовсе. Разговор открывается и по строке
+      // (на телефоне процесс агента при этом не поднимается), поэтому без этого запроса
+      // «Сведения о сессии» оставались бы без файла и без счётчиков.
+      final full = await _fullInfo(session);
+      if (state.session?.id != session.id) return;
+      state = state.copyWith(session: full);
+      // Занятость берём из свежего описания: строка списка могла устареть на несколько секунд,
+      // а от неё зависит, подключаться ли к идущему прогону
+      if (full.busy) await _followRunning(session.id);
     } on AgentApiException catch (e) {
       state = state.copyWith(loading: false).withError(e.message);
+    }
+  }
+
+  /// Полное описание сессии из моста; отказ не считаем ошибкой экрана.
+  ///
+  /// Сведения (путь к файлу, контекст, расход) нужны только панели «Сведения», а разговор уже
+  /// открыт: показать его важнее, чем числа, поэтому при отказе возвращаем то, что известно.
+  Future<AgentSessionInfo> _fullInfo(AgentSessionInfo session) async {
+    try {
+      final full = await _api.session(session.id);
+      // Имя, поставленное в приложении, могло обогнать ответ моста — не затираем его пустым
+      return full.name.isEmpty && session.name.isNotEmpty
+          ? full.withName(session.name)
+          : full;
+    } on AgentApiException {
+      return session;
     }
   }
 
@@ -1404,14 +1429,25 @@ class AgentThreadController extends Notifier<AgentThreadState> {
   /// середины нельзя: дельты, вышедшие между снимком истории и подпиской, потерялись бы.
   /// Поэтому хвост заменяется целиком, а дальше дописываются обычные дельты.
   ///
-  /// Заменяется только тот самый ответ: если в истории текущего ответа не было (её хвост —
-  /// прошлое сообщение агента), снимок добавляется новым, и прошлое не затирается.
+  /// Заменяется только тот самый ответ. Признак «тот самый» — продолжение: текст и
+  /// «размышления» снимка начинаются с уже показанного, а все вызовы инструментов из истории
+  /// есть и в снимке (идентификаторы те же). Проверка по идентификаторам обязательна: у ответа,
+  /// оборвавшегося на команде без текста, текста нет вовсе, и одной проверки «текст пуст»
+  /// хватало, чтобы снимок нового прогона затирал прошлое сообщение — оно пропадало на глазах.
+  /// Если снимок не продолжает последний ответ (хвост — прошлое сообщение агента), он приходит
+  /// новым, и прошлое остаётся на месте.
   void _applySnapshot(AgentItem item) {
     final items = [...state.items];
     final last = items.isEmpty ? null : items.last;
+    final callIds = <String>{
+      for (final tool in item.tools)
+        if (tool.id.isNotEmpty) tool.id,
+    };
     final same = last != null &&
         last.isAssistant &&
-        (last.text.isEmpty || item.text.startsWith(last.text));
+        item.text.startsWith(last.text) &&
+        item.reasoning.startsWith(last.reasoning) &&
+        last.tools.every((t) => t.id.isEmpty || callIds.contains(t.id));
     if (same) {
       items[items.length - 1] = item;
     } else {
