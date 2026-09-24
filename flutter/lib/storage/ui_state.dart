@@ -126,6 +126,22 @@ class UiStateStore {
   Future<void> setAgentEffort(String harness, String effort) =>
       patch({'agent_effort_$harness': effort});
 
+  /// Ширина колонки со списком в раскладке «список — деталка» (`util/master_detail.dart`)
+  /// или `null`, если её ещё не тянули.
+  ///
+  /// Ключ ([key]) — имя раздела: у списка разговоров и у списка настроек удобная ширина
+  /// разная, поэтому общая настройка на всех подгоняла бы чужие разделы под один размер.
+  /// Тип проверяем, как у [tab]: значение приходит с диска, а `as double` на строке уронил бы
+  /// раздел прямо при открытии.
+  double? splitWidth(String key) {
+    final v = read()['split_width_$key'];
+    return v is num ? v.toDouble() : null;
+  }
+
+  /// Запоминает ширину колонки со списком (см. [splitWidth]).
+  Future<void> setSplitWidth(String key, double width) =>
+      patch({'split_width_$key': width});
+
   /// Идентификатор разговора, заведённого для ревью пул-реквеста ([key] вида `repo#123`).
   ///
   /// Связь хранится по идентификатору, а не по имени разговора: имя переписывает сам харнесс
