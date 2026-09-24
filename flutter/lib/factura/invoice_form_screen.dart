@@ -68,6 +68,10 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
   /// Ставка IRPF: `null` — «как решит сервер по профилю компании».
   int? _irpfRate = 7;
 
+  /// Галочка «введённая сумма — то, что заплатил клиент»: тогда база, НДС и IRPF
+  /// считаются от неё обратно, а не наоборот.
+  bool _clientPays = false;
+
   /// Валюта фактуры.
   String _currency = 'EUR';
 
@@ -178,17 +182,35 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
     }
   }
 
-  /// Сумма всех строк без НДС.
-  double get _net => _lines.fold<double>(0, (acc, l) => acc + (double.tryParse(l.amount.text.replaceAll(',', '.')) ?? 0));
+  /// Эффективная ставка IRPF: удержание бывает только на испанском НДС.
+  int get _effectiveIrpf => _vatRate == 21 ? (_irpfRate ?? 0) : 0;
+
+  /// Режим «введена сумма, которую заплатил клиент».
+  ///
+  /// Галочка имеет смысл только для Испании и ровно одной строки: сервер умеет
+  /// разложить итог лишь по одной позиции, с несколькими он её проигнорирует,
+  /// поэтому здесь режим тоже молча выключается.
+  bool get _clientPaysActive => _clientPays && _vatRate == 21 && _lines.length == 1;
+
+  /// Сумма, введённая в строках. Обычно это база без НДС, а в режиме
+  /// [_clientPaysActive] — итог, который переводит клиент.
+  double get _entered => _lines.fold<double>(0, (acc, l) => acc + (double.tryParse(l.amount.text.replaceAll(',', '.')) ?? 0));
+
+  /// База без НДС. В режиме «клиент заплатил» — обратный пересчёт из итога
+  /// по той же формуле, что и на сервере: net = paid / (1 + НДС − IRPF).
+  double get _net {
+    if (!_clientPaysActive) return _entered;
+    final denom = 1 + _vatRate / 100 - _effectiveIrpf / 100;
+    return denom <= 0 ? _entered : _entered / denom;
+  }
 
   /// Итог с НДС.
   double get _total => _net + _net * _vatRate / 100;
 
-  /// Сколько клиент переводит: итог минус удержание IRPF (только для испанского НДС).
-  double get _toPay {
-    final irpf = _vatRate == 21 ? (_irpfRate ?? 0) : 0;
-    return _total - _net * irpf / 100;
-  }
+  /// Сколько клиент переводит. В режиме «клиент заплатил» это ровно введённая
+  /// сумма — как и на сервере, без дрейфа округления.
+  double get _toPay =>
+      _clientPaysActive ? _entered : _total - _net * _effectiveIrpf / 100;
 
   /// Сохраняет черновик на сервере и закрывает форму.
   ///
@@ -225,6 +247,7 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
       ],
       vatRate: _vatRate,
       irpfRate: _vatRate == 21 ? _irpfRate : 0,
+      amountIsClientPays: _clientPaysActive,
       currency: _currency,
       issueDate: '${_issueDate.year.toString().padLeft(4, '0')}-'
           '${_issueDate.month.toString().padLeft(2, '0')}-'
@@ -284,7 +307,11 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
                 const SizedBox(height: 6),
                 for (var i = 0; i < _lines.length; i++) _lineRow(i),
                 TextButton.icon(
-                  onPressed: () => setState(() => _lines.add(_LineDraft())),
+                  onPressed: () => setState(() {
+                    _lines.add(_LineDraft());
+                    // Галочка «сумма от клиента» работает только с одной строкой.
+                    _clientPays = false;
+                  }),
                   icon: const Icon(Icons.add),
                   label: const Text('Добавить строку'),
                 ),
@@ -370,7 +397,10 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
             child: TextField(
               controller: line.amount,
               keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(labelText: 'Сумма'),
+              decoration: InputDecoration(
+                // В режиме «сумма от клиента» в поле лежит итог, а не база — подписываем именно его.
+                labelText: _clientPaysActive ? 'Клиент заплатит' : 'Сумма',
+              ),
               // Пересчитываем итог на каждый символ: иначе человек не видит, что получится.
               onChanged: (_) => setState(() {}),
             ),
@@ -401,7 +431,10 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
           value: _vatRate == 21,
           onChanged: (v) => setState(() {
             _vatRate = v ? 21 : 0;
-            if (!v) _irpfRate = 0;
+            if (!v) {
+              _irpfRate = 0;
+              _clientPays = false;
+            }
           }),
           title: const Text('Клиент в Испании (НДС 21%)'),
           subtitle: const Text('Вне Испании — 0%, удержание IRPF не применяется'),
@@ -416,6 +449,18 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
               DropdownMenuItem(value: 15, child: Text('15%')),
             ],
             onChanged: (v) => setState(() => _irpfRate = v),
+          ),
+        // Режим «сумма от клиента» имеет смысл только для Испании и одной строки:
+        // с несколькими позициями сервер не знает, как разложить введённый итог по строкам.
+        if (_vatRate == 21 && _lines.length == 1)
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _clientPays,
+            onChanged: (v) => setState(() => _clientPays = v),
+            title: const Text('Знаю сумму, которую заплатит клиент'),
+            subtitle: const Text(
+              'Сумма в строке — итог от клиента; база, НДС и IRPF считаются от неё',
+            ),
           ),
         const SizedBox(height: 8),
         Row(
@@ -510,6 +555,9 @@ class _InvoiceFormScreenState extends ConsumerState<InvoiceFormScreen> {
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
+            // В режиме «сумма от клиента» порядок обратный: введённый итог фиксирован,
+            // а база и налоги — производные от него.
+            if (_clientPaysActive) row('Итог от клиента', _entered),
             row('База', _net),
             row('НДС ($_vatRate%)', _net * _vatRate / 100),
             if (irpf > 0) row('Удержание IRPF ($irpf%)', -_net * irpf / 100),

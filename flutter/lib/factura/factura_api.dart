@@ -48,6 +48,7 @@ class InvoicedraftPayload {
     required this.lineItems,
     required this.vatRate,
     required this.irpfRate,
+    this.amountIsClientPays = false,
     required this.currency,
     required this.issueDate,
     required this.description,
@@ -72,6 +73,10 @@ class InvoicedraftPayload {
   /// 0, 7 или 15; сервер сам подставит значение по профилю, если не передавать.
   final int? irpfRate;
 
+  /// Введённая сумма — это то, что реально переводит клиент (итог минус удержание IRPF),
+  /// а базу сервер считает обратно. Имеет смысл только для Испании и одной строки.
+  final bool amountIsClientPays;
+
   final String currency;
 
   /// Дата выставления `YYYY-MM-DD`.
@@ -91,6 +96,7 @@ class InvoicedraftPayload {
         ],
         'vatRate': vatRate,
         if (irpfRate != null) 'irpfRate': irpfRate,
+        if (amountIsClientPays) 'amountIsClientPays': true,
         'currency': currency,
         'issueDate': issueDate,
         if ((description ?? '').isNotEmpty) 'description': description,
