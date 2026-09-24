@@ -89,6 +89,12 @@ class _MediaViewerState extends State<MediaViewer> {
   /// на каждый кадр, а отвечают не по порядку — медленный ответ на кадр №3 перетирал бы
   /// метаданные уже открытого №4.
   int _infoGen = 0;
+  /// Приближен ли текущий кадр. Пока да, листание выключено: горизонтальное движение пальца
+  /// должно прокручивать увеличенный снимок, а не уводить на соседний кадр.
+  bool _zoomed = false;
+  /// Сколько пальцев сейчас на экране. Со второго пальца листание выключается заранее — до
+  /// того, как `PageView` заберёт щипок себе первым касанием (см. `_pagePhysics`).
+  int _pointers = 0;
 
   @override
   /// Подписка на сигнал родителя и метаданные кадра, с которого открылись.
@@ -207,19 +213,32 @@ class _MediaViewerState extends State<MediaViewer> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(children: [
-        PageView.builder(
-          controller: _pc,
-          itemCount: total,
-          onPageChanged: (i) {
-            setState(() => _idx = i);
-            _loadInfo(i);
-          },
-          itemBuilder: (context, i) {
-            // Просим кадр и соседей: соседние слайды PageView строит заранее, и без этой
-            // просьбы они оставались бы спиннерами до следующего движения пальцем.
-            widget.ensure(math.max(0, i - 1), math.min(total - 1, i + 1));
-            return _slide(widget.getItem(i));
-          },
+        Listener(
+          // Пальцы считаем до разбора арены жестов: так второй палец успевает выключить
+          // листание раньше, чем `PageView` заберёт себе первое касание (см. `_pagePhysics`).
+          onPointerDown: (_) => _countPointer(true),
+          onPointerUp: (_) => _countPointer(false),
+          onPointerCancel: (_) => _countPointer(false),
+          child: PageView.builder(
+            controller: _pc,
+            physics: _pagePhysics,
+            itemCount: total,
+            onPageChanged: (i) {
+              setState(() {
+                _idx = i;
+                // Масштаб принадлежит слайду: у нового кадра свой `InteractiveViewer`,
+                // и он начинается с единицы.
+                _zoomed = false;
+              });
+              _loadInfo(i);
+            },
+            itemBuilder: (context, i) {
+              // Просим кадр и соседей: соседние слайды PageView строит заранее, и без этой
+              // просьбы они оставались бы спиннерами до следующего движения пальцем.
+              widget.ensure(math.max(0, i - 1), math.min(total - 1, i + 1));
+              return _slide(widget.getItem(i));
+            },
+          ),
         ),
         SafeArea(
           child: Column(children: [
@@ -253,18 +272,46 @@ class _MediaViewerState extends State<MediaViewer> {
     );
   }
 
+  /// Что делать с листанием прямо сейчас: `null` — листать можно.
+  ///
+  /// Листание выключается в двух случаях, и оба — про одно и то же: жест должен достаться
+  /// содержимому слайда, а не `PageView`. Приближенный кадр надо прокручивать по экрану,
+  /// а щипок начинается с двух пальцев, и первый из них `PageView` иначе забирает себе
+  /// как обычный свайп.
+  ScrollPhysics? get _pagePhysics =>
+      (_zoomed || _pointers > 1) ? const NeverScrollableScrollPhysics() : null;
+
+  /// Пересчитывает число пальцев на экране; при переходе через двух перерисовывает `PageView`
+  /// с новыми `physics`.
+  ///
+  /// Побочно: `_pointers`, а через него — `_pagePhysics` и перестройка страницы.
+  void _countPointer(bool down) {
+    final wasMulti = _pointers > 1;
+    _pointers = math.max(0, _pointers + (down ? 1 : -1));
+    if (wasMulti != (_pointers > 1) && mounted) setState(() {});
+  }
+
+  /// Сообщение слайда, что кадр приблизили или вернули к исходному размеру (см. `_Zoomable`).
+  ///
+  /// Перерисовка только на смене состояния: слайд шлёт это на каждом обновлении жеста,
+  /// а перестраивать `PageView` чаще, чем нужно, незачем.
+  void _setZoomed(bool zoomed) {
+    if (!mounted || zoomed == _zoomed) return;
+    setState(() => _zoomed = zoomed);
+  }
+
   /// Один слайд: фото, видео или спиннер, пока кадр не доехал.
   ///
   /// Спиннер вместо пустоты — потому что кадры приходят по индексам, и «нет данных» здесь
   /// штатная ситуация, а не ошибка: `ensure` уже попросил их у родителя.
   Widget _slide(MediaItem? item) {
-    if (item == null) return const Center(child: CircularProgressIndicator());
+    if (item == null) return const Center(child: _Spinner());
     final isVideo = item.mime.startsWith('video/');
     if (isVideo) return _video(item);
     return _image(item);
   }
 
-  /// Фото: превью 1080 px в `InteractiveViewer`, чтобы можно было приблизить пальцами.
+  /// Фото: превью 1080 px в `_Zoomable`, чтобы можно было приблизить пальцами.
   ///
   /// Именно превью, а не оригинал: в ленте кадры листают десятками, и тянуть полноразмерные
   /// файлы ради просмотра на телефоне смысла нет. Оригинал доступен кнопкой «Скачать».
@@ -274,15 +321,13 @@ class _MediaViewerState extends State<MediaViewer> {
     if (sha == null || sha.isEmpty) {
       return const Center(child: Text('Превью не открылось', style: TextStyle(color: Colors.white70)));
     }
-    return InteractiveViewer(
-      minScale: 1,
-      maxScale: 8,
-      alignment: Alignment.center,
+    return _Zoomable(
+      onZoom: _setZoomed,
       child: CachedNetworkImage(
         imageUrl: widget.api.previewUrl(sha, w: 1080),
         httpHeaders: widget.api.authHeaders,
         fit: BoxFit.contain,
-        placeholder: (_, _) => const CircularProgressIndicator(color: Colors.white),
+        placeholder: (_, _) => const Center(child: _Spinner()),
         errorWidget: (_, _, _) => const Center(child: Text('Превью не открылось — файл мог быть удалён', style: TextStyle(color: Colors.white70))),
       ),
     );
@@ -479,9 +524,158 @@ class _VidState extends State<_Vid> {
               ),
             ),
           ),
+          // Полоса перемотки внизу кадра: без неё ролик можно только запустить с начала.
+          Positioned(left: 0, right: 0, bottom: 0, child: _SeekBar(c)),
         ]),
       );
     }
-    return const CircularProgressIndicator(color: Colors.white);
+    return const Center(child: _Spinner());
+  }
+}
+
+/// Полоса перемотки поверх ролика: ползунок, время и перемотка на нужный момент.
+///
+/// Своя, а не `VideoProgressIndicator` из `video_player`: у той и полоса, и область касания —
+/// пара пикселей, попасть по ним пальцем почти нельзя, а времени на экране она не показывает,
+/// так что перемотать «примерно на минуту» по ней не выйдет.
+///
+/// Своё состояние — только на время перетаскивания: пока палец на ползунке, показываем
+/// позицию пальца, а не плеера (см. `_drag`).
+class _SeekBar extends StatefulWidget {
+  final VideoPlayerController c;
+  const _SeekBar(this.c);
+  @override
+  State<_SeekBar> createState() => _SeekBarState();
+}
+
+/// Состояние полосы: позиция под пальцем, пока его не отпустили.
+class _SeekBarState extends State<_SeekBar> {
+  /// Позиция под пальцем в миллисекундах; `null` — не перетаскивают, показываем плеер.
+  double? _drag;
+
+  /// Перематывает ролик на выбранный момент.
+  ///
+  /// Побочно: `_drag` — полоса сразу показывает то место, куда попал палец, не дожидаясь
+  /// ответа плеера (перемотка отстаёт, и без этого ползунок уезжал бы назад под пальцем).
+  void _seek(double value) {
+    setState(() => _drag = value);
+    widget.c.seekTo(Duration(milliseconds: value.round()));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<VideoPlayerValue>(
+      valueListenable: widget.c,
+      builder: (context, v, _) {
+        final total = v.duration.inMilliseconds;
+        // Длительность известна не сразу: пока её нет, полоса ничего не значит.
+        if (total <= 0) return const SizedBox.shrink();
+        final pos = (_drag ?? v.position.inMilliseconds.toDouble()).clamp(0.0, total.toDouble()).toDouble();
+        return Column(mainAxisSize: MainAxisSize.min, children: [
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 2,
+              activeTrackColor: Colors.white,
+              inactiveTrackColor: Colors.white38,
+              thumbColor: Colors.white,
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+            ),
+            child: Slider(
+              value: pos,
+              max: total.toDouble(),
+              onChanged: _seek,
+              onChangeEnd: (_) => setState(() => _drag = null),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 6),
+            child: Row(children: [
+              Text(fmtDuration((pos / 1000).round()), style: const TextStyle(color: Colors.white, fontSize: 12)),
+              const Spacer(),
+              Text(fmtDuration((total / 1000).round()), style: const TextStyle(color: Colors.white70, fontSize: 12)),
+            ]),
+          ),
+        ]);
+      },
+    );
+  }
+}
+
+/// Спиннер загрузки фиксированного размера.
+///
+/// Размер задан жёстко намеренно: `CircularProgressIndicator` рисует себя в
+/// `constraints.biggest`, поэтому без `SizedBox` он разъезжался на весь экран — и в `Center`,
+/// и в подстановке `CachedNetworkImage`, куда слот отдаёт размеры во весь экран.
+class _Spinner extends StatelessWidget {
+  const _Spinner();
+  @override
+  Widget build(BuildContext context) => const SizedBox(
+        width: 36,
+        height: 36,
+        child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
+      );
+}
+
+/// Фото с приближением: `InteractiveViewer` плюс признак «кадр увеличен» для родителя.
+///
+/// Отдельный виджет ради собственного `TransformationController`: он нужен, чтобы знать
+/// текущий масштаб — по нему `MediaViewer` выключает листание, пока снимок увеличен
+/// (см. `_MediaViewerState._pagePhysics`). Контроллер — свойство слайда: уехал слайд,
+/// вместе с ним умер и масштаб.
+class _Zoomable extends StatefulWidget {
+  final Widget child;
+  /// Признак «масштаб больше единицы» — переключается туда и обратно по ходу жеста.
+  final ValueChanged<bool> onZoom;
+  const _Zoomable({required this.child, required this.onZoom});
+  @override
+  State<_Zoomable> createState() => _ZoomableState();
+}
+
+/// Состояние приближения: матрица кадра и последнее отправленное наружу состояние.
+class _ZoomableState extends State<_Zoomable> {
+  final _tc = TransformationController();
+  /// Последнее сообщённое родителю значение: жест шлёт обновления десятками в секунду,
+  /// а перестраивать `PageView` нужно только на смене — см. `_sync`.
+  bool _zoomed = false;
+
+  /// Пересчитывает масштаб из матрицы и, если признак изменился, сообщает родителю.
+  ///
+  /// Порог чуть больше единицы: пинч никогда не возвращает ровно `1.0`, а масштаб на
+  /// волосок выше не должен запирать листание.
+  void _sync() {
+    final zoomed = _tc.value.getMaxScaleOnAxis() > 1.001;
+    if (zoomed == _zoomed) return;
+    _zoomed = zoomed;
+    widget.onZoom(zoomed);
+  }
+
+  @override
+  /// Отпускает матрицу и снимает признак «увеличен», если слайд ушёл с экрана приближённым.
+  ///
+  /// Сообщение откладываем на конец кадра: `dispose` приходит во время перестройки дерева,
+  /// и `setState` родителя прямо здесь был бы «setState во время build».
+  void dispose() {
+    if (_zoomed) {
+      final onZoom = widget.onZoom;
+      WidgetsBinding.instance.addPostFrameCallback((_) => onZoom(false));
+    }
+    _tc.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return InteractiveViewer(
+      transformationController: _tc,
+      minScale: 1,
+      maxScale: 8,
+      // `alignment` не задаём намеренно. `InteractiveViewer` считает матрицу в координатах
+      // с началом в левом верхнем углу, а `Transform.alignment` смещает масштабирование
+      // к центру коробки — с ним увеличение уезжало не под пальцы, а к середине экрана.
+      onInteractionUpdate: (_) => _sync(),
+      onInteractionEnd: (_) => _sync(),
+      child: widget.child,
+    );
   }
 }
