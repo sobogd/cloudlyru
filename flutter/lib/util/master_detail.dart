@@ -36,8 +36,9 @@ class MasterDetailEntry {
 /// Раскладка «список слева, деталка справа» для разделов приложения.
 ///
 /// Один виджет на все разделы, которые заходят списком: «Проекты», «Настройки» и те, что
-/// появятся дальше. На широком экране колонка со списком и выбранный пункт стоят рядом, а
-/// границу между ними можно тянуть пальцем или мышкой; на узком список занимает всю ширину,
+/// появятся дальше. На широком экране список и выбранный пункт лежат двумя карточками на
+/// чёрном фоне (`C.canvas`), а границу между карточками можно тянуть пальцем или мышкой;
+/// на узком список занимает всю ширину,
 /// а пункт открывается отдельным экраном с кнопкой «назад».
 ///
 /// Какой вид показать, решает ширина самого раздела ([twoPaneMin], по умолчанию 720):
@@ -107,9 +108,16 @@ class _MasterDetailState extends State<MasterDetail> {
   /// быть рабочей областью, и тянуть дальше некуда.
   static const _minDetail = 320.0;
 
-  /// Ширина полосы захвата границы: палец шире одной линии, поэтому линия стоит посередине
-  /// невидимой полосы [_hitWidth] — по ней попадают и на планшете, и мышкой на маке.
-  static const _hitWidth = 12.0;
+  /// Поле вокруг карточек: между ними и краем раздела просвечивает фон приложения.
+  static const _paneGap = 8.0;
+
+  /// Ширина полосы между карточками — та самая невидимая граница, которую тянут. Палец шире
+  /// одной линии, поэтому это полоса, а не штрих: по ней попадают и на планшете, и мышкой.
+  static const _handleWidth = 24.0;
+
+  /// Сколько ширины раздела занимают не список и не деталка: поля и полоса между карточками.
+  /// Вычитается из ширины, когда считается предел колонки со списком.
+  static const _chrome = 2 * _paneGap + _handleWidth;
 
   /// Выбранный пункт; `null` — «первый из списка» (см. [_selected]).
   String? _selectedId;
@@ -158,7 +166,7 @@ class _MasterDetailState extends State<MasterDetail> {
   double _sidebarWidth(double paneWidth) {
     final limit = math.max(
       widget.sidebarMin,
-      math.min(widget.sidebarMax, paneWidth - _minDetail),
+      math.min(widget.sidebarMax, paneWidth - _chrome - _minDetail),
     );
     final base =
         _width ?? (paneWidth * 0.34).clamp(widget.sidebarMin, widget.sidebarDefaultMax);
@@ -170,7 +178,7 @@ class _MasterDetailState extends State<MasterDetail> {
     if (_paneWidth <= 0) return;
     final limit = math.max(
       widget.sidebarMin,
-      math.min(widget.sidebarMax, _paneWidth - _minDetail),
+      math.min(widget.sidebarMax, _paneWidth - _chrome - _minDetail),
     );
     final next = (_sidebarWidth(_paneWidth) + delta).clamp(widget.sidebarMin, limit);
     setState(() => _width = next);
@@ -247,26 +255,46 @@ class _MasterDetailState extends State<MasterDetail> {
   }
 
   /// Однопанельный вид: список во всю ширину, пункт открывается экраном поверх (телефон).
-  Widget _singlePane() => Scaffold(body: _master(wide: false));
+  ///
+  /// Здесь списку карточку не даём: на телефоне ширину делить не с кем, и полноэкранный
+  /// список читается лучше, чем карточка с чёрной рамкой вокруг.
+  Widget _singlePane() =>
+      Scaffold(backgroundColor: C.island, body: _master(wide: false));
 
-  /// Двухпанельный вид: список слева, выбранный пункт справа, между ними — тянущаяся граница.
+  /// Двухпанельный вид: список и выбранный пункт — двумя карточками на чёрном фоне.
   Widget _twoPane(double paneWidth) {
     return Scaffold(
-      body: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          SizedBox(width: _sidebarWidth(paneWidth), child: _master(wide: true)),
-          _ResizeHandle(
-            width: _hitWidth,
-            onDrag: _drag,
-            onDragEnd: _persistWidth,
-            onReset: _resetWidth,
-          ),
-          Expanded(child: _detail()),
-        ],
+      // фон раздела — `canvas`: карточки лежат на нём, и промежутки между ними чёрные
+      backgroundColor: C.canvas,
+      body: Padding(
+        padding: const EdgeInsets.all(_paneGap),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _card(width: _sidebarWidth(paneWidth), child: _master(wide: true)),
+            _ResizeHandle(
+              width: _handleWidth,
+              onDrag: _drag,
+              onDragEnd: _persistWidth,
+              onReset: _resetWidth,
+            ),
+            Expanded(child: _card(child: _detail())),
+          ],
+        ),
       ),
     );
   }
+
+  /// Карточка раскладки: фон `surface` на чёрном фоне раздела и скруглённые углы.
+  ///
+  /// `Material`, а не `Container`: он же даёт подложку всплескам от нажатия в строках списка.
+  /// `clipBehavior` нужен, чтобы подсветка выбранной строки не выходила за скруглённый угол.
+  Widget _card({double? width, required Widget child}) => Material(
+    color: C.surface,
+    borderRadius: BorderRadius.circular(16),
+    clipBehavior: Clip.antiAlias,
+    child: SizedBox(width: width, child: child),
+  );
 
   /// Правая панель: тело выбранного пункта, а если ничего не выбрано — пусто.
   ///
@@ -278,36 +306,27 @@ class _MasterDetailState extends State<MasterDetail> {
     if (selected == null) return const SizedBox.shrink();
     _body(selected);
     final built = [for (final e in widget.entries) if (_built.containsKey(e.id)) e];
-    return Material(
-      color: C.canvas,
-      child: IndexedStack(
-        // размер по панели, а не по самому крупному ребёнку: иначе `IndexedStack` растянул бы
-        // правую панель под него и сломал раскладку
-        sizing: StackFit.expand,
-        index: built.indexWhere((e) => e.id == selected.id),
-        children: [for (final e in built) _built[e.id]!],
-      ),
+    return IndexedStack(
+      // размер по панели, а не по самому крупному ребёнку: иначе `IndexedStack` растянул бы
+      // правую панель под него и сломал раскладку
+      sizing: StackFit.expand,
+      index: built.indexWhere((e) => e.id == selected.id),
+      children: [for (final e in built) _built[e.id]!],
     );
   }
 
-  /// Колонка со списком: шапка и строки пунктов.
-  ///
-  /// Фон — `C.island`, как у левого бара разделов: список и бар читаются одной поверхностью,
-  /// а деталку справа отделяет рамка границы и её собственный фон.
-  Widget _master({required bool wide}) => Material(
-    color: C.island,
-    child: Column(
-      children: [
-        _masterHeader(),
-        Expanded(
-          child: ListView.builder(
-            padding: EdgeInsets.only(bottom: navBarInset(context) + 24),
-            itemCount: widget.entries.length,
-            itemBuilder: (context, i) => _entryTile(widget.entries[i], wide: wide),
-          ),
+  /// Колонка со списком: шапка и строки пунктов. Фон даёт карточка, в которую её кладут.
+  Widget _master({required bool wide}) => Column(
+    children: [
+      _masterHeader(),
+      Expanded(
+        child: ListView.builder(
+          padding: EdgeInsets.only(bottom: navBarInset(context) + 24),
+          itemCount: widget.entries.length,
+          itemBuilder: (context, i) => _entryTile(widget.entries[i], wide: wide),
         ),
-      ],
-    ),
+      ),
+    ],
   );
 
   /// Шапка списка: название раздела и значки-вкладки.
@@ -366,14 +385,15 @@ class _MasterDetailState extends State<MasterDetail> {
   }
 }
 
-/// Перетаскиваемая граница между колонкой со списком и деталкой.
+/// Перетаскиваемая граница между карточками списка и деталки.
 ///
-/// Ширина — полоса захвата, а не линия: линию видно как 1 px по центру, а тянуть её можно по
-/// всей полосе. Двойной тап по границе возвращает ширину по умолчанию — иначе, затащив список
+/// Границы не видно: между карточками чёрный фон, и трогать надо пустоту. Чтобы про это
+/// можно было догадаться, в полосе стоит иконка-грип по центру по вертикали — она и есть
+/// единственная подсказка. Двойной тап возвращает ширину по умолчанию: иначе, затащив список
 /// в неудобное состояние, вернуть его было бы нечем.
 ///
-/// Курсор на маке — «тянуть влево-вправо»: без него про то, что границу можно двигать, не
-/// догадаться, а подсказки у неё нет.
+/// Ширина — полоса, а не штрих: палец шире точки, по полосе попадают и на планшете, и мышкой.
+/// Курсор на маке — «тянуть влево-вправо», та же подсказка для мыши.
 class _ResizeHandle extends StatelessWidget {
   const _ResizeHandle({
     required this.width,
@@ -382,7 +402,7 @@ class _ResizeHandle extends StatelessWidget {
     required this.onReset,
   });
 
-  /// Ширина полосы захвата.
+  /// Ширина полосы между карточками.
   final double width;
 
   /// Сдвиг за кадр во время перетаскивания (в логических пикселях).
@@ -399,12 +419,18 @@ class _ResizeHandle extends StatelessWidget {
     return MouseRegion(
       cursor: SystemMouseCursors.resizeLeftRight,
       child: GestureDetector(
-        // `opaque`: полоса прозрачная, и без этого жесты мимо линии не доходили бы до неё
+        // `opaque`: полоса прозрачная, и без этого жесты мимо иконки не доходили бы до неё
         behavior: HitTestBehavior.opaque,
         onHorizontalDragUpdate: (d) => onDrag(d.delta.dx),
         onHorizontalDragEnd: (_) => onDragEnd(),
         onDoubleTap: onReset,
-        child: VerticalDivider(width: width, thickness: 1, color: C.brd),
+        child: SizedBox(
+          width: width,
+          // грип по центру по вертикали: рисуется он один, а тянется вся полоса
+          child: const Center(
+            child: Icon(Icons.drag_indicator, size: 20, color: C.fg3),
+          ),
+        ),
       ),
     );
   }
