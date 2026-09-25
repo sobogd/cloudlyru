@@ -106,11 +106,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   /// Показаны ли подробные сведения о сессии (токены, счётчики, время, путь к файлу).
   bool _details = false;
 
-  /// Ключи раскрытых служебных сообщений («размышлений», вызовов инструментов, команд).
-  ///
-  /// По ключу, а не по индексу в списке: пока ответ дописывается, пункты добавляются в конец,
-  /// и нумерация уже раскрытых сообщений поехала бы. Ключ даёт [_entryKey].
-  final _open = <String>{};
 
   /// Показан ли разговор с конца.
   ///
@@ -780,7 +775,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       icon: Icons.terminal,
       title: '\$ ${entry.command}',
       copyText: entry.copyText,
-      expandKey: _entryKey(entry),
       body: entry.text.trim().isEmpty
           ? null
           : _OutputText(
@@ -799,7 +793,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           ? entry.tool!.name
           : entry.tool!.summary,
       copyText: entry.copyText,
-      expandKey: _entryKey(entry),
       // Значок состояния прямо в заголовке: без него не видно, вызов ещё идёт или упал
       status: entry.tool!.running
           ? const SizedBox(
@@ -819,9 +812,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     _EntryKind.reasoning => _serviceEntry(
       icon: Icons.psychology_outlined,
       title: 'Размышления',
-      preview: _firstLine(entry.text),
       copyText: entry.copyText,
-      expandKey: _entryKey(entry),
       body: entry.text.trim().isEmpty
           ? null
           : _OutputText(entry.text, color: C.fg2),
@@ -833,29 +824,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
     _EntryKind.step => _stepIndicator(entry.text),
   };
-
-  /// Первая непустая строка текста — то, что видно у свёрнутого служебного сообщения.
-  ///
-  /// Обрезается по длине: одна строка вывода команды или «размышлений» может быть хоть на
-  /// весь экран, а в свёрнутом виде она — только намёк на содержимое.
-  String _firstLine(String text) {
-    final line = _compactLines(text).split('\n').first.trim();
-    return line.length <= _collapsedChars
-        ? line
-        : '${line.substring(0, _collapsedChars).trimRight()}…';
-  }
-
-  /// Ключ состояния раскрытия для пункта переписки.
-  ///
-  /// Ключ обязан быть стабильным, а не «пункт №5 в списке»: пока ответ дописывается, пункты
-  /// добавляются в конец, и номер позиции у уже раскрытого сообщения не менялся бы только по
-  /// случайности. Для вызова инструмента годится его идентификатор от харнесса, для остальных —
-  /// первые символы текста: двух одинаковых кусков в одной переписке не бывает.
-  String _entryKey(_Entry entry) {
-    final id = entry.tool?.id ?? '';
-    if (id.isNotEmpty) return 'tool:$id';
-    return '${entry.kind.name}:${entry.text.hashCode}:${entry.command.hashCode}:${entry.exitCode}';
-  }
 
   /// Содержимое текстового сообщения: сам текст, ожидание ответа и ошибка прогона.
   Widget _entryContent(_Entry entry) {
@@ -990,15 +958,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     required IconData icon,
     required String title,
     required String copyText,
-    required String expandKey,
-    String? preview,
     Widget? status,
     Widget? body,
   }) {
-    final expanded = _open.contains(expandKey);
-    // Свёрнутый шаг показывает первую строку содержимого, раскрытый — название шага: так
-    // заголовок не повторяет ту же строку, которая идёт сразу под ним.
-    final header = expanded ? title : (preview ?? title);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: _messageGapV),
       child: Column(
@@ -1024,7 +986,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                 // в её правом краю — на одном месте у каждого шага
                 Expanded(
                   child: Text(
-                    header.trim().isEmpty ? 'пусто' : header,
+                    title.trim().isEmpty ? 'пусто' : title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -1046,28 +1008,16 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (copyText.trim().isNotEmpty) _CopyButton(text: copyText),
-                    _ExpandButton(
-                      expanded: expanded,
-                      onPressed: () => _toggle(expandKey),
-                    ),
                   ],
                 ),
               ],
             ),
-            if (expanded && body != null)
+            if (body != null)
               Padding(padding: const EdgeInsets.only(top: 6), child: body),
           ],
         ),
     );
   }
-
-  /// Раскрывает или сворачивает служебное сообщение пункта переписки.
-  ///
-  /// Состояние живёт по ключу пункта ([_entryKey]) и переживает перерисовки: ответ
-  /// дописывается по кускам, и без этого раскрытое сообщение схлопывалось бы на каждом кадре.
-  void _toggle(String key) => setState(() {
-    if (!_open.remove(key)) _open.add(key);
-  });
 
   /// Служебная строка: автоответ на подтверждение, которого человек не давал.
   ///
@@ -1575,49 +1525,6 @@ const _entryIconSize = 14.0;
 /// Больше, чем [_actionGap]: значок — не кнопка рядом с текстом, а знак вида шага, и без
 /// заметного отступа он читался бы частью текста.
 const _entryIconGap = 8.0;
-
-/// Сколько символов первой строки видно у свёрнутого служебного сообщения.
-///
-/// Строка всё равно режется по ширине экрана: числом ограничивается только то, что попадает
-/// в виджет — рвать на нём километровую строку вывода команды нечего.
-const _collapsedChars = 160;
-
-/// Кнопка «раскрыть сообщение» — у «размышлений», вызовов инструментов и прямых команд.
-///
-/// Стоит вплотную к кнопке копирования (их разделяет только [_actionGap]): это два действия
-/// над одним сообщением, и разносить их по краям ряда незачем. Стрелка вниз — раскрыть,
-/// вверх — свернуть.
-class _ExpandButton extends StatelessWidget {
-  /// Раскрыто ли сообщение сейчас: от этого зависит направление стрелки и подсказка.
-  final bool expanded;
-
-  /// Что делать при нажатии.
-  final VoidCallback onPressed;
-
-  /// Кнопка раскрытия.
-  const _ExpandButton({required this.expanded, required this.onPressed});
-
-  @override
-  Widget build(BuildContext context) => IconButton(
-    tooltip: expanded ? 'Свернуть' : 'Показать целиком',
-    onPressed: onPressed,
-    // вид тот же, что у копирования: две кнопки в одном ряду не должны выглядеть по-разному.
-    // Шеврон, а не `unfold_*`: стрелка вниз — раскрыть, вверх — свернуть, без дополнительных
-    // линий, которые у `unfold` читаются как «развернуть на весь экран».
-    icon: Icon(
-      expanded ? Icons.expand_less : Icons.expand_more,
-      size: 18,
-      color: C.fg3.withValues(alpha: 0.45),
-    ),
-    visualDensity: VisualDensity.compact,
-    padding: EdgeInsets.zero,
-    constraints: const BoxConstraints(
-      minWidth: _actionSize,
-      minHeight: _actionSize,
-    ),
-    style: _actionButtonStyle,
-  );
-}
 
 /// Кнопка «скопировать сообщение» — одна и та же у сообщений и у шагов журнала.
 ///
