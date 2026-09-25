@@ -759,128 +759,181 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     return entries;
   }
 
-  /// Один пункт журнала переписки.
+  /// Один пункт журнала переписки — всегда в виде карточки с фоном.
   ///
-  /// Журнал — это столбик сообщений без плашек: вопрос человека сдвинут на акцентный фон,
-  /// ответ идёт без фона, работа агента (размышления, инструменты, команды) — без фона и без
-  /// направляющей. Шрифт и кегль у всего текста одни ([_textSize]), различает пункты только
-  /// фон и цвет.
-  ///
-  /// Свёрнутым по умолчанию идёт служебное: «размышления», вызов инструмента и прямая команда
-  /// оболочки. В переписке важны ответы, а не то, как агент к ним шёл; в свёрнутом виде у шага
-  /// видна его первая строка — по ней узнаётся, о чём речь.
+  /// Карточки различаются фоном и текстом по ролям: пользователь — белый фон, тёмный текст;
+  /// агент — акцентный фон, светлый текст; инструкции/команды — зеленоватый; ошибки —
+  /// красноватый. Кнопок копирования больше нет.
   Widget _entry(_Entry entry) => switch (entry.kind) {
-    _EntryKind.note => _note(entry.text),
-    _EntryKind.bash => _serviceEntry(
-      icon: Icons.terminal,
-      title: '\$ ${entry.command}',
-      copyText: entry.copyText,
-      body: entry.text.trim().isEmpty
-          ? null
-          : _OutputText(
-              entry.text,
-              color: entry.exitCode != null && entry.exitCode! != 0
-                  ? C.danger
-                  : C.ok,
-            ),
-    ),
-    // Заголовок шага показывает саму инструкцию — команду, путь или шаблон: по ней выбирают,
-    // раскрывать ли вывод. Раньше здесь стояла первая строка вывода, и у вызова без вывода
-    // (правка файла, запись) свёрнутая строка читалась как «пусто», ничего не сообщая.
-    _EntryKind.tool => _serviceEntry(
-      icon: Icons.build_outlined,
-      title: entry.tool!.summary.isEmpty
-          ? entry.tool!.name
-          : entry.tool!.summary,
-      copyText: entry.copyText,
-      // Значок состояния прямо в заголовке: без него не видно, вызов ещё идёт или упал
-      status: entry.tool!.running
-          ? const SizedBox(
-              width: 12,
-              height: 12,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          : entry.tool!.isError
-          ? const Icon(Icons.error_outline, size: 16, color: C.danger)
-          : null,
-      body: entry.tool!.output.trim().isEmpty
-          ? null
-          : _OutputText(entry.tool!.output),
-    ),
-    // Заголовок «размышлений» не повторяет их первую строку: свёрнутый шаг и так показывает
-    // её сам ([preview]), а раскрытый начинается сразу с текста ниже.
-    _EntryKind.reasoning => _serviceEntry(
-      icon: Icons.psychology_outlined,
-      title: 'Размышления',
-      copyText: entry.copyText,
-      body: entry.text.trim().isEmpty
-          ? null
-          : _OutputText(entry.text, color: C.fg2),
-    ),
-    _EntryKind.user || _EntryKind.text || _EntryKind.waiting => _message(
-      isUser: entry.kind == _EntryKind.user,
-      copyText: entry.copyText,
-      child: _entryContent(entry),
-    ),
+    _EntryKind.note => _noteCard(entry.text),
+    _EntryKind.bash => entry.exitCode != null && entry.exitCode! != 0
+        ? _errorCard('\$ ${entry.command}', entry.text)
+        : _instructionCard('\$ ${entry.command}', entry.text),
+    _EntryKind.tool => entry.tool!.isError
+        ? _errorCard(
+            entry.tool!.summary.isEmpty ? entry.tool!.name : entry.tool!.summary,
+            entry.tool!.output,
+          )
+        : entry.tool!.running
+        ? _instructionCard(
+            '${entry.tool!.summary.isEmpty ? entry.tool!.name : entry.tool!.summary} ⏳',
+            entry.tool!.output,
+          )
+        : _instructionCard(
+            entry.tool!.summary.isEmpty ? entry.tool!.name : entry.tool!.summary,
+            entry.tool!.output,
+          ),
+    _EntryKind.reasoning => _agentCard(entry.text),
+    _EntryKind.user => _userCard(entry.text),
+    _EntryKind.text => _agentCard(entry.text),
+    _EntryKind.waiting => _agentCard(''),
     _EntryKind.step => _stepIndicator(entry.text),
   };
 
-  /// Содержимое текстового сообщения: сам текст, ожидание ответа и ошибка прогона.
-  Widget _entryContent(_Entry entry) {
-    final isUser = entry.kind == _EntryKind.user;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (entry.text.isNotEmpty)
-          isUser
-              ? SelectableText(
-                  entry.text,
-                  style: const TextStyle(
-                    color: C.fg,
-                    fontSize: _textSize,
-                    height: 1.35,
-                  ),
-                )
-              // Пока ответ пишется, он идёт простым текстом: markdown всего сообщения
-              // разбирается заново при каждом изменении строки, и на длинном ответе это не
-              // влезает в бюджет кадра. Разметка включается, как только прогон закончился.
-              : entry.streaming
-              ? SelectableText(
-                  entry.text,
-                  style: const TextStyle(
-                    color: C.fg,
-                    fontSize: _textSize,
-                    height: 1.35,
-                  ),
-                )
-              : SelectableText(entry.text, style: const TextStyle(color: C.fg, fontSize: _textSize, height: 1.35)),
-        // ответ заказан, но ещё ничего не пришло — видно, что работа идёт
-        if (entry.kind == _EntryKind.waiting)
-          const Padding(
+  /// Карточка пользователя: белый фон, чёрный текст.
+  Widget _userCard(String text) {
+    final body = text.isEmpty
+        ? SizedBox()
+        : SelectableText(
+            text,
+            style: TextStyle(
+              color: const Color(0xFF1A1D24),
+              fontSize: _textSize,
+              height: 1.35,
+            ),
+          );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFFFFFF),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: body,
+      ),
+    );
+  }
+
+  /// Карточка сообщения от агента: акцентный фон, светлый текст.
+  Widget _agentCard(String text) {
+    final body = text.isEmpty
+        ? const Padding(
             padding: EdgeInsets.symmetric(vertical: 2),
             child: SizedBox(
               width: 14,
               height: 14,
               child: CircularProgressIndicator(strokeWidth: 2),
             ),
-          ),
-        // Ошибка прогона — часть того сообщения, на котором разговор оборвался: так видно,
-        // на каком шаге это случилось (например, «Request was aborted» после «Стоп»).
-        if (entry.error.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: Text(
-              entry.error,
-              style: const TextStyle(
-                color: C.warn,
-                fontSize: _textSize,
-                height: 1.35,
-              ),
+          )
+        : SelectableText(
+            text,
+            style: const TextStyle(
+              color: C.fg,
+              fontSize: _textSize,
+              height: 1.35,
             ),
-          ),
-      ],
+          );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: C.accent.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: body,
+      ),
     );
   }
+
+  /// Карточка инструкции/команды: зеленоватый фон.
+  Widget _instructionCard(String title, String bodyText) {
+    final showBody = bodyText.trim().isNotEmpty;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: C.ok.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (title.isNotEmpty)
+              Text(
+                title,
+                style: const TextStyle(
+                  color: C.ok,
+                  fontSize: _textSize,
+                  fontWeight: FontWeight.w600,
+                  height: 1.35,
+                ),
+              ),
+            if (showBody)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: _OutputText(bodyText, color: C.fg2),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Карточка ошибки: красноватый фон.
+  Widget _errorCard(String title, String bodyText) {
+    final showBody = bodyText.trim().isNotEmpty;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: C.danger.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (title.isNotEmpty)
+              Text(
+                title,
+                style: const TextStyle(
+                  color: C.danger,
+                  fontSize: _textSize,
+                  fontWeight: FontWeight.w600,
+                  height: 1.35,
+                ),
+              ),
+            if (showBody)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: _OutputText(bodyText, color: C.fg2),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Служебная заметка: мелкая строка с иконкой.
+  Widget _noteCard(String text) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.info_outline, color: C.fg3, size: 14),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            text,
+            style: const TextStyle(color: C.fg3, fontSize: _textSize, height: 1.35),
+          ),
+        ),
+      ],
+    ),
+  );
 
   /// Текущий статус агента: короткая строка в потоке сообщений.
   ///
@@ -904,136 +957,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
               fontSize: _textSize,
               height: 1.35,
             ),
-          ),
-        ),
-      ],
-    ),
-  );
-
-  /// Сообщение журнала: вопрос человека или ответ агента.
-  ///
-  /// Пузырей нет: текст идёт во всю ширину панели, а кнопка «скопировать» стоит в правом краю
-  /// первой строки. У вопроса — полупрозрачный акцентный фон с rounded-углами, у ответа агента
-  /// — без фона.
-  Widget _message({
-    required String copyText,
-    required Widget child,
-    bool isUser = false,
-  }) {
-    final body = isUser
-        ? Container(
-            width: double.infinity,
-            decoration: BoxDecoration(
-              color: C.accent.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            padding: const EdgeInsets.all(12),
-            child: child,
-          )
-        : Padding(
-            padding: const EdgeInsets.only(left: _textIndent),
-            child: child,
-          );
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(child: body),
-          if (copyText.trim().isNotEmpty) ...[
-            const SizedBox(width: _actionGap),
-            _CopyButton(text: copyText),
-          ],
-        ],
-      ),
-    );
-  }
-
-  /// Строка журнала о работе агента: «размышления», вызов инструмента, команда оболочки.
-  ///
-  /// Без левой направляющей: значок вида и заголовок идут одной строкой, обрезанной
-  /// многоточием. Тело (вывод команды, текст размышлений) показывается ниже без отступа.
-  /// Кнопки действий — в правом краю заголовка.
-  Widget _serviceEntry({
-    required IconData icon,
-    required String title,
-    required String copyText,
-    Widget? status,
-    Widget? body,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: _messageGapV),
-      child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                SizedBox(
-                  // высота строки текста: по ней значок встаёт центром на заголовок
-                  width: _entryIconSize,
-                  height: _textLineHeight,
-                  child: Center(
-                    child: Icon(
-                      icon,
-                      size: _entryIconSize,
-                      color: C.fg3.withValues(alpha: 0.55),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: _entryIconGap),
-                // `Expanded`, а не `Flexible`: заголовок занимает всю строку, а кнопки стоят
-                // в её правом краю — на одном месте у каждого шага
-                Expanded(
-                  child: Text(
-                    title.trim().isEmpty ? 'пусто' : title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: C.fg3,
-                      fontSize: _textSize,
-                      height: 1.35,
-                    ),
-                  ),
-                ),
-                if (status != null) ...[
-                  const SizedBox(width: 8),
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: status,
-                  ),
-                ],
-                const SizedBox(width: _actionGap),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (copyText.trim().isNotEmpty) _CopyButton(text: copyText),
-                  ],
-                ),
-              ],
-            ),
-            if (body != null)
-              Padding(padding: const EdgeInsets.only(top: 6), child: body),
-          ],
-        ),
-    );
-  }
-
-  /// Служебная строка: автоответ на подтверждение, которого человек не давал.
-  ///
-  /// Показывается именно в переписке, а не в логе: раздел работает без подтверждений, и
-  /// единственный способ узнать, что агент сделал сам, — увидеть это рядом с ответом.
-  Widget _note(String text) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-    child: Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Icon(Icons.info_outline, color: C.fg3, size: 14),
-        const SizedBox(width: 6),
-        Expanded(
-          child: Text(
-            text,
-            style: const TextStyle(color: C.fg3, fontSize: _textSize, height: 1.35),
           ),
         ),
       ],
@@ -1453,17 +1376,6 @@ class _Entry {
 /// Вид пункта переписки на экране; по нему выбирается оформление сообщения.
 enum _EntryKind { user, text, reasoning, tool, bash, note, waiting, step }
 
-/// Копирует текст сообщения в буфер обмена и подтверждает это коротким сообщением.
-///
-/// Свободная функция, а не метод экрана: кнопка есть и у карточки команды, а карточка —
-/// отдельный виджет. Проверка `context.mounted` обязательна — запись в буфер асинхронная, и
-/// экран за это время могли закрыть.
-Future<void> copyMessage(BuildContext context, String text) async {
-  if (text.trim().isEmpty) return;
-  await Clipboard.setData(ClipboardData(text: text));
-  if (context.mounted) snack(context, 'Скопировано');
-}
-
 /// Предел попыток доехать до конца переписки при её открытии.
 ///
 /// Кадров, а не миллисекунд: до этого предела список продолжает строиться, и прыжок в конец
@@ -1488,86 +1400,11 @@ String _compactLines(String text) => text
 /// Один кегль для всех — без полей на красивость, просто для единообразия.
 const _textSize = 14.0;
 
-/// Сторона кнопки действий («скопировать», «раскрыть») вместе с её полями.
-///
-/// Кнопки стоят в правом краю строки журнала; на их ширину и отступ текст уступает место,
-/// чтобы ряд не вылез за предел ширины переписки.
-const _actionSize = 28.0;
-
-/// Отступ от текста до кнопок действий — и между кнопками тоже.
-///
-/// Аналитический отступ у [IconButton] для этого не годится: на разных размерах экрана он
-/// гулял, и кнопка то липла к тексту, то ли отъезжала от него. Здесь он один и тот же везде.
-const _actionGap = 4.0;
-
 /// Отступ между двумя соседними строками журнала.
 ///
 /// Свой у каждой строки, поэтому у соседей он складывается в двойной — этого хватает, чтобы
 /// сообщения не читались одним блоком.
 const _messageGapV = 6.0;
-
-/// Отступ текста от левого края переписки.
-///
-/// Текст всех сообщений начинается с этого отступа: весь журнал читается одной колонкой.
-const _textIndent = 13.0;
-
-/// Высота строки текста сообщения.
-///
-/// По ней выравнивается значок вида: он должен стоять центром на первой строке заголовка.
-const _textLineHeight = _textSize * 1.35;
-
-/// Размер значка вида в начале служебной строки.
-const _entryIconSize = 14.0;
-
-/// Отступ от значка вида до текста строки.
-///
-/// Больше, чем [_actionGap]: значок — не кнопка рядом с текстом, а знак вида шага, и без
-/// заметного отступа он читался бы частью текста.
-const _entryIconGap = 8.0;
-
-/// Кнопка «скопировать сообщение» — одна и та же у сообщений и у шагов журнала.
-///
-/// Нужна, чтобы копировать целиком, не выделяя текст пальцем: выделение на телефоне попадает
-/// мимо нужных строк, а команду с выводом так копировать неудобно совсем.
-class _CopyButton extends StatelessWidget {
-  /// Текст, который уйдёт в буфер обмена.
-  final String text;
-
-  /// Кнопка копирования.
-  const _CopyButton({required this.text});
-
-  @override
-  Widget build(BuildContext context) => IconButton(
-    tooltip: 'Скопировать сообщение',
-    // копировать пустое нечего: у ещё не начатого ответа и служебных строк кнопки и нет
-    onPressed: text.trim().isEmpty ? null : () => copyMessage(context, text),
-    // Приглушённее остальных иконок: кнопка стоит в краю строки и не должна спорить
-    // за внимание с содержимым сообщения — оттенок берём от fg3, своего цвета для неё нет.
-    icon: Icon(
-      Icons.content_copy,
-      size: 14,
-      color: C.fg3.withValues(alpha: 0.45),
-    ),
-    visualDensity: VisualDensity.compact,
-    padding: EdgeInsets.zero,
-    constraints: const BoxConstraints(
-      minWidth: _actionSize,
-      minHeight: _actionSize,
-    ),
-    style: _actionButtonStyle,
-  );
-}
-
-/// Стиль кнопок действий в строке журнала: «скопировать» и «раскрыть».
-///
-/// Без него строка вырастает до двух строк текста: Android требует область нажатия не меньше
-/// 48 пунктов ([MaterialTapTargetSize.padded]) и этой областью растягивает весь ряд, в котором
-/// стоит кнопка, — хотя текст в ряду один. На десктопе та же кнопка идёт без этой области, и
-/// журнал там читается как надо; здесь она снята, чтобы мобильная и настольная вёрстка
-/// совпадали.
-const _actionButtonStyle = ButtonStyle(
-  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-);
 
 /// Подробности шага журнала: вывод команды или текст «размышлений».
 ///
