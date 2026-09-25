@@ -733,6 +733,11 @@ class CloudlyApi {
   Future<Map<String, dynamic>> macPullRequests({bool refresh = false}) async =>
       _m(await _req('/mac/pull-requests${refresh ? '?refresh=1' : ''}'));
 
+  /// Ставит апрув пул-реквесту рабочей учёткой мака.
+  Future<Map<String, dynamic>> macPullRequestApprove(String repo, int number) async =>
+      _m(await _req('/mac/pull-requests/approve',
+          method: 'POST', body: {'repo': repo, 'number': number}));
+
   /// Добавляет или убирает репозиторий из списка пул-реквестов на маке.
   Future<Map<String, dynamic>> macPullRequestsConfig(String op, String repo) async =>
       _m(await _req('/mac/pull-requests/config', method: 'POST', body: {'op': op, 'repo': repo}));

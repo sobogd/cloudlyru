@@ -18,6 +18,7 @@ CONFIG_PATH = os.environ.get("MAC_STATUS_PULL_REQUESTS_CONFIG") or os.path.join(
     BASE_DIR, "pull-requests.json"
 )
 GITHUB_GRAPHQL = "https://api.github.com/graphql"
+GITHUB_REST = "https://api.github.com"
 JIRA_BROWSE = "https://tangem.atlassian.net/browse/"
 CACHE_SECONDS = 60
 PAGE_SIZE = 50
@@ -179,6 +180,58 @@ def edit_config(data):
         return {"ok": True, "msg": "saved", "count": len(saved["repos"])}
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return {"ok": False, "msg": str(exc)}
+
+
+def approve(data):
+    """Approve one pull request on GitHub.
+
+    Only repositories from the local config may be approved: the request carries a repository
+    name from the client, and the board must not turn into a way to review anything on GitHub.
+    The cache is dropped afterwards so the next board load shows the fresh verdict.
+    """
+    try:
+        config = load_config()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"ok": False, "msg": str(exc)}
+    repo = str((data or {}).get("repo") or "").strip()
+    number = (data or {}).get("number")
+    if repo not in config["repos"]:
+        return {"ok": False, "msg": "repository is not on the board"}
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return {"ok": False, "msg": "invalid pull request number"}
+    token = load_token()
+    if not token:
+        return {"ok": False, "msg": "work GitHub token is not configured"}
+    url = "%s/repos/%s/%s/pulls/%d/reviews" % (GITHUB_REST, config["owner"], repo, number)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"event": "APPROVE"}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "User-Agent": "cloudlyru-mac-status",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        # GitHub explains the refusal in the body — own pull request, already approved, no
+        # access — and that message is the only useful thing to show in the app.
+        try:
+            detail = (json.loads(exc.read() or b"{}") or {}).get("message") or ""
+        except (ValueError, OSError):
+            detail = ""
+        return {"ok": False, "msg": detail or ("GitHub API %s" % exc.code)}
+    except urllib.error.URLError as exc:
+        return {"ok": False, "msg": "GitHub API unavailable: %s" % exc.reason}
+    with _CACHE_LOCK:
+        _CACHE.update({"at": 0, "value": None})
+    return {"ok": True, "msg": "approved"}
 
 
 def _graphql(variables):

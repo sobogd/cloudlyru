@@ -9,7 +9,7 @@ and requiring the X-Mac-Token header when MAC_SERVICE_TOKEN is set):
   POST /api/action        -> {"action": name} from the ACTIONS whitelist below
   POST /api/warp          -> {"op": connect|disconnect|reconnect|status} — Cloudflare WARP
   /api/github-actions/*   -> file-backed GitHub Actions dashboard
-  /api/pull-requests/*    -> open pull requests of the configured repositories
+  /api/pull-requests/*    -> open pull requests of the configured repositories, approve
   /api/envs*              -> list/read/write .env files under ~/work
   /api/term/*             -> console over a pty (poll-based)
 
@@ -1049,6 +1049,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, github_actions.rerun(data))
         elif self.path.startswith("/api/github-actions/config"):
             self._send(200, github_actions.edit_config(data))
+        elif self.path.startswith("/api/pull-requests/approve"):
+            self._send(200, pull_requests.approve(data))
         elif self.path.startswith("/api/pull-requests/config"):
             self._send(200, pull_requests.edit_config(data))
         elif self.path.startswith("/api/envs/write"):

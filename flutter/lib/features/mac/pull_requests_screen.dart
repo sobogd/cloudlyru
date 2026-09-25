@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -188,6 +187,9 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   /// Окно свежести с мака: в списке нет PR, которых месяц никто не трогал, и это видно в шапке.
   int _freshDays = 0;
 
+  /// Имя строки (`repo#123`), которой сейчас ставится апрув; `null` — апрув не идёт.
+  String? _approving;
+
   @override
   void initState() {
     super.initState();
@@ -246,17 +248,6 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       '/pr-review ${row['url'] ?? ''} без оверинжиниринга, если есть замечания то автоматически '
       'review all и ченж реквест если нет замечаний аппрув ставить автоматом';
 
-  /// Копирует готовую команду ревью для этого PR.
-  Future<void> _copyReview(Map<String, dynamic> row) async {
-    final url = '${row['url'] ?? ''}';
-    if (url.isEmpty) return;
-    await Clipboard.setData(ClipboardData(text: _reviewPrompt(row)));
-    if (mounted) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Команда ревью скопирована: #${row['number']}')));
-    }
-  }
-
   /// Открывает новую сессию агента с готовой командой ревью в поле ввода.
   ///
   /// Мастер выбора папки и модели — тот же, что в «Проектах»: ревью просят у агента в той папке,
@@ -278,54 +269,43 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
     );
   }
 
-  /// Меню строки: что можно сделать с этим пул-реквестом.
-  Future<void> _actions(Map<String, dynamic> row) async {
-    final task = '${row['task'] ?? ''}';
-    await showModalBottomSheet<void>(
-      context: context,
-      builder: (sheet) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.smart_toy_outlined),
-              title: Text(_review(row) == null
-                  ? 'Ревью агентом · ${_sessionName(row)}'
-                  : 'Вернуться в разговор · ${_sessionName(row)}'),
-              onTap: () {
-                Navigator.pop(sheet);
-                _reviewWithAgent(row);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.copy_all_outlined),
-              title: const Text('Скопировать команду ревью'),
-              onTap: () {
-                Navigator.pop(sheet);
-                _copyReview(row);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.open_in_new),
-              title: Text('Открыть PR #${row['number']}'),
-              onTap: () {
-                Navigator.pop(sheet);
-                _open('${row['url'] ?? ''}');
-              },
-            ),
-            if (task.isNotEmpty)
-              ListTile(
-                leading: const Icon(Icons.task_alt),
-                title: Text('Открыть $task в Jira'),
-                onTap: () {
-                  Navigator.pop(sheet);
-                  _open('${row['task_url']}');
-                },
-              ),
-          ],
-        ),
-      ),
-    );
+  /// Ставит апрув пул-реквесту рабочей учёткой мака.
+  ///
+  /// Снимок целиком не перезагружается: запрос к GitHub идёт секунд двадцать, а доска живёт до
+  /// явного «Обновить». В ленту строки дописывается свой апрув — этого хватает, чтобы видеть,
+  /// что нажатие сработало; итоговое решение GitHub приедет со следующим обновлением.
+  Future<void> _approve(Map<String, dynamic> row) async {
+    if (_approving != null) return;
+    final repo = '${row['repo'] ?? ''}';
+    final number = row['number'] as int? ?? 0;
+    if (repo.isEmpty || number == 0) return;
+    setState(() => _approving = _sessionName(row));
+    try {
+      final d = await ref.read(appStateProvider).api.macPullRequestApprove(repo, number);
+      if (!mounted) return;
+      final ok = d['ok'] == true;
+      if (ok) {
+        final timeline = (row['timeline'] is List) ? [...(row['timeline'] as List)] : [];
+        timeline.add({
+          'k': 'approve',
+          'at': DateTime.now().toUtc().toIso8601String(),
+          'by': 'я',
+          'n': 1,
+        });
+        setState(() => row['timeline'] = timeline);
+      }
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(ok
+            ? 'Апрув поставлен: $repo#$number'
+            : 'Не вышло: ${d['msg'] ?? 'мак не ответил'}'),
+      ));
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Не вышло: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _approving = null);
+    }
   }
 
   /// Применяет фильтры и сортировку к снимку.
@@ -594,13 +574,15 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   AgentSession? _review(Map<String, dynamic> row) =>
       findReviewSession(ref, _sessionName(row));
 
-  /// Строка одного PR: задача, заголовок и таймлайн событий.
+  /// Строка одного PR: шапка с ярлыками, название и таймлайн событий.
   ///
-  /// Итогового состояния ревью в строке нет: по нему фильтруют чипами сверху, а глазами всё
-  /// равно читают историю — кто когда запросил изменения, сколько было комментариев и что
-  /// было после них. Поэтому вместо набора ярлыков-состояний строка показывает ленту событий.
+  /// Три яруса. Сверху ярлыки: номер PR (ведёт на GitHub), задача (ведёт в Jira), состояние
+  /// ревью глазами GitHub и репозиторий с автором — плюс кнопки действий справа. Под ними
+  /// название. Внизу лента событий: она и есть история, поэтому ничего своего — ни «после
+  /// моего ЧР», ни счётчиков — рядом с ней не висит, чтобы не спорить с лентой за внимание.
   Widget _rowTile(Map<String, dynamic> row) {
     final task = '${row['task'] ?? ''}';
+    final decision = '${row['review_decision'] ?? 'NONE'}';
     final pushedAfterMyCr = row['pushed_after_my_cr'] == true;
     final review = _review(row);
     final theme = Theme.of(context);
@@ -609,55 +591,78 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       // Мой запрос изменений, на который уже запушили правки — единственное состояние доски,
       // требующее действия именно от меня, поэтому подсвечена вся строка, а не только ярлык.
       tileColor: pushedAfterMyCr ? _recheck.withValues(alpha: 0.12) : null,
-      title: Text('#${row['number']} ${row['title']}', maxLines: 2, overflow: TextOverflow.ellipsis),
+      title: Row(
+        children: [
+          Expanded(
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                _tapBadge('#${row['number']}', theme.colorScheme.secondary,
+                    () => _open('${row['url'] ?? ''}')),
+                if (task.isNotEmpty)
+                  _tapBadge(task, theme.colorScheme.primary,
+                      () => _open('${row['task_url'] ?? ''}')),
+                _badge(_decisionLabel(decision), _decisionColor(decision)),
+                if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
+                Text('${row['repo']} · ${row['mine'] == true ? 'я' : row['author']}',
+                    style: theme.textTheme.bodySmall),
+              ],
+            ),
+          ),
+          // Действия — такие же ярлыки, как номер и задача: иконка-робот не объясняла, что
+          // будет по нажатию, а подпись объясняет. Нажатие по самой строке по-прежнему ничего
+          // не делает.
+          _tapBadge(
+            review == null
+                ? 'ревью'
+                : (review.busy ? 'агент работает' : 'в разговор'),
+            review == null
+                ? theme.colorScheme.secondary
+                : (review.busy ? const Color(0xFF26C6DA) : const Color(0xFF9CCC65)),
+            () => _reviewWithAgent(row),
+          ),
+          // Свой пул-реквест GitHub апрувить не даёт, поэтому кнопки там нет.
+          if (row['mine'] != true) ...[
+            const SizedBox(width: 6),
+            _tapBadge(
+              _approving == _sessionName(row) ? 'апрувлю…' : 'апрув',
+              const Color(0xFF4CAF50),
+              () => _approve(row),
+            ),
+          ],
+        ],
+      ),
       subtitle: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const SizedBox(height: 4),
-          Wrap(
-            spacing: 6,
-            runSpacing: 4,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              if (task.isNotEmpty)
-                InkWell(
-                  onTap: () => _open('${row['task_url']}'),
-                  child: _badge(task, theme.colorScheme.primary),
-                ),
-              Text('${row['repo']} · ${row['mine'] == true ? 'я' : row['author']}',
-                  style: theme.textTheme.bodySmall),
-              if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
-              if (pushedAfterMyCr) _badge('пушили после моего ЧР', _recheck),
-              if (review != null)
-                _badge(
-                  review.busy ? 'агент работает' : 'ревью · ${review.messages} сообщ.',
-                  review.busy ? const Color(0xFF26C6DA) : const Color(0xFF9CCC65),
-                ),
-            ],
-          ),
+          const SizedBox(height: 2),
+          Text('${row['title']}',
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodyMedium),
           _timelineStrip(row),
         ],
       ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          IconButton(
-            tooltip: review == null ? 'Отдать на ревью агенту' : 'Вернуться в разговор ревью',
-            visualDensity: VisualDensity.compact,
-            onPressed: () => _reviewWithAgent(row),
-            icon: Icon(
-              review == null ? Icons.smart_toy_outlined : Icons.smart_toy,
-              size: 18,
-              color: review == null ? null : const Color(0xFF9CCC65),
-            ),
-          ),
-          const Icon(Icons.open_in_new, size: 18),
-        ],
-      ),
-      onTap: () => _open('${row['url'] ?? ''}'),
-      onLongPress: () => _actions(row),
     );
   }
+
+  /// Подпись состояния ревью по-русски и коротко — ровно то, что решил GitHub.
+  String _decisionLabel(String decision) => switch (decision) {
+        'APPROVED' => 'апрув',
+        'CHANGES_REQUESTED' => 'ЧР',
+        'REVIEW_REQUIRED' => 'ждёт ревью',
+        _ => 'без ревью',
+      };
+
+  /// Цвет состояния ревью: у каждого состояния свой, серых среди них нет.
+  Color _decisionColor(String decision) => switch (decision) {
+        'APPROVED' => const Color(0xFF4CAF50),
+        'CHANGES_REQUESTED' => Theme.of(context).colorScheme.error,
+        'REVIEW_REQUIRED' => const Color(0xFF42A5F5),
+        _ => const Color(0xFFFFB300),
+      };
 
   /// Лента событий пул-реквеста: запросы изменений, комментарии, апрувы, пуши по порядку.
   ///
@@ -686,25 +691,34 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
     );
   }
 
-  /// Один шаг ленты: подпись со счётчиком, цвет по виду события, во всплывашке — кто и когда.
+  /// Один шаг ленты: эмодзи вида события и число, если событий в шаге несколько.
+  ///
+  /// Ни подложки, ни рамки, ни подписи: в строке их до полутора десятков, и любое оформление
+  /// превращает ленту в кашу. Что именно произошло, кто и когда — во всплывашке, она же
+  /// открывается по нажатию, чтобы лента читалась и пальцем.
   Widget _eventChip(Map<String, dynamic> event) {
     final kind = '${event['k'] ?? ''}';
     final count = event['n'] as int? ?? 1;
     final by = '${event['by'] ?? ''}';
-    final at = '${event['at'] ?? ''}';
-    final (label, color) = switch (kind) {
-      'cr' => ('ЧР', Theme.of(context).colorScheme.error),
-      'approve' => ('апрув', const Color(0xFF4CAF50)),
-      'dismissed' => ('ЧР снят', const Color(0xFF90A4AE)),
-      'comment' => ('💬', const Color(0xFF42A5F5)),
-      'push' => ('⬆', const Color(0xFFFFB300)),
-      _ => (kind, const Color(0xFF90A4AE)),
+    final when = _eventTime('${event['at'] ?? ''}');
+    final (icon, name) = switch (kind) {
+      'cr' => ('🛑', 'запрос изменений'),
+      'approve' => ('✅', 'апрув'),
+      'dismissed' => ('↩️', 'запрос изменений снят'),
+      'comment' => ('💬', count > 1 ? '$count комментария' : 'комментарий'),
+      'push' => ('⬆️', count > 1 ? 'пуш, $count коммита' : 'пуш'),
+      _ => ('•', kind),
     };
-    final text = count > 1 ? '$label$count' : label;
-    final when = _eventTime(at);
-    final who = [if (by.isNotEmpty) by, if (when.isNotEmpty) when].join(' · ');
-    final chip = _badge(text, color);
-    return who.isEmpty ? chip : Tooltip(message: who, child: chip);
+    final hint = [name, if (by.isNotEmpty) by, if (when.isNotEmpty) when].join(' · ');
+    return Tooltip(
+      message: hint,
+      triggerMode: TooltipTriggerMode.tap,
+      preferBelow: false,
+      child: Text(
+        count > 1 ? '$icon$count' : icon,
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
+    );
   }
 
   /// Дата события в виде `ДД.ММ ЧЧ:ММ` по местному времени; пустая строка, если её не разобрать.
@@ -718,6 +732,14 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   /// Цвет «нужно перепроверить»: не совпадает ни с одним состоянием ревью, чтобы строка,
   /// ждущая меня, не путалась с обычным ЧР.
   static const _recheck = Color(0xFFEC407A);
+
+  /// Ярлык, по которому нажимают: тот же вид, что у номера и задачи, — значит по виду
+  /// понятно, что он кликабельный.
+  Widget _tapBadge(String text, Color color, VoidCallback onTap) => InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: _badge(text, color),
+      );
 
   /// Короткий цветной ярлык.
   ///
