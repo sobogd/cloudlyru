@@ -290,6 +290,78 @@ class _InvoiceDetailScreenState extends ConsumerState<InvoiceDetailScreen> {
     }
   }
 
+  /// Аннулирует отправленную фактуру в AEAT (RegistroAnulacion).
+  ///
+  /// Спрашивает подтверждение: номер и ALTA-запись в реестре сохранятся (этого требует
+  /// налоговая — цепь должна остаться целой), но операция выпадет из налоговой базы.
+  /// Успех обновляет карточку, отказ показывает ответ AEAT целиком.
+  Future<void> _annul() async {
+    final inv = _invoice;
+    if (inv == null || _busy) return;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Аннулировать фактуру?'),
+        content: Text(
+          'Фактура ${inv.number ?? '—'} на ${inv.totalAmount.toStringAsFixed(2)} ${inv.currency} '
+          'будет аннулирована в AEAT. Номер и запись в реестре сохранятся, но в налоговую '
+          'базу операция не попадёт.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Отмена')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Аннулировать')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    setState(() => _busy = true);
+    try {
+      final res = await ref.read(facturaApiProvider).annul(inv.id);
+      if (!mounted) return;
+      _changed = true;
+      await _load();
+      if (!mounted) return;
+      if (res.ok) {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Фактура аннулирована'),
+            content: Text(
+              '${inv.number ?? '—'} аннулирована. Не включайте её в Modelo 303.\n'
+              '${res.csv == null ? '' : 'CSV: ${res.csv}'}',
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Понятно')),
+            ],
+          ),
+        );
+      } else {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Не удалось аннулировать'),
+            content: SingleChildScrollView(
+              child: Text(
+                '${res.message ?? 'Налоговая не приняла аннулирование'}\n\n'
+                '${res.rawResponse ?? ''}',
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Закрыть')),
+            ],
+          ),
+        );
+      }
+    } on FacturaApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final inv = _invoice;
@@ -343,6 +415,15 @@ class _InvoiceDetailScreenState extends ConsumerState<InvoiceDetailScreen> {
                     _Banner(text: _error!, color: Theme.of(context).colorScheme.error),
                     const SizedBox(height: 12),
                   ],
+                  if (inv.isAnnulled) ...[
+                    _Banner(
+                      text: 'Фактура аннулирована'
+                          '${inv.annulledAt == null ? '' : ' ${fullDate(inv.annulledAt!)}'}.'
+                          ' В налоговую базу не включается.',
+                      color: Theme.of(context).colorScheme.tertiary,
+                    ),
+                    const SizedBox(height: 12),
+                  ],
                   if (inv.verifactuPending != null)
                     _PendingBanner(
                       pending: inv.verifactuPending!,
@@ -375,6 +456,14 @@ class _InvoiceDetailScreenState extends ConsumerState<InvoiceDetailScreen> {
                       icon: const Icon(Icons.send),
                       label: Text(_busy ? 'Отправка…' : 'Отправить в AEAT'),
                     ),
+                  if (!inv.isDraft && !inv.isAnnulled) ...[
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: _busy ? null : () => unawaited(_annul()),
+                      icon: const Icon(Icons.undo),
+                      label: Text(_busy ? 'Аннулирование…' : 'Аннулировать в AEAT'),
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   OutlinedButton.icon(
                     onPressed: _busy ? null : () => unawaited(_openPdf()),
@@ -475,9 +564,13 @@ class _Header extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          inv.isDraft ? 'Черновик' : 'Отправлена',
+          inv.isAnnulled
+              ? 'Аннулирована'
+              : (inv.isDraft ? 'Черновик' : 'Отправлена'),
           style: theme.textTheme.labelMedium?.copyWith(
-            color: inv.isDraft ? theme.colorScheme.error : theme.colorScheme.primary,
+            color: inv.isAnnulled
+                ? theme.colorScheme.tertiary
+                : (inv.isDraft ? theme.colorScheme.error : theme.colorScheme.primary),
           ),
         ),
         const SizedBox(height: 4),

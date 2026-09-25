@@ -295,6 +295,34 @@ class FacturaApi {
     }
   }
 
+  /// Аннулирует отправленную фактуру в AEAT (RegistroAnulacion).
+  ///
+  /// Исход такой же, как у [submit]: 200 — запись аннулирования принята и фактура помечена
+  /// аннулированной, 400 — налоговая отказала (или ответ не дошёл). Исключение — только на
+  /// сбоях связи, когда неизвестно, дошёл ли запрос.
+  Future<SubmitResult> annul(String id) async {
+    try {
+      final res = await _http.post<Object?>(
+        '/invoices/$id/annul',
+        options: Options(
+          receiveTimeout: const Duration(seconds: 120),
+          validateStatus: (code) => code != null && code < 500,
+        ),
+      );
+      final data = res.data is Map ? Map<String, dynamic>.from(res.data as Map) : const <String, dynamic>{};
+      final code = res.statusCode ?? 0;
+      if (code >= 200 && code < 300) return SubmitResult.success(data);
+      final err = data['error'] is Map ? Map<String, dynamic>.from(data['error'] as Map) : const <String, dynamic>{};
+      return SubmitResult.failure(
+        kind: err['kind']?.toString(),
+        message: (err['message'] ?? _messageOf(data))?.toString(),
+        rawResponse: err['rawResponse']?.toString(),
+      );
+    } on DioException catch (e) {
+      throw FacturaApiException(e.response?.statusCode ?? 0, _dioMessage(e));
+    }
+  }
+
   /// Подтверждает зависшую запись: человек проверил кабинет AEAT и запись там есть.
   Future<void> confirmPending(String id, {String? csv}) =>
       _json('POST', '/invoices/$id/verifactu/confirm', body: {'csv': ?csv});

@@ -515,6 +515,46 @@ export class InvoicesController {
     });
   }
 
+  /** Annul a SENT invoice at AEAT (RegistroAnulacion). Synchronous, same
+   *  response shape as /submit: on success the invoice carries annulledAt
+   *  and the new ANULACION registry row is returned; on failure the AEAT
+   *  verdict is surfaced. The invoice keeps its number + ALTA record. */
+  @Post(":id/annul")
+  async annul(
+    @Req() req: Request,
+    @Param("id") id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    const { companyId } = (req as AuthedRequest).authUser;
+    const inv = await this.prisma.invoice.findFirst({ where: { id, companyId } });
+    if (!inv) throw new NotFoundException();
+    if (inv.status !== "SENT") {
+      throw new BadRequestException("Only SENT invoices can be annulled");
+    }
+    if (inv.annulledAt) {
+      throw new BadRequestException("Invoice already annulled");
+    }
+
+    const result = await this.verifactuSubmit.annul(inv.id);
+    if (result.ok) {
+      res.status(HttpStatus.OK).json({
+        invoice: result.invoice,
+        registry: result.registry,
+        csv: result.csv,
+        warnings: result.warnings,
+      });
+      return;
+    }
+    res.status(HttpStatus.BAD_REQUEST).json({
+      error: {
+        kind: result.kind,
+        message: result.message,
+        code: result.code ?? null,
+        rawResponse: result.rawResponse ?? null,
+      },
+    });
+  }
+
   /** Operator action: a previous /submit attempt for this invoice
    *  lost the network round-trip to AEAT. We left the local registry
    *  in PENDING state because we couldn't tell whether AEAT actually

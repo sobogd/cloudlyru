@@ -40,8 +40,17 @@ export class DeclarationsService {
         select: { activityType: true },
       }),
       // Issued invoices only (SENT) — drafts aren't real fiscal events.
+      // Annulled invoices (annulledAt != null) are excluded: the AEAT
+      // anulación cancels the operation, so it must not enter the tax base
+      // of Modelos 303/130/349. Their ALTA record stays in the VeriFactu
+      // chain, but the declarations engine skips them.
       this.prisma.invoice.findMany({
-        where: { companyId, status: "SENT", issueDate: { gte: yearStart, lt: qEnd } },
+        where: {
+          companyId,
+          status: "SENT",
+          annulledAt: null,
+          issueDate: { gte: yearStart, lt: qEnd },
+        },
         select: {
           issueDate: true,
           nature: true,

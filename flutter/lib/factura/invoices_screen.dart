@@ -312,7 +312,12 @@ class _InvoiceRow extends StatelessWidget {
               '${row.totalAmount.toStringAsFixed(2)} ${row.currency}',
               style: const TextStyle(fontWeight: FontWeight.w600),
             ),
-            if (row.status != 'SENT')
+            if (row.isAnnulled)
+              Text(
+                'аннулирована',
+                style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.tertiary),
+              )
+            else if (row.status != 'SENT')
               Text('черновик', style: theme.textTheme.bodySmall),
           ],
         ),

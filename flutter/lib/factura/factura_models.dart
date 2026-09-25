@@ -40,6 +40,7 @@ class InvoiceSummary {
     required this.currency,
     required this.status,
     required this.contactName,
+    required this.annulledAt,
   });
 
   /// Идентификатор фактуры (cuid).
@@ -64,6 +65,12 @@ class InvoiceSummary {
   /// Имя контрагента из снимка фактуры (не из справочника: снимок не меняется задним числом).
   final String? contactName;
 
+  /// Когда фактура была аннулирована в AEAT; `null` — не аннулирована.
+  final DateTime? annulledAt;
+
+  /// Фактура аннулирована: операция не попадает в налоговую базу.
+  bool get isAnnulled => annulledAt != null;
+
   /// Собирает счёт из строки ответа `/invoices`.
   factory InvoiceSummary.fromJson(Map<String, dynamic> json) => InvoiceSummary(
         id: '${json['id']}',
@@ -75,6 +82,7 @@ class InvoiceSummary {
         contactName: json['contact'] is Map
             ? _str((json['contact'] as Map)['name'])
             : _str((json['contactSnapshot'] as Map?)?['name']),
+        annulledAt: _date(json['annulledAt']),
       );
 }
 
@@ -192,6 +200,7 @@ class InvoiceDetail {
     required this.verifactuChainTail,
     required this.verifactuPending,
     required this.pdfSha256,
+    required this.annulledAt,
   });
 
   final String id;
@@ -257,6 +266,9 @@ class InvoiceDetail {
   /// sha256 файла PDF в бакете; меняется при каждой перерисовке.
   final String? pdfSha256;
 
+  /// Когда фактура была аннулирована в AEAT; `null` — не аннулирована.
+  final DateTime? annulledAt;
+
   /// Имя контрагента для заголовков: из карточки, иначе из снимка.
   String get displayContactName =>
       contact?.name ?? _str(contactSnapshot['name']) ?? '—';
@@ -267,6 +279,10 @@ class InvoiceDetail {
 
   /// Черновик можно править и удалять; отправленную фактуру — уже нет (её заморозила цепочка).
   bool get isDraft => status == 'DRAFT';
+
+  /// Фактура аннулирована в AEAT: номер и запись остаются, но в налоговую базу
+  /// операция не попадает.
+  bool get isAnnulled => annulledAt != null;
 
   /// Собирает подробности фактуры из ответа `/invoices/:id`.
   factory InvoiceDetail.fromJson(Map<String, dynamic> json) {
@@ -314,6 +330,7 @@ class InvoiceDetail {
               Map<String, dynamic>.from(json['verifactuPending'] as Map))
           : null,
       pdfSha256: _str(json['pdfSha256']),
+      annulledAt: _date(json['annulledAt']),
     );
   }
 }

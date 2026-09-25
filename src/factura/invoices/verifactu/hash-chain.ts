@@ -72,6 +72,49 @@ export function computeHuella(f: HashInputFields): {
   return { input, hash: sha256Hex(input) };
 }
 
+// ---- Anulación (RegistroAnulacion) ----
+
+/** Inputs to the per-record hash of an ANULACION record. Five fields — the
+ *  ALTA record has eight. Per the official AEAT hash spec the field names
+ *  carry the "Anulada" suffix, and the identity is the invoice being
+ *  cancelled (not the chain predecessor).
+ *
+ *  Order is pinned by the spec (RD 1007/2023 Anexo) — do not reorder. */
+export interface AnulacionHashInputFields {
+  /** Emitter NIF of the invoice being cancelled. */
+  idEmisorFacturaAnulada: string;
+  /** Number of the invoice being cancelled. */
+  numSerieFacturaAnulada: string;
+  /** Issue date (DD-MM-YYYY) of the invoice being cancelled. */
+  fechaExpedicionFacturaAnulada: string;
+  /** Previous registry row's `currentHash` (the chain link). */
+  huella: string;
+  /** Generation timestamp of THIS record (same ISO-8601 form as alta). */
+  fechaHoraHusoGenRegistro: string;
+}
+
+/** Canonical key-value serialisation for the anulación hash. */
+export function canonicaliseAnulacionHashInput(
+  f: AnulacionHashInputFields,
+): string {
+  return (
+    `IDEmisorFacturaAnulada=${f.idEmisorFacturaAnulada}` +
+    `&NumSerieFacturaAnulada=${f.numSerieFacturaAnulada}` +
+    `&FechaExpedicionFacturaAnulada=${f.fechaExpedicionFacturaAnulada}` +
+    `&Huella=${f.huella}` +
+    `&FechaHoraHusoGenRegistro=${f.fechaHoraHusoGenRegistro}`
+  );
+}
+
+/** Build the canonical string and hash it for an anulación record. */
+export function computeAnulacionHuella(f: AnulacionHashInputFields): {
+  input: string;
+  hash: string;
+} {
+  const input = canonicaliseAnulacionHashInput(f);
+  return { input, hash: sha256Hex(input) };
+}
+
 /** Format the per-invoice date in DD-MM-YYYY (the format the hash input
  *  expects). The Invoice schema stores `issueDate` as `@db.Date` so we
  *  treat the Date object as UTC midnight of the issue day and emit the

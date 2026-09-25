@@ -906,6 +906,13 @@ model Invoice {
   // accept. The invoice stays DRAFT and the UI shows the error modal.
   status String @default("DRAFT")
 
+  // Set once the AEAT anulación (RegistroAnulacion) for this invoice has
+  // been accepted. The invoice keeps its number, its ALTA registry row and
+  // its PDF — AEAT requires the erroneous alta to stay in the chain — but
+  // the declarations engine (Modelos 303/130/349) skips annulled invoices,
+  // so the operation never enters the tax base.
+  annulledAt DateTime?
+
   // --- Payment ---
   paid          Boolean   @default(false)
   paidAt        DateTime?
@@ -926,7 +933,9 @@ model Invoice {
   // --- Verifactu (RD 1007/2023) ---
   // 1:1 with VerifactuRegistry. Optional because the registry is only
   // populated when VERIFACTU_MODE != "disabled" — pre-2026-07-01 default.
-  verifactuRegistry VerifactuRegistry?
+  verifactuRegistry VerifactuRegistry? @relation("RegistryInvoice")
+  // 0..1 — the ANULACION registry row that cancelled this invoice, if any.
+  annulmentRegistry VerifactuRegistry? @relation("RegistryAnnulledInvoice")
   events            InvoiceEvent[]
 
   createdAt DateTime @default(now())
@@ -1202,7 +1211,19 @@ model SupportMessage {
 model VerifactuRegistry {
   id        String @id @default(cuid())
   companyId String
-  invoiceId String @unique
+  // "ALTA" = invoice submission; "ANULACION" = cancellation of a previously
+  // accepted invoice (its ALTA row stays, this adds the opposite-sign
+  // record per RD 1007/2023).
+  kind      String    @default("ALTA")
+  // The invoice this registry row belongs to. Set on ALTA rows; NULL on
+  // ANULACION rows (an annulment is not an invoice — it references the
+  // cancelled one via annulledInvoiceId below). Kept @unique so each
+  // invoice has at most one ALTA record; Postgres treats NULLs as
+  // distinct, so multiple ANULACION rows don't collide.
+  invoiceId String? @unique
+  // For ANULACION rows: the invoice being cancelled. Unique so each invoice
+  // can be annulled at most once.
+  annulledInvoiceId String? @unique
 
   // Monotonic per company; uniqueness enforced so the chain can't fork.
   sequenceNumber Int
@@ -1231,7 +1252,8 @@ model VerifactuRegistry {
 
   signedAt DateTime @default(now())
 
-  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoice Invoice? @relation("RegistryInvoice", fields: [invoiceId], references: [id], onDelete: Cascade)
+  annulledInvoice Invoice? @relation("RegistryAnnulledInvoice", fields: [annulledInvoiceId], references: [id], onDelete: Cascade)
 
   @@unique([companyId, sequenceNumber])
   @@index([companyId, signedAt])

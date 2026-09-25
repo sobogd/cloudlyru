@@ -182,6 +182,53 @@ export function buildSoapEnvelope(input: {
   );
 }
 
+/** Per-record payload for an ANULACION record — cancels a previously
+ *  submitted invoice. Its identity (IDFactura) is the invoice being
+ *  cancelled, with the "Anulada" suffix on each field. */
+export interface RegistroAnulacionInput {
+  /** Emitter NIF of the invoice being cancelled. */
+  idEmisorFacturaAnulada: string;
+  /** Number of the invoice being cancelled. */
+  numSerieFacturaAnulada: string;
+  /** Issue date (DD-MM-YYYY) of the invoice being cancelled. */
+  fechaExpedicionFacturaAnulada: string;
+  /** Chain link — always a reference to the previous registry record
+   *  (an anulación is never the first record of a chain, since it must
+   *  cancel something). */
+  encadenamiento: {
+    idEmisorFactura: string;
+    numSerieFactura: string;
+    fechaExpedicionFactura: string;
+    huella: string;
+  };
+  /** ISO-8601 datetime with explicit offset — same form as alta. */
+  fechaHoraHusoGenRegistro: string;
+  /** Uppercase hex SHA-256 of this anulación record. */
+  huella: string;
+}
+
+/** Build the SOAP envelope for a single ANULACION record. Same cabecera
+ *  and SistemaInformatico as an alta batch; the only difference is the
+ *  RegistroFactura child carries RegistroAnulacion instead of RegistroAlta. */
+export function buildAnulacionSoapEnvelope(input: {
+  cabecera: CabeceraInput;
+  sistemaInformatico: SistemaInformaticoInput;
+  anulacion: RegistroAnulacionInput;
+}): string {
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<soapenv:Envelope xmlns:soapenv="${NS_SOAP}" xmlns:sfLR="${NS_LR}" xmlns:sf="${NS_SF}">` +
+    `<soapenv:Header/>` +
+    `<soapenv:Body>` +
+    `<sfLR:RegFactuSistemaFacturacion>` +
+    renderCabecera(input.cabecera) +
+    renderRegistroAnulacion(input.anulacion, input.sistemaInformatico) +
+    `</sfLR:RegFactuSistemaFacturacion>` +
+    `</soapenv:Body>` +
+    `</soapenv:Envelope>`
+  );
+}
+
 function renderCabecera(c: CabeceraInput): string {
   // Cabecera is declared inside SuministroLR.xsd (targetNamespace sfLR),
   // so the element itself lives in sfLR even though its TYPE
@@ -224,6 +271,40 @@ function renderRegistroFactura(
     `<sf:TipoHuella>01</sf:TipoHuella>` +
     `<sf:Huella>${esc(r.huella)}</sf:Huella>` +
     `</sf:RegistroAlta>` +
+    `</sfLR:RegistroFactura>`
+  );
+}
+
+/** Render one `<RegistroAnulacion>`. Mirrors the alta record minus the
+ *  invoice-specific blocks (NombreRazonEmisor, TipoFactura, Desglose,
+ *  CuotaTotal/ImporteTotal, Destinatarios) — those live on the cancelled
+ *  invoice's original ALTA record, not here. */
+function renderRegistroAnulacion(
+  r: RegistroAnulacionInput,
+  sif: SistemaInformaticoInput,
+): string {
+  return (
+    `<sfLR:RegistroFactura>` +
+    `<sf:RegistroAnulacion>` +
+    `<sf:IDVersion>1.0</sf:IDVersion>` +
+    `<sf:IDFactura>` +
+    `<sf:IDEmisorFacturaAnulada>${esc(r.idEmisorFacturaAnulada)}</sf:IDEmisorFacturaAnulada>` +
+    `<sf:NumSerieFacturaAnulada>${esc(r.numSerieFacturaAnulada)}</sf:NumSerieFacturaAnulada>` +
+    `<sf:FechaExpedicionFacturaAnulada>${esc(r.fechaExpedicionFacturaAnulada)}</sf:FechaExpedicionFacturaAnulada>` +
+    `</sf:IDFactura>` +
+    `<sf:Encadenamiento>` +
+    `<sf:RegistroAnterior>` +
+    `<sf:IDEmisorFactura>${esc(r.encadenamiento.idEmisorFactura)}</sf:IDEmisorFactura>` +
+    `<sf:NumSerieFactura>${esc(r.encadenamiento.numSerieFactura)}</sf:NumSerieFactura>` +
+    `<sf:FechaExpedicionFactura>${esc(r.encadenamiento.fechaExpedicionFactura)}</sf:FechaExpedicionFactura>` +
+    `<sf:Huella>${esc(r.encadenamiento.huella)}</sf:Huella>` +
+    `</sf:RegistroAnterior>` +
+    `</sf:Encadenamiento>` +
+    renderSistemaInformatico(sif) +
+    `<sf:FechaHoraHusoGenRegistro>${esc(r.fechaHoraHusoGenRegistro)}</sf:FechaHoraHusoGenRegistro>` +
+    `<sf:TipoHuella>01</sf:TipoHuella>` +
+    `<sf:Huella>${esc(r.huella)}</sf:Huella>` +
+    `</sf:RegistroAnulacion>` +
     `</sfLR:RegistroFactura>`
   );
 }

@@ -3,6 +3,7 @@ import { Prisma, type Invoice, type VerifactuRegistry } from "@prisma/client";
 
 import { PrismaService } from "../../../prisma/prisma.service";
 import {
+  computeAnulacionHuella,
   computeHuella,
   deriveTipoFactura,
   formatAmountForHash,
@@ -131,6 +132,65 @@ export class VerifactuService {
         // In "submit" mode the cron will push this row to AEAT and
         // flip the status; in "local" mode it stays PENDING forever.
         aeatStatus: cfg.mode === "submit" ? "PENDING" : "PENDING",
+      },
+    });
+  }
+
+  /** Create the VerifactuRegistry row for an ANULACION record.
+   *  MUST be called inside the same Prisma transaction that will submit it,
+   *  with the same lock semantics as createInsideTx — the chain link
+   *  (previousHash) must be the record AEAT actually saw.
+   *
+   *  The anulación is not an invoice: it has no invoiceId of its own, no QR
+   *  and no TipoFactura. Its identity is the invoice being cancelled, and
+   *  its hash is computed over the five anulación fields (see hash-chain).
+   *  Returns the created row with aeatStatus=PENDING; the caller submits it
+   *  and flips the status / rolls back exactly like an alta submit. */
+  async createAnulacionInsideTx(
+    tx: Prisma.TransactionClient,
+    args: {
+      companyId: string;
+      issuerNif: string;
+      annulledInvoiceId: string;
+      annulledNumber: string;
+      annulledIssueDate: Date;
+    },
+  ): Promise<VerifactuRegistry> {
+    const previous = await tx.verifactuRegistry.findFirst({
+      where: { companyId: args.companyId },
+      orderBy: { sequenceNumber: "desc" },
+      select: { sequenceNumber: true, currentHash: true },
+    });
+    const sequenceNumber = (previous?.sequenceNumber ?? 0) + 1;
+    const previousHash = previous?.currentHash ?? "";
+
+    const signedAt = new Date();
+    const fechaHora = formatTimestampForHash(signedAt);
+
+    const { input, hash } = computeAnulacionHuella({
+      idEmisorFacturaAnulada: args.issuerNif,
+      numSerieFacturaAnulada: args.annulledNumber,
+      fechaExpedicionFacturaAnulada: formatDateForHash(args.annulledIssueDate),
+      huella: previousHash,
+      fechaHoraHusoGenRegistro: fechaHora,
+    });
+
+    return tx.verifactuRegistry.create({
+      data: {
+        companyId: args.companyId,
+        kind: "ANULACION",
+        invoiceId: null,
+        annulledInvoiceId: args.annulledInvoiceId,
+        sequenceNumber,
+        previousHash,
+        currentHash: hash,
+        hashInput: input,
+        // tipoFactura keeps its schema default — it's meaningless on an
+        // anulación (the type lives on the cancelled invoice's ALTA row).
+        // No QR either: an annulment carries no cotejo link.
+        qrUrl: "",
+        signedAt,
+        aeatStatus: "PENDING",
       },
     });
   }

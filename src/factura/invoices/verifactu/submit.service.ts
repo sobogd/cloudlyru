@@ -14,10 +14,12 @@ import {
 } from "./hash-chain";
 import { getVerifactuConfig, VerifactuService } from "./verifactu.service";
 import {
+  buildAnulacionSoapEnvelope,
   buildSoapEnvelope,
   deriveDesglose,
   type DestinatarioInput,
   type RegistroAltaInput,
+  type RegistroAnulacionInput,
   type SistemaInformaticoInput,
 } from "./xml-builder";
 import { env } from "../../../config/env";
@@ -535,6 +537,313 @@ export class VerifactuSubmitService {
     });
   }
 
+  /** Annul a SENT invoice: submit an ANULACION record to AEAT and, once
+   *  accepted, stamp Invoice.annulledAt so the declarations engine drops
+   *  the operation from the tax base. The original ALTA record and the
+   *  invoice number stay in the chain — RD 1007/2023 requires both the
+   *  erroneous alta and its anulación to remain visible.
+   *
+   *  Mirrors submit()'s transaction/rollback discipline: create the
+   *  ANULACION registry row inside the per-company lock, POST it, then
+   *  finalise (registry ACCEPTED + invoice.annulledAt) or roll back. */
+  async annul(invoiceId: string): Promise<SubmitOk | SubmitErr> {
+    const cfg = getVerifactuConfig();
+    if (cfg.mode === "disabled") {
+      return {
+        ok: false,
+        kind: "aeat_rejected",
+        message: "VERIFACTU_MODE=disabled — set to 'submit' to annul at AEAT",
+        code: null,
+      };
+    }
+
+    const loaded = await this.prisma.invoice.findUnique({
+      where: { id: invoiceId },
+    });
+    if (!loaded) {
+      return { ok: false, kind: "aeat_rejected", message: "Invoice not found", code: null };
+    }
+    if (loaded.status !== "SENT") {
+      return { ok: false, kind: "aeat_rejected", message: "Only SENT invoices can be annulled", code: null };
+    }
+    if (loaded.annulledAt) {
+      return { ok: false, kind: "aeat_rejected", message: "Invoice is already annulled", code: null };
+    }
+    if (!loaded.number) {
+      return { ok: false, kind: "aeat_rejected", message: "Invoice has no allocated number — cannot be annulled", code: null };
+    }
+
+    const emitter =
+      (loaded.emitterSnapshot as {
+        legalName?: string | null;
+        name?: string;
+        taxId?: string | null;
+      }) ?? {};
+    const issuerNif = (emitter.taxId || "").trim().toUpperCase();
+    if (!issuerNif) {
+      return {
+        ok: false,
+        kind: "aeat_rejected",
+        message: "Emitter NIF is empty — set Company.taxId in Settings",
+        code: null,
+      };
+    }
+
+    const cert = await this.loadEmitterCert(loaded.companyId);
+    if (!cert.ok) {
+      return { ok: false, kind: "aeat_rejected", message: cert.message, code: null };
+    }
+
+    return this.withCompanyLock(loaded.companyId, async () => {
+      // Idempotency + recovery, mirroring submit(): if a prior attempt
+      // committed its ANULACION registry row but lost the AEAT response,
+      // re-send the byte-identical envelope rather than create a second.
+      const fresh = await this.prisma.invoice.findUnique({ where: { id: invoiceId } });
+      if (fresh?.annulledAt) {
+        const existing = await this.prisma.verifactuRegistry.findFirst({
+          where: { annulledInvoiceId: invoiceId, kind: "ANULACION" },
+        });
+        if (existing) {
+          const csv =
+            (existing.aeatResponseRaw as { csv?: string | null } | null)?.csv ?? null;
+          return { ok: true, invoice: fresh, registry: existing, csv, warnings: [] };
+        }
+        return {
+          ok: false,
+          kind: "aeat_rejected",
+          message: "Invoice is already annulled",
+          code: null,
+        };
+      }
+
+      let existingPendingForThis = await this.prisma.verifactuRegistry.findFirst({
+        where: { annulledInvoiceId: invoiceId, kind: "ANULACION", aeatStatus: "PENDING" },
+      });
+
+      // Chain-integrity gate: another PENDING record for this company means
+      // a prior submit (alta or anulación) lost its AEAT round-trip. Refuse
+      // until the operator resolves it, so the new record never chains off
+      // an unconfirmed predecessor.
+      if (!existingPendingForThis) {
+        const otherPending = await this.prisma.verifactuRegistry.findFirst({
+          where: { companyId: loaded.companyId, aeatStatus: "PENDING" },
+        });
+        if (otherPending) {
+          return {
+            ok: false,
+            kind: "aeat_rejected",
+            message: `Cannot annul: registry #${otherPending.sequenceNumber} is still pending AEAT confirmation. Resolve it first (AEAT portal → mark ACCEPTED or cancel locally), then retry.`,
+            code: null,
+          };
+        }
+      }
+
+      let registry: VerifactuRegistry;
+      if (existingPendingForThis) {
+        registry = existingPendingForThis;
+      } else {
+        registry = await this.prisma.$transaction(async (tx) => {
+          return this.verifactu.createAnulacionInsideTx(tx, {
+            companyId: loaded.companyId,
+            issuerNif,
+            annulledInvoiceId: loaded.id,
+            annulledNumber: loaded.number!,
+            annulledIssueDate: loaded.issueDate,
+          });
+        });
+      }
+
+      try {
+        const envelope = await this.buildAnulacionEnvelope({
+          invoice: loaded,
+          registry,
+          issuerNif,
+          emitter,
+        });
+
+        await this.events.log({
+          invoiceId: loaded.id,
+          companyId: loaded.companyId,
+          type: "VERIFACTU_ANULACION_REQUEST",
+          outcome: "info",
+          summary: `POST anulación → AEAT (${cfg.env}) — cancels ${loaded.number}, seq #${registry.sequenceNumber}`,
+          payload: {
+            env: cfg.env,
+            sequenceNumber: registry.sequenceNumber,
+            huella: registry.currentHash,
+            soapEnvelope: envelope,
+          },
+        });
+
+        let aeatResult: AeatSubmitResult;
+        try {
+          aeatResult = await submitToAeat(cfg.env, envelope, cert.cert);
+        } catch (err) {
+          const e = err as { kind?: string; message?: string; rawResponseXml?: string };
+          await this.events.log({
+            invoiceId: loaded.id,
+            companyId: loaded.companyId,
+            type: "VERIFACTU_ANULACION_NETWORK_ERROR",
+            outcome: "error",
+            summary: `Anulación AEAT call failed (registry left PENDING for retry): ${e.message ?? "unknown"}`,
+            payload: { kind: e.kind, message: e.message, rawResponse: e.rawResponseXml },
+          });
+          return {
+            ok: false,
+            kind:
+              e.kind === "network_error" ||
+              e.kind === "http_error" ||
+              e.kind === "soap_fault" ||
+              e.kind === "parse_error"
+                ? e.kind
+                : "aeat_rejected",
+            message: e.message ?? "AEAT anulación failed",
+            code: null,
+            rawResponse: e.rawResponseXml,
+          };
+        }
+
+        const line = aeatResult.lineas[0];
+        const accepted =
+          aeatResult.estadoEnvio !== "Incorrecto" &&
+          (line?.estado === "Correcto" || line?.estado === "AceptadoConErrores");
+
+        if (!accepted) {
+          await this.events.log({
+            invoiceId: loaded.id,
+            companyId: loaded.companyId,
+            type: "VERIFACTU_ANULACION_REJECTED",
+            outcome: "error",
+            summary: `Anulación rejected (code ${line?.codigoError ?? "?"}): ${line?.descripcionError ?? aeatResult.estadoEnvio}`,
+            payload: {
+              estadoEnvio: aeatResult.estadoEnvio,
+              httpStatus: aeatResult.httpStatus,
+              line,
+              rawResponse: aeatResult.rawResponseXml,
+            },
+          });
+          await this.rollback(registry.id, loaded.id, loaded.companyId, null);
+          return {
+            ok: false,
+            kind: "aeat_rejected",
+            message:
+              line?.descripcionError ||
+              `AEAT rejected the annulment (EstadoEnvio=${aeatResult.estadoEnvio})`,
+            code: line?.codigoError ?? null,
+            rawResponse: aeatResult.rawResponseXml,
+          };
+        }
+
+        const status: string =
+          line?.estado === "Correcto" ? "ACCEPTED" : "ACCEPTED_WITH_ERRORS";
+        const [updatedRegistry, updatedInvoice] = await this.prisma.$transaction([
+          this.prisma.verifactuRegistry.update({
+            where: { id: registry.id },
+            data: {
+              aeatStatus: status,
+              aeatSubmittedAt: new Date(),
+              aeatResponseCode: line?.codigoError?.toString() ?? null,
+              aeatResponseRaw: {
+                csv: aeatResult.csv,
+                estadoEnvio: aeatResult.estadoEnvio,
+                line: line ?? null,
+                httpStatus: aeatResult.httpStatus,
+              } as unknown as Prisma.InputJsonValue,
+              aeatRetryCount: { increment: 1 },
+            },
+          }),
+          this.prisma.invoice.update({
+            where: { id: loaded.id },
+            data: { annulledAt: new Date() },
+          }),
+        ]);
+
+        await this.events.log({
+          invoiceId: loaded.id,
+          companyId: loaded.companyId,
+          type: "VERIFACTU_ANULACION_RESPONSE",
+          outcome: "ok",
+          summary:
+            line?.estado === "Correcto"
+              ? `Anulación accepted (CSV ${aeatResult.csv})`
+              : `Anulación accepted with warnings (CSV ${aeatResult.csv}, code ${line?.codigoError})`,
+          payload: {
+            csv: aeatResult.csv,
+            estadoEnvio: aeatResult.estadoEnvio,
+            httpStatus: aeatResult.httpStatus,
+            line,
+            rawResponse: aeatResult.rawResponseXml,
+          },
+        });
+
+        const warnings =
+          line?.estado === "AceptadoConErrores" && line.descripcionError
+            ? [{ code: line.codigoError, description: line.descripcionError }]
+            : [];
+        return {
+          ok: true,
+          invoice: updatedInvoice,
+          registry: updatedRegistry,
+          csv: aeatResult.csv,
+          warnings,
+        };
+      } catch (err) {
+        // Defensive: an unexpected error after the registry row was created
+        // rolls it back so the chain stays contiguous (no serial to release —
+        // an anulación reuses the cancelled invoice's number).
+        await this.rollback(registry.id, loaded.id, loaded.companyId, null);
+        throw err;
+      }
+    });
+  }
+
+  /** Load the company's FNMT signing cert, or return a user-facing error.
+   *  Extracted so submit() and annul() share the same checks + messages. */
+  private async loadEmitterCert(
+    companyId: string,
+  ): Promise<{ ok: true; cert: VerifactuCert } | { ok: false; message: string }> {
+    const certCompany = await this.prisma.company.findUnique({
+      where: { id: companyId },
+      select: {
+        verifactuCertCipher: true,
+        verifactuCertNonce: true,
+        verifactuCertTag: true,
+        verifactuCertExpiry: true,
+      },
+    });
+    if (
+      !certCompany?.verifactuCertCipher ||
+      !certCompany.verifactuCertNonce ||
+      !certCompany.verifactuCertTag
+    ) {
+      return {
+        ok: false,
+        message:
+          "No signing certificate on file for this company. Upload your FNMT .p12 in Settings → Verifactu certificate.",
+      };
+    }
+    if (
+      certCompany.verifactuCertExpiry &&
+      certCompany.verifactuCertExpiry.getTime() < Date.now()
+    ) {
+      return {
+        ok: false,
+        message: `The company's signing certificate expired on ${certCompany.verifactuCertExpiry
+          .toISOString()
+          .slice(0, 10)}. Upload a fresh cert in Settings.`,
+      };
+    }
+    return {
+      ok: true,
+      cert: loadVerifactuCertForCompany({
+        companyId,
+        cipher: Buffer.from(certCompany.verifactuCertCipher),
+        nonce: Buffer.from(certCompany.verifactuCertNonce),
+        tag: Buffer.from(certCompany.verifactuCertTag),
+      }),
+    };
+  }
+
   private async rollback(
     registryId: string,
     invoiceId: string,
@@ -591,25 +900,12 @@ export class VerifactuSubmitService {
     if (registry.sequenceNumber === 1) {
       encadenamiento = { kind: "primero" };
     } else {
-      const prev = await this.prisma.verifactuRegistry.findFirst({
-        where: {
-          companyId: registry.companyId,
-          sequenceNumber: registry.sequenceNumber - 1,
-        },
-        include: { invoice: { select: { number: true, issueDate: true } } },
-      });
-      if (!prev || !prev.invoice.number) {
-        throw new Error(
-          `Registry ${registry.id} has no predecessor at seq ${registry.sequenceNumber - 1}`,
-        );
-      }
-      encadenamiento = {
-        kind: "anterior",
-        idEmisorFactura: issuerNif,
-        numSerieFactura: prev.invoice.number,
-        fechaExpedicionFactura: formatDateForHash(prev.invoice.issueDate),
-        huella: prev.currentHash,
-      };
+      const prev = await this.previousChainLink(
+        registry.companyId,
+        registry.sequenceNumber - 1,
+        issuerNif,
+      );
+      encadenamiento = { kind: "anterior", ...prev };
     }
 
     // VeriFactu reports EUR — read the EUR mirror, falling back to the
@@ -697,6 +993,84 @@ export class VerifactuSubmitService {
       sistemaInformatico: sif,
       registros: [registroAlta],
     });
+  }
+
+  /** Build the SOAP envelope for an ANULACION record. Same cabecera and
+   *  SistemaInformatico as an alta batch; the record body carries the
+   *  cancelled invoice's identity and its own hash. */
+  private async buildAnulacionEnvelope(args: {
+    invoice: Invoice;
+    registry: VerifactuRegistry;
+    issuerNif: string;
+    emitter: { legalName?: string | null; name?: string };
+  }): Promise<string> {
+    const { invoice, registry, issuerNif, emitter } = args;
+
+    // The chain link is the previous record (alta or another anulación).
+    const prev = await this.previousChainLink(
+      registry.companyId,
+      registry.sequenceNumber - 1,
+      issuerNif,
+    );
+
+    const numeroInstalacion =
+      env.VERIFACTU_INSTALLATION_ID.trim() || registry.companyId;
+    const sif: SistemaInformaticoInput = { ...SOFTWARE, numeroInstalacion };
+    const nombreRazonEmisor = (emitter.legalName || emitter.name || issuerNif).slice(0, 120);
+
+    const anulacion: RegistroAnulacionInput = {
+      idEmisorFacturaAnulada: issuerNif,
+      numSerieFacturaAnulada: invoice.number!,
+      fechaExpedicionFacturaAnulada: formatDateForHash(invoice.issueDate),
+      encadenamiento: prev,
+      fechaHoraHusoGenRegistro: formatTimestampForHash(registry.signedAt),
+      huella: registry.currentHash,
+    };
+
+    return buildAnulacionSoapEnvelope({
+      cabecera: {
+        obligadoNombreRazon: nombreRazonEmisor,
+        obligadoNif: issuerNif,
+      },
+      sistemaInformatico: sif,
+      anulacion,
+    });
+  }
+
+  /** Resolve the RegistroAnterior identity of the record at the given
+   *  sequence number. For an ALTA row that's its own invoice; for an
+   *  ANULACION row it's the CANCELLED invoice — the anulación has no
+   *  number of its own, and AEAT chains the next record off the annulled
+   *  invoice's identity (verified against the official examples). */
+  private async previousChainLink(
+    companyId: string,
+    sequenceNumber: number,
+    issuerNif: string,
+  ): Promise<{
+    idEmisorFactura: string;
+    numSerieFactura: string;
+    fechaExpedicionFactura: string;
+    huella: string;
+  }> {
+    const prev = await this.prisma.verifactuRegistry.findFirst({
+      where: { companyId, sequenceNumber },
+      include: {
+        invoice: { select: { number: true, issueDate: true } },
+        annulledInvoice: { select: { number: true, issueDate: true } },
+      },
+    });
+    const identity = prev?.invoice ?? prev?.annulledInvoice;
+    if (!prev || !identity?.number) {
+      throw new Error(
+        `Registry at seq ${sequenceNumber} has no resolvable chain identity`,
+      );
+    }
+    return {
+      idEmisorFactura: issuerNif,
+      numSerieFactura: identity.number,
+      fechaExpedicionFactura: formatDateForHash(identity.issueDate),
+      huella: prev.currentHash,
+    };
   }
 }
 
