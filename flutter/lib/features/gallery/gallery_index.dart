@@ -178,18 +178,34 @@ class GalleryIndex {
     required double width,
     required bool hasNote,
   }) {
+    // Колонки и шаг ряда — от одной ширины: число клеток в ряду и высота ряда обязаны
+    // считаться по одной геометрии, иначе номера кадров и строки разъедутся.
+    final columns = GalleryGrid.columnsFor(width);
     final rowStep = GalleryGrid.rowStep(width);
     return GalleryIndex._(
       hasNote: hasNote,
       rowStep: rowStep,
-      layout: _layout(months, rowStep, hasNote),
+      columns: columns,
+      layout: _layout(months, rowStep, columns, hasNote),
     );
   }
 
-  GalleryIndex._({required this.hasNote, required this.rowStep, required _Layout layout}) : _l = layout;
+  GalleryIndex._({
+    required this.hasNote,
+    required this.rowStep,
+    required this.columns,
+    required _Layout layout,
+  }) : _l = layout;
 
   /// Шаг ряда кадров: сторона клетки плюс зазор. Высоты строк берутся отсюда.
   final double rowStep;
+
+  /// Кадров в ряду: число колонок на ширине экрана, при которой собран индекс.
+  ///
+  /// Держится в индексе, а не пересчитывается из текущей ширины: индекс живёт до следующей
+  /// пересборки, а пересборка всегда идёт с новой шириной и новыми колонками (см.
+  /// `GalleryController._rebuild`).
+  final int columns;
 
   /// Есть ли в конце списка строка состояния.
   final bool hasNote;
@@ -231,14 +247,14 @@ class GalleryIndex {
         height: GalleryGrid.headerHeight,
       );
     }
-    // Ряды кадров идут по четыре: первый кадр ряда — четвёртый по счёту от начала месяца.
-    final first = (k - 1) * GalleryGrid.columns;
+    // Ряды кадров идут по [columns]: первый кадр ряда — [columns]-й по счёту от начала месяца.
+    final first = (k - 1) * columns;
     final left = b.count - first;
     return GalleryRowSpec.items(
       month: b.month,
       firstItem: b.firstItem + first,
       monthOffset: first,
-      cells: left < GalleryGrid.columns ? left : GalleryGrid.columns,
+      cells: left < columns ? left : columns,
       rowInBlock: k,
       top: b.top + GalleryGrid.headerHeight + (k - 1) * rowStep,
       height: rowStep,
@@ -394,7 +410,7 @@ class GalleryIndex {
   ///
   /// Пустые месяцы пропускаются: в ленте они не занимают места. Хвост кадров без даты идёт
   /// последним блоком: в ленте такие кадры идут после всех датированных.
-  static _Layout _layout(List<MediaMonthBucket> months, double rowStep, bool hasNote) {
+  static _Layout _layout(List<MediaMonthBucket> months, double rowStep, int columns, bool hasNote) {
     final dated = months.where((m) => (m.month ?? '').isNotEmpty && m.count > 0).toList()
       ..sort((a, b) => b.month!.compareTo(a.month!));
     var undated = 0;
@@ -407,7 +423,7 @@ class GalleryIndex {
     var top = 0.0;
     void add(String month, int count) {
       if (count <= 0) return;
-      final rows = 1 + (count + GalleryGrid.columns - 1) ~/ GalleryGrid.columns;
+      final rows = 1 + (count + columns - 1) ~/ columns;
       blocks.add(GalleryBlock(
         month: month,
         count: count,
