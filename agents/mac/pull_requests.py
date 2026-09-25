@@ -229,16 +229,46 @@ def _discussion(node, author):
     return items
 
 
-def _last_change_request(node):
-    """Return the timestamp and author of the most recent change request."""
+def _last_change_request(node, by=None):
+    """Return the timestamp and author of the most recent change request.
+
+    With `by` set, only that reviewer's own change requests count: the board wants to know
+    whether the pull request moved after *my* review, not after somebody else's.
+    """
     last_at, last_by = "", ""
     for review in (node.get("reviews") or {}).get("nodes") or []:
         if not review or review.get("state") != "CHANGES_REQUESTED":
             continue
+        login = ((review.get("author") or {}).get("login")) or ""
+        if by and login != by:
+            continue
         at = review.get("submittedAt") or ""
         if at >= last_at:
-            last_at, last_by = at, ((review.get("author") or {}).get("login")) or ""
+            last_at, last_by = at, login
     return last_at, last_by
+
+
+def _my_review(node, login):
+    """Return the state and timestamp of my own latest blocking review.
+
+    `COMMENTED` reviews are skipped the way GitHub skips them when it computes `reviewDecision`:
+    a comment neither approves nor blocks, so it must not hide an earlier change request.
+    """
+    last_at, last_state = "", ""
+    if not login:
+        return last_state, last_at
+    for review in (node.get("reviews") or {}).get("nodes") or []:
+        if not review:
+            continue
+        state = review.get("state") or ""
+        if state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            continue
+        if ((review.get("author") or {}).get("login")) != login:
+            continue
+        at = review.get("submittedAt") or ""
+        if at >= last_at:
+            last_at, last_state = at, state
+    return last_state, last_at
 
 
 def _row(node, viewer):
@@ -253,6 +283,9 @@ def _row(node, viewer):
     commits = (node.get("commits") or {}).get("nodes") or []
     pushed_at = (((commits[0] or {}).get("commit") or {}).get("committedDate")) if commits else ""
     after_push = [item for item in comments if pushed_at and item[0] > pushed_at]
+    my_state, my_review_at = _my_review(node, viewer)
+    my_cr_at = my_review_at if my_state == "CHANGES_REQUESTED" else ""
+    pushed_after_my_cr = bool(my_cr_at and pushed_at and pushed_at > my_cr_at)
 
     def logins(items):
         seen = []
@@ -276,6 +309,9 @@ def _row(node, viewer):
         "change_requests": (node.get("changeRequests") or {}).get("totalCount") or 0,
         "changes_requested_at": cr_at,
         "changes_requested_by": cr_by,
+        "my_review": my_state,
+        "my_change_request_at": my_cr_at,
+        "pushed_after_my_cr": pushed_after_my_cr,
         "comments_total": node.get("totalCommentsCount") or 0,
         "comments_recent": len(comments),
         "comments_after_cr": len(after_cr),

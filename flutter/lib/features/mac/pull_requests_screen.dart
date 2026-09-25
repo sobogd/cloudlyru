@@ -590,10 +590,15 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
     final task = '${row['task'] ?? ''}';
     final afterCr = row['comments_after_cr'] as int? ?? 0;
     final total = row['comments_total'] as int? ?? 0;
+    final approvals = row['approvals'] as int? ?? 0;
+    final pushedAfterMyCr = row['pushed_after_my_cr'] == true;
     final review = _review(row);
     final theme = Theme.of(context);
     return ListTile(
       dense: true,
+      // Мой запрос изменений, на который уже запушили правки — единственное состояние доски,
+      // требующее действия именно от меня, поэтому подсвечена вся строка, а не только ярлык.
+      tileColor: pushedAfterMyCr ? _recheck.withValues(alpha: 0.12) : null,
       title: Text('#${row['number']} ${row['title']}', maxLines: 2, overflow: TextOverflow.ellipsis),
       subtitle: Padding(
         padding: const EdgeInsets.only(top: 4),
@@ -610,6 +615,11 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
             Text('${row['repo']} · ${row['mine'] == true ? 'я' : row['author']}',
                 style: theme.textTheme.bodySmall),
             _badge(_decisionLabel(decision), _decisionColor(decision)),
+            // Апрув не снимает чужой ЧР, и GitHub показывает только блокирующее состояние:
+            // без этого ярлыка «ЧР» у апрувнутого PR выглядит ошибкой доски.
+            if (approvals > 0 && decision != 'APPROVED')
+              _badge('$approvals апрув', const Color(0xFF4CAF50)),
+            if (pushedAfterMyCr) _badge('пушили после моего ЧР', _recheck),
             if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
             if (total > 0) Text('💬 $total', style: theme.textTheme.bodySmall),
             if (afterCr > 0) _badge('+$afterCr после ЧР', Colors.orange),
@@ -641,6 +651,10 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       onLongPress: () => _actions(row),
     );
   }
+
+  /// Цвет «нужно перепроверить»: не совпадает ни с одним состоянием ревью, чтобы строка,
+  /// ждущая меня, не путалась с обычным ЧР.
+  static const _recheck = Color(0xFFEC407A);
 
   /// Короткий цветной ярлык.
   ///

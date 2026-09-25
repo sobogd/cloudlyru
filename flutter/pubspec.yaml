@@ -20,7 +20,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # scripts/build-release.sh на своём маке (workflow сборки приложений больше нет), и номер
 # сборки обязан расти с каждым выпуском. Номер общий для платформ: из него же берётся
 # CFBundleVersion настольной и iOS-сборки, поэтому поднимать его достаточно один раз.
-version: 1.0.0+192
+version: 1.0.0+193
 
 environment:
   sdk: ^3.13.3
