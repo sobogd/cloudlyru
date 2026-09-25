@@ -14,7 +14,7 @@
   <key>WorkingDirectory</key><string>/Users/sobogd/work/tangem</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>/Users/sobogd/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>/Users/sobogd/.nvm/versions/node/v22.23.3/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>CLAUDE_CONFIG_DIR</key><string>/Users/sobogd/.claude-work</string>
   </dict>
   <key>StandardOutPath</key><string>/tmp/claude-tangem.log</string>

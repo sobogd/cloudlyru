@@ -3,7 +3,7 @@
 # run-llm-mt.sh — keeps the local translation model (TranslateGemma-4B) serving translation.
 #
 # Managed by launchd (com.agent.llm-mt, RunAtLoad + KeepAlive). Это второй текстовый движок
-# рядом с com.agent.llm: там универсальная Qwen3.5-4B под поиск, код и чат, а здесь —
+# рядом с com.agent.llm: там универсальная Qwen3.8-27B под поиск, код и чат, а здесь —
 # специализированная переводческая модель на 127.0.0.1:1235.
 #
 # Зачем отдельная модель под перевод. Замерено на этой машине на живом тексте (страница

@@ -10,7 +10,9 @@
 | [pi](https://github.com/earendil-works/pi) (`@earendil-works/pi-coding-agent`) | `pi --mode rpc`, JSON-RPC по stdio | локальная llama.cpp и любые удалённые провайдеры |
 | [Claude Code](https://claude.com/claude-code) | `claude --print --input-format stream-json --output-format stream-json` | свои (подписка или ключ на маке) |
 
-У pi модель по умолчанию — локальная (`llama.cpp` на этом маке, `qwen/qwen3.5-9b`).
+У pi модель по умолчанию — локальная (`llama.cpp` на этом маке, `qwen/qwen3.8-27b`). Прежние
+имена (`qwen/qwen3.5-9b`, `qwen/qwen3.5-4b`) движок отдаёт теми же алиасами, поэтому конфиги и
+сессии, записанные до смены модели, продолжают работать.
 
 ```
 телефон / мак (приложение CloudlyRu)

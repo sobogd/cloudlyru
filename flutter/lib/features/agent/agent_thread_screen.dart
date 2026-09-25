@@ -9,7 +9,7 @@ import 'package:record/record.dart';
 
 import '../../theme.dart';
 import '../../util/format.dart';
-import '../../util/markdown_view.dart';
+
 import '../../util/widgets.dart';
 import 'agent_api.dart';
 import 'agent_controller.dart';
@@ -853,7 +853,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
                     height: 1.35,
                   ),
                 )
-              : MarkdownText(entry.text),
+              : SelectableText(entry.text, style: const TextStyle(color: C.fg, fontSize: _textSize, height: 1.35)),
         // ответ заказан, но ещё ничего не пришло — видно, что работа идёт
         if (entry.kind == _EntryKind.waiting)
           const Padding(

@@ -818,15 +818,6 @@ class AgentThreadController extends Notifier<AgentThreadState> {
 
   /// Накопленный, но ещё не показанный текст ответа и «размышлений».
   ///
-  /// Дельты приходят десятками в секунду; применять каждую сразу — значит пересобирать
-  /// состояние и перерисовывать markdown по тридцать-пятьдесят раз в секунду. Поэтому куски
-  /// копятся здесь и показываются не чаще десяти раз в секунду (см. [_flushSoon]).
-  String _pendingText = '';
-  String _pendingReasoning = '';
-
-  /// Таймер показа накопленного: срабатывает один раз на пачку дельт.
-  Timer? _flushTimer;
-
   /// Поток дошёл до конца прогона (`done`, `idle`) или до ошибки: закрытие потока после этого
   /// уже не считается обрывом.
   bool _sawTerminal = false;
@@ -848,7 +839,6 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     ref.onDispose(() {
       _sub?.cancel();
       _stopWatchdog();
-      _flushTimer?.cancel();
       _finish();
     });
     return const AgentThreadState();
@@ -1070,8 +1060,6 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     _sub?.cancel();
     _sub = null;
     _stopWatchdog();
-    _flushTimer?.cancel();
-    _flushTimer = null;
     _pendingText = '';
     _pendingReasoning = '';
     _cancelledByUser = false;
@@ -1311,22 +1299,38 @@ class AgentThreadController extends Notifier<AgentThreadState> {
 
   /// Дописывает полученное событие в состояние экрана.
   ///
-  /// Текст и «размышления» не применяются сразу: они копятся и показываются пачкой не чаще
-  /// десяти раз в секунду (см. [_flushSoon]) — иначе markdown хвостового ответа перепарсивался
-  /// бы на каждую дельту, и вывод «тупил». Всё остальное применяется сразу и — важно — после
-  /// показа накопленного: иначе новый текст после карточки инструмента оказался бы выше неё, и
-  /// разговор читался бы не в порядке работы агента.
+  /// Текст и «размышления» приклеиваются сразу — стримминг по буквам выключен, ответ
+  /// показывается целиком после завершения прогона. Всё остальное применяется сразу и —
+  /// важно — после показа накопленного: иначе новый текст после карточки инструмента оказался
+  /// бы выше неё, и разговор читался бы не в порядке работы агента.
   void _applyEvent(AgentEvent event) {
     _lastEventAt = DateTime.now();
     // Пульс связи: сторожа он сбросил выше, а состояние экрана не меняет
     if (event.ping) return;
     if (event.text != null || event.reasoning != null) {
-      _pendingText += event.text ?? '';
-      _pendingReasoning += event.reasoning ?? '';
-      _flushSoon();
+      // Текст ответа приклеивается к сессии сразу: дельты больше не копятся и не
+      // задерживаются таймером — экран перестраивается один раз, когда прогон кончает,
+      // а не по десять раз в секунду во время печати.
+      final text = event.text ?? '';
+      final reasoning = event.reasoning ?? '';
+      final items = [...state.items];
+      if (items.isEmpty || !items.last.isAssistant || _newAnswerPending) {
+        items.add(const AgentItem(kind: 'assistant'));
+        _newAnswerPending = false;
+      }
+      final last = items.last;
+      items[items.length - 1] = last.copyWith(
+        text: text.isEmpty ? null : last.text + text,
+        reasoning: reasoning.isEmpty ? null : last.reasoning + reasoning,
+        blocks: _appendText(
+          last.blocks,
+          text.isEmpty ? null : text,
+          reasoning.isEmpty ? null : reasoning,
+        ),
+      );
+      state = state.copyWith(items: items);
       return;
     }
-    _flushPending();
 
     if (event.error != null) {
       _sawTerminal = true;
@@ -1433,44 +1437,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     }
   }
 
-  /// Показывает накопленный текст в ближайшие 100 мс.
-  ///
-  /// Таймер, а не отложенный кадр: дельты приходят пачками по несколько штук подряд, и один
-  /// таймер склеивает всю пачку в одну перерисовку.
-  void _flushSoon() {
-    _flushTimer ??= Timer(const Duration(milliseconds: 100), () {
-      _flushTimer = null;
-      _flushPending();
-    });
-  }
 
-  /// Переносит накопленные дельты в состояние разговора.
-  ///
-  /// Хвост ответа дописывается на месте: куски одного ответа — это одно сообщение, и заводить
-  /// на каждую пачку новый элемент значило бы показывать дельты отдельными репликами.
-  void _flushPending() {
-    final text = _pendingText;
-    final reasoning = _pendingReasoning;
-    _pendingText = '';
-    _pendingReasoning = '';
-    if (text.isEmpty && reasoning.isEmpty) return;
-    final items = [...state.items];
-    if (items.isEmpty || !items.last.isAssistant || _newAnswerPending) {
-      items.add(const AgentItem(kind: 'assistant'));
-      _newAnswerPending = false;
-    }
-    final last = items.last;
-    items[items.length - 1] = last.copyWith(
-      text: text.isEmpty ? null : last.text + text,
-      reasoning: reasoning.isEmpty ? null : last.reasoning + reasoning,
-      blocks: _appendText(
-        last.blocks,
-        text.isEmpty ? null : text,
-        reasoning.isEmpty ? null : reasoning,
-      ),
-    );
-    state = state.copyWith(items: items);
-  }
 
   /// Заменяет хвост переписки снимком идущего прогона, полученным от моста.
   ///
@@ -1646,8 +1613,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     _done = null;
     _sub = null;
     _stopWatchdog();
-    _flushTimer?.cancel();
-    _flushTimer = null;
+    // _pendingText/_pendingReasoning сбрасываются в момент применения дельт (см. _applyEvent).
     _pendingText = '';
     _pendingReasoning = '';
     // Прогон закончился: повторять его текст уже некому, а новый вопрос вправе быть таким же

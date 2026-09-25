@@ -1173,7 +1173,7 @@ class _TextPreviewState extends State<TextPreview> {
         border: Border.all(color: C.brd),
       ),
       child: _isMarkdownFile(widget.meta)
-          ? MarkdownText(text)
+          ? SelectableText(text, style: monoTextStyle)
           : SelectableText(text, style: monoTextStyle),
     );
   }
