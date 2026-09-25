@@ -1060,8 +1060,6 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     _sub?.cancel();
     _sub = null;
     _stopWatchdog();
-    _pendingText = '';
-    _pendingReasoning = '';
     _cancelledByUser = false;
     _finish();
   }
@@ -1613,9 +1611,6 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     _done = null;
     _sub = null;
     _stopWatchdog();
-    // _pendingText/_pendingReasoning сбрасываются в момент применения дельт (см. _applyEvent).
-    _pendingText = '';
-    _pendingReasoning = '';
     // Прогон закончился: повторять его текст уже некому, а новый вопрос вправе быть таким же
     _runningText = '';
     _failingSince = null;

@@ -13,7 +13,7 @@ import '../../providers.dart';
 import '../../theme.dart';
 import '../../util/download.dart';
 import '../../util/format.dart';
-import '../../util/markdown_view.dart';
+
 import '../../util/widgets.dart';
 
 /// Высота заглушки превью, пока картинка или страница ещё едет: спиннер должен занимать
@@ -1078,9 +1078,16 @@ class _PdfPreviewState extends State<PdfPreview> {
 /// каким картинка тянет оригинал: сервер отдаёт текст вложением с нейтральным типом, но байты
 /// при этом те же самые.
 ///
-/// Markdown показывается размеченным ([MarkdownText]), остальной текст — как есть моноширинным
-/// шрифтом: у `.csv`, `.json` и логов разметки нет, и разбирать их как markdown значило бы
-/// портить данные.
+/// Весь текстовый контент показывается простым моноширинным текстом: и `.md`, и `.txt`,
+/// и `.csv`, `.json`. Поддержки разметки нет, файл читается как plain text.
+
+const _monoTextStyle = TextStyle(
+  color: C.fg,
+  fontSize: 12.5,
+  height: 1.35,
+  fontFamily: 'monospace',
+);
+
 class TextPreview extends StatefulWidget {
   final CloudlyApi api;
   final FileMeta meta;
@@ -1173,8 +1180,8 @@ class _TextPreviewState extends State<TextPreview> {
         border: Border.all(color: C.brd),
       ),
       child: _isMarkdownFile(widget.meta)
-          ? SelectableText(text, style: monoTextStyle)
-          : SelectableText(text, style: monoTextStyle),
+          ? SelectableText(text, style: _monoTextStyle)
+          : SelectableText(text, style: _monoTextStyle),
     );
   }
 }
