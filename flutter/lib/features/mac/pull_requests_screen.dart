@@ -576,10 +576,10 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
 
   /// Строка одного PR: шапка с ярлыками, название и таймлайн событий.
   ///
-  /// Три яруса. Сверху ярлыки: номер PR (ведёт на GitHub), задача (ведёт в Jira), состояние
-  /// ревью глазами GitHub и репозиторий с автором — плюс кнопки действий справа. Под ними
-  /// название. Внизу лента событий: она и есть история, поэтому ничего своего — ни «после
-  /// моего ЧР», ни счётчиков — рядом с ней не висит, чтобы не спорить с лентой за внимание.
+  /// Четыре яруса. Сверху ярлыки: номер PR (ведёт на GitHub), задача (ведёт в Jira),
+  /// состояние ревью словами GitHub, репозиторий с автором. Под ними название, под названием
+  /// лента событий, под лентой — действия. Ничего своего рядом с лентой не висит: ни «после
+  /// моего ЧР», ни счётчиков, — чтобы не спорить с ней за внимание.
   Widget _rowTile(Map<String, dynamic> row) {
     final task = '${row['task'] ?? ''}';
     final decision = '${row['review_decision'] ?? 'NONE'}';
@@ -591,47 +591,22 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       // Мой запрос изменений, на который уже запушили правки — единственное состояние доски,
       // требующее действия именно от меня, поэтому подсвечена вся строка, а не только ярлык.
       tileColor: pushedAfterMyCr ? _recheck.withValues(alpha: 0.12) : null,
-      title: Row(
+      title: Wrap(
+        spacing: 6,
+        runSpacing: 4,
+        crossAxisAlignment: WrapCrossAlignment.center,
         children: [
-          Expanded(
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 4,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                _tapBadge('#${row['number']}', theme.colorScheme.secondary,
-                    () => _open('${row['url'] ?? ''}')),
-                if (task.isNotEmpty)
-                  _tapBadge(task, theme.colorScheme.primary,
-                      () => _open('${row['task_url'] ?? ''}')),
-                _badge(_decisionLabel(decision), _decisionColor(decision)),
-                if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
-                Text('${row['repo']} · ${row['mine'] == true ? 'я' : row['author']}',
-                    style: theme.textTheme.bodySmall),
-              ],
-            ),
-          ),
-          // Действия — такие же ярлыки, как номер и задача: иконка-робот не объясняла, что
-          // будет по нажатию, а подпись объясняет. Нажатие по самой строке по-прежнему ничего
-          // не делает.
-          _tapBadge(
-            review == null
-                ? 'ревью'
-                : (review.busy ? 'агент работает' : 'в разговор'),
-            review == null
-                ? theme.colorScheme.secondary
-                : (review.busy ? const Color(0xFF26C6DA) : const Color(0xFF9CCC65)),
-            () => _reviewWithAgent(row),
-          ),
-          // Свой пул-реквест GitHub апрувить не даёт, поэтому кнопки там нет.
-          if (row['mine'] != true) ...[
-            const SizedBox(width: 6),
-            _tapBadge(
-              _approving == _sessionName(row) ? 'апрувлю…' : 'апрув',
-              const Color(0xFF4CAF50),
-              () => _approve(row),
-            ),
-          ],
+          _tapBadge('#${row['number']}', theme.colorScheme.secondary,
+              () => _open('${row['url'] ?? ''}')),
+          if (task.isNotEmpty)
+            _tapBadge(task, theme.colorScheme.primary,
+                () => _open('${row['task_url'] ?? ''}')),
+          // Состояние — ровно та строка, которую вернул GitHub: доска ничего не переводит,
+          // и «APPROVED» в строке — это в точности то, что покажет сам GitHub.
+          _badge(decision, _decisionColor(decision)),
+          if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
+          Text('${_shortRepo('${row['repo']}')} · ${row['mine'] == true ? 'я' : row['author']}',
+              style: theme.textTheme.bodySmall),
         ],
       ),
       subtitle: Column(
@@ -643,18 +618,51 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
               overflow: TextOverflow.ellipsis,
               style: theme.textTheme.bodyMedium),
           _timelineStrip(row),
+          // Действия — под лентой и такими же ярлыками, как номер и задача: иконка-робот не
+          // объясняла, что будет по нажатию, а подпись объясняет. Нажатие по самой строке
+          // по-прежнему ничего не делает.
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children: [
+                _tapBadge(
+                  review == null
+                      ? 'ревью'
+                      : (review.busy ? 'агент работает' : 'в разговор'),
+                  review == null
+                      ? theme.colorScheme.secondary
+                      : (review.busy ? const Color(0xFF26C6DA) : const Color(0xFF9CCC65)),
+                  () => _reviewWithAgent(row),
+                ),
+                // Свой пул-реквест GitHub апрувить не даёт, поэтому кнопки там нет.
+                if (row['mine'] != true)
+                  _tapBadge(
+                    _approving == _sessionName(row) ? 'апрувлю…' : 'апрув',
+                    const Color(0xFF4CAF50),
+                    () => _approve(row),
+                  ),
+              ],
+            ),
+          ),
         ],
       ),
     );
   }
 
-  /// Подпись состояния ревью по-русски и коротко — ровно то, что решил GitHub.
-  String _decisionLabel(String decision) => switch (decision) {
-        'APPROVED' => 'апрув',
-        'CHANGES_REQUESTED' => 'ЧР',
-        'REVIEW_REQUIRED' => 'ждёт ревью',
-        _ => 'без ревью',
-      };
+  /// Имя репозитория без командной приставки: `tangem-checkout-api` → `checkout-api`.
+  ///
+  /// Приставка одинакова почти у всех строк доски и занимает место, по которому ничего не
+  /// различить. Пустого имени после обрезки не бывает: приставку срезаем только с хвостом.
+  String _shortRepo(String repo) {
+    for (final prefix in const ['tangem-', 'diffuse-']) {
+      if (repo.length > prefix.length && repo.startsWith(prefix)) {
+        return repo.substring(prefix.length);
+      }
+    }
+    return repo;
+  }
 
   /// Цвет состояния ревью: у каждого состояния свой, серых среди них нет.
   Color _decisionColor(String decision) => switch (decision) {
@@ -670,9 +678,8 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   /// подряд идущие коммиты одной отправки — один пуш. Здесь остаётся нарисовать их слева
   /// направо в одну строку: история не переносится и не режется, длинную прокручивают пальцем.
   ///
-  /// `reverse: true` — это не обратный порядок событий, а начальное положение прокрутки: лента
-  /// открыта на конце, где лежит самое свежее, и листается влево в прошлое. Так не нужен
-  /// контроллер на строку и прыжок в конец после первого кадра.
+  /// Порядок обратный времени: свежее стоит слева, у начала строки, — его видно без всякой
+  /// прокрутки, а вправо лента уходит в прошлое, куда заглядывают редко.
   Widget _timelineStrip(Map<String, dynamic> row) {
     final raw = (row['timeline'] is List) ? (row['timeline'] as List) : const [];
     final events = raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
@@ -681,11 +688,10 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       padding: const EdgeInsets.only(top: 6),
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
-        reverse: true,
         child: Row(
           mainAxisSize: MainAxisSize.min,
           spacing: 3,
-          children: [for (final event in events) _eventChip(event)],
+          children: [for (final event in events.reversed) _eventChip(event)],
         ),
       ),
     );
