@@ -694,8 +694,18 @@ class CloudlyApi {
   Future<Map<String, dynamic>> macHistory() async => _m(await _req('/mac/history'));
 
   /// Действие над маком из белого списка панели (`reboot`, `sleep`, `firewall-on`, …).
-  Future<Map<String, dynamic>> macAction(String action) async =>
-      _m(await _req('/mac/action', method: 'POST', body: {'action': action}));
+  Future<Map<String, dynamic>> macAction(String action, {Map<String, dynamic>? extraBody}) async {
+    final body = <String, dynamic>{'action': action};
+    if (extraBody != null) body.addAll(extraBody);
+    return _m(await _req('/mac/action', method: 'POST', body: body));
+  }
+
+  /// Состояние локальных LLM-моделей (oMLX): список моделей и текущая загруженная.
+  Future<Map<String, dynamic>> macModels() async => _m(await _req('/mac/models'));
+
+  /// Переключает модель oMLX на указанную (`35b` или `27b`).
+  Future<Map<String, dynamic>> macModelSwitch(String modelId) async =>
+      _m(await _req('/mac/action', method: 'POST', body: {'action': 'switch-model', 'model': modelId}));
 
   /// WARP: `connect` | `disconnect` | `reconnect` | `status`.
   Future<Map<String, dynamic>> macWarp(String op) async =>

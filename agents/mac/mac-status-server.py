@@ -83,6 +83,35 @@ ACTIONS = {
     "claude-restart":  f"launchctl kickstart -k {GUI}/com.agent.claude-tangem",
 }
 
+# ---- Local LLM models (oMLX) ----
+MLX_PORT = 1234
+MLX_HOST = "127.0.0.1"
+
+MODELS = {
+    "35b": {
+        "id": "35b",
+        "name": "Qwen3.6-35B-A3B-OptiQ-4bit",
+        "path": "/Users/sobogd/models/mlx/Qwen3.6-35B-A3B-OptiQ-4bit",
+        "quantization": "Q4 (MoE, activated 3.8B)",
+        "size_gb": 23,
+    },
+    "27b": {
+        "id": "27b",
+        "name": "Qwen3.8-27B-oQ6",
+        "path": "/Users/sobogd/models/mlx/Qwen3.8-27B-oQ6",
+        "draft_path": "/Users/sobogd/models/mlx/Qwen3.8-27B-MTP-4bit",
+        "quantization": "Q6 (Dense, 27B)",
+        "size_gb": 22.8,
+    },
+}
+
+MLX_RELOAD = f"http://{MLX_HOST}:{MLX_PORT}/admin/api/reload"
+MLX_LOADED = f"http://{MLX_HOST}:{MLX_PORT}/admin/api/loaded"
+
+MLX_HEADERS = {
+    "X-API-Key": "11fff0b9f747f9337c25a8eb2fa9f4e6bf3fe4ea6067c25ea5ada0c319909237"
+}
+
 _CACHES = {"ip": {"t": 0, "v": None}, "sec": {"t": 0, "v": None},
            "warp": {"t": 0, "v": None}, "worg": {"t": 0, "v": None}}
 _HIST = collections.deque(maxlen=400)  # ~100 min at 15s
@@ -335,12 +364,86 @@ def _sampler():
         time.sleep(15)
 
 
-def do_action(name):
+def do_action(name, **kw):
+    # --- model switching ---
+    if name == "switch-model":
+        return do_switch_model(kw.get("model", ""))
     if name not in ACTIONS:
         return {"ok": False, "msg": f"unknown action: {name}"}
     subprocess.Popen(ACTIONS[name], shell=True)
     _CACHES["sec"]["t"] = 0
     return {"ok": True, "msg": f"{name} started"}
+
+
+def do_switch_model(model_id: str) -> dict:
+    """Unload current model, then load the requested one via oMLX admin API."""
+    if model_id not in MODELS:
+        return {"ok": False, "msg": f"unknown model: {model_id}. Available: {', '.join(MODELS)}"}
+
+    import urllib.request
+
+    # 1. Unload all
+    try:
+        req = urllib.request.Request(
+            f"http://{MLX_HOST}:{MLX_PORT}/admin/api/unload", method="POST",
+        )
+        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        return {"ok": False, "msg": f"unload failed: {e}"}
+
+    # 2. Wait for unload to settle
+    time.sleep(3)
+
+    # 3. Load the target model
+    model = MODELS[model_id]
+    payload = json.dumps({"model": model["path"]}).encode()
+    try:
+        req = urllib.request.Request(
+            MLX_RELOAD, data=payload, method="POST",
+        )
+        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
+        req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req, timeout=60)
+    except Exception as e:
+        return {"ok": False, "msg": f"load failed: {e}"}
+
+    time.sleep(5)
+
+    # 4. Verify it's loaded
+    try:
+        req = urllib.request.Request(MLX_LOADED, method="GET")
+        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
+        resp = urllib.request.urlopen(req, timeout=10)
+        loaded = json.loads(resp.read())
+        current = loaded.get("current", "")
+        name_in = model["name"]
+        if name_in in current:
+            return {"ok": True, "msg": f"Loaded {model['name']}", "model": model_id}
+        return {"ok": True, "msg": f"Reload sent (verified: {current})", "model": model_id}
+    except Exception:
+        return {"ok": True, "msg": f"Reload sent for {model['name']}", "model": model_id}
+
+
+def get_models_status() -> dict:
+    """Return available models and which one is currently loaded in oMLX."""
+    result = {"models": MODELS, "current": None}
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(MLX_LOADED, method="GET")
+        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
+        resp = urllib.request.urlopen(req, timeout=10)
+        loaded = json.loads(resp.read())
+        current = loaded.get("current", "")
+        for mid, mdef in MODELS.items():
+            if mdef["name"] in current:
+                result["current"] = mid
+                break
+    except Exception:
+        pass  # oMLX is down or unreachable
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +616,7 @@ def _claude_env():
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = CLAUDE_DIR
     env["BROWSER"] = "/usr/bin/true"
-    env["PATH"] = "/Users/sobogd/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
+    env["PATH"] = "/Users/sobogd/.nvm/versions/node/v22.23.3/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
     return env
 
 
@@ -770,7 +873,7 @@ def _term_env():
     env["BASH_SILENCE_DEPRECATION_WARNING"] = "1"
     env.setdefault("LANG", "en_US.UTF-8")
     # Keep the same toolchain PATH the rest of the panel uses.
-    env["PATH"] = "/Users/sobogd/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    env["PATH"] = "/Users/sobogd/.nvm/versions/node/v22.23.3/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     env["HOME"] = os.path.expanduser("~")
     return env
 
@@ -1042,7 +1145,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             data = {}
         if self.path.startswith("/api/action"):
-            self._send(200, do_action(data.get("action", "")))
+            self._send(200, do_action(data.get("action", ""), **data))
         elif self.path.startswith("/api/github-actions/run"):
             self._send(200, github_actions.dispatch(data))
         elif self.path.startswith("/api/github-actions/rerun"):

@@ -29,6 +29,9 @@ class _MacScreenState extends ConsumerState<MacScreen> {
   /// Снимок `/mac/status`; `null` — ответа ещё не было (показывается спиннер).
   Map<String, dynamic>? _status;
 
+  /// Снимок `/mac/models` — доступные и текущая LLM-модель.
+  Map<String, dynamic>? _models;
+
   /// Текст последней неудачи: заменяет карточки, потому что показывать устаревший статус хуже,
   /// чем честно сказать, что мак не ответил.
   String? _error;
@@ -36,13 +39,14 @@ class _MacScreenState extends ConsumerState<MacScreen> {
   /// Идёт загрузка/перечитывание статуса (защита от гонки двух запросов).
   bool _loading = false;
 
-  /// Идёт действие/WARP-переключение: блокирует кнопки, чтобы не отправить два действия подряд.
+  /// Идёт действие/WARP-переключение/смена модели: блокирует кнопки.
   bool _busy = false;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _loadModels();
   }
 
   /// Перечитывает снимок состояния.
@@ -66,6 +70,17 @@ class _MacScreenState extends ConsumerState<MacScreen> {
     }
   }
 
+  /// Перечитывает снимок моделей.
+  Future<void> _loadModels() async {
+    try {
+      final m = await ref.read(appStateProvider).api.macModels();
+      if (!mounted) return;
+      setState(() => _models = m);
+    } catch (e) {
+      // non-critical — just won't show the model switcher
+    }
+  }
+
   /// Отправляет действие над маком, спросив подтверждение (действия необратимы/рвут сеть).
   Future<void> _action(String action, String title) async {
     final ok = await _confirm(title, 'Действие выполнится на MacBook.');
@@ -76,6 +91,25 @@ class _MacScreenState extends ConsumerState<MacScreen> {
   /// Переключает WARP; подтверждения нет — операция безопасна и обратима.
   Future<void> _warp(String op) async {
     await _run(() => ref.read(appStateProvider).api.macWarp(op));
+  }
+
+  /// Переключает LLM-модель; подтверждение не нужно — операция обратима.
+  Future<void> _switchModel(String modelId, String modelName) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await ref.read(appStateProvider).api.macModelSwitch(modelId);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Switching to $modelName…')));
+        await _loadModels();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   /// Общая обёртка действия: блокирует кнопки, перечитывает состояние, показывает ошибку.
@@ -156,6 +190,7 @@ class _MacScreenState extends ConsumerState<MacScreen> {
         children: [
           _systemCard(s),
           _warpCard(s),
+          _modelCard(),
           _actionsCard(),
           _linksCard(),
           const SizedBox(height: 24),
@@ -239,6 +274,55 @@ class _MacScreenState extends ConsumerState<MacScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// Карточка локальных LLM-моделей (oMLX): текущая модель и кнопки переключения.
+  Widget _modelCard() {
+    final m = _models;
+    if (m == null) return const SizedBox.shrink();
+    final current = _str(m['current']);
+    final modelList = (m['models'] as Map<String, dynamic>? ?? {});
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('LLM · oMLX', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text('Текущая: ${current ?? 'не загружена'}', style: Theme.of(context).textTheme.bodySmall),
+            const SizedBox(height: 8),
+            for (final entry in modelList.entries)
+              _modelSwitchTile(entry.key, entry.value, current),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Кнопка переключения на одну модель.
+  Widget _modelSwitchTile(String id, Map<String, dynamic> info, String? current) {
+    final isActive = id == current;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              '${info['name'] ?? id} (${info['quantization'] ?? ''})',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: isActive ? null : Colors.grey,
+                fontWeight: isActive ? FontWeight.w500 : FontWeight.normal,
+              ),
+            ),
+          ),
+          FilledButton.tonal(
+            onPressed: _busy || isActive ? null : () => _switchModel(id, '${info['name'] ?? id}'),
+            child: Text(isActive ? 'Active' : 'Switch'),
+          ),
+        ],
       ),
     );
   }

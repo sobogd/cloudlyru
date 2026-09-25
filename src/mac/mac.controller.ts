@@ -50,8 +50,14 @@ export class MacController {
   @Post('action')
   async action(@Body() body: Record<string, unknown> = {}) {
     return this.wrap(() =>
-      this.mac.call('POST', '/api/action', { body: { action: str(body.action) } }),
+      this.mac.call('POST', '/api/action', { body }),
     );
+  }
+
+  /** Состояние локальных LLM-моделей (oMLX) и текущая модель. */
+  @Get('models')
+  async models() {
+    return this.wrap(() => this.mac.call('GET', '/api/models'));
   }
 
   /** WARP: connect | disconnect | reconnect | status. */
