@@ -397,7 +397,12 @@ def do_switch_model(model_id: str) -> dict:
 
     # 3. Load the target model
     model = MODELS[model_id]
-    payload = json.dumps({"model": model["path"]}).encode()
+    load_payload = {"model": model["path"]}
+    # 27B uses MTP draft for accelerated inference
+    if model_id == "27b":
+        load_payload["vlm_mtp_enabled"] = True
+        load_payload["is_default"] = True
+    payload = json.dumps(load_payload).encode()
     try:
         req = urllib.request.Request(
             MLX_RELOAD, data=payload, method="POST",
