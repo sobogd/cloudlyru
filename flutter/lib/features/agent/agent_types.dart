@@ -143,11 +143,11 @@ class AgentSessionInfo {
   /// Имя сессии, если задано.
   final String name;
 
-  /// Модель и её провайдер (например, `qwen/qwen3.5-9b` и `local`).
+  /// Модель и её провайдер (например, `qwen/qwen3.8-27b` и `local`).
   final String model;
   final String provider;
 
-  /// Человеческое название модели («Qwen3.5-9B Q6_K (локально, llama.cpp)»), если pi его дал.
+  /// Человеческое название модели («Qwen3.8-27B Q4_K_XL (локально, llama.cpp)»), если pi его дал.
   final String modelName;
 
   /// Модель считает на домашнем маке, а не по API — по этому признаку сессия подписывается
@@ -967,6 +967,11 @@ class AgentEvent {
   /// Своего содержимого у события нет — оно нужно только чтобы приложение знало, что поток жив.
   final bool ping;
 
+  /// Сжатие контекста завершено: mост прислал `compaction_end` из pi.
+  ///
+  /// По этому событию экран знает, что compact завершён и сессию можно обновить.
+  final bool compacted;
+
   /// Событие потока ответа.
   const AgentEvent({
     this.text,
@@ -986,5 +991,6 @@ class AgentEvent {
     this.idle = false,
     this.snapshot,
     this.ping = false,
+    this.compacted = false,
   });
 }

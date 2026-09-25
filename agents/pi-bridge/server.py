@@ -2836,6 +2836,53 @@ class ClaudeSession(AgentSession):
         return normalize_claude_messages(entries)
 
 
+def _session_brief(session):
+    """Возвращает снимок сессии для экрана в формате JSON.
+
+    Минимальный набор полей, который понимает клиентский AgentSessionInfo:
+    id, busy, contextPercent, contextTokens, contextWindow, model, modelName,
+    provider, messages, cost, tokens и т.д.
+    """
+    state = session.state if isinstance(session.state, dict) else {}
+    model = state.get("model") if isinstance(state.get("model"), dict) else {}
+    context = state.get("contextUsage") if isinstance(state.get("contextUsage"), dict) else {}
+    tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else {}
+    meta = session.start_meta or {}
+    context_estimated = bool(context.get("estimated")) if isinstance(context, dict) else False
+    return {
+        "id": session.key,
+        "harness": session.harness,
+        "harnessName": HARNESS_NAMES.get(session.harness, session.harness),
+        "contextEstimated": context_estimated,
+        "path": session.cwd,
+        "name": str(
+            session.pending_name or state.get("sessionName") or meta.get("name") or ""
+        ),
+        "model": str(model.get("id") or ""),
+        "modelName": str(model.get("name") or ""),
+        "provider": str(model.get("provider") or ""),
+        "local": is_local_model(model),
+        "thinkingLevel": str(state.get("thinkingLevel") or ""),
+        "effort": str(state.get("effort") or ""),
+        "busy": session.busy,
+        "messages": int(state.get("messageCount") or 0),
+        "contextTokens": context.get("tokens"),
+        "contextWindow": context.get("contextWindow"),
+        "contextPercent": context.get("percent", 0),
+        "tokensInput": tokens.get("input") or 0,
+        "tokensOutput": tokens.get("output") or 0,
+        "tokensCacheRead": tokens.get("cacheRead") or 0,
+        "tokensTotal": tokens.get("totalTokens") or tokens.get("total") or 0,
+        "cost": float(state.get("cost") or 0),
+        "userMessages": int(state.get("userMessages") or 0),
+        "assistantMessages": int(state.get("assistantMessages") or 0),
+        "toolCalls": int(state.get("toolCalls") or 0),
+        "startedAt": state.get("startedAt"),
+        "updatedAt": session.touched,
+        "sessionFile": str(session_file(session)) if session_file(session) else "",
+    }
+
+
 def translate_pi_event(session, event):
     """Переводит событие pi в события экрана; второй элемент ответа — «прогон закончился».
 
@@ -2903,10 +2950,17 @@ def translate_pi_event(session, event):
         return [{"type": "compacted"}], False
 
     if kind == "agent_settled":
-        # полностью устоявшийся прогон: ни ретраев, ни очереди продолжений
+        # полностью устоявшийся прогон: ни ретраев, ни очереди продолжений.
+        # Возвращаем `done` с текущим снимком сессии, чтобы клиент обновил
+        # busy, контекст-процент и другие поля.
         session.busy = False
         session.touched = time.time()
-        return out, True
+        # Минимальный снимок сессии: обновляем состояние перед отдачей.
+        try:
+            session.state = session.refresh_state()
+        except Exception as e:
+            log("не смог обновить состояние сессии %s: %s" % (session.id, e))
+        return [{"type": "done", "session": _session_brief(session)}], True
 
     if kind in ("auto_retry_start", "auto_retry_end", "extension_error", "queue_update"):
         return [{**event, "type": kind}], False

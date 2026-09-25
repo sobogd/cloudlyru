@@ -1089,6 +1089,27 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
   /// Заполнение контекста — полоса во всю ширину над полем ввода.
   ///
+  /// Текущий шаг: что агент делает прямо сейчас.
+  ///
+  /// Показывается над полосой расхода контекста — в том же тоне, что поле ввода. Состояния:
+  /// `«в очереди»` — прогон ждёт освобождения сессии; `«сжимаю контекст»` — идёт compact;
+  /// `«читаю файл»`, `«выполняю команду»` и т.п. — от mоста через событие `status`.
+  Widget _statusRow(AgentThreadState state) {
+    final step = state.step;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 4, 14, 0),
+      child: Text(
+        step,
+        style: const TextStyle(
+          color: C.fg2,
+          fontSize: 12,
+          height: 1.3,
+        ),
+      ),
+    );
+  }
+
   /// Тонкая полоса без рамок и внешних отступов, фон — как у поля ввода: она примыкает к
   /// нему сверху и читается его границей, а не отдельным элементом. Числа и проценты живут
   /// в «Сведениях о сессии» — здесь нужен только сам расход.
@@ -1213,6 +1234,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (state.step.isNotEmpty) _statusRow(state),
         _contextBorder(state),
         Stack(
           children: [

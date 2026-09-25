@@ -365,7 +365,7 @@ class AgentApi {
   /// Разбирает `провайдер/идентификатор` в пару; `null` — строка пустая или без провайдера.
   ///
   /// Делим по первому слэшу: у моделей llama.cpp идентификатор сам содержит слэш
-  /// (`qwen/qwen3.5-9b`), поэтому «последний слэш» здесь был бы ошибкой.
+  /// (`qwen/qwen3.8-27b`), поэтому «последний слэш» здесь был бы ошибкой.
   (String, String)? _splitModel(String? key) {
     final text = (key ?? '').trim();
     if (text.isEmpty) return null;
@@ -548,7 +548,12 @@ class AgentApi {
     return data?['text']?.toString().trim() ?? '';
   }
 
-  /// Сжимает контекст сессии: длинная работа иначе перестанет влезать в окно модели.
+  /// Запускает сжатие контекста и ждёт завершения.
+  ///
+  /// Compact — долгая операция: mост делает `session.command("compact")` с timeout 900 с
+  /// (15 минут). HTTP-ответ приходит только когда compact завершился, и в теле — summary.
+  ///
+  /// Возвращает summary сжатия.
   Future<String> compact(String id) async {
     final data = await _send<Map<String, dynamic>>(
       () => _post('/projects/sessions/$id/compact'),
@@ -695,8 +700,11 @@ class AgentApi {
           done: true,
           error: json['message']?.toString() ?? 'агент не ответил',
         );
+      case 'compacted':
+        // Сжатие контекста завершено: mост шлёт это через `compaction_end`.
+        return const AgentEvent(compacted: true);
       default:
-        // `accepted`, `closed`, `compacted` и прочее состояние экрана не меняют: незнакомые
+        // `accepted`, `closed` и прочее состояние экрана не меняют: незнакомые
         // события пропускаем, чтобы новый мост не ломал старую сборку приложения.
         return null;
     }

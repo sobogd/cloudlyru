@@ -1096,6 +1096,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     // закрытой сессии мост отвечает «нечего останавливать» — это не ошибка.
     try {
       await _api.abort(session.id);
+      // После abort обновляем сессию, чтобы снять занятость на клиенте.
+      final fresh = await _api.session(session.id);
+      state = state.copyWith(session: fresh);
     } on AgentApiException catch (e) {
       state = state.withError(e.message);
     }
@@ -1354,6 +1357,9 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     if (event.done) {
       _sawTerminal = true;
       _finish();
+      // После завершения прогона проверяем, не пора ли сжать контекст:
+      // если contextPercent >= 85, compact запускается автоматически.
+      unawaited(_maybeAutoCompact());
       return;
     }
     if (event.note != null) {
@@ -1381,6 +1387,49 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     if (event.toolEnd != null) {
       _upsertTool(event.toolEnd!, keepArgs: true, finished: true);
       return;
+    }
+    if (event.compacted) {
+      // Compact завершён: обновляем сессию, чтобы актуализировать расход контекста.
+      unawaited(_updateSessionAfterCompact());
+      return;
+    }
+  }
+
+  /// Перечитывает сессию после завершения компакта.
+  ///
+  /// Compact меняет историю: старые сообщения остаются в файле, но удаляются из контекста.
+  /// Сессия на маке обновляется, и мост пересылает снимок через `done`. Здесь мы
+  /// подтягиваем актуальную версию сессии, чтобы экран показывал верный `contextPercent`.
+  Future<void> _updateSessionAfterCompact() async {
+    final sessionId = state.session?.id;
+    if (sessionId == null) return;
+    try {
+      final session = await _api.session(sessionId);
+      state = state.copyWith(
+        session: session,
+        step: '',
+      );
+    } on AgentApiException {
+      // Тихо: compact уже прошёл, это фоновое обновление.
+      state = state.copyWith(step: '');
+    }
+  }
+
+  /// Если контекст переполнен, запускает сжатие автоматически.
+  ///
+  /// Порог — 85%: `contextPercent` считается относительно лимита модели. Если он выше 85%,
+  /// следующий ответ может не влезть, и compact нужен.
+  Future<void> _maybeAutoCompact() async {
+    final session = state.session;
+    if (session == null || state.sending || state.step.isNotEmpty) return;
+    final percent = session.contextPercent;
+    if (percent < 85) return;
+    state = state.copyWith(step: 'сжимаю контекст');
+    try {
+      await _api.compact(session.id);
+      state = state.copyWith(step: '', session: await _api.session(session.id));
+    } on AgentApiException catch (e) {
+      state = state.copyWith(step: '').withError('compact: ${e.message}');
     }
   }
 
