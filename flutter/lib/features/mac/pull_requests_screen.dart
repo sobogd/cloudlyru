@@ -96,7 +96,7 @@ enum _Sort {
 /// список загружается один раз и живёт до явного «Обновить».
 class _Board {
   /// Снимок доски.
-  const _Board(this.pulls, this.repos, this.error, this.loadedAt);
+  const _Board(this.pulls, this.repos, this.error, this.loadedAt, this.freshDays);
 
   /// Все открытые PR из ответа мака.
   final List<Map<String, dynamic>> pulls;
@@ -109,6 +109,9 @@ class _Board {
 
   /// Когда снимок приехал — показывается в шапке списка.
   final DateTime loadedAt;
+
+  /// За сколько последних дней мак взял пул-реквесты; 0 — окно неизвестно.
+  final int freshDays;
 }
 
 /// Держатель снимка: живёт в контейнере Riverpod, то есть столько же, сколько само приложение.
@@ -182,6 +185,9 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   /// Когда приехал показанный снимок; `null` — данных ещё нет.
   DateTime? _loadedAt;
 
+  /// Окно свежести с мака: в списке нет PR, которых месяц никто не трогал, и это видно в шапке.
+  int _freshDays = 0;
+
   @override
   void initState() {
     super.initState();
@@ -191,6 +197,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       _repos = cached.repos;
       _err = cached.error;
       _loadedAt = cached.loadedAt;
+      _freshDays = cached.freshDays;
     } else {
       _load();
     }
@@ -213,6 +220,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
         repos.whereType<String>().toList(),
         d['ok'] == false ? '${d['msg'] ?? 'ошибка на маке'}' : null,
         DateTime.now(),
+        d['fresh_days'] as int? ?? 0,
       );
       ref.read(_boardCacheProvider).value = board;
       if (!mounted) return;
@@ -221,6 +229,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
         _repos = board.repos;
         _err = board.error;
         _loadedAt = board.loadedAt;
+        _freshDays = board.freshDays;
       });
     } catch (e) {
       if (mounted) setState(() => _err = '$e');
@@ -456,6 +465,7 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
                         children: [
                           Text(
                               '${rows.length} из ${all.length}'
+                              '${_freshDays > 0 ? ' · за $_freshDays дн.' : ''}'
                               '${_loadedAt == null ? '' : ' · ${_time(_loadedAt!)}'}',
                               style: Theme.of(context).textTheme.bodySmall),
                           const Spacer(),
@@ -584,13 +594,13 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   AgentSession? _review(Map<String, dynamic> row) =>
       findReviewSession(ref, _sessionName(row));
 
-  /// Строка одного PR: задача, заголовок, состояние и обсуждение.
+  /// Строка одного PR: задача, заголовок и таймлайн событий.
+  ///
+  /// Итогового состояния ревью в строке нет: по нему фильтруют чипами сверху, а глазами всё
+  /// равно читают историю — кто когда запросил изменения, сколько было комментариев и что
+  /// было после них. Поэтому вместо набора ярлыков-состояний строка показывает ленту событий.
   Widget _rowTile(Map<String, dynamic> row) {
-    final decision = '${row['review_decision'] ?? 'NONE'}';
     final task = '${row['task'] ?? ''}';
-    final afterCr = row['comments_after_cr'] as int? ?? 0;
-    final total = row['comments_total'] as int? ?? 0;
-    final approvals = row['approvals'] as int? ?? 0;
     final pushedAfterMyCr = row['pushed_after_my_cr'] == true;
     final review = _review(row);
     final theme = Theme.of(context);
@@ -600,36 +610,33 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       // требующее действия именно от меня, поэтому подсвечена вся строка, а не только ярлык.
       tileColor: pushedAfterMyCr ? _recheck.withValues(alpha: 0.12) : null,
       title: Text('#${row['number']} ${row['title']}', maxLines: 2, overflow: TextOverflow.ellipsis),
-      subtitle: Padding(
-        padding: const EdgeInsets.only(top: 4),
-        child: Wrap(
-          spacing: 6,
-          runSpacing: 4,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            if (task.isNotEmpty)
-              InkWell(
-                onTap: () => _open('${row['task_url']}'),
-                child: _badge(task, theme.colorScheme.primary),
-              ),
-            Text('${row['repo']} · ${row['mine'] == true ? 'я' : row['author']}',
-                style: theme.textTheme.bodySmall),
-            _badge(_decisionLabel(decision), _decisionColor(decision)),
-            // Апрув не снимает чужой ЧР, и GitHub показывает только блокирующее состояние:
-            // без этого ярлыка «ЧР» у апрувнутого PR выглядит ошибкой доски.
-            if (approvals > 0 && decision != 'APPROVED')
-              _badge('$approvals апрув', const Color(0xFF4CAF50)),
-            if (pushedAfterMyCr) _badge('пушили после моего ЧР', _recheck),
-            if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
-            if (total > 0) Text('💬 $total', style: theme.textTheme.bodySmall),
-            if (afterCr > 0) _badge('+$afterCr после ЧР', Colors.orange),
-            if (review != null)
-              _badge(
-                review.busy ? 'агент работает' : 'ревью · ${review.messages} сообщ.',
-                review.busy ? const Color(0xFF26C6DA) : const Color(0xFF9CCC65),
-              ),
-          ],
-        ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SizedBox(height: 4),
+          Wrap(
+            spacing: 6,
+            runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              if (task.isNotEmpty)
+                InkWell(
+                  onTap: () => _open('${row['task_url']}'),
+                  child: _badge(task, theme.colorScheme.primary),
+                ),
+              Text('${row['repo']} · ${row['mine'] == true ? 'я' : row['author']}',
+                  style: theme.textTheme.bodySmall),
+              if (row['draft'] == true) _badge('черновик', const Color(0xFFB388FF)),
+              if (pushedAfterMyCr) _badge('пушили после моего ЧР', _recheck),
+              if (review != null)
+                _badge(
+                  review.busy ? 'агент работает' : 'ревью · ${review.messages} сообщ.',
+                  review.busy ? const Color(0xFF26C6DA) : const Color(0xFF9CCC65),
+                ),
+            ],
+          ),
+          _timelineStrip(row),
+        ],
       ),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
@@ -650,6 +657,62 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       onTap: () => _open('${row['url'] ?? ''}'),
       onLongPress: () => _actions(row),
     );
+  }
+
+  /// Лента событий пул-реквеста: запросы изменений, комментарии, апрувы, пуши по порядку.
+  ///
+  /// Мак отдаёт события уже свёрнутыми: подряд идущие комментарии — один шаг со счётчиком,
+  /// подряд идущие коммиты одной отправки — один пуш. Здесь остаётся нарисовать их слева
+  /// направо в одну строку: история не переносится и не режется, длинную прокручивают пальцем.
+  ///
+  /// `reverse: true` — это не обратный порядок событий, а начальное положение прокрутки: лента
+  /// открыта на конце, где лежит самое свежее, и листается влево в прошлое. Так не нужен
+  /// контроллер на строку и прыжок в конец после первого кадра.
+  Widget _timelineStrip(Map<String, dynamic> row) {
+    final raw = (row['timeline'] is List) ? (row['timeline'] as List) : const [];
+    final events = raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+    if (events.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        reverse: true,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          spacing: 3,
+          children: [for (final event in events) _eventChip(event)],
+        ),
+      ),
+    );
+  }
+
+  /// Один шаг ленты: подпись со счётчиком, цвет по виду события, во всплывашке — кто и когда.
+  Widget _eventChip(Map<String, dynamic> event) {
+    final kind = '${event['k'] ?? ''}';
+    final count = event['n'] as int? ?? 1;
+    final by = '${event['by'] ?? ''}';
+    final at = '${event['at'] ?? ''}';
+    final (label, color) = switch (kind) {
+      'cr' => ('ЧР', Theme.of(context).colorScheme.error),
+      'approve' => ('апрув', const Color(0xFF4CAF50)),
+      'dismissed' => ('ЧР снят', const Color(0xFF90A4AE)),
+      'comment' => ('💬', const Color(0xFF42A5F5)),
+      'push' => ('⬆', const Color(0xFFFFB300)),
+      _ => (kind, const Color(0xFF90A4AE)),
+    };
+    final text = count > 1 ? '$label$count' : label;
+    final when = _eventTime(at);
+    final who = [if (by.isNotEmpty) by, if (when.isNotEmpty) when].join(' · ');
+    final chip = _badge(text, color);
+    return who.isEmpty ? chip : Tooltip(message: who, child: chip);
+  }
+
+  /// Дата события в виде `ДД.ММ ЧЧ:ММ` по местному времени; пустая строка, если её не разобрать.
+  String _eventTime(String iso) {
+    final at = DateTime.tryParse(iso)?.toLocal();
+    if (at == null) return '';
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${two(at.day)}.${two(at.month)} ${two(at.hour)}:${two(at.minute)}';
   }
 
   /// Цвет «нужно перепроверить»: не совпадает ни с одним состоянием ревью, чтобы строка,
@@ -673,25 +736,6 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
                 .labelSmall
                 ?.copyWith(color: color, fontWeight: FontWeight.w600)),
       );
-
-  /// Подпись состояния ревью по-русски и коротко.
-  String _decisionLabel(String decision) => switch (decision) {
-        'APPROVED' => 'апрув',
-        'CHANGES_REQUESTED' => 'ЧР',
-        'REVIEW_REQUIRED' => 'ждёт ревью',
-        _ => 'без ревью',
-      };
-
-  /// Цвет состояния ревью: у каждого состояния свой, серых среди них нет.
-  Color _decisionColor(String decision) {
-    final scheme = Theme.of(context).colorScheme;
-    return switch (decision) {
-      'APPROVED' => const Color(0xFF4CAF50),
-      'CHANGES_REQUESTED' => scheme.error,
-      'REVIEW_REQUIRED' => const Color(0xFF42A5F5),
-      _ => const Color(0xFFFFB300),
-    };
-  }
 
   /// Время снимка в виде `ЧЧ:ММ` — на телефоне дата не нужна, список живёт часы.
   String _time(DateTime at) =>
