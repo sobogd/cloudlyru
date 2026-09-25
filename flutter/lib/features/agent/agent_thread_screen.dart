@@ -606,7 +606,12 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     // Над перепиской — строка «показать более раннее»: история приходит страницами, и разговор
     // открывается последними сообщениями
     final older = state.hasOlder;
-    return ListView.builder(
+    // `SelectionContainer` объединяет выделения из всех карточек в одну область — можно
+    // провести пальцем/курсором по нескольким сообщениям и скопировать разом.
+    return SelectionContainer(
+      delegate: StaticSelectionContainerDelegate(),
+      child: ListView.builder(
+
       controller: _scroll,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
       // ответ агента показывается несколькими сообщениями: команда и текст — разные шаги
@@ -616,6 +621,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         if (older && i == 0) return _olderRow();
         return _entry(entries[older ? i - 1 : i]);
       },
+    ),
     );
   }
 
@@ -632,6 +638,18 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       ),
     ),
   );
+
+  /// Подпись инструмента: `read(/path)`, `bash(cmd --flag)`, `edit(file.txt)`, и т.д.
+  ///
+  /// Вместо `summary` (которая обрезает название инструмента и показывает только первый
+  /// аргумент) — полное имя + все аргументы в круглых скобках через запятую.
+  String _toolLabel(AgentTool tool) {
+    if (tool.args.isEmpty) return tool.name;
+    final parts = tool.args.entries
+        .map((e) => '${e.key}: ${e.value}')
+        .join(', ');
+    return '${tool.name}($parts)';
+  }
 
   /// Догружает страницу выше и оставляет на экране то, что человек видел.
   ///
@@ -770,19 +788,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         ? _errorCard('\$ ${entry.command}', entry.text)
         : _instructionCard('\$ ${entry.command}', entry.text),
     _EntryKind.tool => entry.tool!.isError
-        ? _errorCard(
-            entry.tool!.summary.isEmpty ? entry.tool!.name : entry.tool!.summary,
-            entry.tool!.output,
-          )
+        ? _errorCard(_toolLabel(entry.tool!), entry.tool!.output)
         : entry.tool!.running
-        ? _instructionCard(
-            '${entry.tool!.summary.isEmpty ? entry.tool!.name : entry.tool!.summary} ⏳',
-            entry.tool!.output,
-          )
-        : _instructionCard(
-            entry.tool!.summary.isEmpty ? entry.tool!.name : entry.tool!.summary,
-            entry.tool!.output,
-          ),
+        ? _instructionCard('${_toolLabel(entry.tool!)} ⏳', entry.tool!.output)
+        : _instructionCard(_toolLabel(entry.tool!), entry.tool!.output),
     _EntryKind.reasoning => _agentCard(entry.text),
     _EntryKind.user => _userCard(entry.text),
     _EntryKind.text => _agentCard(entry.text),
@@ -794,7 +803,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   Widget _userCard(String text) {
     final body = text.isEmpty
         ? SizedBox()
-        : SelectableText(
+        : Text(
             text,
             style: TextStyle(
               color: const Color(0xFF1A1D24),
@@ -826,7 +835,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
               child: CircularProgressIndicator(strokeWidth: 2),
             ),
           )
-        : SelectableText(
+        : Text(
             text,
             style: const TextStyle(
               color: C.fg,
