@@ -1,6 +1,7 @@
 """File-backed pull request board for the Mac status server."""
 
 import calendar
+import concurrent.futures as futures
 import json
 import os
 import re
@@ -53,16 +54,10 @@ REVIEW_ECHO_SECONDS = 120
 JIRA_STRICT = re.compile(r"\b([A-Z][A-Z0-9]{1,9})-(\d{1,6})\b")
 JIRA_LOOSE = re.compile(r"^\W*([A-Za-z]{2,6})[-_\s](\d{2,6})\b")
 
-_CACHE_LOCK = threading.Lock()
-_CACHE = {"at": 0, "value": None}
-
-QUERY = """
-query($q: String!, $size: Int!, $cursor: String) {
-  viewer { login }
-  search(query: $q, type: ISSUE, first: $size, after: $cursor) {
-    pageInfo { hasNextPage endCursor }
-    nodes {
-      ... on PullRequest {
+# Cheap fields: everything the board can show without reading the discussion. One page of them
+# costs 1 point and about a second, against 17 points and seven seconds for the full shape, so
+# the list is refreshed with this query and the heavy one runs only for what actually moved.
+LIGHT_FIELDS = """
         number
         title
         url
@@ -75,6 +70,11 @@ query($q: String!, $size: Int!, $cursor: String) {
         reviewDecision
         approvals: reviews(states: APPROVED) { totalCount }
         changeRequests: reviews(states: CHANGES_REQUESTED) { totalCount }
+"""
+
+# The discussion itself: reviews, comments, threads and commits — everything the timeline is
+# built from. Asked for one pull request at a time, by repository and number.
+HEAVY_FIELDS = """
         reviews(last: %(reviews)d) {
           nodes { state submittedAt author { login } }
         }
@@ -92,10 +92,6 @@ query($q: String!, $size: Int!, $cursor: String) {
         commits(last: %(commits)d) {
           nodes { commit { committedDate } }
         }
-      }
-    }
-  }
-}
 """ % {
     "reviews": RECENT_REVIEWS,
     "comments": RECENT_COMMENTS,
@@ -103,6 +99,52 @@ query($q: String!, $size: Int!, $cursor: String) {
     "replies": THREAD_REPLIES,
     "commits": RECENT_COMMITS,
 }
+
+LIGHT_QUERY = """
+query($q: String!, $size: Int!, $cursor: String) {
+  viewer { login }
+  search(query: $q, type: ISSUE, first: $size, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {%s} }
+  }
+}
+""" % LIGHT_FIELDS
+
+# How many light and detail requests run at once. GitHub answers one big search noticeably
+# slower than the same search split per repository, and independent batches do not wait for
+# each other; the numbers are small on purpose, the secondary rate limit counts concurrency.
+LIGHT_WORKERS = 6
+DETAIL_WORKERS = 3
+
+# How many pull requests one detail request asks about. Twenty aliases is still a single round
+# trip, and a batch that fails costs only its own twenty.
+DETAIL_BATCH = 20
+
+# A detail entry is re-read when `updatedAt` moves. GitHub bumps it on everything the board
+# draws, but the guarantee is not written down anywhere, so an entry also expires on its own
+# after this long — a day of staleness is the worst the board can drift.
+DETAIL_TTL_SECONDS = 6 * 3600
+
+CACHE_PATH = os.environ.get("MAC_STATUS_PULL_REQUESTS_CACHE") or os.path.join(
+    os.path.expanduser("~/.cache/cloudlyru"), "pull-requests.json"
+)
+
+# Everything the board knows, guarded by one lock:
+#   entries[key] = {"lite": {...}, "row": {...} | None, "detail_at": epoch, "detail_for": iso}
+#   order        — keys in the order the last light query returned them
+#   queue        — keys waiting for their details, in order
+#   busy         — keys a worker is fetching right now
+_STATE_LOCK = threading.Lock()
+_STATE = {
+    "entries": {},
+    "order": [],
+    "queue": [],
+    "busy": set(),
+    "viewer": "",
+    "light_at": 0,
+    "error": "",
+}
+_WORKER = {"count": 0}
 
 
 def _validate_config(config):
@@ -155,8 +197,7 @@ def _save_config(config):
         except OSError:
             pass
         raise
-    with _CACHE_LOCK:
-        _CACHE.update({"at": 0, "value": None})
+    _forget_all()
     return config
 
 
@@ -229,17 +270,16 @@ def approve(data):
         return {"ok": False, "msg": detail or ("GitHub API %s" % exc.code)}
     except urllib.error.URLError as exc:
         return {"ok": False, "msg": "GitHub API unavailable: %s" % exc.reason}
-    with _CACHE_LOCK:
-        _CACHE.update({"at": 0, "value": None})
+    _forget_details("%s#%d" % (repo, number))
     return {"ok": True, "msg": "approved"}
 
 
-def _graphql(variables):
+def _graphql(query, variables=None):
     """Call the GitHub GraphQL API with the private work token."""
     token = load_token()
     if not token:
         raise RuntimeError("work GitHub token is not configured")
-    body = json.dumps({"query": QUERY, "variables": variables}).encode("utf-8")
+    body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
     request = urllib.request.Request(
         GITHUB_GRAPHQL,
         data=body,
@@ -495,64 +535,310 @@ def _row(node, viewer):
     }
 
 
+def _load_cache():
+    """Read the persisted board, so a restarted agent does not re-read GitHub from scratch."""
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(saved, dict):
+        return
+    entries = saved.get("entries")
+    if not isinstance(entries, dict):
+        return
+    with _STATE_LOCK:
+        _STATE["entries"] = {
+            key: value for key, value in entries.items() if isinstance(value, dict)
+        }
+        _STATE["order"] = [k for k in (saved.get("order") or []) if k in _STATE["entries"]]
+        _STATE["viewer"] = str(saved.get("viewer") or "")
+
+
+def _save_cache():
+    """Persist the board next to the other caches; a failure here is never fatal."""
+    with _STATE_LOCK:
+        payload = {
+            "entries": _STATE["entries"],
+            "order": _STATE["order"],
+            "viewer": _STATE["viewer"],
+        }
+    try:
+        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".pull-requests-", suffix=".json",
+                                        dir=os.path.dirname(CACHE_PATH))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp_path, CACHE_PATH)
+    except OSError:
+        pass
+
+
+def _forget_all():
+    """Drop everything: the repository list changed, so even the key set is wrong now."""
+    with _STATE_LOCK:
+        _STATE.update({"entries": {}, "order": [], "queue": [], "light_at": 0})
+    _save_cache()
+
+
+def _forget_details(key):
+    """Re-read one pull request on the next board load — its discussion just changed."""
+    with _STATE_LOCK:
+        entry = _STATE["entries"].get(key)
+        if entry:
+            entry["detail_for"] = ""
+            entry["detail_at"] = 0
+        _STATE["light_at"] = 0
+
+
+def _lite(node):
+    """Flatten the cheap half of a pull request: everything but the discussion."""
+    return {
+        "repo": (node.get("repository") or {}).get("name") or "",
+        "number": node.get("number"),
+        "title": node.get("title") or "",
+        "url": node.get("url") or "",
+        "draft": bool(node.get("isDraft")),
+        "author": ((node.get("author") or {}).get("login")) or "",
+        "review_decision": node.get("reviewDecision") or "NONE",
+        "approvals": (node.get("approvals") or {}).get("totalCount") or 0,
+        "change_requests": (node.get("changeRequests") or {}).get("totalCount") or 0,
+        "comments_total": node.get("totalCommentsCount") or 0,
+        "created_at": node.get("createdAt"),
+        "updated_at": node.get("updatedAt"),
+    }
+
+
+def _light_repo(owner, repo, since):
+    """Cheap pass over one repository: every open pull request with its `updatedAt`."""
+    search = "is:pr is:open sort:updated-desc updated:>=%s repo:%s/%s" % (since, owner, repo)
+    nodes = []
+    viewer = ""
+    cursor = None
+    for _ in range(MAX_PAGES):
+        data = _graphql(LIGHT_QUERY, {"q": search, "size": PAGE_SIZE, "cursor": cursor})
+        viewer = ((data.get("viewer") or {}).get("login")) or viewer
+        result = data.get("search") or {}
+        nodes.extend(node for node in (result.get("nodes") or []) if node and node.get("number"))
+        page = result.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            break
+        cursor = page.get("endCursor")
+    return nodes, viewer
+
+
+def _light_pass(config, now):
+    """Ask GitHub for the current list of open pull requests and their `updatedAt`.
+
+    One request per repository, all at once: the same search over six repositories at a time
+    takes two and a half times longer than the slowest of them alone.
+
+    Entries are created for pull requests seen for the first time and the cheap half is
+    refreshed for the rest, so a renamed title or a new approval shows up immediately, without
+    waiting for the discussion to be re-read.
+    """
+    since = time.strftime("%Y-%m-%d", time.gmtime(now - FRESH_DAYS * 86400))
+    repos = config["repos"]
+    with futures.ThreadPoolExecutor(max_workers=min(len(repos), LIGHT_WORKERS)) as pool:
+        results = list(pool.map(lambda repo: _light_repo(config["owner"], repo, since), repos))
+    order = []
+    viewer = ""
+    for nodes, login in results:
+        viewer = login or viewer
+        for node in nodes:
+            lite = _lite(node)
+            key = "%s#%s" % (lite["repo"], lite["number"])
+            order.append(key)
+            with _STATE_LOCK:
+                entry = _STATE["entries"].setdefault(key, {"row": None, "detail_for": "",
+                                                           "detail_at": 0})
+                entry["lite"] = lite
+    with _STATE_LOCK:
+        _STATE["order"] = order
+        _STATE["viewer"] = viewer or _STATE["viewer"]
+        _STATE["light_at"] = now
+        # Merged, closed or aged out: the board is exactly what the last light pass returned.
+        for key in [k for k in _STATE["entries"] if k not in order]:
+            _STATE["entries"].pop(key, None)
+    return order, since
+
+
+def _needs_details(key, now):
+    """True when the discussion of this pull request has to be read again."""
+    entry = _STATE["entries"].get(key) or {}
+    lite = entry.get("lite") or {}
+    if not entry.get("row"):
+        return True
+    if entry.get("detail_for") != (lite.get("updated_at") or ""):
+        return True
+    return now - (entry.get("detail_at") or 0) > DETAIL_TTL_SECONDS
+
+
+def _detail_query(keys, owner):
+    """One request asking for the discussion of several pull requests by alias."""
+    parts = ["query {", "  viewer { login }"]
+    for index, key in enumerate(keys):
+        repo, _, number = key.rpartition("#")
+        parts.append(
+            '  p%d: repository(owner: "%s", name: "%s") { pullRequest(number: %d) { %s %s } }'
+            % (index, owner, repo, int(number), LIGHT_FIELDS, HEAVY_FIELDS)
+        )
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _fetch_details(keys, owner):
+    """Read the discussion of one batch and store the finished rows."""
+    data = _graphql(_detail_query(keys, owner))
+    viewer = ((data.get("viewer") or {}).get("login")) or ""
+    now = time.time()
+    with _STATE_LOCK:
+        if viewer:
+            _STATE["viewer"] = viewer
+        known = _STATE["viewer"]
+    for index, key in enumerate(keys):
+        node = ((data.get("p%d" % index) or {}).get("pullRequest")) or None
+        if not node:
+            continue
+        row = _row(node, known)
+        with _STATE_LOCK:
+            entry = _STATE["entries"].get(key)
+            if entry is None:
+                continue
+            entry["lite"] = _lite(node)
+            entry["row"] = row
+            entry["detail_for"] = row.get("updated_at") or ""
+            entry["detail_at"] = now
+
+
+def _worker(owner):
+    """Drain the queue of pull requests whose discussion is stale, batch by batch."""
+    while True:
+        with _STATE_LOCK:
+            if not _STATE["queue"]:
+                _WORKER["count"] -= 1
+                break
+            batch = _STATE["queue"][:DETAIL_BATCH]
+            _STATE["queue"] = _STATE["queue"][DETAIL_BATCH:]
+            _STATE["busy"].update(batch)
+        try:
+            _fetch_details(batch, owner)
+            with _STATE_LOCK:
+                _STATE["error"] = ""
+        except RuntimeError as exc:
+            # A failed batch is not retried in this pass: its entries keep their old rows and
+            # stay stale, so the next board load queues them again.
+            with _STATE_LOCK:
+                _STATE["error"] = str(exc)
+        finally:
+            with _STATE_LOCK:
+                _STATE["busy"].difference_update(batch)
+        _save_cache()
+
+
+def _enqueue(keys, owner):
+    """Queue the stale pull requests and make sure enough workers are running.
+
+    Batches are independent, so several go at once: the whole board fills in about as long as
+    the slowest batch instead of the sum of all of them.
+    """
+    with _STATE_LOCK:
+        queued = set(_STATE["queue"]) | _STATE["busy"]
+        for key in keys:
+            if key not in queued:
+                _STATE["queue"].append(key)
+        want = min(DETAIL_WORKERS, -(-len(_STATE["queue"]) // DETAIL_BATCH))
+        starting = max(0, want - _WORKER["count"])
+        _WORKER["count"] += starting
+    for _ in range(starting):
+        threading.Thread(target=_worker, args=(owner,), daemon=True).start()
+
+
+def _snapshot(config, since, now):
+    """Build the answer out of whatever the cache holds right now.
+
+    A pull request whose discussion is still being read is returned anyway — with the cheap
+    half filled in and the previous timeline, if there was one — and marked `stale`, so the app
+    shows the row immediately and draws a spinner where the fresh history will land.
+    """
+    pulls = []
+    with _STATE_LOCK:
+        pending = set(_STATE["queue"]) | _STATE["busy"]
+        for key in _STATE["order"]:
+            entry = _STATE["entries"].get(key)
+            if not entry:
+                continue
+            lite = dict(entry.get("lite") or {})
+            row = dict(entry.get("row") or {})
+            row.update(lite)
+            row.setdefault("timeline", [])
+            row["mine"] = bool(_STATE["viewer"]) and row.get("author") == _STATE["viewer"]
+            row["task"] = task_key(row.get("title") or "")
+            row["task_url"] = (JIRA_BROWSE + row["task"]) if row["task"] else ""
+            row["stale"] = key in pending or not entry.get("row")
+            pulls.append(row)
+        viewer = _STATE["viewer"]
+        error = _STATE["error"]
+        waiting = len(pending)
+    pulls.sort(key=lambda row: (row["repo"], -(row["number"] or 0)))
+    return {
+        "ok": True,
+        "msg": error,
+        "owner": config["owner"],
+        "repos": config["repos"],
+        "viewer": viewer,
+        "pulls": pulls,
+        "count": len(pulls),
+        "pending": waiting,
+        "tasks": sorted({row["task"] for row in pulls if row["task"]}),
+        "updated_at": int(now),
+        "since": since,
+        "fresh_days": FRESH_DAYS,
+        "config_path": os.path.basename(CONFIG_PATH),
+    }
+
+
 def board(refresh=False):
     """Return the open pull requests of the configured repositories updated recently.
 
-    Grouping, sorting and filtering (task, repository, author, review state, drafts) belong to
-    the client: one shared snapshot keeps the GitHub rate limit low and makes switching a
-    filter free.
+    Two passes. The cheap one asks GitHub for the list and `updatedAt` of every open pull
+    request — a second for the whole board — and the expensive one, which reads the discussion
+    a timeline is built from, runs in the background and only for what actually moved. The
+    answer never waits for it: rows come back at once, the ones still being read carry
+    `stale: true` and `pending` counts them, so the app can poll until the board settles.
+
+    Grouping, sorting and filtering belong to the client: one shared snapshot keeps the GitHub
+    rate limit low and makes switching a filter free.
     """
     now = time.time()
-    with _CACHE_LOCK:
-        cached = _CACHE["value"]
-        if not refresh and cached is not None and now - _CACHE["at"] < CACHE_SECONDS:
-            return cached
     try:
         config = load_config()
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return {"ok": False, "msg": str(exc), "pulls": []}
     if not config["repos"]:
         return {"ok": True, "owner": config["owner"], "repos": [], "pulls": [],
-                "viewer": "", "updated_at": int(now)}
+                "viewer": "", "pending": 0, "updated_at": int(now)}
 
     since = time.strftime("%Y-%m-%d", time.gmtime(now - FRESH_DAYS * 86400))
-    search = "is:pr is:open sort:updated-desc updated:>=%s " % since + " ".join(
-        "repo:%s/%s" % (config["owner"], repo) for repo in config["repos"]
-    )
-    rows = []
-    viewer = ""
-    cursor = None
-    try:
-        for _ in range(MAX_PAGES):
-            data = _graphql({"q": search, "size": PAGE_SIZE, "cursor": cursor})
-            viewer = ((data.get("viewer") or {}).get("login")) or viewer
-            result = data.get("search") or {}
-            for node in result.get("nodes") or []:
-                if node:
-                    rows.append(_row(node, viewer))
-            page = result.get("pageInfo") or {}
-            if not page.get("hasNextPage"):
-                break
-            cursor = page.get("endCursor")
-    except RuntimeError as exc:
-        return {"ok": False, "msg": str(exc), "owner": config["owner"],
-                "repos": config["repos"], "pulls": [], "viewer": viewer,
-                "updated_at": int(now)}
+    with _STATE_LOCK:
+        fresh = _STATE["order"] and now - _STATE["light_at"] < CACHE_SECONDS
+    if refresh or not fresh:
+        try:
+            order, since = _light_pass(config, now)
+        except RuntimeError as exc:
+            with _STATE_LOCK:
+                empty = not _STATE["order"]
+            if empty:
+                return {"ok": False, "msg": str(exc), "owner": config["owner"],
+                        "repos": config["repos"], "pulls": [], "viewer": "",
+                        "pending": 0, "updated_at": int(now)}
+            with _STATE_LOCK:
+                _STATE["error"] = str(exc)
+        else:
+            with _STATE_LOCK:
+                stale = [key for key in order if _needs_details(key, now)]
+            _enqueue(stale, config["owner"])
+    return _snapshot(config, since, now)
 
-    rows.sort(key=lambda row: (row["repo"], -(row["number"] or 0)))
-    result = {
-        "ok": True,
-        "owner": config["owner"],
-        "repos": config["repos"],
-        "viewer": viewer,
-        "pulls": rows,
-        "count": len(rows),
-        "tasks": sorted({row["task"] for row in rows if row["task"]}),
-        "updated_at": int(now),
-        "since": since,
-        "fresh_days": FRESH_DAYS,
-        "config_path": os.path.basename(CONFIG_PATH),
-    }
-    with _CACHE_LOCK:
-        _CACHE.update({"at": now, "value": result})
-    return result
+
+_load_cache()

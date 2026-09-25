@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -95,7 +97,7 @@ enum _Sort {
 /// список загружается один раз и живёт до явного «Обновить».
 class _Board {
   /// Снимок доски.
-  const _Board(this.pulls, this.repos, this.error, this.loadedAt, this.freshDays);
+  const _Board(this.pulls, this.repos, this.error, this.loadedAt, this.freshDays, this.pending);
 
   /// Все открытые PR из ответа мака.
   final List<Map<String, dynamic>> pulls;
@@ -111,6 +113,9 @@ class _Board {
 
   /// За сколько последних дней мак взял пул-реквесты; 0 — окно неизвестно.
   final int freshDays;
+
+  /// Сколько строк мак ещё дочитывает из GitHub; 0 — доска целиком свежая.
+  final int pending;
 }
 
 /// Держатель снимка: живёт в контейнере Riverpod, то есть столько же, сколько само приложение.
@@ -190,6 +195,12 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   /// Имя строки (`repo#123`), которой сейчас ставится апрув; `null` — апрув не идёт.
   String? _approving;
 
+  /// Сколько строк мак ещё дочитывает: пока не ноль, экран сам перезапрашивает снимок.
+  int _pending = 0;
+
+  /// Таймер опроса, пока мак дочитывает ленты.
+  Timer? _poll;
+
   @override
   void initState() {
     super.initState();
@@ -200,29 +211,41 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
       _err = cached.error;
       _loadedAt = cached.loadedAt;
       _freshDays = cached.freshDays;
-    } else {
-      _load();
     }
+    // Мак держит свой кэш и отвечает из него мгновенно, поэтому при открытии экран всегда
+    // спрашивает доску заново — но без `refresh`: это не поход в GitHub за всем подряд.
+    _load(refresh: false);
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
   }
 
   /// Загружает снимок с мака и кладёт его в кэш.
   ///
-  /// Вызывается только руками — при первом открытии за сеанс и по кнопке «Обновить»; каждый
-  /// такой вызов просит мак сходить в GitHub заново (`refresh=1`), иначе кнопка обновления
-  /// возвращала бы тот же ответ из минутного кэша панели.
-  Future<void> _load() async {
+  /// `refresh` — просьба сходить в GitHub за списком заново; без него мак отвечает из своего
+  /// кэша за миллисекунды. Ленты мак дочитывает фоном, поэтому пока в ответе есть `pending`,
+  /// экран сам перезапрашивает снимок и дорисовывает строки по мере готовности.
+  Future<void> _load({bool refresh = true, bool silent = false}) async {
     if (_busy) return;
-    setState(() => _busy = true);
+    if (!silent) setState(() => _busy = true);
     try {
-      final d = await ref.read(appStateProvider).api.macPullRequests(refresh: true);
+      final d = await ref.read(appStateProvider).api.macPullRequests(refresh: refresh);
       final list = (d['pulls'] is List) ? (d['pulls'] as List) : const [];
       final repos = (d['repos'] is List) ? (d['repos'] as List) : const [];
       final board = _Board(
         list.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList(),
         repos.whereType<String>().toList(),
-        d['ok'] == false ? '${d['msg'] ?? 'ошибка на маке'}' : null,
+        // Мак отвечает `ok` и с непустым `msg`: список приехал, а какая-то пачка лент — нет.
+        // Такую жалобу тоже видно в шапке, иначе часть строк молча осталась бы вчерашней.
+        d['ok'] == false
+            ? '${d['msg'] ?? 'ошибка на маке'}'
+            : ('${d['msg'] ?? ''}'.isEmpty ? null : '${d['msg']}'),
         DateTime.now(),
         d['fresh_days'] as int? ?? 0,
+        d['pending'] as int? ?? 0,
       );
       ref.read(_boardCacheProvider).value = board;
       if (!mounted) return;
@@ -232,12 +255,23 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
         _err = board.error;
         _loadedAt = board.loadedAt;
         _freshDays = board.freshDays;
+        _pending = board.pending;
       });
+      _schedulePoll();
     } catch (e) {
       if (mounted) setState(() => _err = '$e');
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted && !silent) setState(() => _busy = false);
     }
+  }
+
+  /// Ставит следующий опрос, если мак ещё дочитывает ленты.
+  void _schedulePoll() {
+    _poll?.cancel();
+    if (_pending <= 0) return;
+    _poll = Timer(const Duration(seconds: 2), () {
+      if (mounted) _load(refresh: false, silent: true);
+    });
   }
 
   /// Имя разговора для этого PR: по нему второе нажатие робота возвращает в ту же переписку.
@@ -446,10 +480,11 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
                           Text(
                               '${rows.length} из ${all.length}'
                               '${_freshDays > 0 ? ' · за $_freshDays дн.' : ''}'
+                              '${_pending > 0 ? ' · дочитываю $_pending' : ''}'
                               '${_loadedAt == null ? '' : ' · ${_time(_loadedAt!)}'}',
                               style: Theme.of(context).textTheme.bodySmall),
                           const Spacer(),
-                          if (_busy)
+                          if (_busy || _pending > 0)
                             const SizedBox(
                                 width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
                         ],
@@ -674,6 +709,9 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
 
   /// Лента событий пул-реквеста: запросы изменений, комментарии, апрувы, пуши по порядку.
   ///
+  /// Строка, чью ленту мак ещё читает, показывает крутилку: список приходит сразу, истории
+  /// подтягиваются фоном.
+  ///
   /// Мак отдаёт события уже свёрнутыми: подряд идущие комментарии — один шаг со счётчиком,
   /// подряд идущие коммиты одной отправки — один пуш. Здесь остаётся нарисовать их слева
   /// направо в одну строку: история не переносится и не режется, длинную прокручивают пальцем.
@@ -683,7 +721,10 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
   Widget _timelineStrip(Map<String, dynamic> row) {
     final raw = (row['timeline'] is List) ? (row['timeline'] as List) : const [];
     final events = raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
-    if (events.isEmpty) return const SizedBox.shrink();
+    // Пока мак дочитывает обсуждение этой строки, вместо ленты (или слева от прежней) крутится
+    // точка: список приезжает целиком за пару секунд, а ленты подтягиваются следом.
+    final stale = row['stale'] == true;
+    if (events.isEmpty && !stale) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(top: 6),
       child: SingleChildScrollView(
@@ -691,7 +732,15 @@ class _PullRequestsScreenState extends ConsumerState<PullRequestsScreen> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           spacing: 3,
-          children: [for (final event in events.reversed) _eventChip(event)],
+          children: [
+            if (stale)
+              const Padding(
+                padding: EdgeInsets.only(right: 3),
+                child: SizedBox(
+                    width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5)),
+              ),
+            for (final event in events.reversed) _eventChip(event),
+          ],
         ),
       ),
     );
