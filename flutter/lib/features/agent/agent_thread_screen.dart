@@ -607,7 +607,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       );
     }
     // элементы разворачиваются в сообщения один раз на сборку: от них же зависит и их число
-    final entries = _entries(state.items, streaming: state.sending);
+    final entries = _entries(state.items, streaming: state.sending, step: state.step);
     // Над перепиской — строка «показать более раннее»: история приходит страницами, и разговор
     // открывается последними сообщениями
     final older = state.hasOlder;
@@ -676,13 +676,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   ///
   /// [streaming] — ответ пишется прямо сейчас: его хвост показывается простым текстом (см.
   /// [_entryContent]), чтобы markdown не разбирался заново на каждую пачку дельт.
-  List<_Entry> _entries(List<AgentItem> items, {required bool streaming}) {
+  List<_Entry> _entries(List<AgentItem> items, {required bool streaming, String? step}) {
     if (_entriesCache != null &&
         identical(_entriesFor, items) &&
         _entriesStreaming == streaming) {
       return _entriesCache!;
     }
-    final entries = _buildEntries(items, streaming);
+    final entries = _buildEntries(items, streaming, step: step);
     _entriesFor = items;
     _entriesStreaming = streaming;
     _entriesCache = entries;
@@ -690,7 +690,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   }
 
   /// Разбирает переписку в сообщения журнала (без кэша — см. [_entries]).
-  List<_Entry> _buildEntries(List<AgentItem> items, bool streaming) {
+  List<_Entry> _buildEntries(List<AgentItem> items, bool streaming, {String? step}) {
     final entries = <_Entry>[];
     for (final item in items) {
       // блоки разбираем в свой список: ошибку прогона надо привязать к последнему сообщению
@@ -700,7 +700,12 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         mine.add(_Entry(_EntryKind.note, text: item.text));
       } else if (item.kind == 'bash') {
         mine.add(
-          _Entry(_EntryKind.bash, text: item.text, command: item.command),
+          _Entry(
+            _EntryKind.bash,
+            text: item.text,
+            command: item.command,
+            exitCode: item.exitCode,
+          ),
         );
       } else if (item.isUser) {
         mine.add(_Entry(_EntryKind.user, text: item.text));
@@ -752,15 +757,19 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     if (streaming && entries.isNotEmpty && items.isNotEmpty && items.last.isAssistant) {
       entries[entries.length - 1] = entries.last.copyWith(streaming: true);
     }
+    // Показываем текущий шаг агента в потоке сообщений, если что-то настраивается.
+    if ((step?.isNotEmpty ?? false) && !streaming) {
+      entries.add(_Entry(_EntryKind.step, text: step!));
+    }
     return entries;
   }
 
   /// Один пункт журнала переписки.
   ///
-  /// Журнал — это столбик сообщений без плашек: вопрос человека отмечен акцентной чертой слева,
-  /// ответ идёт обычным текстом во всю ширину, а работа агента (размышления, инструменты,
-  /// команды) — от вертикальной направляющей. Шрифт и кегль у всего текста одни ([_textSize]),
-  /// различает пункты только цвет.
+  /// Журнал — это столбик сообщений без плашек: вопрос человека сдвинут на акцентный фон,
+  /// ответ идёт без фона, работа агента (размышления, инструменты, команды) — без фона и без
+  /// направляющей. Шрифт и кегль у всего текста одни ([_textSize]), различает пункты только
+  /// фон и цвет.
   ///
   /// Свёрнутым по умолчанию идёт служебное: «размышления», вызов инструмента и прямая команда
   /// оболочки. В переписке важны ответы, а не то, как агент к ним шёл; в свёрнутом виде у шага
@@ -772,7 +781,14 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       title: '\$ ${entry.command}',
       copyText: entry.copyText,
       expandKey: _entryKey(entry),
-      body: entry.text.trim().isEmpty ? null : _OutputText(entry.text),
+      body: entry.text.trim().isEmpty
+          ? null
+          : _OutputText(
+              entry.text,
+              color: entry.exitCode != null && entry.exitCode! != 0
+                  ? C.danger
+                  : C.ok,
+            ),
     ),
     // Заголовок шага показывает саму инструкцию — команду, путь или шаблон: по ней выбирают,
     // раскрывать ли вывод. Раньше здесь стояла первая строка вывода, и у вызова без вывода
@@ -815,6 +831,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       copyText: entry.copyText,
       child: _entryContent(entry),
     ),
+    _EntryKind.step => _stepIndicator(entry.text),
   };
 
   /// Первая непустая строка текста — то, что видно у свёрнутого служебного сообщения.
@@ -837,7 +854,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   String _entryKey(_Entry entry) {
     final id = entry.tool?.id ?? '';
     if (id.isNotEmpty) return 'tool:$id';
-    return '${entry.kind.name}:${entry.text.hashCode}:${entry.command.hashCode}';
+    return '${entry.kind.name}:${entry.text.hashCode}:${entry.command.hashCode}:${entry.exitCode}';
   }
 
   /// Содержимое текстового сообщения: сам текст, ожидание ответа и ошибка прогона.
@@ -897,26 +914,52 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     );
   }
 
+  /// Текущий статус агента: короткая строка в потоке сообщений.
+  ///
+  /// Показывается, когда агент работает и статус изменился: «Analyzing files», «Executing
+  /// command» и т.п. — без дублирования над полем ввода.
+  Widget _stepIndicator(String text) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 4),
+    child: Row(
+      children: [
+        SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            text,
+            style: const TextStyle(
+              color: C.fg3,
+              fontSize: _textSize,
+              height: 1.35,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
   /// Сообщение журнала: вопрос человека или ответ агента.
   ///
   /// Пузырей нет: текст идёт во всю ширину панели, а кнопка «скопировать» стоит в правом краю
-  /// первой строки. Вопрос отмечен акцентной чертой слева — единственное, чем он отличается
-  /// от ответа: кегль, шрифт и цвет текста у них общие ([_textSize]).
+  /// первой строки. У вопроса — полупрозрачный акцентный фон с rounded-углами, у ответа агента
+  /// — без фона.
   Widget _message({
     required String copyText,
     required Widget child,
     bool isUser = false,
   }) {
-    // У вопроса слева акцентная черта: она и говорит, что это реплика человека, а не ответ
     final body = isUser
         ? Container(
-            decoration: const BoxDecoration(
-              border: Border(
-                left: BorderSide(color: C.accent, width: _accentBarWidth),
-              ),
+            width: double.infinity,
+            decoration: BoxDecoration(
+              color: C.accent.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(10),
             ),
-            // черта стоит в отступе, а текст вопроса — в колонке остального текста
-            padding: const EdgeInsets.only(left: _textIndent - _accentBarWidth),
+            padding: const EdgeInsets.all(12),
             child: child,
           )
         : Padding(
@@ -940,11 +983,9 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
   /// Строка журнала о работе агента: «размышления», вызов инструмента, команда оболочки.
   ///
-  /// От вертикальной направляющей слева идут значок вида и заголовок одной строкой: он
-  /// обрезается многоточием, чтобы шаг занимал одну строку и журнал читался целиком. Кнопки
-  /// действий — в правом краю заголовка, там же, где у сообщений. Тело (вывод команды, текст
-  /// размышлений) показывается ниже и сдвинуто за направляющую: видно, что это подробности
-  /// шага, а не отдельная реплика.
+  /// Без левой направляющей: значок вида и заголовок идут одной строкой, обрезанной
+  /// многоточием. Тело (вывод команды, текст размышлений) показывается ниже без отступа.
+  /// Кнопки действий — в правом краю заголовка.
   Widget _serviceEntry({
     required IconData icon,
     required String title,
@@ -960,13 +1001,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final header = expanded ? title : (preview ?? title);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: _messageGapV),
-      child: Container(
-        // направляющая — левая граница блока: она тянется на всю его высоту, включая тело
-        decoration: const BoxDecoration(
-          border: Border(left: BorderSide(color: C.brd, width: _railWidth)),
-        ),
-        padding: const EdgeInsets.only(left: _textIndent - _railWidth),
-        child: Column(
+      child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
@@ -1023,7 +1058,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
               Padding(padding: const EdgeInsets.only(top: 6), child: body),
           ],
         ),
-      ),
     );
   }
 
@@ -1086,29 +1120,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       ],
     ),
   );
-
-  /// Заполнение контекста — полоса во всю ширину над полем ввода.
-  ///
-  /// Текущий шаг: что агент делает прямо сейчас.
-  ///
-  /// Показывается над полосой расхода контекста — в том же тоне, что поле ввода. Состояния:
-  /// `«в очереди»` — прогон ждёт освобождения сессии; `«сжимаю контекст»` — идёт compact;
-  /// `«читаю файл»`, `«выполняю команду»` и т.п. — от mоста через событие `status`.
-  Widget _statusRow(AgentThreadState state) {
-    final step = state.step;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(14, 4, 14, 0),
-      child: Text(
-        step,
-        style: const TextStyle(
-          color: C.fg2,
-          fontSize: 12,
-          height: 1.3,
-        ),
-      ),
-    );
-  }
 
   /// Тонкая полоса без рамок и внешних отступов, фон — как у поля ввода: она примыкает к
   /// нему сверху и читается его границей, а не отдельным элементом. Числа и проценты живут
@@ -1234,7 +1245,6 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (state.step.isNotEmpty) _statusRow(state),
         _contextBorder(state),
         Stack(
           children: [
@@ -1442,6 +1452,10 @@ class _Entry {
   /// Команда — у вида [_EntryKind.bash].
   final String command;
 
+  /// Код выхода оболочки для элемента `bash`: `null` — не передан, `0` — успех, `!= 0` —
+  /// ошибка. Используется для раскраски вывода команды.
+  final int? exitCode;
+
   /// Ошибка прогона, показываемая под текстом этого сообщения.
   final String error;
 
@@ -1454,6 +1468,7 @@ class _Entry {
     this.text = '',
     this.tool,
     this.command = '',
+    this.exitCode,
     this.error = '',
     this.streaming = false,
   });
@@ -1474,18 +1489,19 @@ class _Entry {
   };
 
   /// Копия с добавленной ошибкой прогона (остальные поля не меняются).
-  _Entry copyWith({String? error, bool? streaming}) => _Entry(
+  _Entry copyWith({String? error, bool? streaming, int? exitCode}) => _Entry(
     kind,
     text: text,
     tool: tool,
     command: command,
+    exitCode: exitCode ?? this.exitCode,
     error: error ?? this.error,
     streaming: streaming ?? this.streaming,
   );
 }
 
 /// Вид пункта переписки на экране; по нему выбирается оформление сообщения.
-enum _EntryKind { user, text, reasoning, tool, bash, note, waiting }
+enum _EntryKind { user, text, reasoning, tool, bash, note, waiting, step }
 
 /// Копирует текст сообщения в буфер обмена и подтверждает это коротким сообщением.
 ///
@@ -1541,21 +1557,9 @@ const _actionGap = 4.0;
 /// сообщения не читались одним блоком.
 const _messageGapV = 6.0;
 
-/// Ширина вертикальной направляющей у шагов агента.
-///
-/// Тонкая, потому что шагов в переписке много и линия не должна спорить с текстом; она только
-/// показывает, где заканчивается ответ и начинается работа над ним.
-const _railWidth = 2.0;
-
-/// Ширина акцентной черты у вопроса человека.
-///
-/// Толще направляющей: реплик человека мало, и каждая должна быть видна.
-const _accentBarWidth = 3.0;
-
 /// Отступ текста от левого края переписки.
 ///
-/// В нём стоят акцентная черта вопроса и направляющая шагов, а сам текст — и вопроса, и ответа,
-/// и шагов — начинается с этого отступа: весь журнал читается одной колонкой.
+/// Текст всех сообщений начинается с этого отступа: весь журнал читается одной колонкой.
 const _textIndent = 13.0;
 
 /// Высота строки текста сообщения.
@@ -1667,7 +1671,8 @@ class _OutputText extends StatefulWidget {
   /// Текст как он пришёл.
   final String text;
 
-  /// Цвет текста: у вывода команды приглушённый, у «размышлений» — второстепенный.
+  /// Цвет текста: у успешного вывода — зелёный, у упавшей команды — красный, у «размышлений»
+  /// и обычных шагов — второстепенный.
   final Color color;
 
   /// Подробности шага.

@@ -773,6 +773,10 @@ class AgentItem {
   /// Команда для элемента `bash`.
   final String command;
 
+  /// Код выхода оболочки для элемента `bash`: `null` — мост не прислал, `0` — успех, `!= 0`
+  /// — ошибка. Без этого поля экран не может раскрасить вывод команды в зелёный/красный.
+  final int? exitCode;
+
   /// Элемент переписки.
   const AgentItem({
     required this.kind,
@@ -782,6 +786,7 @@ class AgentItem {
     this.tools = const [],
     this.error = '',
     this.command = '',
+    this.exitCode,
   });
 
   /// Разбор элемента из ответа моста.
@@ -791,6 +796,7 @@ class AgentItem {
     reasoning: json['reasoning']?.toString() ?? '',
     error: json['error']?.toString() ?? '',
     command: json['command']?.toString() ?? '',
+    exitCode: json['exitCode'] is int ? json['exitCode'] : null,
     blocks: <AgentBlock>[
       if (json['blocks'] is List)
         for (final b in json['blocks'] as List)
@@ -816,6 +822,7 @@ class AgentItem {
     List<AgentBlock>? blocks,
     List<AgentTool>? tools,
     String? error,
+    int? exitCode,
   }) => AgentItem(
     kind: kind,
     text: text ?? this.text,
@@ -824,6 +831,7 @@ class AgentItem {
     tools: tools ?? this.tools,
     error: error ?? this.error,
     command: command,
+    exitCode: exitCode ?? this.exitCode,
   );
 
   /// Ответ пуст: ни текста, ни карточек — на экране это ожидание первого куска ответа.
