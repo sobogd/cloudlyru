@@ -9,6 +9,7 @@ import 'package:record/record.dart';
 
 import '../../theme.dart';
 import '../../util/format.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../../util/widgets.dart';
 import 'agent_api.dart';
@@ -803,12 +804,36 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   Widget _userCard(String text) {
     final body = text.isEmpty
         ? SizedBox()
-        : Text(
-            text,
-            style: TextStyle(
-              color: const Color(0xFF1A1D24),
-              fontSize: _textSize,
-              height: 1.35,
+        : MarkdownBody(
+            data: text,
+            selectable: true,
+            styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+              p: TextStyle(
+                color: const Color(0xFF1A1D24),
+                fontSize: _textSize,
+                height: 1.35,
+              ),
+              code: TextStyle(
+                color: const Color(0xFF1A1D24),
+                backgroundColor: C.surface3,
+                fontSize: _textSize,
+                fontFamily: 'monospace',
+              ),
+              blockquote: TextStyle(
+                color: C.fg2,
+                fontSize: _textSize,
+                height: 1.35,
+              ),
+              em: TextStyle(
+                color: const Color(0xFF1A1D24),
+                fontStyle: FontStyle.italic,
+                fontSize: _textSize,
+              ),
+              strong: TextStyle(
+                color: const Color(0xFF1A1D24),
+                fontSize: _textSize,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           );
     return Padding(
@@ -835,12 +860,36 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
               child: CircularProgressIndicator(strokeWidth: 2),
             ),
           )
-        : Text(
-            text,
-            style: const TextStyle(
-              color: C.fg,
-              fontSize: _textSize,
-              height: 1.35,
+        : MarkdownBody(
+            data: text,
+            selectable: true,
+            styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+              p: TextStyle(
+                color: C.fg,
+                fontSize: _textSize,
+                height: 1.35,
+              ),
+              code: TextStyle(
+                color: C.fg,
+                backgroundColor: C.surface3,
+                fontSize: _textSize,
+                fontFamily: 'monospace',
+              ),
+              blockquote: TextStyle(
+                color: C.fg2,
+                fontSize: _textSize,
+                height: 1.35,
+              ),
+              em: TextStyle(
+                color: C.fg,
+                fontStyle: FontStyle.italic,
+                fontSize: _textSize,
+              ),
+              strong: TextStyle(
+                color: C.fg,
+                fontSize: _textSize,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           );
     return Padding(
@@ -1392,17 +1441,37 @@ enum _EntryKind { user, text, reasoning, tool, bash, note, waiting, step }
 /// прокрутки; если разметка доезжает позже, это видно, но список уже показывает конец.
 const _maxInitialJumpTries = 40;
 
-/// Убирает пустые строки из служебного текста: вывода команды и «размышлений».
+/// Убирает пустые строки и markdown-символы из служебного текста: вывода команды,
+/// «размышлений» и обычного ответа агента.
 ///
 /// И то и другое приходит с пустыми строками пачками (разделители прогресса, отступы
 /// форматирования) — в переписке они ничего не сообщают, зато удлиняют сообщение. Отступы
-/// в начале строки сохраняем: в выводе кода они значат вложенность.
-String _compactLines(String text) => text
-    .split('\n')
-    .map((line) => line.trimRight())
-    .where((line) => line.trim().isNotEmpty)
-    .join('\n')
-    .trim();
+/// в начале строки сохраняем: в выводе кода они значат вложенность. Markdown-символы
+/// (`**bold**`, `` `code` ``, `# заголовки`, `> цитаты`, `- списки`) убираются, чтобы
+/// текст оставался plain — без мусора из символов разметки.
+String _compactLines(String text) {
+  var result = text
+      // заголовки: `## Text` → `Text`
+      .replaceAll(RegExp(r'^#{1,6}\s+'), '#')
+      // жирный: `**text**` → `text`
+      .replaceAll(RegExp(r'\*\*(.+?)\*\*'), r'$1')
+      // курсив: `*text*` → `text`
+      .replaceAll(RegExp(r'\*(.+?)\*'), r'$1')
+      // код в строке: `` `code` `` → `code`
+      .replaceAll(RegExp(r'`([^`]+)`'), r'$1')
+      // ссылки: `[text](url)` → `text`
+      .replaceAll(RegExp(r'\[([^\]]+)\]\([^)]+\)'), r'$1')
+      //移除项目符号: `- ` или `* ` в начале строки
+      .replaceAll(RegExp(r'^[-*]\s+'), '')
+      // блок-цитаты: `> text` → `text`
+      .replaceAll(RegExp(r'^>\s?'), '')
+      .split('\n')
+      .map((line) => line.trimRight())
+      .where((line) => line.trim().isNotEmpty)
+      .join('\n')
+      .trim();
+  return result;
+}
 
 /// Кегль текста сообщений: один и тот же у ответа, команды и «размышлений».
 ///
