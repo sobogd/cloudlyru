@@ -1,164 +1,23 @@
-# CODING-PLAN — ревью раздела «Проекты» и правила кода
+# План (plan of attack)
 
-Дата: 15.06.2026. Черновик решений; по каждому пункту жду «да/»другое» до вайпа.
+Максимум &lt;= N пунктов в работах (worktree, push main, ci)
 
-## 1. Архитектура (как есть)
+## 1. П1 (P1) — `retry()`: мост недоступен → no blind second prompt
+- Root: if the bridge is unavailable we don't know if busy; blindly re-sending → possible second run.
+- Fix: on `AgentApiException` in `retry` → `state.withError(e.message)`, return; follow only on clean state.
 
-```
-Flutter (телефон / macOS)
-  └─ HTTPS ─► NestJS (src/) — авторизация, аудит, rate-limit
-                 └─ ssh reverse-туннель (loopback:18820 → mac:18820)
-                       └─ pi-bridge (python, только loopback)
-                              ├─ agentic CLI (agenta)   — сессии .pi/sessions/*.jsonl
-                              └─ claude code (agentic) — ~/.claude/projects/<slogan>/<uuid>.jsonl
-```
+## 2. П2 (P2) — bridge dedupe: `is_duplicate(text, message_id)` queue vs current
+- Root: `is_duplicate` doesn't consider runs in the rewrite; if `id` in queue, dup means we push to the queue again.
+- Fix: if `message_id` in the queue, `is_duplicate` should return `true` (already queued) before comparison; `current_id` is enough.
 
-- **Источники правды** — файлы истории на маке. Bridge **stateless**: хранит только
-  «кто жив прямо сейчас» + очередь занятых. Связь — `sessionId` (agentic: hash из каталога
-  сессий; claude: `sessionId` в `claude-sessions.json`).
-- **Ответ — SSE**: каждая строка события `: {json}\n\n`; дельты свёрнуты в 0.05 сек;
-  heartbeat 1 сек; без событий 40 сек → «связь оборвалась» → reconnect.
-- Телефон **никогда** не пишет на мак напрямую — только через туннель NestJS.
-  Нет туннеля → `bridge_unavailable` (502/503).
+## 3. П3 (P3) — `replacePath` zone 32k line limit on long prompts
+- Root: Mac text files with long prompts are truncated at 32 000 lines; UTF-8 decoding breaks UTF-16 surrogates in a macOS bundle.
+- Fix: remove the 32k line limit (no limit); decode directly in native (no conversion to Array buffer).
 
-### AppState и фоновые изоляты — не в этом разделе
+## 4. П4 (P4) — doc update: besides the `AgentApiException` pitfall, the bridge has only 2 counts, not 4
+- Root: `AgentApiException` in two places (prompt & events) is quoted as one, but it's 2: 409 busy at prompt and idle at events; removing (support doc) the 409 means only 2 counts to explain.
+- Fix: update `AGENTS.md` references to "2 counts"=2; doc for `AgentApiException` "busy" `code === 'busy' | 409`.
 
-AppState/изолят-звук живёт в `handleForeground/handleBackground` — это зона **голосового**
-ввода (whisper-STT). Для раздела «Проекты» AppState **не нужен**:
-
-- «агент дописался без меня» — снимок активности (`GET /projects/activity`) при открытии
-  экрана, не фоновое событие;
-- «связь оборвалась» — SSE `onDone` + сторож тишины (40 с) + авто-переподключение (`resume()`);
-- «мак уснул» — мост шлёт `device_sleep`;
-- «мост умер» — plain HTTP error → меню действий (туннель / панель / телефон).
-
-Изолят на фон не нужен: клиент спи-сгарит сокеты, а `resume()` при foreground сделает
-переподключение. Позиция: AppState-изолят оставлен только для whisper, в «Проекты» не
-тянется.
-
-### Платформы
-
-`applicationId: ru.cloudly.sync`; `flutter/` — Android + iOS + macOS, web не выполняется.
-
-## 2. Найденные баги (по приоритету)
-
-### 🔴 Критичные
-
-**B1. `retry()` может отправить тот же вопрос дважды.**
-`agent_controller.dart` → `retry()`: запрос свежего состояния сессии упал (мост временно
-недоступен) — код уходит в `_run(session.id, lastUser.text)`, но прогон на маке ещё жив
-(заголовок уже снят, а `busy` в bridge ещё `true`). Двойной прогон.
-**Фикс:** после `abort` и до повторной отправки ждать `session().busy == false`;
-если busy — `_followRunning`, не `_run`.
-
-**B2. Idle без события ошибки.**
-pipeline mоста: harness вернул `finishReason` пустой/неизвестный и ни одной дельты не было
-— всё равно шлётся `idle`, клиент ставит «готово» без ответа.
-**Фикс:** в bridge, если за прогон не было ни дельты, ни tool-события — `error` с текстом,
-не `idle`.
-
-**B3. Race в `Deliverable.drain` (mост).**
-Флаги `finished/done/failed` снимаются отдельно от копирования контента — два потока
-(SSE-слушатель и flush дельты) могут пересечься: один заберёт `text`, другой — `reasoning`,
-а `finished` уже снят. **Фикс:** один `with self.lock:` на весь `drain`.
-
-**B4. Модель-конфликт override vs UI.**
-`model_session_params` в mосте берёт override только если он явно передан в `prompt`/
-`result`. Если сессия открыта с моделью A, а UI переключил на B (`POST /model`) —
-следующий авто-prompt из очереди идёт на A, а экран показывает B.
-**Фикс:** либо «apply на следующий прогон», либо UI не показывает B, пока не пришёл
-`result` с новой моделью.
-
-### 🟡 Средние
-
-**M1. Кэш списка сессий сбрасывается целиком.**
-`if len(cache) > 32: cache.clear()` — любой общий список > 32 проектов = полный `stat`
-всех файлов истории при каждом обновлении (клиент обновляет каждые 5 сек).
-**Фикс:** LRU или per-entry TTL без полного wipe.
-
-**M2. STT блокирует общий цикл tоnnel.**
-`POST /projects/transcribe` стримится через тот же событие-cycle; `whisper-cli` 10–30 сек
-на длинном аудио — все критические запросы сессий ждут. **Фикс:** STT — отдельный поток
-(`voice_stt` уже subprocess — проверить надёжность), либо отдельный порт/туннель.
-
-**M3. Polling activity (5 с) vs метка «готово».**
-`ProjectsActivityService` опрашивает мост только при живых SSE-клиентах; при возврате на
-экран «снимок» не рекурится — метка «готово не считан» может сдвинуться на 5–10 сек.
-**Фикс:** fresh-health при `markSeen` / при возврате в раздел.
-
-**M4. Abort по обрыву клиентского TCP рвёт всех слушателей.**
-NestJS `PromptStream`: `req.on('close')` → `abort.abort()` → bridge abort event. Но
-`follow_events` в mосте ловит **все** SSE-клиенты одним циклом; один abort расползается
-по всем подключениям к сессии (включая `resume()` на том же устройстве).
-**Фикс:** abort — на конкретный task-id, не на сессию. Либо `/events` — только наблюдение
-(обрыв не рвёт), `/prompt` — только явный tcp-рывок.
-
-**M5. `assert` в критическом пути mоста.**
-`step_last_session`: `assert d.is_dir()` → `AssertionError` (500 в SSE) на пустом каталоге.
-**Фикс:** явная проверка + `ValueError`.
-
-### 🟢 Низкие
-
-- **L1.** README mоста разошлась с кодом по таймингам («alma: 8500–9000 мс» vs
-  `6000–7000 мс`). Коммент не трогали — смысл переезжает в README.
-- **L2.** `CLOUDLYRU_BASE_URL`-fallback: при `baseUrl: '/'` → relative setUrl, 404;
-  нужен явный «server required»-error в `ProjectsSection`.
-- **L3.** `refreshIndicator` + `AlwaysScrollableScrollPhysics` на macOS — колесо
-  постоянно «refreshing» (pull → refresh → pull). Мелочь.
-- **L4.** `clipboard` — один API на 3 ОС (web не выполняется). Ок.
-
-## 3. Правило: код без комментариев (локальный override)
-
-**Правило** (пробито в `AGENTS.md` в секции «Код без комментариев»):
-
-- **Не пишем** комментарии в `.py` / `.ts` / `.dart` / `.swift` в **этом проекте**.
-- **Исключение** — только если без комментария код не читается: MATH-парадокс,
-  парсинг чужого формата, PARSING-версия, SEC-ссылка на RFC/CVE. Такие строки —
-  единицы на файл, формат: `MATH: ...`, `PARSING: claude-code jsonl v0.x`, `SEC: TLS1.3
-  only, CVE-2025-...`.
-- **Никогда не пишем**: переименование имени/функции; `TODO` без issue-контроля;
-  «раньше было X, теперь Y» (git-лог).
-- **Найденные комментарии удалять при разработке**: не отдельный big-bang «удалил всё»,
-  а вместе с правкой того же блока — правило: «изменил строку = в том же коммите вычистил
-  комменты вокруг».
-- **Между мостом и гонками**: Java-комменты молчат — у нас на **другой** горе `Guice`
-  или `Pyguration` — не переносятся; только repo-local.
-- **Переезд смысла**: если коммент несёт наследство (алгоритм, инвариант, ссылка на
-  стандарт) — выносится в README рядом или в этот план; в файле строка стирается.
-- **JSDoc `@deprecated use X`** — остаётся (editor-tools).
-
-### Оценка старого комментов (для плановой чистки)
-
-| Центр | Файл | ~Строк |
-|-------|------|--------|
-| pi-bridge | `server.py` (~4234 LOC) | ~800 |
-| NestJS | `src/projects/*.ts` (~550 LOC) | ~230 |
-| Flutter | `flutter/lib/features/agent/*.dart` (~1500 LOC) | ~400 |
-| mac-агенты | `agents/mac/**/*.swift` (~800 LOC) | ~120 |
-| скрипты | `scripts/*.mjs` / `*.sh` | ~150 |
-
-## 4. Порядок работы (план)
-
-1. **B1** — retry-конфликт (Flutter, S)
-2. **B2** — idle/error-граница (mост, S)
-3. **B3** — `Deliverable.drain` lock (mост, S)
-4. **B4** — модель override (mост + UI, M)
-5. **M4** — abort per-task (mост + NestJS, M)
-6. **M1** — LRU кэш сессий (mост, S)
-7. **M2** — STT поток (mост, M)
-8. **M3** — polling activity (NestJS, S)
-9. **M5** — assert → ValueError (mост, S)
-10. **Чистка комментов** — по мере правки, не отдельным коммитом.
-
-Каждый пункт — отдельное worktree-окно: `git fetch origin main` →
-`git worktree add ../cloudlyru-bN` → правки (+ чистка комментов в тех же блоках) →
-`flutter analyze` / `npx tsc --noEmit` / `python3 -m py_compile server.py` →
-bump `1.0.0+N+1` (для Flutter) → `./scripts/gh-push.sh HEAD:main` → `git worktree remove`.
-
-## 5. Статус
-
-- [x] CODING-PLAN.md в корне
-- [x] Правило «код без комментариев» — AGENTS.md (локальный override)
-- [ ] B1..B4 — жду да и начинаю
-- [ ] M1..M5 — по очереди
-- [ ] Чистка комментов — по мере правки
+## 5. П5 (P5) — `AgentController.retry()` call `_followRunning` after abort (session busy=false)
+- Root: user aborts a session; then retry → bridge marks busy to true and the follow is lost (busy state not ready post-abort, busy resetting at that point is async: the `_prompt()` in the bridge hasn't updated yet).
+- Fix: after `state.session.busy == false`; or check `session.busy` after calling refresh.
