@@ -1013,30 +1013,32 @@ class AgentThreadController extends Notifier<AgentThreadState> {
 
   /// Повторяет работу после ошибки: сначала пробует вернуться к идущему прогону и только
   /// если на маке ничего не считается — отправляет последний вопрос заново.
-  ///
-  /// Раньше здесь всегда была повторная отправка, и после любого обрыва связи тот же вопрос
-  /// уезжал агенту второй раз: два полных прогона и двойной расход токенов на один вопрос.
   Future<void> retry() async {
     final session = state.session;
     if (session == null || state.sending) return;
     state = state.clearError();
-    // Свежее состояние сессии отвечает на главный вопрос: считается ли там что-то сейчас
-    try {
-      final fresh = await _api.session(session.id);
-      state = state.copyWith(session: fresh);
-      if (fresh.busy) {
-        await _followRunning(session.id);
-        return;
-      }
-    } on AgentApiException {
-      // Состояние не спросили (мост недоступен) — пробуем отправить вопрос: если прогон всё же
-      // идёт, мост отсечёт повтор и подключит экран к ответу
-    }
     final lastUser = state.items.lastWhere(
       (i) => i.isUser,
       orElse: () => const AgentItem(kind: 'user'),
     );
     if (lastUser.text.isEmpty) return;
+    // Свежее состояние сессии отвечает на главный вопрос: считается ли там что-то сейчас
+    try {
+      final fresh = await _api.session(session.id);
+      state = state.copyWith(session: fresh);
+    } on AgentApiException catch (e) {
+      // Мост недоступен — состояние неизвестно. Занятость не спрашивают: если busy, повторит
+      // вайповый прогон; если free, ради неочевидного состояния не стоит гадать. Возвращаем
+      // без изменений — пользователь увидит error и, когда состояние чистое, повторит по
+      // кнопке.
+      state = state.withError(e.message);
+      return;
+    }
+    if (state.session == null) return;
+    if (state.session!.busy) {
+      await _followRunning(session.id);
+      return;
+    }
     await _run(session.id, lastUser.text);
   }
 
