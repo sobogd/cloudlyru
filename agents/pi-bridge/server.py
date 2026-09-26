@@ -3288,7 +3288,6 @@ _sessions_cache_lock = threading.Lock()
 
 
 def cached_sessions(key, build):
-    """Список разговоров из короткого кэша; [build] вызывается только при промахе."""
     now = time.time()
     with _sessions_cache_lock:
         entry = _sessions_cache.get(key)
@@ -3296,10 +3295,10 @@ def cached_sessions(key, build):
             return entry[1]
     value = build()
     with _sessions_cache_lock:
-        # Ключей мало (папка + харнесс), но растущий без предела словарь всё равно лишний
-        if len(_sessions_cache) > 32:
-            _sessions_cache.clear()
         _sessions_cache[key] = (now, value)
+        while len(_sessions_cache) > 32:
+            oldest = min(_sessions_cache, key=lambda k: _sessions_cache[k][0])
+            del _sessions_cache[oldest]
     return value
 
 
