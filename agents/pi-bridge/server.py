@@ -2140,21 +2140,14 @@ class AgentSession:
         self.current_id = ""
 
     def is_duplicate(self, text, message_id=""):
-        """Повторяет ли сообщение то, что уже выполняется или ждёт очереди.
-
-        Зачем: приложение слало один и тот же вопрос по нескольку раз — после обрыва потока
-        (кнопка «Повторить») и при переподключении сети, — и мост каждый раз честно прогонял ту
-        же работу заново: четыре полных прогона на один вопрос в одной сессии. Повтор отсекаем,
-        а приложение подключаем к идущему ответу, чтобы оно в любом случае увидело результат.
-
-        Как только прогон закончился, такой же вопрос снова проходит: повторить его осознанно
-        человек вправе, и мешать этому нельзя.
-        """
         if message_id:
             if self.current_id and self.current_id == message_id:
                 return True
-            return any(item.get("id") == message_id for item in self.queue)
-        # Идентификатора нет (старая сборка приложения) — сравниваем текст, как раньше
+            if any(item.get("id") == message_id for item in self.queue):
+                return True
+            if self.current_prompt is not None and self.current_prompt == text:
+                return True
+            return any(item.get("text") == text for item in self.queue)
         if self.current_prompt is not None and self.current_prompt == text:
             return True
         return any(item.get("text") == text for item in self.queue)
