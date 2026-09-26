@@ -276,7 +276,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       } else {
         await Navigator.of(context).push(
           CupertinoPageRoute<void>(
-            builder: (_) => AgentThreadScreen(session: fast, project: project),
+            builder: (_) => AgentThreadScreen(session: fast, project: project, hidden: true),
           ),
         );
         if (mounted) await _sessions.load();
@@ -349,6 +349,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
           project: project,
           initialPrompt: prompt,
           pendingName: pendingName,
+          hidden: true,
         ),
       ),
     );

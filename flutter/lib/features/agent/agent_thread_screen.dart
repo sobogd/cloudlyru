@@ -66,6 +66,13 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
   /// закрыл бы весь раздел. На отдельном экране `null` — там работает именно `Navigator`.
   final VoidCallback? onDismiss;
 
+  /// Скрывает вывод инструментов, оставляя только название и статус.
+  ///
+  /// true — project view (две карточки: список и переписка); для project view все
+  /// завершённые инструменты показываются только как `read(/path)` без содержимого файла.
+  /// false — standalone экран; вывод инструментов показывается полностью.
+  final bool hidden;
+
   /// Экран (или панель) разговора с агентом.
   const AgentThreadScreen({
     super.key,
@@ -76,6 +83,7 @@ class AgentThreadScreen extends ConsumerStatefulWidget {
     this.onDismiss,
     this.initialPrompt,
     this.pendingName,
+    this.hidden = false,
   });
 
   @override
@@ -603,7 +611,12 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       );
     }
     // элементы разворачиваются в сообщения один раз на сборку: от них же зависит и их число
-    final entries = _entries(state.items, streaming: state.sending, step: state.step);
+    final entries = _entries(
+      state.items,
+      streaming: state.sending,
+      step: state.step,
+      toolHidden: widget.hidden,
+    );
     // Над перепиской — строка «показать более раннее»: история приходит страницами, и разговор
     // открывается последними сообщениями
     final older = state.hasOlder;
@@ -640,17 +653,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     ),
   );
 
-  /// Подпись инструмента: `read(/path)`, `bash(cmd --flag)`, `edit(file.txt)`, и т.д.
-  ///
-  /// Вместо `summary` (которая обрезает название инструмента и показывает только первый
-  /// аргумент) — полное имя + все аргументы в круглых скобках через запятую.
-  String _toolLabel(AgentTool tool) {
-    if (tool.args.isEmpty) return tool.name;
-    final parts = tool.args.entries
-        .map((e) => '${e.key}: ${e.value}')
-        .join(', ');
-    return '${tool.name}($parts)';
-  }
+
 
   /// Догружает страницу выше и оставляет на экране то, что человек видел.
   ///
@@ -680,6 +683,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   List<_Entry>? _entriesCache;
   List<AgentItem>? _entriesFor;
   bool _entriesStreaming = false;
+  bool _entriesToolHidden = false;
 
   /// Разворачивает элементы разговора в плоский список сообщений.
   ///
@@ -690,21 +694,29 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   ///
   /// [streaming] — ответ пишется прямо сейчас: его хвост показывается простым текстом (см.
   /// [_entryContent]), чтобы markdown не разбирался заново на каждую пачку дельт.
-  List<_Entry> _entries(List<AgentItem> items, {required bool streaming, String? step}) {
+  /// [toolHidden] — true для project view: скрывает вывод завершённых инструментов,
+  /// оставляет только название и статус; running инструмент показывается полностью.
+  List<_Entry> _entries(List<AgentItem> items,
+      {required bool streaming,
+      String? step,
+      bool toolHidden = false}) {
     if (_entriesCache != null &&
         identical(_entriesFor, items) &&
-        _entriesStreaming == streaming) {
+        _entriesStreaming == streaming &&
+        _entriesToolHidden == toolHidden) {
       return _entriesCache!;
     }
-    final entries = _buildEntries(items, streaming, step: step);
+    final entries = _buildEntries(items, streaming, step: step, toolHidden: toolHidden);
     _entriesFor = items;
     _entriesStreaming = streaming;
+    _entriesToolHidden = toolHidden;
     _entriesCache = entries;
     return entries;
   }
 
   /// Разбирает переписку в сообщения журнала (без кэша — см. [_entries]).
-  List<_Entry> _buildEntries(List<AgentItem> items, bool streaming, {String? step}) {
+  List<_Entry> _buildEntries(List<AgentItem> items, bool streaming,
+      {String? step, bool toolHidden = false}) {
     final entries = <_Entry>[];
     for (final item in items) {
       // блоки разбираем в свой список: ошибку прогона надо привязать к последнему сообщению
@@ -778,27 +790,49 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     return entries;
   }
 
+  /// Подпись инструмента: `read(/path)`, `bash(cmd --flag)`, `edit(file.txt)`, и т.д.
+  ///
+  /// Вместо `summary` (которая обрезает название инструмента и показывает только первый
+  /// аргумент) — полное имя + все аргументы в круглых скобках через запятую.
+  String _toolLabel(AgentTool tool) {
+    if (tool.args.isEmpty) return tool.name;
+    final parts = tool.args.entries
+        .map((e) => '${e.key}: ${e.value}')
+        .join(', ');
+    return '${tool.name}($parts)';
+  }
+
   /// Один пункт журнала переписки — всегда в виде карточки с фоном.
   ///
   /// Карточки различаются фоном и текстом по ролям: пользователь — белый фон, тёмный текст;
   /// агент — акцентный фон, светлый текст; инструкции/команды — зеленоватый; ошибки —
   /// красноватый. Кнопок копирования больше нет.
-  Widget _entry(_Entry entry) => switch (entry.kind) {
-    _EntryKind.note => _noteCard(entry.text),
-    _EntryKind.bash => entry.exitCode != null && entry.exitCode! != 0
-        ? _errorCard('\$ ${entry.command}', entry.text)
-        : _instructionCard('\$ ${entry.command}', entry.text),
-    _EntryKind.tool => entry.tool!.isError
-        ? _errorCard(_toolLabel(entry.tool!), entry.tool!.output)
-        : entry.tool!.running
-        ? _instructionCard('${_toolLabel(entry.tool!)} ⏳', entry.tool!.output)
-        : _instructionCard(_toolLabel(entry.tool!), entry.tool!.output),
-    _EntryKind.reasoning => _agentCard(entry.text),
-    _EntryKind.user => _userCard(entry.text),
-    _EntryKind.text => _agentCard(entry.text),
-    _EntryKind.waiting => _agentCard(''),
-    _EntryKind.step => _stepIndicator(entry.text),
-  };
+  Widget _entry(_Entry entry) {
+    if (entry.kind == _EntryKind.note) return _noteCard(entry.text);
+    if (entry.kind == _EntryKind.bash) {
+      return entry.exitCode != null && entry.exitCode! != 0
+          ? _errorCard('\$ ${entry.command}', entry.text)
+          : _instructionCard('\$ ${entry.command}', entry.text);
+    }
+    if (entry.kind == _EntryKind.tool) {
+      final tool = entry.tool!;
+      // Running инструмент показывается полностью — видно, что он делает прямо сейчас.
+      if (tool.running) {
+        return _instructionCard('⏳ ${_toolLabel(tool)}', tool.output);
+      }
+      // Завершённый инструмент — только название и статус, без вывода.
+      if (tool.isError) {
+        return _errorCard(_toolLabel(tool), '');
+      }
+      return _instructionCard(_toolLabel(tool), '');
+    }
+    if (entry.kind == _EntryKind.reasoning) return _agentCard(entry.text);
+    if (entry.kind == _EntryKind.user) return _userCard(entry.text);
+    if (entry.kind == _EntryKind.text) return _agentCard(entry.text);
+    if (entry.kind == _EntryKind.waiting) return _agentCard('');
+    if (entry.kind == _EntryKind.step) return _stepIndicator(entry.text);
+    return SizedBox();
+  }
 
   /// Карточка пользователя: белый фон, чёрный текст.
   Widget _userCard(String text) {

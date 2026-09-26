@@ -106,10 +106,12 @@ MODELS = {
 }
 
 MLX_RELOAD = f"http://{MLX_HOST}:{MLX_PORT}/admin/api/reload"
-MLX_LOADED = f"http://{MLX_HOST}:{MLX_PORT}/admin/api/loaded"
+MLX_LOADED = f"http://{MLX_HOST}:{MLX_PORT}/v1/models"
+MLX_ADMIN = f"http://{MLX_HOST}:{MLX_PORT}/admin/api/loaded"
 
+MLX_TOKEN = "11fff0b9f747f9337c25a8eb2fa9f4e6bf3fe4ea6067c25ea5ada0c319909237"
 MLX_HEADERS = {
-    "X-API-Key": "11fff0b9f747f9337c25a8eb2fa9f4e6bf3fe4ea6067c25ea5ada0c319909237"
+    "Authorization": f"Bearer {MLX_TOKEN}"
 }
 
 _CACHES = {"ip": {"t": 0, "v": None}, "sec": {"t": 0, "v": None},
@@ -375,79 +377,94 @@ def do_action(name, **kw):
     return {"ok": True, "msg": f"{name} started"}
 
 
+def _mlx_req(method, path, body=None):
+    """HTTP request to oMLX via OpenAI-compatible API (Bearer token).
+
+    Uses `/v1/models/*` for load/unload and `/v1/models/status` for status.
+    """
+    import urllib.request
+    url = f"http://{MLX_HOST}:{MLX_PORT}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {MLX_TOKEN}")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    return urllib.request.urlopen(req, timeout=60)
+
+
+def _mlx_models_status():
+    """GET /v1/models/status — returns per-model loaded flag."""
+    resp = _mlx_req("GET", "/v1/models/status")
+    return json.loads(resp.read())
+
+
+def _mlx_get_current():
+    """Find the currently loaded model name from /v1/models/status."""
+    try:
+        status = _mlx_models_status()
+        for m in status.get("models", []):
+            if m.get("loaded"):
+                return m["id"]
+    except Exception:
+        pass
+    return ""
+
+
 def do_switch_model(model_id: str) -> dict:
-    """Unload current model, then load the requested one via oMLX admin API."""
+    """Unload currently loaded model, then load the requested one.
+
+    Uses oMLX OpenAI-compatible endpoints (Bearer auth):
+    - GET /v1/models/status — find what's loaded
+    - POST /v1/models/{id}/unload — free current model
+    - POST /v1/models/{id}/load — load the target
+    """
     if model_id not in MODELS:
         return {"ok": False, "msg": f"unknown model: {model_id}. Available: {', '.join(MODELS)}"}
 
-    import urllib.request
-
-    # 1. Unload all
-    try:
-        req = urllib.request.Request(
-            f"http://{MLX_HOST}:{MLX_PORT}/admin/api/unload", method="POST",
-        )
-        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        return {"ok": False, "msg": f"unload failed: {e}"}
-
-    # 2. Wait for unload to settle
-    time.sleep(3)
-
-    # 3. Load the target model
     model = MODELS[model_id]
-    load_payload = {"model": model["path"]}
-    # 27B uses MTP draft for accelerated inference
-    if model_id == "27b":
-        load_payload["vlm_mtp_enabled"] = True
-        load_payload["is_default"] = True
-    payload = json.dumps(load_payload).encode()
+
+    # 1. Find current loaded model
+    current = _mlx_get_current()
+    if current and current != model["name"]:
+        # 2. Unload the current model via OpenAI-compatible API
+        try:
+            _mlx_req("POST", f"/v1/models/{urllib.parse.quote(current, safe='')}/unload")
+        except Exception as e:
+            return {"ok": False, "msg": f"unload {current} failed: {e}"}
+        time.sleep(3)
+
+    # 3. Load the target model via OpenAI-compatible API
     try:
-        req = urllib.request.Request(
-            MLX_RELOAD, data=payload, method="POST",
-        )
-        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
-        req.add_header("Content-Type", "application/json")
-        urllib.request.urlopen(req, timeout=60)
+        _mlx_req("POST", f"/v1/models/{urllib.parse.quote(model['name'], safe='')}/load")
     except Exception as e:
         return {"ok": False, "msg": f"load failed: {e}"}
 
-    time.sleep(5)
-
-    # 4. Verify it's loaded
-    try:
-        req = urllib.request.Request(MLX_LOADED, method="GET")
-        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
-        resp = urllib.request.urlopen(req, timeout=10)
-        loaded = json.loads(resp.read())
-        current = loaded.get("current", "")
-        name_in = model["name"]
-        if name_in in current:
-            return {"ok": True, "msg": f"Loaded {model['name']}", "model": model_id}
-        return {"ok": True, "msg": f"Reload sent (verified: {current})", "model": model_id}
-    except Exception:
-        return {"ok": True, "msg": f"Reload sent for {model['name']}", "model": model_id}
+    # 4. Wait and verify
+    time.sleep(8)
+    new_current = _mlx_get_current()
+    if new_current == model["name"]:
+        return {"ok": True, "msg": f"Loaded {model['name']}", "model": model_id}
+    return {"ok": True, "msg": f"Load triggered (current: {new_current or 'none'})", "model": model_id}
 
 
 def get_models_status() -> dict:
-    """Return available models and which one is currently loaded in oMLX."""
-    result = {"models": MODELS, "current": None}
-    import urllib.request
+    """Return available models and which one is currently loaded in oMLX.
 
+    Uses /v1/models/status — the OpenAI-compatible endpoint that returns
+    per-model loaded flag.
+    """
+    result = {"models": MODELS, "current": None}
     try:
-        req = urllib.request.Request(MLX_LOADED, method="GET")
-        req.add_header("X-API-Key", MLX_HEADERS["X-API-Key"])
-        resp = urllib.request.urlopen(req, timeout=10)
-        loaded = json.loads(resp.read())
-        current = loaded.get("current", "")
-        for mid, mdef in MODELS.items():
-            if mdef["name"] in current:
-                result["current"] = mid
+        status = _mlx_models_status()
+        for m in status.get("models", []):
+            if m.get("loaded"):
+                for mid, mdef in MODELS.items():
+                    if mdef["name"] == m["id"]:
+                        result["current"] = mid
+                        break
                 break
     except Exception:
-        pass  # oMLX is down or unreachable
-
+        pass
     return result
 
 
@@ -1132,6 +1149,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              "files": _env_scan()})
         elif self.path.startswith("/api/term/history"):
             self._send(200, _term_history())
+        elif self.path.startswith("/api/models"):
+            self._send(200, get_models_status())
         elif self.path.startswith("/api/term/poll"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._send(200, _term_poll((q.get("after") or ["0"])[0]))

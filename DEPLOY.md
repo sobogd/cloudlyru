@@ -191,7 +191,7 @@ curl -s https://files.iq-factura.com/api/v1/healthz     # {"ok":true,…}
 Публикация — локальный скрипт `./scripts/build-release.sh`: он собирает Flutter-клиент
 (`flutter/`) на этом маке и заливает подписанную сборку (тестов в проекте нет, проверка —
 `flutter analyze` и телефон). Перед запуском поднять `versionCode` в
-`flutter/pubspec.yaml` (`version: <versionName>+<versionCode>`, сейчас `1.0.0+45`) — скрипт
+`flutter/pubspec.yaml` (`version: <versionName>+<versionCode>`) — скрипт
 публикации не даёт положить сборку с тем же или меньшим номером, иначе телефон её как обновление
 не увидит:
 
