@@ -180,22 +180,20 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
       overflow: TextOverflow.ellipsis,
       style: const TextStyle(color: C.fg3, fontSize: 12),
     ),
-    onTap: provider.local ? null : () => _edit(provider),
-    trailing: provider.local
-        ? const Icon(Icons.lock_outline, size: 18, color: C.fg3)
-        : PopupMenuButton<String>(
-            tooltip: 'Действия',
-            onSelected: (v) => v == 'edit'
-                ? _edit(provider)
-                : v == 'key'
-                ? _key(provider)
-                : _delete(provider),
-            itemBuilder: (context) => const [
-              PopupMenuItem(value: 'edit', child: Text('Изменить')),
-              PopupMenuItem(value: 'key', child: Text('Ключ')),
-              PopupMenuItem(value: 'delete', child: Text('Удалить')),
-            ],
-          ),
+    onTap: () => _edit(provider),
+    trailing: PopupMenuButton<String>(
+      tooltip: 'Действия',
+      onSelected: (v) => v == 'edit'
+          ? _edit(provider)
+          : v == 'key'
+          ? _key(provider)
+          : _delete(provider),
+      itemBuilder: (context) => const [
+        PopupMenuItem(value: 'edit', child: Text('Изменить')),
+        PopupMenuItem(value: 'key', child: Text('Ключ')),
+        PopupMenuItem(value: 'delete', child: Text('Удалить')),
+      ],
+    ),
   );
 
   /// Строка встроенного провайдера: задан ли ключ и кнопка его замены.
