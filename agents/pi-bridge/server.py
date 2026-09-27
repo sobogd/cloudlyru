@@ -1742,6 +1742,10 @@ def provider_list():
                     "contextWindow": m.get("contextWindow"),
                     "maxTokens": m.get("maxTokens"),
                     "thinking": bool(m.get("reasoning")),
+                    # Приложению нужен сам признак, а не список input целиком: он строит из него
+                    # чекбокс «принимает картинки».
+                    "images": "image" in (m.get("input") or []),
+                    **( {"samplingParams": m["samplingParams"]} if isinstance(m.get("samplingParams"), dict) else {} ),
                 }
                 for m in (body.get("models") or [])
                 if isinstance(m, dict) and m.get("id")
@@ -1840,13 +1844,22 @@ def save_provider(body):
             "id": str(item["id"]),
             "name": str(item.get("name") or item["id"]),
             "reasoning": bool(item.get("thinking")),
-            "input": ["text"],
+            # Картинки модель принимает, если pi сам записал `image` в input: без этого
+            # флага приложению не предлагать модель для скриншотов и фото.
+            "input": ["text", "image"] if item.get("images") else ["text"],
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         }
         if item.get("contextWindow"):
             entry["contextWindow"] = int(item["contextWindow"])
         if item.get("maxTokens"):
             entry["maxTokens"] = int(item["maxTokens"])
+        sampling = item.get("samplingParams")
+        if isinstance(sampling, dict):
+            # Свободные параметры сэмплирования (температура, top_p…): пи смешивает их в тело
+            # запроса как есть. Берём только скаляры — прочее мосту незачем писать в models.json.
+            clean = {str(k): v for k, v in sampling.items() if isinstance(v, (int, float, str))}
+            if clean:
+                entry["samplingParams"] = clean
         new_models.append(entry)
     if not new_models:
         raise PiError("нужна хотя бы одна модель: без неё pi не сможет выбрать, чем отвечать")

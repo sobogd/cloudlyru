@@ -572,6 +572,13 @@ class AgentModel {
   /// Модель умеет «размышления».
   final bool thinking;
 
+  /// Модель принимает картинки в дополнение к тексту (`input: ["text", "image"]`).
+  final bool images;
+
+  /// Свободные параметры сэмплирования (`samplingParams` в models.json):
+  /// температура, top_p и прочее — мост смешивает их в тело запроса как есть.
+  final Map<String, Object?> samplingParams;
+
   /// Модель считает на этом маке, а не по API.
   final bool local;
 
@@ -586,6 +593,8 @@ class AgentModel {
     this.contextWindow,
     this.maxTokens,
     this.thinking = false,
+    this.images = false,
+    this.samplingParams = const {},
     this.local = false,
     this.hasKey = true,
   });
@@ -602,9 +611,18 @@ class AgentModel {
         ? (json['maxTokens'] as num).toInt()
         : null,
     thinking: json['thinking'] == true,
+    images:
+        (json['input'] is List) &&
+            ((json['input'] as List).contains('image')) == true,
+    samplingParams: <String, Object?>{
+      if (json['samplingParams'] is Map)
+        for (final e in (json['samplingParams'] as Map).entries)
+          '${e.key}': e.value,
+    },
     local: json['local'] == true,
     hasKey: json['hasKey'] != false,
   );
+
 
   /// Строка для хранения выбора в настройках и для сравнения с текущей моделью сессии.
   String get key => '$provider/$id';

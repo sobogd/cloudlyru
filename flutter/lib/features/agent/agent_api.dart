@@ -188,6 +188,9 @@ class AgentApi {
                 if (m.contextWindow != null) 'contextWindow': m.contextWindow,
                 if (m.maxTokens != null) 'maxTokens': m.maxTokens,
                 'thinking': m.thinking,
+                if (m.images) 'images': true,
+                if (m.samplingParams.isNotEmpty)
+                  'samplingParams': m.samplingParams,
               },
           ],
         },

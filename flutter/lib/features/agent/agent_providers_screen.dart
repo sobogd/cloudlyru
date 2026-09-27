@@ -1,3 +1,5 @@
+import 'dart:convert' show jsonEncode;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -362,6 +364,17 @@ class _AgentProviderFormScreenState
   final _apiKey = TextEditingController();
   final _manualModel = TextEditingController();
 
+  /// Развёрнутая модель (одна за раз); `null` — ни одна.
+  String? _expandedModel;
+
+  /// Черновики полей развёрнутой модели: окно контекста и потолок ответа.
+  final _ctxController = TextEditingController();
+  final _maxTokensController = TextEditingController();
+
+  /// Черновик параметров сэмплирования развёрнутой модели: пары ключ и значение.
+  final List<TextEditingController> _paramKeys = [];
+  final List<TextEditingController> _paramValues = [];
+
   /// Модели провайдера: выбранные в списке и добавленные вручную.
   late final List<AgentModel> _models = [...?widget.provider?.models];
 
@@ -385,6 +398,9 @@ class _AgentProviderFormScreenState
     _api.dispose();
     _apiKey.dispose();
     _manualModel.dispose();
+    for (final c in [..._paramKeys, ..._paramValues]) {
+      c.dispose();
+    }
     super.dispose();
   }
 
@@ -409,6 +425,90 @@ class _AgentProviderFormScreenState
     if (error == null && mounted) {
       snack(context, 'Провайдер ответил: моделей ${models.length}');
     }
+  }
+
+  /// Разворачивает строку модели и грузит её параметры в черновики, либо сворачивает.
+  ///
+  /// Одновременно развёрнута одна модель: общая пара контроллеров черновика не должна
+  /// показывать чужие значения, а переключаясь между моделями пользователь ждёт увидеть свои.
+  void _toggleModel(int index) {
+    final model = _models[index];
+    if (_expandedModel == model.id) {
+      setState(() => _expandedModel = null);
+    } else {
+      for (final c in [..._paramKeys, ..._paramValues]) {
+        c.dispose();
+      }
+      _paramKeys.clear();
+      _paramValues.clear();
+      for (final e in model.samplingParams.entries) {
+        _paramKeys.add(TextEditingController(text: e.key));
+        final value = e.value == null ? '' : switch (e.value) {
+          String() => e.value as String,
+              final other => jsonEncode(other),
+        };
+        _paramValues.add(TextEditingController(text: value));
+      }
+      setState(() {
+        _expandedModel = model.id;
+        final ctx = model.contextWindow ?? 0;
+        _ctxController.text = ctx == 0 ? '' : '$ctx';
+        final maxTokens = model.maxTokens ?? 0;
+        _maxTokensController.text = maxTokens == 0 ? '' : '$maxTokens';
+      });
+    }
+  }
+
+  /// Сбрасывает черновики развёрнутой модели: строки параметров освобождаются, поля очищаются.
+  void _resetModelDrafts() {
+    for (final c in [..._paramKeys, ..._paramValues]) {
+      c.dispose();
+    }
+    _paramKeys.clear();
+    _paramValues.clear();
+    _ctxController.text = '';
+    _maxTokensController.text = '';
+  }
+
+  /// Пары параметров сэмплирования из черновика: пустые ключи и значения отбрасываются.
+  Map<String, Object?> _draftParams() {
+    final params = <String, Object?>{};
+    for (var i = 0; i < _paramKeys.length; i++) {
+      final key = _paramKeys[i].text.trim();
+      if (key.isEmpty) continue;
+      final value = _parseParamValue(_paramValues[i].text);
+      if (value != null) params[key] = value;
+    }
+    return params;
+  }
+
+  /// Значение параметра из текста формы в JSON: число, булево или строка.
+  static Object? _parseParamValue(String raw) {
+    final text = raw.trim();
+    if (text.isEmpty) return null;
+    if (text == 'true') return true;
+    if (text == 'false') return false;
+    final number = int.tryParse(text) ?? double.tryParse(text);
+    if (number != null && number.toString() == text) return number;
+    return text;
+  }
+
+  /// Пишет текущие значения черновиков в развёрнутую модель при каждом изменении поля.
+  void _syncModelDrafts(int index) {
+    final model = _models[index];
+    if (_expandedModel != model.id) return;
+    setState(() {
+      _models[index] = AgentModel(
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        contextWindow: int.tryParse(_ctxController.text.trim()),
+        maxTokens: int.tryParse(_maxTokensController.text.trim()),
+        thinking: model.thinking,
+        images: model.images,
+        samplingParams: _draftParams(),
+      );
+    });
   }
 
   /// Сохраняет провайдера и закрывает форму.
@@ -571,31 +671,8 @@ class _AgentProviderFormScreenState
             'Модели провайдера',
             style: TextStyle(color: C.fg3, fontSize: 12),
           ),
-          for (final model in _models)
-            ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              title: Text(
-                model.id,
-                style: const TextStyle(color: C.fg, fontSize: 13.5),
-              ),
-              subtitle: Text(
-                [
-                  if (model.contextWindow != null)
-                    'окно ${model.contextWindow}',
-                  if (model.maxTokens != null) 'потолок ${model.maxTokens}',
-                  if (model.thinking) 'размышления',
-                ].join(' · '),
-                style: const TextStyle(color: C.fg3, fontSize: 11.5),
-              ),
-              trailing: IconButton(
-                tooltip: 'Убрать',
-                onPressed: () => setState(
-                  () => _models.removeWhere((m) => m.id == model.id),
-                ),
-                icon: const Icon(Icons.close, size: 18, color: C.fg3),
-              ),
-            ),
+          for (var i = 0; i < _models.length; i++)
+            _modelTile(i),
           const SizedBox(height: 16),
           FilledButton(
             onPressed: _saving ? null : _save,
@@ -620,12 +697,15 @@ class _AgentProviderFormScreenState
     String hint, {
     bool enabled = true,
     bool obscure = false,
+    TextInputType? keyboardType,
+    ValueChanged<String>? onChanged,
   }) => Padding(
     padding: const EdgeInsets.only(bottom: 10),
     child: TextField(
       controller: controller,
       enabled: enabled,
       obscureText: obscure,
+      keyboardType: keyboardType ?? TextInputType.text,
       style: const TextStyle(color: C.fg, fontSize: 13),
       decoration: InputDecoration(
         labelText: label,
@@ -639,4 +719,215 @@ class _AgentProviderFormScreenState
       ),
     ),
   );
+
+  /// Строка модели с разворачиваемыми параметрами.
+  Widget _modelTile(int index) {
+    final model = _models[index];
+    final expanded = _expandedModel == model.id;
+    return Column(
+      children: [
+        ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          title: Text(model.id, style: const TextStyle(color: C.fg, fontSize: 13.5)),
+          subtitle: Text(_modelParamsLabel(model), style: const TextStyle(color: C.fg3, fontSize: 11.5)),
+          onTap: () => _toggleModel(index),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Параметры',
+                onPressed: () => _toggleModel(index),
+                icon: Icon(
+                  expanded ? Icons.expand_less : Icons.expand_more,
+                  size: 18,
+                ),
+              ),
+              IconButton(
+                tooltip: 'Убрать',
+                onPressed: () {
+                  if (_expandedModel == model.id) _resetModelDrafts();
+                  setState(() {
+                    if (_expandedModel == model.id) _expandedModel = null;
+                    _models.removeWhere((m) => m.id == model.id);
+                  });
+                },
+                icon: const Icon(Icons.close, size: 18, color: C.fg3),
+              ),
+            ],
+          ),
+        ),
+        if (expanded) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 0, 16, 4),
+            child: Column(
+              children: [
+                _field(
+                  _ctxController,
+                  'Окно контекста',
+                  'токены: сколько модели видно из истории',
+                  keyboardType: TextInputType.number,
+                  onChanged: (_) => _syncModelDrafts(index),
+                ),
+                _field(
+                  _maxTokensController,
+                  'Потолок ответа',
+                  'максимум токенов в одном ответе',
+                  keyboardType: TextInputType.number,
+                  onChanged: (_) => _syncModelDrafts(index),
+                ),
+                CheckboxListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: const Text(
+                    'Размышляет',
+                    style: TextStyle(color: C.fg, fontSize: 13),
+                  ),
+                  value: model.thinking,
+                  onChanged: (on) => _patchModel(index, thinking: on == true),
+                ),
+                CheckboxListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: const Text(
+                    'Принимает картинки',
+                    style: TextStyle(color: C.fg, fontSize: 13),
+                  ),
+                  value: model.images,
+                  onChanged: (on) => _patchModel(index, images: on == true),
+                ),
+                ...[
+                  const SizedBox(height: 12),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 16, right: 8),
+                    child: Text(
+                      'Параметры сэмплирования',
+                      style: TextStyle(color: C.fg3, fontSize: 12),
+                    ),
+                  ),
+                  for (var i = 0; i < _paramKeys.length; i++) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(child: _paramField(_paramKeys[i], 'ключ', index)),
+                        const SizedBox(width: 8),
+                        Expanded(child: _paramField(_paramValues[i], 'значение', index)),
+                        IconButton(
+                          tooltip: 'Убрать параметр',
+                          onPressed: () => _removeParamRow(i),
+                          icon: const Icon(Icons.close, size: 16, color: C.fg3),
+                        ),
+                      ],
+                    ),
+                  ],
+                  TextButton.icon(
+                    onPressed: _addParamRow,
+                    icon: const Icon(Icons.add, size: 16),
+                    label: Text(
+                      'Добавить параметр',
+                      style: TextStyle(color: C.accent, fontSize: 13),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          )],
+      ],
+    );
+  }
+
+  /// Короткая сводка параметров под названием модели: что из них задано.
+  String _modelParamsLabel(AgentModel model) {
+    final parts = <String>[
+      if (model.contextWindow != null) 'окно ${_fmtTokens(model.contextWindow!)}',
+      if (model.maxTokens != null) 'потолок ${_fmtTokens(model.maxTokens!)}',
+    ];
+    if (model.thinking) {
+      parts.add('размышляет');
+    }
+    if (model.images) {
+      parts.add('картинки');
+    }
+    final n = model.samplingParams.length;
+    if (n > 0) {
+      parts.add('$n ${_plural(n, 'параметр', 'параметра', 'параметров')}');
+    }
+    return parts.join(' · ');
+  }
+
+  /// Человекочитаемо: 131072 → «128K», 4096 → «4К».
+  String _fmtTokens(int v) {
+    if (v >= 1024 && v % 1024 == 0) {
+      return '${v ~/ 1024}К';
+    }
+    if (v >= 1 << 20) {
+      return '${(v / (1 << 20)).toStringAsFixed(1)}М';
+    }
+    return '$v';
+  }
+
+  /// Склонение: «1 параметр», «2 параметра», «5 параметров».
+  String _plural(int n, String one, String few, String many) {
+    final m10 = n % 10;
+    final m100 = n % 100;
+    if (m10 == 1 && m100 != 11) {
+      return one;
+    }
+    if (m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14)) {
+      return few;
+    }
+    return many;
+  }
+
+  /// Чекбокс: обновляет один флаг, остальные значения модели — из черновиков.
+  void _patchModel(int index, {bool? thinking, bool? images}) {
+    final model = _models[index];
+    setState(() {
+      _models[index] = AgentModel(
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        contextWindow: int.tryParse(_ctxController.text.trim()),
+        maxTokens: int.tryParse(_maxTokensController.text.trim()),
+        thinking: thinking ?? model.thinking,
+        images: images ?? model.images,
+        samplingParams: _draftParams(),
+      );
+    });
+  }
+
+  /// Поле пары «ключ = значение» в списке параметров сэмплирования.
+  Widget _paramField(TextEditingController controller, String hint, int modelIndex) {
+    return TextField(
+      controller: controller,
+      onChanged: (_) => _syncModelDrafts(modelIndex),
+      style: const TextStyle(color: C.fg, fontSize: 13),
+      decoration: InputDecoration(
+        hintText: hint,
+        hintStyle: const TextStyle(color: C.fg3, fontSize: 12),
+        filled: true,
+        fillColor: C.canvas,
+        border: const OutlineInputBorder(),
+        isDense: true,
+      ),
+    );
+  }
+
+  void _addParamRow() {
+    setState(() {
+      _paramKeys.add(TextEditingController());
+      _paramValues.add(TextEditingController());
+    });
+  }
+
+  void _removeParamRow(int i) {
+    setState(() {
+      final k = _paramKeys.removeAt(i);
+      k.dispose();
+      final v = _paramValues.removeAt(i);
+      v.dispose();
+    });
+  }
 }
