@@ -8,20 +8,7 @@ import '../../util/widgets.dart';
 import 'agent_controller.dart';
 import 'agent_types.dart';
 
-/// Экран «Модели и ключи»: провайдеры, которые видит харнесс на маке, и их ключи.
-///
-/// Всё, что здесь меняется, меняется в файлах pi на маке: свои провайдеры — в
-/// `~/.pi/agent/models.json`, ключи встроенных — в `~/.pi/agent/auth.json`. Приложение только
-/// показывает список и пишет изменения через мост, поэтому ключи не лежат ни в телефоне, ни на
-/// сервере: они уезжают на мак и остаются там.
-///
-/// Два вида провайдеров, и разница только в том, кто знает адрес API:
-/// * **свои** — адрес, тип API, ключ и список моделей задаёт человек; годятся для любого
-///   OpenAI-совместимого сервиса, включая свой сервер;
-/// * **встроенные** — их pi знает сам (anthropic, openai, deepseek и прочие), у них задаётся
-///   только ключ, а список моделей появляется у pi сразу после этого.
 class AgentProvidersScreen extends ConsumerStatefulWidget {
-  /// Экран провайдеров.
   const AgentProvidersScreen({super.key});
 
   @override
@@ -29,9 +16,7 @@ class AgentProvidersScreen extends ConsumerStatefulWidget {
       _AgentProvidersScreenState();
 }
 
-/// Состояние экрана: контроллер списка, взятый один раз.
 class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
-  /// Контроллер списка провайдеров.
   late final AgentProvidersController _providers;
 
   @override
@@ -43,7 +28,6 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     });
   }
 
-  /// Открывает форму своего провайдера: новую или для правки существующего.
   Future<void> _edit([AgentProvider? provider]) async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -53,7 +37,6 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     if (mounted) await _providers.load();
   }
 
-  /// Удаляет своего провайдера с подтверждением.
   Future<void> _delete(AgentProvider provider) async {
     final ok = await confirmDialog(
       context,
@@ -67,11 +50,6 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     await _providers.remove(provider.key);
   }
 
-  /// Спрашивает ключ встроенного провайдера и сохраняет (или убирает) его.
-  ///
-  /// Показываем только признак «ключ задан»: сохранённый ключ не читается обратно ни в
-  /// приложение, ни на сервер — заменить его можно, а подсмотреть нельзя. Пустое поле убирает
-  /// ключ совсем: так провайдер отключается, не трогая ничего лишнего.
   Future<void> _key(AgentProvider provider) async {
     final value = await showDialog<String>(
       context: context,
@@ -150,7 +128,6 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     );
   }
 
-  /// Заголовок раздела списка.
   Widget _sectionTitle(String text) => Padding(
     padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
     child: Text(
@@ -159,7 +136,6 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     ),
   );
 
-  /// Строка своего провайдера: адрес, модели, правка и удаление.
   Widget _customTile(AgentProvider provider) => ListTile(
     leading: Icon(
       provider.local ? Icons.memory : Icons.cloud_outlined,
@@ -198,7 +174,6 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     ),
   );
 
-  /// Строка встроенного провайдера: задан ли ключ и кнопка его замены.
   Widget _builtinTile(AgentProvider provider) => ListTile(
     leading: Icon(
       provider.hasKey ? Icons.key : Icons.key_off_outlined,
@@ -220,7 +195,6 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
     ),
   );
 
-  /// Сообщение об ошибке над списком.
   Widget _errorBar(String message) => Container(
     width: double.infinity,
     margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -246,25 +220,16 @@ class _AgentProvidersScreenState extends ConsumerState<AgentProvidersScreen> {
   );
 }
 
-/// Диалог ввода ключа встроенного провайдера.
-///
-/// Отдельный виджет, а не поле в обработчике нажатия: контроллер поля должен освобождаться
-/// тогда же, когда исчезает само поле (в [State.dispose]), иначе диалог, закрываясь с
-/// анимацией, обращается к уже освобождённому контроллеру.
 class _KeyDialog extends StatefulWidget {
-  /// Провайдер, для которого вводится ключ.
   final AgentProvider provider;
 
-  /// Диалог ключа.
   const _KeyDialog({required this.provider});
 
   @override
   State<_KeyDialog> createState() => _KeyDialogState();
 }
 
-/// Состояние диалога: одно поле с ключом.
 class _KeyDialogState extends State<_KeyDialog> {
-  /// Поле ключа; новый ключ не подставляем — сохранённый не читается обратно.
   final _controller = TextEditingController();
 
   @override
@@ -326,16 +291,9 @@ class _KeyDialogState extends State<_KeyDialog> {
   }
 }
 
-/// Форма своего провайдера: адрес, ключ и модели.
-///
-/// Модели не заставляют вписывать руками: кнопка «Проверить и подтянуть» спрашивает у
-/// провайдера его собственный список (`GET /models`), и выбранные модели добавляются в
-/// настройки. Проверка заодно отвечает на вопрос, рабочий ли ключ, — до сохранения.
 class AgentProviderFormScreen extends ConsumerStatefulWidget {
-  /// Провайдер для правки; `null` — новый.
   final AgentProvider? provider;
 
-  /// Форма своего провайдера.
   const AgentProviderFormScreen({super.key, this.provider});
 
   @override
@@ -343,10 +301,8 @@ class AgentProviderFormScreen extends ConsumerStatefulWidget {
       _AgentProviderFormScreenState();
 }
 
-/// Состояние формы: поля, черновики моделей и признак «идёт проверка».
 class _AgentProviderFormScreenState
     extends ConsumerState<AgentProviderFormScreen> {
-  /// Поля формы: идентификатор, название, адрес, тип API и ключ.
   late final TextEditingController _key = TextEditingController(
     text: widget.provider?.key ?? '',
   );
@@ -364,30 +320,22 @@ class _AgentProviderFormScreenState
   final _apiKey = TextEditingController();
   final _manualModel = TextEditingController();
 
-  /// Развёрнутая модель (одна за раз); `null` — ни одна.
   String? _expandedModel;
 
-  /// Черновики полей развёрнутой модели: окно контекста и потолок ответа.
   final _ctxController = TextEditingController();
   final _maxTokensController = TextEditingController();
 
-  /// Черновик параметров сэмплирования развёрнутой модели: пары ключ и значение.
   final List<TextEditingController> _paramKeys = [];
   final List<TextEditingController> _paramValues = [];
 
-  /// Модели провайдера: выбранные в списке и добавленные вручную.
   late final List<AgentModel> _models = [...?widget.provider?.models];
 
-  /// Модели, полученные от провайдера при проверке (ещё не выбранные).
   List<AgentModel> _found = const [];
 
-  /// Идёт проверка провайдера.
   bool _probing = false;
 
-  /// Идёт сохранение.
   bool _saving = false;
 
-  /// Текст ошибки, показываемый рядом с полями.
   String? _error;
 
   @override
@@ -404,7 +352,6 @@ class _AgentProviderFormScreenState
     super.dispose();
   }
 
-  /// Проверяет адрес и ключ и подтягивает список моделей провайдера.
   Future<void> _probe() async {
     setState(() {
       _probing = true;
@@ -427,10 +374,6 @@ class _AgentProviderFormScreenState
     }
   }
 
-  /// Разворачивает строку модели и грузит её параметры в черновики, либо сворачивает.
-  ///
-  /// Одновременно развёрнута одна модель: общая пара контроллеров черновика не должна
-  /// показывать чужие значения, а переключаясь между моделями пользователь ждёт увидеть свои.
   void _toggleModel(int index) {
     final model = _models[index];
     if (_expandedModel == model.id) {
@@ -459,7 +402,6 @@ class _AgentProviderFormScreenState
     }
   }
 
-  /// Сбрасывает черновики развёрнутой модели: строки параметров освобождаются, поля очищаются.
   void _resetModelDrafts() {
     for (final c in [..._paramKeys, ..._paramValues]) {
       c.dispose();
@@ -470,7 +412,6 @@ class _AgentProviderFormScreenState
     _maxTokensController.text = '';
   }
 
-  /// Пары параметров сэмплирования из черновика: пустые ключи и значения отбрасываются.
   Map<String, Object?> _draftParams() {
     final params = <String, Object?>{};
     for (var i = 0; i < _paramKeys.length; i++) {
@@ -482,7 +423,6 @@ class _AgentProviderFormScreenState
     return params;
   }
 
-  /// Значение параметра из текста формы в JSON: число, булево или строка.
   static Object? _parseParamValue(String raw) {
     final text = raw.trim();
     if (text.isEmpty) return null;
@@ -493,7 +433,6 @@ class _AgentProviderFormScreenState
     return text;
   }
 
-  /// Пишет текущие значения черновиков в развёрнутую модель при каждом изменении поля.
   void _syncModelDrafts(int index) {
     final model = _models[index];
     if (_expandedModel != model.id) return;
@@ -511,7 +450,6 @@ class _AgentProviderFormScreenState
     });
   }
 
-  /// Сохраняет провайдера и закрывает форму.
   Future<void> _save() async {
     setState(() {
       _saving = true;
@@ -690,7 +628,6 @@ class _AgentProviderFormScreenState
     );
   }
 
-  /// Поле формы с подписью и подсказкой.
   Widget _field(
     TextEditingController controller,
     String label,
@@ -720,7 +657,6 @@ class _AgentProviderFormScreenState
     ),
   );
 
-  /// Строка модели с разворачиваемыми параметрами.
   Widget _modelTile(int index) {
     final model = _models[index];
     final expanded = _expandedModel == model.id;
@@ -838,7 +774,6 @@ class _AgentProviderFormScreenState
     );
   }
 
-  /// Короткая сводка параметров под названием модели: что из них задано.
   String _modelParamsLabel(AgentModel model) {
     final parts = <String>[
       if (model.contextWindow != null) 'окно ${_fmtTokens(model.contextWindow!)}',
@@ -857,7 +792,6 @@ class _AgentProviderFormScreenState
     return parts.join(' · ');
   }
 
-  /// Человекочитаемо: 131072 → «128K», 4096 → «4К».
   String _fmtTokens(int v) {
     if (v >= 1024 && v % 1024 == 0) {
       return '${v ~/ 1024}К';
@@ -868,7 +802,6 @@ class _AgentProviderFormScreenState
     return '$v';
   }
 
-  /// Склонение: «1 параметр», «2 параметра», «5 параметров».
   String _plural(int n, String one, String few, String many) {
     final m10 = n % 10;
     final m100 = n % 100;
@@ -881,7 +814,6 @@ class _AgentProviderFormScreenState
     return many;
   }
 
-  /// Чекбокс: обновляет один флаг, остальные значения модели — из черновиков.
   void _patchModel(int index, {bool? thinking, bool? images}) {
     final model = _models[index];
     setState(() {
@@ -898,7 +830,6 @@ class _AgentProviderFormScreenState
     });
   }
 
-  /// Поле пары «ключ = значение» в списке параметров сэмплирования.
   Widget _paramField(TextEditingController controller, String hint, int modelIndex) {
     return TextField(
       controller: controller,

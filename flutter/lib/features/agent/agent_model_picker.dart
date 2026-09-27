@@ -8,16 +8,6 @@ import 'agent_controller.dart';
 import 'agent_providers_screen.dart';
 import 'agent_types.dart';
 
-/// Диалог выбора модели: локальная llama.cpp на маке или удалённый провайдер по API.
-///
-/// Список приходит от pi с мака, поэтому в нём ровно то, что он действительно может запустить:
-/// добавить удалённую модель — значит прописать провайдера и ключ в `~/.pi/agent/models.json`
-/// на маке, и после этого она появится здесь. В приложении ключей нет и не будет: оно только
-/// выбирает из того, что уже настроено, и показывает признак «ключ не задан» у тех провайдеров,
-/// которые без него не ответят.
-///
-/// Выбранная модель применяется к открытой сессии и запоминается как модель по умолчанию для
-/// новых: человек, перешедший на удалённую модель, ждёт её и в следующем проекте.
 Future<AgentModel?> showModelPicker(
   BuildContext context,
   WidgetRef ref, {
@@ -25,9 +15,6 @@ Future<AgentModel?> showModelPicker(
   String? current,
 }) async {
   final controller = ref.read(agentModelsProvider.notifier);
-  // Список читаем здесь, а не при входе в раздел: запрос к маку нужен только тому, кто
-  // действительно открывает выбор модели. Харнесс важен: у pi модели задаются провайдерами,
-  // у Claude Code — своим набором, и показывать одни вместо других нельзя.
   unawaited(controller.load(harness: harness));
   return showDialog<AgentModel>(
     context: context,
@@ -35,15 +22,11 @@ Future<AgentModel?> showModelPicker(
   );
 }
 
-/// Диалог выбора модели.
 class _ModelPickerDialog extends ConsumerWidget {
-  /// Харнесс, чьи модели показываются.
   final String harness;
 
-  /// Ключ модели, которая используется сейчас (`провайдер/идентификатор`).
   final String? current;
 
-  /// Диалог выбора модели.
   const _ModelPickerDialog({required this.harness, this.current});
 
   @override
@@ -126,12 +109,8 @@ class _ModelPickerDialog extends ConsumerWidget {
               ),
       ),
       actions: [
-        // Провайдеры есть только у pi: Claude Code берёт модели из своей подписки или ключа,
-        // и добавлять там нечего
         if (harness == 'pi')
           TextButton(
-            // Добавить провайдера можно прямо отсюда: чаще всего выбор модели открывают именно
-            // для того, чтобы понять, чего в списке не хватает
             onPressed: () {
               Navigator.of(context).pop();
               Navigator.of(context).push(
@@ -150,13 +129,11 @@ class _ModelPickerDialog extends ConsumerWidget {
     );
   }
 
-  /// Заголовок группы моделей: «на маке» и «по API».
   Widget _groupTitle(String text) => Padding(
     padding: const EdgeInsets.only(top: 8, bottom: 2),
     child: Text(text, style: const TextStyle(color: C.fg3, fontSize: 12)),
   );
 
-  /// Строка модели: название, идентификатор, окно контекста и признак «нужен ключ».
   Widget _row(BuildContext context, WidgetRef ref, AgentModel model) {
     final isCurrent =
         current != null && (current == model.key || current == model.id);
@@ -211,7 +188,6 @@ class _ModelPickerDialog extends ConsumerWidget {
     );
   }
 
-  /// Токены в коротком виде: «32 768» и «200 000» читаются лучше, чем «32768».
   String _tokens(int value) {
     final text = value.toString();
     final buffer = StringBuffer();
@@ -223,18 +199,11 @@ class _ModelPickerDialog extends ConsumerWidget {
   }
 }
 
-/// Диалог выбора уровня усилия Claude Code: сколько модель думает над ответом.
-///
-/// Возвращает идентификатор уровня, пустую строку — «как решает Claude Code» — или `null`,
-/// если диалог закрыли. Пустая строка отличается от отмены намеренно: снять выбор и вернуться
-/// к умолчанию модели — осмысленное действие, и молча путать его с закрытием диалога нельзя.
 Future<String?> showEffortPicker(
   BuildContext context,
   WidgetRef ref, {
   required String current,
 }) async {
-  // Список уровней приходит тем же ответом, что и модели. Читаем его здесь, а не при входе в
-  // разговор: запрос нужен только тому, кто действительно открывает выбор усилия.
   unawaited(ref.read(agentModelsProvider.notifier).load(harness: 'claude'));
   return showDialog<String>(
     context: context,
@@ -242,18 +211,14 @@ Future<String?> showEffortPicker(
   );
 }
 
-/// Диалог выбора уровня усилия: «как решает модель» плюс уровни, которые знает мост.
 class _EffortPickerDialog extends ConsumerWidget {
-  /// Текущий уровень сессии; пусто — умолчание модели.
   final String current;
 
-  /// Диалог выбора усилия.
   const _EffortPickerDialog({required this.current});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(agentModelsProvider);
-    // Уровни приходят только от Claude Code: у pi список пуст, и показывать там нечего
     final efforts = state.harness == 'claude'
         ? state.efforts
         : const <AgentEffort>[];
@@ -333,7 +298,6 @@ class _EffortPickerDialog extends ConsumerWidget {
     );
   }
 
-  /// Строка уровня: по тапу возвращает идентификатор наружу.
   Widget _row(
     BuildContext context, {
     required String id,

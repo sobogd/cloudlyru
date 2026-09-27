@@ -6,24 +6,15 @@ import 'agent_controller.dart';
 import 'agent_providers_screen.dart';
 import 'agent_types.dart';
 
-/// Выбор человека в мастере новой сессии: папка, харнесс и модель.
-///
-/// Именем типа, а не записью из трёх полей: результат уходит наружу, и по нему экран открывает
-/// сессию — так видно, что «сначала пусто» здесь невозможно.
 class NewSessionChoice {
-  /// Папка проекта, в которой поднимется агент.
   final AgentProject project;
 
-  /// Харнесс разговора (`pi` или `claude`).
   final String harness;
 
-  /// Модель в виде `провайдер/идентификатор`; `null` — модель по умолчанию харнесса.
   final String? modelKey;
 
-  /// Имя разговора, если человек его задал; пусто — имя поставит сам харнесс по первому вопросу.
   final String name;
 
-  /// Выбор новой сессии.
   const NewSessionChoice({
     required this.project,
     required this.harness,
@@ -32,16 +23,6 @@ class NewSessionChoice {
   });
 }
 
-/// Мастер новой сессии: папка проекта → модель (локальные, удалённые, Claude Code).
-///
-/// Показывается модалкой по кнопке «+» в общем списке разговоров. Сессию он не открывает сам, а
-/// только возвращает выбор: поднимает её экран, который умеет показать отказ моста и перейти в
-/// переписку.
-///
-/// Список моделей берётся у всех харнессов сразу: в этом выборе рядом стоят локальные модели pi,
-/// удалённые по API и модели Claude Code, и человек должен видеть их одним списком.
-/// [suggestedName] — имя, предложенное разделом, который позвал мастер (доска PR предлагает
-/// `repo#123`). Человек его правит или стирает: поле необязательное.
 Future<NewSessionChoice?> showNewSessionWizard(
   BuildContext context,
   WidgetRef ref, {
@@ -53,33 +34,22 @@ Future<NewSessionChoice?> showNewSessionWizard(
   );
 }
 
-/// Диалог-мастер: два шага в одном виджете, чтобы шаг назад не терял выбранную папку.
 class _NewSessionWizard extends ConsumerStatefulWidget {
-  /// Диалог мастера новой сессии.
   const _NewSessionWizard({this.suggestedName = ''});
 
-  /// Имя, с которым поле открывается заполненным.
   final String suggestedName;
 
   @override
   ConsumerState<_NewSessionWizard> createState() => _NewSessionWizardState();
 }
 
-/// Состояние мастера: текущий шаг и выбранная на первом шаге папка.
 class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
-  /// Шаг: 0 — папка, 1 — модель.
   int _step = 0;
 
-  /// Папка, выбранная на первом шаге.
   AgentProject? _project;
 
-  /// Загружаем ли мы данные (используется, чтобы не запускать загрузку дважды).
   bool _started = false;
 
-  /// Имя будущего разговора: необязательное, живёт на обоих шагах.
-  ///
-  /// Полем, а не отдельным шагом: имя нужно далеко не всегда, и лишний экран между выбором
-  /// модели и разговором стоил бы нажатия в каждой новой сессии.
   late final TextEditingController _name =
       TextEditingController(text: widget.suggestedName);
 
@@ -92,21 +62,9 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
   @override
   void initState() {
     super.initState();
-    // Данные читаем после первого кадра: провайдеры в initState трогать нельзя. Проекты и
-    // харнессы читаются заново, а не берутся из экрана: диалог может открыться и до его
-    // первой загрузки.
     WidgetsBinding.instance.addPostFrameCallback((_) => _prepare());
   }
 
-  /// Читает проекты и харнессы, затем модели всех доступных харнессов.
-  ///
-  /// Харнессы определяют, чьи модели показывать, поэтому модели читаются только после них. Если
-  /// про харнессы узнать не удалось (мост недоступен), предлагаем хотя бы pi: его список моделей
-  /// всё равно вернёт ошибку словами, и она покажется в диалоге.
-  ///
-  /// Проекты перечитываются всегда, а не берутся из экрана: в них лежит число разговоров в
-  /// папке, и после удаления сессии оно расходилось с самим списком («5 разговоров» при четырёх
-  /// строках), потому что экран обновляет только список сессий, а проекты читает один раз.
   Future<void> _prepare() async {
     if (_started) return;
     _started = true;
@@ -143,7 +101,6 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     );
   }
 
-  /// Шапка: на первом шаге — название, на втором — выбранная папка и возврат назад.
   Widget _header() {
     if (_step == 0) {
       return const Padding(
@@ -176,7 +133,6 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     );
   }
 
-  /// Первый шаг: список папок, в которых можно поднять агента.
   Widget _folderStep() {
     final state = ref.watch(agentProjectsProvider);
     if (state.loading && state.projects.isEmpty) {
@@ -225,7 +181,6 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     );
   }
 
-  /// Второй шаг: модели трёх групп — на маке, по API и Claude Code.
   Widget _modelStep() {
     final state = ref.watch(agentAllModelsProvider);
     final piLocal = [
@@ -286,7 +241,6 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     );
   }
 
-  /// Строка модели: по тапу возвращает выбор наружу.
   Widget _modelRow(AgentModel model, String harness) {
     final enabled = model.hasKey;
     return InkWell(
@@ -345,7 +299,6 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     );
   }
 
-  /// Кнопки внизу: добавить провайдера и закрыть.
   Widget _actions() {
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -367,14 +320,11 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     );
   }
 
-  /// Кнопки мастера: провайдеры и отмена.
   Widget _buttons() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
       child: Row(
         children: [
-          // Провайдеров можно добавлять при pi: Claude Code берёт модели из своей подписки или
-          // ключа, и снаружи в него не влезть
           TextButton(
             onPressed: () {
               Navigator.of(context).pop();
@@ -396,13 +346,11 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     );
   }
 
-  /// Заголовок группы моделей.
   Widget _groupTitle(String text) => Padding(
     padding: const EdgeInsets.fromLTRB(8, 10, 8, 2),
     child: Text(text, style: const TextStyle(color: C.fg3, fontSize: 12)),
   );
 
-  /// Пояснение вместо списка: пусто, но не из-за ошибки запроса.
   Widget _hint(String text) => Padding(
     padding: const EdgeInsets.all(20),
     child: Text(
@@ -411,11 +359,9 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     ),
   );
 
-  /// Значок харнесса: у pi терминал, у Claude Code — звёздочка его бренда.
   IconData _harnessIcon(String harness) =>
       harness == 'claude' ? Icons.auto_awesome : Icons.terminal;
 
-  /// Токены в коротком виде: «32 768» читается лучше, чем «32768».
   String _tokens(int value) {
     final text = value.toString();
     final buffer = StringBuffer();

@@ -1,30 +1,14 @@
-/// Типы раздела «Проекты»: то, что приходит от моста до харнесса pi (`agents/pi-bridge`).
-///
-/// Отдельным файлом от клиента ([agent_api.dart]) и состояния ([agent_controller.dart]) — как
-/// в остальных разделах: разбор JSON не должен быть перемешан с сетью и экраном.
-///
-/// Все поля разбираются мягко (недостающее — пустое значение, а не исключение): список
-/// проектов важнее строгости одной строки, а мост и приложение обновляются порознь.
 library;
 
-/// Проект — папка, в которой работает агент.
-///
-/// Именно папка, а не запись в базе: у pi сессия привязана к рабочей директории, и вся
-/// «регистрация проекта» — это наличие папки внутри разрешённого корня.
 class AgentProject {
-  /// Полный путь на маке; он же идентификатор проекта в ручках моста.
   final String path;
 
-  /// Имя последней папки — то, что показывается в списке.
   final String name;
 
-  /// Сколько сессий уже есть в этой папке.
   final int sessions;
 
-  /// Время последней сессии, если она была.
   final DateTime? lastUsed;
 
-  /// Проект из ответа моста.
   const AgentProject({
     required this.path,
     required this.name,
@@ -32,7 +16,6 @@ class AgentProject {
     this.lastUsed,
   });
 
-  /// Разбор строки списка проектов.
   factory AgentProject.fromJson(Map<String, dynamic> json) => AgentProject(
     path: json['path']?.toString() ?? '',
     name: json['name']?.toString() ?? '',
@@ -40,55 +23,32 @@ class AgentProject {
     lastUsed: DateTime.tryParse(json['lastUsed']?.toString() ?? ''),
   );
 
-  /// Проект по одному пути: имя — последняя папка.
-  ///
-  /// Нужен общему списку разговоров: там у сессии есть только её рабочая папка, а разобранного
-  /// проекта (с именем и счётчиком) нет — открывать сессию всё равно надо с путём.
   factory AgentProject.fromPath(String path) {
     final parts = path.split('/').where((p) => p.isNotEmpty).toList();
     return AgentProject(path: path, name: parts.isEmpty ? path : parts.last);
   }
 }
 
-/// Сессия pi в проекте — строка списка сессий (файл истории на маке).
 class AgentSession {
-  /// Идентификатор сессии pi; им же она продолжается.
   final String id;
 
-  /// Имя сессии: поставленное человеком (`/name`) или первые слова первого вопроса.
   final String name;
 
-  /// Сколько сообщений в сессии.
   final int messages;
 
-  /// Модель, которой считался разговор (`провайдер` и идентификатор из первой записи сессии).
-  ///
-  /// Нужна списку: по ней видно, где считалась сессия — на маке или по API, — и это не
-  /// приходится выяснять, открыв разговор.
   final String provider;
   final String model;
 
-  /// Харнесс разговора (`pi` или `claude`) и его название для значка в списке.
   final String harness;
   final String harnessName;
 
-  /// Рабочая папка разговора — в каком проекте его открывать.
-  ///
-  /// Приходит только в общем списке (без папки): по ней строка показывает проект и по ней же
-  /// сессия открывается заново. В списке одной папки поле пустое — она и так известна.
   final String path;
 
-  /// Когда сессия начата и когда в ней последний раз что-то происходило.
   final DateTime? startedAt;
   final DateTime? updatedAt;
 
-  /// Агент работает в этой сессии прямо сейчас — даже если экран разговора закрыт.
-  ///
-  /// Нужно списку: уход с экрана работу не останавливает, разговор может продолжать считаться,
-  /// и без пометки это выглядит как «ничего не происходит».
   final bool busy;
 
-  /// Сессия из ответа моста.
   const AgentSession({
     required this.id,
     this.name = '',
@@ -103,7 +63,6 @@ class AgentSession {
     this.busy = false,
   });
 
-  /// Разбор сессии из ответа моста.
   factory AgentSession.fromJson(Map<String, dynamic> json) => AgentSession(
     id: json['id']?.toString() ?? '',
     name: json['name']?.toString() ?? '',
@@ -118,94 +77,61 @@ class AgentSession {
     busy: json['busy'] == true,
   );
 
-  /// Подпись модели для строки списка: `провайдер/идентификатор` или пустая строка.
   String get modelLabel => model.isEmpty ? '' : '$provider/$model';
 
-  /// Имя проекта разговора — последняя папка его пути; пусто, если пути нет.
   String get projectName {
     final parts = path.split('/').where((p) => p.isNotEmpty).toList();
     return parts.isEmpty ? '' : parts.last;
   }
 }
 
-/// Открытая сессия: то, что мост шлёт в ответ на открытие и в конце каждого ответа.
-///
-/// Кроме модели и занятости несёт статистику разговора: сколько занято окно модели, сколько
-/// токенов израсходовано и сколько в сессии сообщений и вызовов инструментов. Это нужно экрану
-/// сессии — по этим числам видно, когда пора сжимать контекст, и как долго идёт работа.
 class AgentSessionInfo {
-  /// Идентификатор сессии.
   final String id;
 
-  /// Рабочая папка процесса pi.
   final String path;
 
-  /// Имя сессии, если задано.
   final String name;
 
-  /// Модель и её провайдер (например, `qwen/qwen3.8-27b` и `local`).
   final String model;
   final String provider;
 
-  /// Человеческое название модели («Qwen3.8-27B Q4_K_XL (локально, llama.cpp)»), если pi его дал.
   final String modelName;
 
-  /// Модель считает на домашнем маке, а не по API — по этому признаку сессия подписывается
-  /// словами, чтобы удалённая модель не выглядела как локальная.
   final bool local;
 
-  /// Харнесс разговора (`pi` или `claude`).
   final String harness;
   final String harnessName;
 
-  /// Заполнение контекста — оценка, а не точное число (так у Claude Code: он не отдаёт
-  /// «занято токенов» одним полем, и процент считается из расхода последнего хода).
   final bool contextEstimated;
 
-  /// Сколько сообщений в сессии.
   final int messages;
 
-  /// Занята ли сессия: идёт генерация.
   final bool busy;
 
-  /// Уровень «размышлений» у pi (`off`, `medium`, …): у локальной модели выключен, у
-  /// reasoning-моделей по API включается на маке. У Claude Code вместо него — [effort].
   final String thinkingLevel;
 
-  /// Уровень усилия Claude Code (`low`, `medium`, …, пусто — умолчание модели).
-  ///
-  /// Нужен экрану сессии: выбор уровня живёт в меню и показывается в сведениях, а у pi такого
-  /// выбора нет — его размышления задаёт сама модель.
   final String effort;
 
-  /// Сколько токенов контекста занято и каково окно модели.
   final int? contextTokens;
   final int? contextWindow;
 
-  /// Заполнение окна в процентах — то же число, что показывает pi.
   final double contextPercent;
 
-  /// Расход токенов за всю сессию (по данным провайдера) и стоимость, если провайдер её считает.
   final int tokensInput;
   final int tokensOutput;
   final int tokensCacheRead;
   final int tokensTotal;
   final double cost;
 
-  /// Счётчики разговора: вопросов, ответов и вызовов инструментов.
   final int userMessages;
   final int assistantMessages;
   final int toolCalls;
 
-  /// Когда сессия начата и когда в ней последний раз что-то происходило.
   final DateTime? startedAt;
   final DateTime? updatedAt;
 
-  /// Файл сессии на маке: путь показывается в сведениях, чтобы разговор можно было найти
-  /// в терминале (`pi -r`) или удалить руками.
   final String sessionFile;
 
-  /// Сессия из ответа моста.
   const AgentSessionInfo({
     required this.id,
     required this.path,
@@ -237,12 +163,6 @@ class AgentSessionInfo {
     this.sessionFile = '',
   });
 
-  /// Копия описания с другим именем — для переименованного разговора.
-  ///
-  /// Нужна потому, что класс неизменяемый, а имя в шапке открытого разговора берётся именно
-  /// отсюда: без обновления правка была бы видна в списке, но не в шапке самого разговора.
-  /// Метод узкий, а не полный `copyWith`: менять у описания бывает только имя, а полный список
-  /// полей пришлось бы править при каждом новом поле и легко было бы в нём ошибиться.
   AgentSessionInfo withName(String value) => AgentSessionInfo(
     id: id,
     path: path,
@@ -274,7 +194,6 @@ class AgentSessionInfo {
     sessionFile: sessionFile,
   );
 
-  /// Разбор сессии из ответа моста.
   factory AgentSessionInfo.fromJson(Map<String, dynamic> json) {
     final tokens = json['tokens'] is Map
         ? (json['tokens'] as Map).cast<String, dynamic>()
@@ -314,10 +233,6 @@ class AgentSessionInfo {
     );
   }
 
-  /// Сколько токенов окна ещё свободно; `null`, если pi пока не посчитал заполнение.
-  ///
-  /// Нужно экрану прямо: «осталось 5 021» понятнее, чем «84%», когда думаешь, влезет ли в
-  /// контекст ещё одна большая команда.
   int? get contextFree {
     final used = contextTokens;
     final window = contextWindow;
@@ -325,60 +240,38 @@ class AgentSessionInfo {
     return (window - used).clamp(0, window);
   }
 
-  /// Подпись модели для шапки и сведений: название из pi, иначе идентификатор.
   String get modelLabel => modelName.isNotEmpty ? modelName : model;
 
-  /// Где считает модель — словами для экрана.
   String get whereLabel => local ? 'локальная (на маке)' : 'по API (удалённая)';
 }
 
-/// Итог удаления сессий: сколько удалилось и сколько вернулось.
-///
-/// «Вернулось» — не ошибка моста, а живой процесс: у Claude Code разговор, открытый в
-/// терминале, заново пишет свой журнал сразу после удаления. Такие разговоры удаляются не из
-/// приложения, и человеку надо сказать это словами.
 class AgentDeleteResult {
-  /// Сколько сессий удалено.
   final int deleted;
 
-  /// Сколько файлов восстановили живые процессы.
   final int restored;
 
-  /// Итог удаления.
   const AgentDeleteResult({this.deleted = 0, this.restored = 0});
 
-  /// Хоть что-то удалилось.
   bool get anyDeleted => deleted > 0;
 
-  /// Что-то вернулось — такие разговоры ведутся снаружи.
   bool get anyRestored => restored > 0;
 }
 
-/// Работа на маке: что считается прямо сейчас и что закончилось, пока приложения не было.
-///
-/// Снимок держит сервер (он опрашивает мост сам), поэтому «готово» видно и после того, как
-/// приложение закрывалось. Настоящих уведомлений в фоне нет — это отдельная работа с push-каналом.
 class AgentActivity {
-  /// Идентификаторы сессий, которые считаются прямо сейчас.
   final Set<String> running;
 
-  /// Сессии, которые закончились недавно: им показывается «готово».
   final Set<String> finished;
 
-  /// Когда снимок обновлялся на сервере; `null` — ещё ни разу.
   final DateTime? updatedAt;
 
-  /// Снимок работы.
   const AgentActivity({
     this.running = const {},
     this.finished = const {},
     this.updatedAt,
   });
 
-  /// Пустой снимок: ничего не известно.
   static const empty = AgentActivity();
 
-  /// Разбор снимка из ответа сервера.
   factory AgentActivity.fromJson(Map<String, dynamic> json) {
     Set<String> ids(Object? raw) => <String>{
       if (raw is List)
@@ -393,25 +286,15 @@ class AgentActivity {
   }
 }
 
-/// Харнесс — агент, который работает в папке проекта: pi или Claude Code.
-///
-/// Их может быть несколько, и разговоры у каждого свои: истории лежат в разных местах на маке,
-/// а модели задаются по-своему. Поэтому у сессии всегда есть харнесс, и приложение показывает
-/// его значком, чтобы не путать, чей это разговор.
 class AgentHarness {
-  /// Имя харнесса: `pi` или `claude`.
   final String harness;
 
-  /// Человеческое название для экрана.
   final String name;
 
-  /// Стоит ли он на маке (иначе предлагать его бессмысленно).
   final bool available;
 
-  /// Версия, как её печатает сам харнесс.
   final String version;
 
-  /// Харнесс из ответа моста.
   const AgentHarness({
     required this.harness,
     this.name = '',
@@ -419,7 +302,6 @@ class AgentHarness {
     this.version = '',
   });
 
-  /// Разбор харнесса из ответа моста.
   factory AgentHarness.fromJson(Map<String, dynamic> json) => AgentHarness(
     harness: json['harness']?.toString() ?? '',
     name: json['name']?.toString() ?? '',
@@ -427,43 +309,28 @@ class AgentHarness {
     version: json['version']?.toString() ?? '',
   );
 
-  /// Подпись для экрана: название, а если его нет — имя харнесса.
   String get label => name.isNotEmpty ? name : harness;
 }
 
-/// Провайдер моделей, настроенный у pi на маке: свой (с адресом и ключом) или встроенный.
-///
-/// Ключ сюда не попадает никогда — только признак «задан» и его длина: приложению незачем
-/// знать сам ключ, а показать «ключ сохранён» и «похоже, вставился не полностью» по длине можно.
 class AgentProvider {
-  /// Идентификатор провайдера у pi (`local`, `deepseek`, `openai`, …).
   final String key;
 
-  /// Человеческое название.
   final String name;
 
-  /// Адрес API; у встроенных провайдеров пусто — pi знает его сам.
   final String baseUrl;
 
-  /// Тип API (`openai-completions` и подобные) — только у своих провайдеров.
   final String api;
 
-  /// Свой провайдер из `models.json` (можно править и удалять) или встроенный (`auth.json`).
   final bool custom;
 
-  /// Ключ задан (или не нужен, как у локальной модели).
   final bool hasKey;
 
-  /// Длина сохранённого ключа: по ней видно, вставился ли он целиком.
   final int keyLength;
 
-  /// Провайдер считает на этом маке (llama.cpp), а не по API.
   final bool local;
 
-  /// Модели, описанные у своего провайдера (у встроенных список даёт сам pi).
   final List<AgentModel> models;
 
-  /// Провайдер из ответа моста.
   const AgentProvider({
     required this.key,
     this.name = '',
@@ -476,7 +343,6 @@ class AgentProvider {
     this.models = const [],
   });
 
-  /// Разбор провайдера из ответа моста.
   factory AgentProvider.fromJson(Map<String, dynamic> json) => AgentProvider(
     key: json['key']?.toString() ?? '',
     name: json['name']?.toString() ?? '',
@@ -501,40 +367,24 @@ class AgentProvider {
     ],
   );
 
-  /// Подпись для экрана: название, а если его нет — идентификатор.
   String get label => name.isNotEmpty ? name : key;
 }
 
-/// Уровень усилия Claude Code: сколько модель думает над ответом (флаг `--effort`).
-///
-/// Список приходит от моста тем же ответом, что и модели, и бывает пустым: у pi такого выбора
-/// нет, а у модели Claude Code без поддержки уровня выбор всё равно остаётся за ней самой.
-/// Идентификатор уходит в мост как есть, название показывается человеку.
 class AgentEffort {
-  /// Идентификатор уровня (`low`, `medium`, `high`, `xhigh`, `max`).
   final String id;
 
-  /// Человеческое название уровня.
   final String name;
 
-  /// Уровень усилия из ответа моста.
   const AgentEffort({required this.id, this.name = ''});
 
-  /// Разбор уровня из ответа моста.
   factory AgentEffort.fromJson(Map<String, dynamic> json) => AgentEffort(
     id: json['id']?.toString() ?? '',
     name: json['name']?.toString() ?? '',
   );
 
-  /// Подпись для экрана: название, а если его нет — идентификатор.
   String get label => name.isNotEmpty ? name : id;
 }
 
-/// Название уровня усилия по идентификатору.
-///
-/// Нужно сведениям о сессии и подписи после выбора: в описании сессии лежит только идентификатор
-/// (`high`), а список уровней приходит отдельно и в этот момент может быть не загружен. Для
-/// незнакомого идентификатора возвращаем его самого — показать пустоту было бы хуже.
 String agentEffortLabel(String id) {
   switch (id.trim()) {
     case 'low':
@@ -552,40 +402,25 @@ String agentEffortLabel(String id) {
   }
 }
 
-/// Модель, доступная харнессу на маке: локальная llama.cpp или удалённая по API.
-///
-/// Список приходит от pi, поэтому в нём ровно то, что он действительно может запустить.
-/// Ключей от API здесь нет: они остаются на маке, приложению приходит только признак «ключ
-/// задан», чтобы не предлагать модель, которая всё равно не ответит.
 class AgentModel {
-  /// Провайдер (`local`, `openai`, `deepseek`, …) и идентификатор модели.
   final String provider;
   final String id;
 
-  /// Человеческое название.
   final String name;
 
-  /// Окно контекста и потолок ответа в токенах, если pi их знает.
   final int? contextWindow;
   final int? maxTokens;
 
-  /// Модель умеет «размышления».
   final bool thinking;
 
-  /// Модель принимает картинки в дополнение к тексту (`input: ["text", "image"]`).
   final bool images;
 
-  /// Свободные параметры сэмплирования (`samplingParams` в models.json):
-  /// температура, top_p и прочее — мост смешивает их в тело запроса как есть.
   final Map<String, Object?> samplingParams;
 
-  /// Модель считает на этом маке, а не по API.
   final bool local;
 
-  /// У провайдера задан ключ (или он не нужен, как у локальной модели).
   final bool hasKey;
 
-  /// Модель из списка pi.
   const AgentModel({
     required this.provider,
     required this.id,
@@ -599,7 +434,6 @@ class AgentModel {
     this.hasKey = true,
   });
 
-  /// Разбор модели из ответа моста.
   factory AgentModel.fromJson(Map<String, dynamic> json) => AgentModel(
     provider: json['provider']?.toString() ?? '',
     id: json['id']?.toString() ?? '',
@@ -624,37 +458,24 @@ class AgentModel {
   );
 
 
-  /// Строка для хранения выбора в настройках и для сравнения с текущей моделью сессии.
   String get key => '$provider/$id';
 
-  /// Подпись строки списка: имя модели, а если его нет — идентификатор.
   String get label => name.isNotEmpty ? name : id;
 }
 
-/// Вызов инструмента агентом: что попросил, с чем и что получил.
-///
-/// Одна карточка на вызов: результат приходит отдельным сообщением pi, а показывать его
-/// отдельной строкой переписки незачем — это часть одного действия.
 class AgentTool {
-  /// Идентификатор вызова у pi; по нему результат подклеивается к вызову.
   final String id;
 
-  /// Имя инструмента: `bash`, `read`, `edit`, `write`, `grep`, `find`, `ls` и прочие у pi.
   final String name;
 
-  /// Аргументы вызова как их передал агент (команда, путь, шаблон).
   final Map<String, dynamic> args;
 
-  /// Вывод инструмента; у долгих команд наполняется по мере выполнения.
   final String output;
 
-  /// Инструмент завершился ошибкой.
   final bool isError;
 
-  /// Вызов ещё выполняется — на карточке это спиннер вместо галочки.
   final bool running;
 
-  /// Вызов инструмента.
   const AgentTool({
     required this.id,
     required this.name,
@@ -664,7 +485,6 @@ class AgentTool {
     this.running = false,
   });
 
-  /// Разбор вызова из ответа моста (в истории приходит готовым объектом).
   factory AgentTool.fromJson(Map<String, dynamic> json) => AgentTool(
     id: json['id']?.toString() ?? '',
     name: json['name']?.toString() ?? '',
@@ -675,7 +495,6 @@ class AgentTool {
     isError: json['isError'] == true,
   );
 
-  /// Копия с заменёнными полями; `null` означает «оставить как было».
   AgentTool copyWith({
     Map<String, dynamic>? args,
     String? output,
@@ -690,10 +509,6 @@ class AgentTool {
     running: running ?? this.running,
   );
 
-  /// Подпись вызова одной строкой: команда у оболочки, путь у файловых инструментов.
-  ///
-  /// Нужна строке карточки, пока она свёрнута: по ней видно, что агент делает, не разворачивая
-  /// вывод целиком.
   String get summary {
     for (final key in [
       'command',
@@ -710,92 +525,55 @@ class AgentTool {
   }
 }
 
-/// Блок ответа агента в том порядке, в каком он появился: кусок текста, «размышления» или
-/// ссылка на карточку вызова инструмента.
-///
-/// Нужен именно порядок. Модель отвечает так: пишет текст, просит выполнить команду, получает
-/// результат, пишет текст дальше — и всё это один ответ на один вопрос. Если рисовать текст
-/// отдельно от карточек, новый текст оказывается над карточками, и разговор читается не в том
-/// порядке, в каком шёл. Карточки адресуются идентификатором: сам вывод инструмента лежит в
-/// [AgentItem.tools] и в блоках не дублируется.
 class AgentBlock {
-  /// Вид блока: `text`, `reasoning` или `tool`.
   final String type;
 
-  /// Текст блока (для `text` и `reasoning`); у блока-инструмента пусто.
   final String text;
 
-  /// Идентификатор вызова инструмента (для `tool`).
   final String toolId;
 
-  /// Блок ответа.
   const AgentBlock({required this.type, this.text = '', this.toolId = ''});
 
-  /// Кусок текста ответа.
   const AgentBlock.text(String value) : this(type: 'text', text: value);
 
-  /// Кусок «размышлений» модели.
   const AgentBlock.reasoning(String value)
     : this(type: 'reasoning', text: value);
 
-  /// Ссылка на карточку вызова инструмента.
   const AgentBlock.tool(String id) : this(type: 'tool', toolId: id);
 
-  /// Разбор блока из ответа моста.
   factory AgentBlock.fromJson(Map<String, dynamic> json) => AgentBlock(
     type: json['type']?.toString() ?? 'text',
     text: json['text']?.toString() ?? '',
     toolId: json['id']?.toString() ?? '',
   );
 
-  /// Это кусок текста.
   bool get isText => type == 'text';
 
-  /// Это «размышления».
   bool get isReasoning => type == 'reasoning';
 
-  /// Это карточка вызова инструмента.
   bool get isTool => type == 'tool';
 
-  /// Копия с дописанным текстом.
   AgentBlock plus(String extra) =>
       AgentBlock(type: type, text: text + extra, toolId: toolId);
 }
 
-/// Элемент переписки: вопрос человека, ответ агента или прямая команда оболочки.
-///
-/// Одним типом, а не тремя, потому что экран рисует их одним списком и различает по [kind].
 class AgentItem {
-  /// Вид элемента: `user` (вопрос), `assistant` (ответ агента), `bash` (команда оболочки),
-  /// `note` (служебная строка, например автоответ на подтверждение).
   final String kind;
 
-  /// Текст: вопрос, ответ агента или вывод команды.
   final String text;
 
-  /// «Размышления» модели, если она их отдаёт (у локальной qwen они выключены).
   final String reasoning;
 
-  /// Блоки ответа в порядке появления: текст, «размышления» и карточки инструментов.
-  ///
-  /// Пустой список означает ответ от старого моста, который блоков ещё не присылал: тогда
-  /// экран рисует текст, размышления и карточки по отдельным полям.
   final List<AgentBlock> blocks;
 
-  /// Вызовы инструментов этого ответа (в том числе те, на которые ссылаются блоки).
   final List<AgentTool> tools;
 
-  /// Ошибка ответа (например, «Request was aborted»), если прогон не удался.
   final String error;
 
-  /// Команда для элемента `bash`.
   final String command;
 
-  /// Код выхода оболочки для элемента `bash`: `null` — мост не прислал, `0` — успех, `!= 0`
-  /// — ошибка. Без этого поля экран не может раскрасить вывод команды в зелёный/красный.
   final int? exitCode;
 
-  /// Элемент переписки.
   const AgentItem({
     required this.kind,
     this.text = '',
@@ -807,7 +585,6 @@ class AgentItem {
     this.exitCode,
   });
 
-  /// Разбор элемента из ответа моста.
   factory AgentItem.fromJson(Map<String, dynamic> json) => AgentItem(
     kind: json['kind']?.toString() ?? 'assistant',
     text: json['text']?.toString() ?? '',
@@ -827,13 +604,10 @@ class AgentItem {
     ],
   );
 
-  /// Это вопрос человека.
   bool get isUser => kind == 'user';
 
-  /// Это ответ агента (пузырь с текстом, размышлениями и карточками инструментов).
   bool get isAssistant => kind == 'assistant';
 
-  /// Копия с заменёнными полями.
   AgentItem copyWith({
     String? text,
     String? reasoning,
@@ -852,37 +626,27 @@ class AgentItem {
     exitCode: exitCode ?? this.exitCode,
   );
 
-  /// Ответ пуст: ни текста, ни карточек — на экране это ожидание первого куска ответа.
   bool get isEmpty =>
       text.isEmpty && reasoning.isEmpty && tools.isEmpty && blocks.isEmpty;
 }
 
-/// Расход токенов на ответ: приходит от провайдера по ходу генерации.
 class AgentUsage {
-  /// Токенов во входе и в ответе (у локальной llama.cpp вход считается по факту прогрева).
   final int input;
   final int output;
 
-  /// Всего токенов в контексте по данным провайдера.
   final int total;
 
-  /// Расход токенов.
   const AgentUsage({this.input = 0, this.output = 0, this.total = 0});
 }
 
-/// Состояние моста: жив ли он, какая версия pi и какая модель выбрана.
 class AgentHealth {
-  /// Версия харнесса, как её печатает `pi --version`.
   final String pi;
 
-  /// Провайдер и модель, которые мост передаёт pi.
   final String provider;
   final String model;
 
-  /// Корни, внутри которых разрешён выбор проектов.
   final List<String> roots;
 
-  /// Состояние моста.
   const AgentHealth({
     this.pi = '',
     this.provider = '',
@@ -890,7 +654,6 @@ class AgentHealth {
     this.roots = const [],
   });
 
-  /// Разбор ответа `/health`.
   factory AgentHealth.fromJson(Map<String, dynamic> json) => AgentHealth(
     pi: json['pi']?.toString() ?? '',
     provider: json['provider']?.toString() ?? '',
@@ -901,27 +664,17 @@ class AgentHealth {
     ],
   );
 
-  /// Подпись «харнесс и модель» для шапки раздела.
   String get label =>
       [if (pi.isNotEmpty) 'pi $pi', if (model.isNotEmpty) model].join(' · ');
 }
 
-/// Страница истории разговора: последние сообщения и признак «выше есть ещё».
-///
-/// Нужна потому, что история отдаётся не целиком: у длинной сессии она измеряется мегабайтами
-/// JSON, и тянуть её при каждом открытии разговора незачем. Приложение берёт последнюю страницу,
-/// а предыдущие догружает по нажатию — с индексом `before`.
 class AgentHistoryPage {
-  /// Сообщения страницы, от старых к новым.
   final List<AgentItem> items;
 
-  /// Сколько сообщений в разговоре всего — по этому числу считается позиция страницы.
   final int total;
 
-  /// Есть ли сообщения выше этой страницы.
   final bool hasMore;
 
-  /// Страница истории.
   const AgentHistoryPage({
     this.items = const [],
     this.total = 0,
@@ -929,76 +682,43 @@ class AgentHistoryPage {
   });
 }
 
-/// Одно событие потока ответа.
-///
-/// Как и у чата, событие несёт ровно то, что изменилось, а все поля необязательные: незнакомый
-/// тип события не ломает разбор, и старая сборка приложения переживает новый мост.
 class AgentEvent {
-  /// Кусок текста ответа.
   final String? text;
 
-  /// Кусок «размышлений».
   final String? reasoning;
 
-  /// Что происходит прямо сейчас: «читаю файл», «выполняю команду».
   final String? status;
 
-  /// Начался вызов инструмента.
   final AgentTool? toolStart;
 
-  /// Прогресс вызова: накопленный вывод на текущий момент.
   final AgentTool? toolProgress;
 
-  /// Вызов завершён.
   final AgentTool? toolEnd;
 
-  /// Объявленный (ещё без аргументов) вызов инструмента.
   final AgentTool? toolCall;
 
-  /// Служебная строка для переписки: например, автоответ на подтверждение.
   final String? note;
 
-  /// Сообщение принято в очередь занятой сессии; число — его место в очереди.
   final int? queued;
 
-  /// Сообщение из очереди ушло агенту: подпись очереди можно снимать.
   final bool queuedStarted;
 
-  /// Расход токенов.
   final AgentUsage? usage;
 
-  /// Сессия после завершения прогона (модель, расход контекста).
   final AgentSessionInfo? session;
 
-  /// Ответ завершён.
   final bool done;
 
-  /// Причина отказа; вместе с [done] означает, что поток закончился ошибкой.
   final String? error;
 
-  /// Смотреть нечего: так отвечает ручка наблюдения за прогоном, когда прогона нет.
-  ///
-  /// Нужно тому, кто подключается к идущему прогону после обрыва связи: по этому событию видно,
-  /// что ответ уже не пишется и продолжения не будет.
   final bool idle;
 
-  /// Снимок идущего прогона: всё, что агент уже написал в текущем ответе.
-  ///
-  /// Приходит в начале потока при подключении к идущему прогону. Экран заменяет им хвост
-  /// переписки: так куски ответа, вышедшие между его снимком истории и подпиской, не теряются.
   final AgentItem? snapshot;
 
-  /// Пульс связи: мост шлёт его, пока агент молчит (модель думает, инструмент работает).
-  ///
-  /// Своего содержимого у события нет — оно нужно только чтобы приложение знало, что поток жив.
   final bool ping;
 
-  /// Сжатие контекста завершено: mост прислал `compaction_end` из pi.
-  ///
-  /// По этому событию экран знает, что compact завершён и сессию можно обновить.
   final bool compacted;
 
-  /// Событие потока ответа.
   const AgentEvent({
     this.text,
     this.reasoning,
