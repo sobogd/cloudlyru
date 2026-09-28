@@ -526,10 +526,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
       } else if (item.isUser) {
         mine.add(_Entry(_EntryKind.user, text: item.text));
       } else if (item.blocks.isEmpty) {
-        if (item.reasoning.isNotEmpty) {
+        if (item.reasoning.trim().isNotEmpty) {
           mine.add(_Entry(_EntryKind.reasoning, text: item.reasoning));
         }
-        if (item.text.isNotEmpty) {
+        if (item.text.trim().isNotEmpty) {
           mine.add(_Entry(_EntryKind.text, text: item.text));
         }
         for (final tool in item.tools) {
@@ -544,9 +544,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
             final tool = byId[block.toolId];
             if (tool != null) mine.add(_Entry(_EntryKind.tool, tool: tool));
           } else if (block.isReasoning) {
-            mine.add(_Entry(_EntryKind.reasoning, text: block.text));
+            if (block.text.trim().isNotEmpty) {
+              mine.add(_Entry(_EntryKind.reasoning, text: block.text));
+            }
           } else {
-            mine.add(_Entry(_EntryKind.text, text: block.text));
+            if (block.text.trim().isNotEmpty) {
+              mine.add(_Entry(_EntryKind.text, text: block.text));
+            }
           }
         }
       }
@@ -705,6 +709,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
   Widget _instructionCard(String title, String bodyText) {
     final showBody = bodyText.trim().isNotEmpty;
+    if (title.trim().isEmpty && !showBody) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: _messageGapV),
       child: Container(
@@ -739,6 +744,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
   Widget _errorCard(String title, String bodyText) {
     final showBody = bodyText.trim().isNotEmpty;
+    if (title.trim().isEmpty && !showBody) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: _messageGapV),
       child: Container(

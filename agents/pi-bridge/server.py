@@ -250,11 +250,11 @@ def normalize_messages(messages):
                     kind = block.get("type")
                     if kind == "text":
                         text = str(block.get("text") or "")
-                        if text:
+                        if text.strip():
                             blocks.append({"type": "text", "text": text})
                     elif kind == "thinking":
                         thinking = str(block.get("thinking") or "")
-                        if thinking:
+                        if thinking.strip():
                             blocks.append({"type": "reasoning", "text": thinking})
                     elif kind == "toolCall":
                         call = {
@@ -1455,6 +1455,8 @@ class RunUi:
             return
         if self.blocks and self.blocks[-1].get("type") == kind:
             self.blocks[-1]["text"] += text
+            return
+        if not text.strip():
             return
         self.blocks.append({"type": kind, "text": text})
 

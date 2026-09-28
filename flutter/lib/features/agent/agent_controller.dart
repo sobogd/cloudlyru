@@ -787,6 +787,19 @@ class AgentThreadController extends Notifier<AgentThreadState> {
       await _followRunning(session.id);
       return;
     }
+    try {
+      final page = await _api.messagesPage(session.id, limit: _pageSize);
+      _oldestIndex = page.total - page.items.length;
+      state = state.copyWith(items: page.items, hasOlder: page.hasMore);
+    } on AgentApiException catch (e) {
+      state = state.withError(e.message);
+      return;
+    }
+    final last = state.items.isEmpty ? null : state.items.last;
+    if (last != null && last.isAssistant && !last.isEmpty) {
+      _finish();
+      return;
+    }
     await _run(session.id, lastUser.text);
   }
 
@@ -1101,13 +1114,18 @@ class AgentThreadController extends Notifier<AgentThreadState> {
       for (final tool in item.tools)
         if (tool.id.isNotEmpty) tool.id,
     };
-    final same = last != null &&
-        last.isAssistant &&
-        item.text.startsWith(last.text) &&
-        item.reasoning.startsWith(last.reasoning) &&
-        last.tools.every((t) => t.id.isEmpty || callIds.contains(t.id));
-    if (same) {
-      items[items.length - 1] = item;
+    bool continues(AgentItem? candidate) =>
+        candidate != null &&
+        candidate.isAssistant &&
+        item.text.startsWith(candidate.text) &&
+        item.reasoning.startsWith(candidate.reasoning) &&
+        candidate.tools.every((t) => t.id.isEmpty || callIds.contains(t.id));
+    var index = continues(last) ? items.length - 1 : -1;
+    if (index < 0 && last != null && last.isUser && items.length >= 2) {
+      index = continues(items[items.length - 2]) ? items.length - 2 : -1;
+    }
+    if (index >= 0) {
+      items[index] = item;
     } else {
       items.add(item);
     }
@@ -1158,7 +1176,7 @@ class AgentThreadController extends Notifier<AgentThreadState> {
     final next = [...blocks];
     if (next.isNotEmpty && next.last.type == blank.type) {
       next[next.length - 1] = next.last.plus(extra);
-    } else {
+    } else if (extra.trim().isNotEmpty) {
       next.add(AgentBlock(type: blank.type, text: extra));
     }
     return next;
