@@ -47,6 +47,7 @@ BUILTIN_PROVIDERS = [
 ]
 
 COMMAND_TIMEOUT = 60.0
+STATE_TIMEOUT = 8.0
 IDLE_STOP_SECONDS = 1800.0
 MAX_MESSAGE_CHARS = 20_000
 HEARTBEAT_SECONDS = 15
@@ -1662,8 +1663,11 @@ class AgentSession:
         return self.proc is not None and self.proc.poll() is None
 
     def _restart(self):
-        self.busy = False
-        self._start(self.id)
+        with self.lock:
+            if self.alive():
+                return
+            self.busy = False
+            self._start(self.id)
 
     def prompt(self, text):
         raise NotImplementedError
@@ -1823,22 +1827,27 @@ class PiSession(AgentSession):
         self.command("prompt", message=text)
 
     def abort(self):
-        self.command("abort")
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        try:
+            self._write({"id": uuid.uuid4().hex, "type": "abort"})
+        except PiError as e:
+            log("не смог отправить abort в сессию %s: %s" % (self.id, e))
 
     def set_model(self, provider, model):
         self.command("set_model", provider=provider, modelId=model)
         self.provider, self.model = provider, model
         remember_session_choice(session_key(self.harness, self.id), provider=provider, model=model)
 
-    def messages(self):
-        data = self.command("get_messages")
+    def messages(self, timeout=STATE_TIMEOUT):
+        data = self.command("get_messages", timeout=timeout)
         messages = data.get("messages")
         return normalize_messages(messages if isinstance(messages, list) else [])
 
-    def refresh_state(self):
+    def refresh_state(self, timeout=COMMAND_TIMEOUT):
         try:
-            self.state = self.command("get_state")
-            stats = self.command("get_session_stats")
+            self.state = self.command("get_state", timeout=timeout)
+            stats = self.command("get_session_stats", timeout=timeout)
         except PiError as e:
             log("не смог обновить состояние сессии %s: %s" % (self.id, e))
             return self.state
@@ -2143,7 +2152,7 @@ def translate_pi_event(session, event):
         session.busy = False
         session.touched = time.time()
         try:
-            session.state = session.refresh_state()
+            session.state = session.refresh_state(timeout=STATE_TIMEOUT)
         except Exception as e:
             log("не смог обновить состояние сессии %s: %s" % (session.id, e))
         return [{"type": "done", "session": _session_brief(session)}], True
@@ -2272,28 +2281,16 @@ class Pool:
 
     def open(self, cwd, harness=HARNESS_PI, session_id=None, provider=None, model=None, effort=None):
         key = session_key(harness, session_id) if session_id else ""
-        with self.lock:
-            if key and key in self.sessions:
-                session = self.sessions[key]
+        if key:
+            with self.lock:
+                session = self.sessions.get(key)
+            if session is not None:
                 if not session.alive():
                     session._restart()
                 session.touched = time.time()
                 return session
-
-            if harness == HARNESS_CLAUDE:
-                session = ClaudeSession(cwd, session_id, model=model, effort=effort)
-            else:
-                session = PiSession(cwd, session_id, model=model, provider=provider)
-            if not session.id:
-                detail = session.stderr_tail[-1] if session.stderr_tail else "без вывода"
-                session.stop()
-                raise PiError("%s не сообщил идентификатор сессии (%s)" % (harness, detail))
-            remember_session_choice(
-                session.key,
-                provider=provider,
-                model=model,
-                effort=session.effort if harness == HARNESS_CLAUDE else None,
-            )
+        session = self._spawn(cwd, harness, session_id, provider, model, effort)
+        with self.lock:
             existing = self.sessions.get(session.key)
             if existing is not None and existing is not session:
                 session.stop()
@@ -2301,6 +2298,23 @@ class Pool:
                 return existing
             self.sessions[session.key] = session
             return session
+
+    def _spawn(self, cwd, harness, session_id, provider, model, effort):
+        if harness == HARNESS_CLAUDE:
+            session = ClaudeSession(cwd, session_id, model=model, effort=effort)
+        else:
+            session = PiSession(cwd, session_id, model=model, provider=provider)
+        if not session.id:
+            detail = session.stderr_tail[-1] if session.stderr_tail else "без вывода"
+            session.stop()
+            raise PiError("%s не сообщил идентификатор сессии (%s)" % (harness, detail))
+        remember_session_choice(
+            session.key,
+            provider=provider,
+            model=model,
+            effort=session.effort if harness == HARNESS_CLAUDE else None,
+        )
+        return session
 
     def maybe(self, key):
         keys = [str(key)]
@@ -2453,6 +2467,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 
@@ -2515,7 +2531,15 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 4 and parts[3] == "messages":
                     if session is not None:
                         brief = self._session_brief(session)
-                        items = session.messages()
+                        try:
+                            items = session.messages()
+                        except PiError as e:
+                            log("не смог прочитать сообщения сессии %s: %s" % (session.id, e))
+                            file = session_file(session)
+                            try:
+                                items = read_file_messages(session.harness, file) if file is not None else []
+                            except PiError:
+                                items = []
                     else:
                         harness, native_id = split_key(parts[2])
                         file = find_session_file(harness, native_id)
@@ -2530,7 +2554,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._events(session)
                 elif len(parts) == 3:
                     if session is not None:
-                        session.refresh_state()
+                        session.refresh_state(timeout=STATE_TIMEOUT)
                         self._json(200, {"session": self._session_brief(session)})
                     else:
                         harness, native_id = split_key(parts[2])
@@ -2606,6 +2630,8 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(200, {"ok": True, "aborted": False})
                         return
                     session.abort()
+                    session.busy = False
+                    session.forget_run()
                     self._json(200, {"ok": True, "aborted": True})
                     return
                 session = POOL.maybe(parts[2])
@@ -2631,13 +2657,13 @@ class Handler(BaseHTTPRequestHandler):
                     if not provider or not model:
                         raise PiError("нужны provider и modelId")
                     session.set_model(provider, model)
-                    session.refresh_state()
+                    session.refresh_state(timeout=STATE_TIMEOUT)
                     self._json(200, {"session": self._session_brief(session)})
                 elif action == "effort":
                     if session.harness != HARNESS_CLAUDE:
                         raise PiError("уровень усилия есть только у Claude Code")
                     session.set_effort(str(body.get("effort") or ""))
-                    session.refresh_state()
+                    session.refresh_state(timeout=STATE_TIMEOUT)
                     self._json(200, {"session": self._session_brief(session)})
                 elif action == "ui":
                     self._json(200, self._manual_ui(session, body))
@@ -2737,7 +2763,7 @@ class Handler(BaseHTTPRequestHandler):
         if harness == HARNESS_CLAUDE and effort is not None:
             remember_claude_effort(effort)
         session = POOL.open(path, harness, session_id, provider=provider, model=model, effort=effort)
-        session.refresh_state()
+        session.refresh_state(timeout=STATE_TIMEOUT)
         self._json(200, {"session": self._session_brief(session)})
 
     def _reopen(self, key):
@@ -2830,7 +2856,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _settled_brief(self, session):
         try:
-            session.state = session.refresh_state()
+            session.state = session.refresh_state(timeout=STATE_TIMEOUT)
         except PiError as e:
             log("не смог обновить состояние сессии %s: %s" % (session.id, e))
         return self._session_brief(session)
