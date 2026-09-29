@@ -1675,7 +1675,7 @@ class AgentSession:
     def abort(self):
         raise NotImplementedError
 
-    def refresh_state(self):
+    def refresh_state(self, timeout=COMMAND_TIMEOUT):
         raise NotImplementedError
 
     def messages(self):
@@ -1997,7 +1997,7 @@ class ClaudeSession(AgentSession):
         self.stop()
         self._start(self.id)
 
-    def refresh_state(self):
+    def refresh_state(self, timeout=COMMAND_TIMEOUT):
         usage = self.last_usage if isinstance(self.last_usage, dict) else {}
         used = sum(int(usage.get(k) or 0) for k in (
             "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
