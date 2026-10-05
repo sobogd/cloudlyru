@@ -24,6 +24,8 @@ class ProjectsScreen extends ConsumerStatefulWidget {
 enum _Tab {
   sessions,
 
+  harness,
+
   pulls,
 }
 
@@ -34,6 +36,8 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   static const _sidebarMax = 380.0;
 
   late final AgentSessionsController _sessions;
+
+  late final AgentHarnessSessionsController _harness;
 
   _Tab _tab = _Tab.sessions;
 
@@ -70,12 +74,14 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   void initState() {
     super.initState();
     _sessions = ref.read(agentSessionsProvider.notifier);
+    _harness = ref.read(agentHarnessSessionsProvider.notifier);
     _projects = ref.read(agentProjectsProvider.notifier);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _projects.load();
       ref.read(agentHarnessesProvider.notifier).load();
       _sessions.load();
+      _harness.load();
       ref.read(agentActivityProvider.notifier).load();
       _ticker = Timer.periodic(const Duration(seconds: 5), (_) => _refresh());
       _lifecycle = AppLifecycleListener(onResume: _refresh);
@@ -97,7 +103,10 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
   void _refresh() {
     if (!mounted) return;
     _ticks += 1;
-    if (_ticks <= 4 || _ticks % 6 == 0) _sessions.load(silent: true);
+    if (_ticks <= 4 || _ticks % 6 == 0) {
+      _sessions.load(silent: true);
+      _harness.load(silent: true);
+    }
     ref.read(agentActivityProvider.notifier).load();
   }
 
@@ -112,8 +121,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     required bool wide,
     String? prompt,
     String? sessionName,
-  }) async {
-    if (sessionName != null && sessionName.isNotEmpty) {
+  }) async {    if (sessionName != null && sessionName.isNotEmpty) {
       final existing = findReviewSession(ref, sessionName);
       if (existing != null) {
         await _open(
@@ -142,6 +150,10 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       nameIt: choice.name.isNotEmpty ? choice.name : sessionName,
       reviewKey: sessionName,
     );
+  }
+
+  void _openNewHarness({required bool wide}) {
+    _open(AgentProject.fromPath(''), harness: 'harness', embedded: wide);
   }
 
   Future<void> _open(
@@ -210,6 +222,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       return;
     }
     _retry = null;
+    if (project.path.isEmpty && session.path.isNotEmpty) {
+      project = AgentProject.fromPath(session.path);
+    }
     final pendingName = sessionId == null && nameIt != null
         ? await applySessionName(ref, session.id, nameIt)
         : null;
@@ -282,10 +297,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     final id = _selectedId;
     if (id == null) return;
     if (ref.read(agentSessionsProvider).sessions.any((s) => s.id == id)) return;
+    if (ref.read(agentHarnessSessionsProvider).sessions.any((s) => s.id == id)) return;
     _clearSelection();
   }
 
   Future<void> _delete(AgentSession session) async {
+    final isHarness = session.harness == 'harness';
     final ok = await confirmDialog(
       context,
       'Удалить сессию',
@@ -295,10 +312,12 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       confirmLabel: 'Удалить',
     );
     if (!ok || !mounted) return;
-    final result = await _sessions.remove(session.id);
+    final AgentDeleteResult? result = isHarness
+        ? await _harness.remove(session.id)
+        : await _sessions.remove(session.id);
     if (!mounted || result == null) return;
     _pruneSelection();
-    if (result.anyRestored) {
+    if (!isHarness && result.anyRestored) {
       snack(
         context,
         'Этот разговор ведёт живой процесс Claude Code: файл восстановлен, удалить его отсюда '
@@ -312,9 +331,11 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     );
   }
 
-  String _title(AgentSession session) => session.name.isEmpty
-      ? 'Сессия ${session.id.substring(0, 8)}'
-      : session.name;
+  String _title(AgentSession session) {
+    if (session.name.isNotEmpty) return session.name;
+    if (session.preview.isNotEmpty) return session.preview;
+    return 'Сессия ${session.id.substring(session.id.lastIndexOf('-') + 1).substring(0, 8)}';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -353,13 +374,15 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
         _sidebarHeader(),
         if (state.error != null) _errorBar(state.error!),
         Expanded(
-          child: _tab == _Tab.sessions
-              ? _body(state, wide: wide)
-              : PullRequestsScreen(
-                  embedded: true,
-                  onReview: (name, prompt) =>
-                      _newSession(wide: wide, prompt: prompt, sessionName: name),
-                ),
+          child: switch (_tab) {
+            _Tab.sessions => _body(state, wide: wide),
+            _Tab.harness => _harnessBody(ref.watch(agentHarnessSessionsProvider), wide: wide),
+            _Tab.pulls => PullRequestsScreen(
+              embedded: true,
+              onReview: (name, prompt) =>
+                  _newSession(wide: wide, prompt: prompt, sessionName: name),
+            ),
+          },
         ),
       ],
     ),
@@ -372,10 +395,17 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
       child: Row(
         children: [
           Expanded(
-            child: Text(_tab == _Tab.sessions ? 'Проекты' : 'Пул-реквесты',
-                style: const TextStyle(color: C.fg, fontSize: 18)),
+            child: Text(
+              switch (_tab) {
+                _Tab.sessions => 'Проекты',
+                _Tab.harness => 'Харнесс',
+                _Tab.pulls => 'Пул-реквесты',
+              },
+              style: const TextStyle(color: C.fg, fontSize: 18),
+            ),
           ),
           _tabButton(_Tab.sessions, Icons.forum_outlined, 'Разговоры'),
+          _tabButton(_Tab.harness, Icons.build_outlined, 'Харнесс'),
           _tabButton(_Tab.pulls, Icons.merge_type, 'Пул-реквесты'),
         ],
       ),
@@ -486,6 +516,61 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     ),
   );
 
+  Widget _harnessBody(AgentHarnessSessionsState state, {required bool wide}) {
+    if (state.loading && state.sessions.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final count = state.sessions.length;
+    final empty = count == 0;
+    return RefreshIndicator(
+      onRefresh: () => _harness.load(),
+      child: ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: EdgeInsets.only(bottom: navBarInset(context) + 24),
+        itemCount: count + 1 + (empty ? 1 : 0),
+        itemBuilder: (context, i) {
+          if (i < count) return _sessionTile(state.sessions[count - 1 - i], wide: wide);
+          if (i == count && empty) return _harnessEmptyHint();
+          return _harnessAddTile(wide: wide);
+        },
+      ),
+    );
+  }
+
+  Widget _harnessAddTile({required bool wide}) => Material(
+    color: Colors.transparent,
+    child: InkWell(
+      onTap: () => _openNewHarness(wide: wide),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+        child: Row(
+          children: [
+            const Icon(Icons.add, size: 22, color: C.accent),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Новый прогон',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: C.accent, fontSize: 15),
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  Widget _harnessEmptyHint() => const Padding(
+    padding: EdgeInsets.fromLTRB(24, 24, 24, 0),
+    child: Text(
+      'Прогонов пока нет. Нажмите «Новый прогон» — LLM-агент запустится на маке, '
+      'он сможет читать файлы и выполнять команды.',
+      textAlign: TextAlign.center,
+      style: TextStyle(color: C.fg3, fontSize: 13, height: 1.4),
+    ),
+  );
+
   Widget _sessionTile(AgentSession session, {required bool wide}) {
     final activity = ref.watch(agentActivityProvider);
     final selected = wide && session.id == _selectedId;
@@ -582,7 +667,9 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     if (!mounted || name == null) return;
     final clean = name.trim();
     if (clean.isEmpty) return;
-    final saved = await _sessions.rename(session.id, clean);
+    final String? saved = session.harness == 'harness'
+        ? await _harness.rename(session.id, clean)
+        : await _sessions.rename(session.id, clean);
     if (!mounted || saved == null) return;
     if (_opened?.id == session.id) {
       ref.read(agentThreadProvider.notifier).rename(saved);

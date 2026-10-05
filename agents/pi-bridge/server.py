@@ -18,6 +18,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import harness_adapter as ha
+
 PORT = int(os.environ.get("PI_BRIDGE_PORT", "18820"))
 HOST = os.environ.get("PI_BRIDGE_HOST", "127.0.0.1")
 
@@ -107,6 +109,7 @@ def load_config():
         "provider": "",
         "model": "",
         "claude_effort": "",
+        "harness": {"grpc": "127.0.0.1:9000", "sse": "http://127.0.0.1:9001"},
         "token": secrets.token_hex(24),
     }
     save_config(cfg)
@@ -311,7 +314,8 @@ def normalize_messages(messages):
 
 HARNESS_PI = "pi"
 HARNESS_CLAUDE = "claude"
-HARNESS_NAMES = {HARNESS_PI: "pi", HARNESS_CLAUDE: "Claude Code"}
+HARNESS_LLM = "harness"
+HARNESS_NAMES = {HARNESS_PI: "pi", HARNESS_CLAUDE: "Claude Code", HARNESS_LLM: "LLM harness"}
 
 CLAUDE_ALIASES = [
     {"id": "default", "name": "Как настроено в Claude Code", "contextWindow": 200_000},
@@ -383,7 +387,7 @@ def session_key(harness, session_id):
 
 def split_key(key):
     text = str(key or "")
-    for harness in (HARNESS_PI, HARNESS_CLAUDE):
+    for harness in (HARNESS_PI, HARNESS_CLAUDE, HARNESS_LLM):
         prefix = harness + "--"
         if text.startswith(prefix):
             return harness, text[len(prefix):]
@@ -423,6 +427,8 @@ def session_cwd(harness, session_id):
 
 def find_session_file(harness, session_id):
     if not session_id:
+        return None
+    if harness == HARNESS_LLM:
         return None
     if harness == HARNESS_CLAUDE:
         found = sorted(claude_projects_dir().glob("*/%s.jsonl" % session_id))
@@ -643,6 +649,13 @@ def harness_status():
             "available": bool(path),
             "version": version,
         })
+    status = ha.LINK.status()
+    result.append({
+        "harness": HARNESS_LLM,
+        "name": HARNESS_NAMES[HARNESS_LLM],
+        "available": status is not None,
+        "version": ha.MODEL["name"] if status is not None else "",
+    })
     return result
 
 
@@ -971,6 +984,8 @@ def provider_base_url(provider):
 
 
 def list_models(harness=HARNESS_PI):
+    if harness == HARNESS_LLM:
+        return [dict(ha.MODEL)]
     if harness == HARNESS_CLAUDE:
         return [
             {
@@ -1171,6 +1186,14 @@ def clean_session_name(name):
 def flush_pending_name(session):
     if not session or not session.pending_name:
         return
+    if session.harness == HARNESS_LLM:
+        try:
+            ha.rename_session(session.id, session.pending_name)
+        except ha.Err as e:
+            log("отложенное имя не записалось (%s): %s" % (session.key, e))
+            return
+        session.pending_name = ""
+        return
     file = session_file(session)
     if file is None:
         return
@@ -1185,6 +1208,11 @@ def flush_pending_name(session):
 def set_session_name(key, name):
     harness, session_id = split_key(key)
     clean = clean_session_name(name)
+    if harness == HARNESS_LLM:
+        try:
+            return ha.rename_session(session_id, clean)
+        except ha.Err as e:
+            raise PiError(str(e))
     file = find_session_file(harness, session_id)
     if file is None:
         live = POOL.maybe(key)
@@ -2047,6 +2075,107 @@ class ClaudeSession(AgentSession):
         return normalize_claude_messages(entries)
 
 
+class HarnessSession(AgentSession):
+
+    harness = HARNESS_LLM
+
+    def __init__(self, cwd, session_id=None):
+        super().__init__(cwd, model="mtplx")
+        self.provider = "harness"
+        self.effort = ""
+        self.last_usage = {}
+        if session_id:
+            self.id = str(session_id)
+        else:
+            try:
+                self.id = ha.new_session()
+            except ha.Err as e:
+                raise PiError(str(e))
+        if not self.id:
+            raise PiError("LLM harness не сообщил идентификатор сессии")
+        ha.HUB.attach(self)
+
+    def alive(self):
+        return ha.available()
+
+    def _restart(self):
+        pass
+
+    def stop(self):
+        ha.HUB.detach(self)
+
+    def prompt(self, text):
+        self.counters["userMessages"] += 1
+        try:
+            ha.ask(self.id, text)
+        except ha.Err as e:
+            raise PiError(str(e))
+
+    def abort(self):
+        try:
+            ha.stop_run(self.id)
+        except ha.Err as e:
+            raise PiError(str(e))
+
+    def set_effort(self, effort):
+        effort = str(effort or "").strip()
+        if effort and effort not in ha.EFFORT_IDS:
+            raise PiError("неизвестный уровень размышлений: %s" % effort)
+        if effort:
+            try:
+                ha.set_effort(effort)
+            except ha.Err as e:
+                raise PiError(str(e))
+        self.effort = effort
+
+    def set_model(self, provider, model):
+        raise PiError("у LLM harness одна встроенная модель: mtplx")
+
+    def refresh_state(self, timeout=COMMAND_TIMEOUT):
+        status = ha.LINK.status()
+        if status is None:
+            raise PiError("LLM harness недоступен: запустите демон на маке")
+        active = str(status.session_id or "") == self.id
+        used = int(status.prompt_tokens_last or 0) if active else 0
+        window = ha.MODEL["contextWindow"]
+        info = ha.find_brief(self.id) or {}
+        effort = str(status.settings.thinking_effort or "") if active else self.effort
+        if effort:
+            self.effort = effort
+        usage = dict(self.last_usage) if isinstance(self.last_usage, dict) else {}
+        self.state = {
+            **self.state,
+            "model": {"id": "mtplx", "name": ha.MODEL["name"], "provider": "harness"},
+            "thinkingLevel": "on",
+            "effort": self.effort,
+            "messageCount": int(info.get("messages") or 0) or (self.counters["userMessages"] + self.counters["assistantMessages"]),
+            "userMessages": self.counters["userMessages"],
+            "assistantMessages": self.counters["assistantMessages"],
+            "toolCalls": self.counters["toolCalls"],
+            "startedAt": info.get("startedAt") or self.state.get("startedAt"),
+            "tokens": {
+                "input": int(usage.get("input") or 0),
+                "output": int(usage.get("output") or 0),
+                "cacheRead": int(usage.get("cacheRead") or 0),
+                "total": int(usage.get("total") or 0),
+            },
+            "contextUsage": {
+                "tokens": used,
+                "contextWindow": window,
+                "percent": round(used / window * 100, 1) if window else 0,
+                "estimated": True,
+            } if used else None,
+            "sessionFile": "",
+        }
+        return self.state
+
+    def messages(self):
+        try:
+            return ha.fetch_messages(self.id)
+        except ha.Err as e:
+            raise PiError(str(e))
+
+
 def _session_brief(session):
     state = session.state if isinstance(session.state, dict) else {}
     model = state.get("model") if isinstance(state.get("model"), dict) else {}
@@ -2266,6 +2395,8 @@ def translate(session, event):
         return [event], kind == "error"
     if kind == "fatal":
         return [{"type": "error", "message": str(event.get("message") or "сбой харнесса")}], True
+    if session.harness == HARNESS_LLM:
+        return ha.translate_harness_event(session, event)
     if session.harness == HARNESS_CLAUDE:
         return translate_claude_event(session, event)
     return translate_pi_event(session, event)
@@ -2302,6 +2433,8 @@ class Pool:
     def _spawn(self, cwd, harness, session_id, provider, model, effort):
         if harness == HARNESS_CLAUDE:
             session = ClaudeSession(cwd, session_id, model=model, effort=effort)
+        elif harness == HARNESS_LLM:
+            session = HarnessSession(cwd, session_id)
         else:
             session = PiSession(cwd, session_id, model=model, provider=provider)
         if not session.id:
@@ -2519,7 +2652,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {
                     "models": list_models(harness),
                     "harness": harness,
-                    "efforts": CLAUDE_EFFORTS if harness == HARNESS_CLAUDE else [],
+                    "efforts": CLAUDE_EFFORTS if harness == HARNESS_CLAUDE else (ha.EFFORTS if harness == HARNESS_LLM else []),
                 })
             elif path == "/providers":
                 self._json(200, {"providers": provider_list()})
@@ -2542,11 +2675,21 @@ class Handler(BaseHTTPRequestHandler):
                                 items = []
                     else:
                         harness, native_id = split_key(parts[2])
-                        file = find_session_file(harness, native_id)
-                        if file is None:
-                            raise PiError("сессия не найдена: %s" % parts[2])
-                        brief = self._file_brief(harness, native_id, file)
-                        items = read_file_messages(harness, file)
+                        if harness == HARNESS_LLM:
+                            brief = ha.find_brief(native_id)
+                            if brief is None:
+                                raise PiError("сессия не найдена: %s" % parts[2])
+                            items = []
+                            try:
+                                items = ha.fetch_messages(native_id)
+                            except ha.Err:
+                                items = []
+                        else:
+                            file = find_session_file(harness, native_id)
+                            if file is None:
+                                raise PiError("сессия не найдена: %s" % parts[2])
+                            brief = self._file_brief(harness, native_id, file)
+                            items = read_file_messages(harness, file)
                     self._json(200, {"session": brief, **page_items(items, params)})
                 elif len(parts) == 4 and parts[3] == "events":
                     if session is None:
@@ -2558,10 +2701,16 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(200, {"session": self._session_brief(session)})
                     else:
                         harness, native_id = split_key(parts[2])
-                        file = find_session_file(harness, native_id)
-                        if file is None:
-                            raise PiError("сессия не найдена: %s" % parts[2])
-                        self._json(200, {"session": self._file_brief(harness, native_id, file)})
+                        if harness == HARNESS_LLM:
+                            brief = ha.find_brief(native_id)
+                            if brief is None:
+                                raise PiError("сессия не найдена: %s" % parts[2])
+                            self._json(200, {"session": brief})
+                        else:
+                            file = find_session_file(harness, native_id)
+                            if file is None:
+                                raise PiError("сессия не найдена: %s" % parts[2])
+                            self._json(200, {"session": self._file_brief(harness, native_id, file)})
                 else:
                     self._json(404, {"error": "неизвестная ручка: %s" % path})
             else:
@@ -2642,6 +2791,13 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "prompt":
                     self._prompt(session, body)
                 elif action == "compact":
+                    if session.harness == HARNESS_LLM:
+                        try:
+                            data = ha.compact_now()
+                        except ha.Err as e:
+                            raise PiError(str(e))
+                        self._json(200, {"summary": data.get("summaryPreview") or ""})
+                        return
                     if session.harness != HARNESS_PI:
                         raise PiError("сжатие контекста есть только у pi: Claude Code сжимает его сам")
                     instructions = body.get("instructions")
@@ -2652,6 +2808,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     self._json(200, {"summary": data.get("summary") or ""})
                 elif action == "model":
+                    if session.harness == HARNESS_LLM:
+                        raise PiError("у LLM harness одна встроенная модель: mtplx")
                     provider = str(body.get("provider") or "").strip()
                     model = str(body.get("modelId") or "").strip()
                     if not provider or not model:
@@ -2660,12 +2818,19 @@ class Handler(BaseHTTPRequestHandler):
                     session.refresh_state(timeout=STATE_TIMEOUT)
                     self._json(200, {"session": self._session_brief(session)})
                 elif action == "effort":
+                    if session.harness == HARNESS_LLM:
+                        session.set_effort(str(body.get("effort") or ""))
+                        session.refresh_state(timeout=STATE_TIMEOUT)
+                        self._json(200, {"session": self._session_brief(session)})
+                        return
                     if session.harness != HARNESS_CLAUDE:
                         raise PiError("уровень усилия есть только у Claude Code")
                     session.set_effort(str(body.get("effort") or ""))
                     session.refresh_state(timeout=STATE_TIMEOUT)
                     self._json(200, {"session": self._session_brief(session)})
                 elif action == "ui":
+                    if session.harness == HARNESS_LLM:
+                        raise PiError("у LLM harness нет диалогов подтверждения")
                     self._json(200, self._manual_ui(session, body))
                 else:
                     self._json(404, {"error": "неизвестная ручка: %s" % path})
@@ -2683,6 +2848,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"providers": delete_provider(parts[2])})
                 return
             if len(parts) == 3 and parts[1] == "sessions":
+                if split_key(parts[2])[0] == HARNESS_LLM:
+                    session = POOL.take(parts[2])
+                    if session is not None:
+                        session.stop()
+                    try:
+                        ha.delete_session(split_key(parts[2])[1])
+                    except ha.Err as e:
+                        raise PiError(str(e))
+                    self._json(200, {"ok": True, "deleted": 1, "restored": 0})
+                    return
                 session = POOL.take(parts[2])
                 if session is not None:
                     session.stop()
@@ -2729,13 +2904,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _build_sessions(self, folders, asked):
         sessions = []
-        for folder in folders:
-            if asked in ("", HARNESS_PI):
-                for file in session_files(folder):
-                    sessions.append({**cached_meta(file, read_session_meta), "harness": HARNESS_PI, "path": str(folder)})
-            if asked in ("", HARNESS_CLAUDE):
-                for file in claude_session_files(folder):
-                    sessions.append({**cached_meta(file, read_claude_meta), "harness": HARNESS_CLAUDE, "path": str(folder)})
+        if asked == HARNESS_LLM:
+            try:
+                sessions.extend(ha.list_sessions())
+            except ha.Err:
+                pass
+        else:
+            for folder in folders:
+                if asked in ("", HARNESS_PI):
+                    for file in session_files(folder):
+                        sessions.append({**cached_meta(file, read_session_meta), "harness": HARNESS_PI, "path": str(folder)})
+                if asked in ("", HARNESS_CLAUDE):
+                    for file in claude_session_files(folder):
+                        sessions.append({**cached_meta(file, read_claude_meta), "harness": HARNESS_CLAUDE, "path": str(folder)})
         sessions.sort(key=lambda s: s.get("startedAt") or "", reverse=True)
         for session in sessions:
             session["id"] = session_key(session["harness"], session["id"])
@@ -2768,6 +2949,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _reopen(self, key):
         harness, native_id = split_key(key)
+        if harness == HARNESS_LLM:
+            cwd = ha.HUB.root or str((CONFIG.get("roots") or [str(Path.home() / "work")])[0])
+            path = allowed_path(cwd)
+            if path is None:
+                raise PiError("сессия открыта в папке вне разрешённых корней: %s" % cwd)
+            log("поднимаю потерянную сессию harness %s заново в %s" % (key, path))
+            return POOL.open(path, harness, native_id)
         cwd = session_cwd(harness, native_id)
         if not cwd:
             return None
@@ -3025,6 +3213,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     host = str(CONFIG.get("host") or HOST)
     port = int(CONFIG.get("port") or PORT)
+    harness_cfg = CONFIG.get("harness") if isinstance(CONFIG.get("harness"), dict) else {}
+    ha.init(harness_cfg.get("grpc"), harness_cfg.get("sse"))
     server = ThreadingHTTPServer((host, port), Handler)
     log("мост pi слушает %s:%d, корни: %s" % (host, port, ", ".join(CONFIG.get("roots") or [])))
     try:

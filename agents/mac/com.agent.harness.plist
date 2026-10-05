@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.harness</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/run-harness.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/sobogd/work/llm-harness</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/harness-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/harness-agent.err.log</string>
+</dict>
+</plist>

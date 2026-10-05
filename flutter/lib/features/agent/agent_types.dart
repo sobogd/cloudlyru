@@ -44,6 +44,8 @@ class AgentSession {
 
   final String path;
 
+  final String preview;
+
   final DateTime? startedAt;
   final DateTime? updatedAt;
 
@@ -58,6 +60,7 @@ class AgentSession {
     this.harness = '',
     this.harnessName = '',
     this.path = '',
+    this.preview = '',
     this.startedAt,
     this.updatedAt,
     this.busy = false,
@@ -72,6 +75,7 @@ class AgentSession {
     harness: json['harness']?.toString() ?? '',
     harnessName: json['harnessName']?.toString() ?? '',
     path: json['path']?.toString() ?? '',
+    preview: json['preview']?.toString() ?? '',
     startedAt: DateTime.tryParse(json['startedAt']?.toString() ?? ''),
     updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
     busy: json['busy'] == true,

@@ -222,9 +222,13 @@ export class ProjectsController {
    * нему приложение рисует общий список разговоров. С `path` — разговоры одной папки.
    */
   @Get('sessions')
-  async sessions(@Query('path') path?: string) {
+  async sessions(@Query('path') path?: string, @Query('harness') harness?: string) {
     const dir = (path ?? '').trim();
-    const query = dir ? `?path=${encodeURIComponent(dir)}` : '';
+    const h = (harness ?? '').trim();
+    const parts: string[] = [];
+    if (dir) parts.push(`path=${encodeURIComponent(dir)}`);
+    if (h) parts.push(`harness=${encodeURIComponent(h)}`);
+    const query = parts.length ? `?${parts.join('&')}` : '';
     return this.wrap(() =>
       this.projects.call<Record<string, unknown>>('GET', `/sessions${query}`),
     );

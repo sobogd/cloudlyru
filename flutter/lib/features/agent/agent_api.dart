@@ -216,12 +216,17 @@ class AgentApi {
     ];
   }
 
-  Future<List<AgentSession>> sessions([String? path]) async {
+  Future<List<AgentSession>> sessions([String? path, String? harness]) async {
     final dir = (path ?? '').trim();
+    final h = (harness ?? '').trim();
+    final query = <String, dynamic>{
+      if (dir.isNotEmpty) 'path': dir,
+      if (h.isNotEmpty) 'harness': h,
+    };
     final data = await _send<Map<String, dynamic>>(
       () => _get(
         '/projects/sessions',
-        queryParameters: dir.isEmpty ? null : <String, dynamic>{'path': dir},
+        queryParameters: query.isEmpty ? null : query,
       ),
     );
     final raw = data?['sessions'];

@@ -211,6 +211,10 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
 
   Future<void> _pickModel() async {
     final session = ref.read(agentThreadProvider).session;
+    if (session?.harness == 'harness') {
+      snack(context, 'Модель LLM-агента выбрана на маке и не переключается из приложения');
+      return;
+    }
     final chosen = await showModelPicker(
       context,
       ref,
@@ -225,7 +229,13 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
   Future<void> _pickEffort() async {
     final session = ref.read(agentThreadProvider).session;
     if (session == null) return;
-    final chosen = await showEffortPicker(context, ref, current: session.effort);
+    final harness = session.harness;
+    final chosen = await showEffortPicker(
+      context,
+      ref,
+      current: session.effort,
+      harness: harness.isEmpty ? 'claude' : harness,
+    );
     if (chosen == null || !mounted) return;
     await _thread.setEffort(chosen);
     if (!mounted) return;
@@ -377,7 +387,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
         child: Text(_details ? 'Скрыть сведения' : 'Сведения о сессии'),
       ),
       const PopupMenuItem(value: 'model', child: Text('Модель')),
-      if (state.session?.harness == 'claude')
+      if (state.session?.harness == 'claude' || state.session?.harness == 'harness')
         const PopupMenuItem(value: 'effort', child: Text('Усилие')),
       PopupMenuItem(
         value: 'stop',
@@ -875,6 +885,11 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
           session.effort.isEmpty
               ? 'как решает Claude Code'
               : agentEffortLabel(session.effort),
+        )
+      else if (session.harness == 'harness')
+        (
+          'Усилие',
+          session.effort.isEmpty ? 'среднее (умолчание)' : agentEffortLabel(session.effort),
         )
       else if (session.thinkingLevel.isNotEmpty)
         ('Размышления', session.thinkingLevel),

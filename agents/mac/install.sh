@@ -19,3 +19,12 @@ done
 echo "deployed $count plists to $DST"
 echo "labels: $(ls "$SRC"/com.agent.*.plist | xargs -n1 basename | sed 's/com.agent.//;s/.plist//' | tr '\n' ' ')"
 echo "NOTE: changes apply on next reboot (running jobs keep current defs)."
+
+# pi-bridge needs grpcio (llm-harness adapter), which the system python lacks:
+# keep a dedicated venv next to the bridge.
+PB="$ROOT/../pi-bridge"
+if [ ! -x "$PB/.venv/bin/python3" ]; then
+  /opt/homebrew/bin/python3 -m venv "$PB/.venv"
+  "$PB/.venv/bin/python3" -m pip install -q grpcio protobuf
+fi
+echo "pi-bridge venv: $PB/.venv"

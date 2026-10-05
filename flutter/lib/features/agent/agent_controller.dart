@@ -510,6 +510,84 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
   }
 }
 
+class AgentHarnessSessionsState {
+  final List<AgentSession> sessions;
+
+  final bool loading;
+
+  final String? error;
+
+  const AgentHarnessSessionsState({
+    this.sessions = const [],
+    this.loading = false,
+    this.error,
+  });
+}
+
+final agentHarnessSessionsProvider =
+    NotifierProvider<AgentHarnessSessionsController, AgentHarnessSessionsState>(
+      AgentHarnessSessionsController.new,
+    );
+
+class AgentHarnessSessionsController extends Notifier<AgentHarnessSessionsState> {
+  AgentApi get _api => ref.read(agentApiProvider);
+
+  @override
+  AgentHarnessSessionsState build() => const AgentHarnessSessionsState();
+
+  Future<void> load({bool silent = false}) async {
+    state = AgentHarnessSessionsState(
+      sessions: state.sessions,
+      loading: !silent,
+      error: state.error,
+    );
+    try {
+      state = AgentHarnessSessionsState(
+        sessions: await _api.sessions(null, 'harness'),
+      );
+    } on AgentApiException catch (e) {
+      state = AgentHarnessSessionsState(
+        sessions: state.sessions,
+        error: e.message,
+      );
+    }
+  }
+
+  Future<AgentDeleteResult?> remove(String sessionId) async {
+    try {
+      final result = await _api.deleteSession(sessionId);
+      state = AgentHarnessSessionsState(
+        sessions: [
+          for (final s in state.sessions)
+            if (s.id != sessionId) s,
+        ],
+      );
+      await load();
+      return result;
+    } on AgentApiException catch (e) {
+      state = AgentHarnessSessionsState(
+        sessions: state.sessions,
+        error: e.message,
+      );
+      return null;
+    }
+  }
+
+  Future<String?> rename(String sessionId, String name) async {
+    try {
+      final saved = await _api.renameSession(sessionId, name);
+      await load();
+      return saved;
+    } on AgentApiException catch (e) {
+      state = AgentHarnessSessionsState(
+        sessions: state.sessions,
+        error: e.message,
+      );
+      return null;
+    }
+  }
+}
+
 
 class AgentThreadState {
   final AgentSessionInfo? session;

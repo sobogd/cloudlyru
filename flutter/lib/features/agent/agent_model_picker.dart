@@ -203,32 +203,33 @@ Future<String?> showEffortPicker(
   BuildContext context,
   WidgetRef ref, {
   required String current,
+  String harness = 'claude',
 }) async {
-  unawaited(ref.read(agentModelsProvider.notifier).load(harness: 'claude'));
+  unawaited(ref.read(agentModelsProvider.notifier).load(harness: harness));
   return showDialog<String>(
     context: context,
-    builder: (_) => _EffortPickerDialog(current: current),
+    builder: (_) => _EffortPickerDialog(current: current, harness: harness),
   );
 }
 
 class _EffortPickerDialog extends ConsumerWidget {
   final String current;
 
-  const _EffortPickerDialog({required this.current});
+  final String harness;
+
+  const _EffortPickerDialog({required this.current, this.harness = 'claude'});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(agentModelsProvider);
-    final efforts = state.harness == 'claude'
+    final efforts = state.harness == harness
         ? state.efforts
         : const <AgentEffort>[];
+    final title = harness == 'harness' ? 'Усилие · LLM-агент' : 'Усилие · Claude Code';
 
     return AlertDialog(
       backgroundColor: C.surface,
-      title: const Text(
-        'Усилие · Claude Code',
-        style: TextStyle(color: C.fg, fontSize: 16),
-      ),
+      title: Text(title, style: const TextStyle(color: C.fg, fontSize: 16)),
       content: SizedBox(
         width: 420,
         child: state.loading && efforts.isEmpty
@@ -253,12 +254,13 @@ class _EffortPickerDialog extends ConsumerWidget {
                           ),
                         ),
                       ),
-                    _row(
-                      context,
-                      id: '',
-                      label: 'Как решает Claude Code',
-                      note: 'умолчание модели',
-                    ),
+                    if (harness != 'harness')
+                      _row(
+                        context,
+                        id: '',
+                        label: 'Как решает Claude Code',
+                        note: 'умолчание модели',
+                      ),
                     for (final effort in efforts)
                       _row(context, id: effort.id, label: effort.label),
                     if (!state.loading && efforts.isEmpty && state.error == null)
