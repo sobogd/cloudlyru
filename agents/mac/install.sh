@@ -11,7 +11,7 @@ DST="$HOME/Library/LaunchAgents"
 mkdir -p "$ROOT/logs" 2>/dev/null || true
 
 count=0
-for p in "$SRC"/com.agent.*.plist; do
+for p in "$SRC"/com.agent.*.plist "$ROOT"/../pi-bridge/com.agent.pi-bridge.plist; do
   [ -e "$p" ] || continue
   cp "$p" "$DST/$(basename "$p")"
   count=$((count+1))
