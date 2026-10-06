@@ -184,10 +184,20 @@ class Hub:
 
     def route(self, event):
         etype = str(event.get("type") or "")
-        if etype == "session_loaded":
-            root = root_from_path(event.get("path"))
+        if etype in ("session_loaded", "session_reset"):
+            root = str(event.get("root") or "") or root_from_path(event.get("path"))
             if root and root != self.root:
                 self.root = root
+            if etype == "session_reset":
+                sid = str(event.get("session_id") or "")
+                if sid:
+                    with self.lock:
+                        self.active = sid
+                    targets = list(self.attached.get(sid) or ())
+                else:
+                    targets = []
+                for session in targets:
+                    session._dispatch(event)
             return
         sid = str(event.get("session_id") or self.active)
         if sid:
@@ -208,10 +218,20 @@ def init(grpc_addr, sse_base):
     status = LINK.status()
     if status is not None:
         HUB.set_active(status.session_id)
-        root = root_from_path(getattr(status, "loaded_from", ""))
+        root = str(getattr(status, "root", "") or "") or root_from_path(getattr(status, "loaded_from", ""))
         if root:
             HUB.root = root
     HUB.start()
+
+
+def _sync_root():
+    """Подтягиваем root демона после команды, которая могла его сменить."""
+    status = LINK.status()
+    if status is None:
+        return
+    root = str(getattr(status, "root", "") or "") or root_from_path(getattr(status, "loaded_from", ""))
+    if root:
+        HUB.root = root
 
 
 def available():
@@ -231,30 +251,41 @@ def _check(reply, field="message"):
         raise Err(str(message))
 
 
-def new_session():
+def new_session(root=""):
     try:
-        reply = LINK.call("NewSession", pb.Empty())
+        reply = LINK.call("NewSession", pb.NewSessionRequest(root=root))
         HUB.set_active(reply.session_id)
+        _sync_root()
         return str(reply.session_id or "")
     except grpc.RpcError as e:
         raise Err(grpc_error(e, "не удалось создать сессию harness"))
 
 
-def _load_if_needed(native_id):
+def load_session(native_id, root=""):
+    try:
+        reply = LINK.call("LoadSession", pb.LoadSessionRequest(session_id=native_id, root=root))
+        HUB.set_active(reply.session_id or native_id)
+        _sync_root()
+    except grpc.RpcError as e:
+        raise Err(grpc_error(e, "не удалось загрузить сессию harness"))
+
+
+def _load_if_needed(native_id, root=""):
     status = _require_status()
     if str(status.session_id or "") != native_id:
         try:
-            LINK.call("LoadSession", pb.LoadSessionRequest(session_id=native_id))
+            LINK.call("LoadSession", pb.LoadSessionRequest(session_id=native_id, root=root))
             HUB.set_active(native_id)
+            _sync_root()
         except grpc.RpcError as e:
             raise Err(grpc_error(e, "harness занят другим разговором: дождитесь конца прогона"))
 
 
-def ask(native_id, prompt):
+def ask(native_id, prompt, root=""):
     """Вопрос в разговор: если он не активен — сначала грузим. state='queued'
     в ответе значит, что демон к тому моменту ушёл в прогон: просто ждём,
     harness сам достанет сообщение из очереди."""
-    _load_if_needed(native_id)
+    _load_if_needed(native_id, root)
     try:
         reply = LINK.call("Ask", pb.AskRequest(prompt=prompt, session_id=native_id), timeout=30)
         HUB.set_active(reply.session_id or native_id)
@@ -281,17 +312,18 @@ def resume_run(native_id):
         raise Err(grpc_error(e, "не удалось продолжить прогон"))
 
 
-def delete_session(native_id):
+def delete_session(native_id, root=""):
     try:
-        reply = LINK.call("DeleteSession", pb.DeleteSessionRequest(session_id=native_id))
+        reply = LINK.call("DeleteSession", pb.DeleteSessionRequest(session_id=native_id, root=root))
         HUB.set_active(reply.session_id)
+        _sync_root()
     except grpc.RpcError as e:
         raise Err(grpc_error(e, "не удалось удалить сессию harness"))
 
 
-def rename_session(native_id, name):
+def rename_session(native_id, name, root=""):
     try:
-        reply = LINK.call("RenameSession", pb.RenameSessionRequest(session_id=native_id, name=name))
+        reply = LINK.call("RenameSession", pb.RenameSessionRequest(session_id=native_id, name=name, root=root))
         if not reply.ok:
             raise Err(str(reply.error or "не удалось переименовать сессию"))
         return str(name)
@@ -322,10 +354,10 @@ def compact_now(keep_last=0):
         raise Err(grpc_error(e, "не удалось сжать контекст"))
 
 
-def fetch_messages(native_id):
+def fetch_messages(native_id, root=""):
     """GetMessages читает только активный разговор, так что при необходимости
     сначала загружаем нужный."""
-    _load_if_needed(native_id)
+    _load_if_needed(native_id, root)
     try:
         reply = LINK.call("GetMessages", pb.GetMessagesRequest(), timeout=60)
     except grpc.RpcError as e:
@@ -333,9 +365,9 @@ def fetch_messages(native_id):
     return normalize_messages(list(reply.m))
 
 
-def list_sessions():
+def list_sessions(root=""):
     try:
-        reply = LINK.call("ListSessions", pb.Empty())
+        reply = LINK.call("ListSessions", pb.ListSessionsRequest(root=root))
     except grpc.RpcError:
         raise Err("LLM harness недоступен: запустите демон на маке")
     return [session_brief(info) for info in reply.sessions]
@@ -343,7 +375,7 @@ def list_sessions():
 
 def find_brief(native_id):
     try:
-        reply = LINK.call("ListSessions", pb.Empty())
+        reply = LINK.call("ListSessions", pb.ListSessionsRequest())
     except grpc.RpcError:
         return None
     for info in reply.sessions:
@@ -366,11 +398,10 @@ def root_from_path(path):
 
 
 def session_brief(info):
-    root = HUB.root
     return {
         "id": info.id,
         "harness": HARNESS,
-        "path": root,
+        "path": str(info.root or HUB.root or ""),
         "name": str(info.name or ""),
         "preview": str(info.preview or "")[:120],
         "messages": int(info.messages or 0),

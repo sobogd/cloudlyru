@@ -279,11 +279,12 @@ export class ProjectsController {
   @Post('sessions')
   async open(@Body() body: Record<string, unknown> = {}) {
     const path = typeof body.path === 'string' ? body.path.trim() : '';
-    if (!path) throw badRequest('path обязателен');
     const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
     // какой агент ведёт разговор: без него мост открывает сессию pi, и выбранный Claude Code
     // молча превращался бы в разговор pi
     const harness = typeof body.harness === 'string' ? body.harness.trim() : '';
+    // у llm-harness папки проекта нет: демон живёт в своём корне, и мост сам знает, где
+    if (!path && harness !== 'harness') throw badRequest('path обязателен');
     // модель выбирается при открытии: у pi их бывает несколько (локальная и удалённая по API),
     // а после открытия её меняет ручка model, не перезапуская разговор
     const provider = typeof body.provider === 'string' ? body.provider.trim() : '';

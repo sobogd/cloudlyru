@@ -27,17 +27,25 @@ Future<NewSessionChoice?> showNewSessionWizard(
   BuildContext context,
   WidgetRef ref, {
   String suggestedName = '',
+  String? fixedHarness,
 }) {
   return showDialog<NewSessionChoice>(
     context: context,
-    builder: (_) => _NewSessionWizard(suggestedName: suggestedName),
+    builder: (_) => _NewSessionWizard(
+      suggestedName: suggestedName,
+      fixedHarness: fixedHarness,
+    ),
   );
 }
 
 class _NewSessionWizard extends ConsumerStatefulWidget {
-  const _NewSessionWizard({this.suggestedName = ''});
+  const _NewSessionWizard({this.suggestedName = '', this.fixedHarness});
 
   final String suggestedName;
+
+  final String? fixedHarness;
+
+  bool get harnessFixed => fixedHarness != null;
 
   @override
   ConsumerState<_NewSessionWizard> createState() => _NewSessionWizardState();
@@ -69,6 +77,7 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     if (_started) return;
     _started = true;
     await ref.read(agentProjectsProvider.notifier).load();
+    if (widget.harnessFixed) return;
     var available = ref.read(agentHarnessesProvider).available;
     if (available.isEmpty) {
       await ref.read(agentHarnessesProvider.notifier).load();
@@ -93,7 +102,9 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _header(),
-            Flexible(child: _step == 0 ? _folderStep() : _modelStep()),
+            Flexible(
+              child: widget.harnessFixed ? _folderStep() : (_step == 0 ? _folderStep() : _modelStep()),
+            ),
             _actions(),
           ],
         ),
@@ -102,6 +113,15 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
   }
 
   Widget _header() {
+    if (widget.harnessFixed) {
+      return const Padding(
+        padding: EdgeInsets.fromLTRB(20, 18, 20, 4),
+        child: Text(
+          'Новый прогон · папка',
+          style: TextStyle(color: C.fg, fontSize: 16),
+        ),
+      );
+    }
     if (_step == 0) {
       return const Padding(
         padding: EdgeInsets.fromLTRB(20, 18, 20, 4),
@@ -172,10 +192,20 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(color: C.fg3, fontSize: 11.5),
           ),
-          onTap: () => setState(() {
-            _project = project;
-            _step = 1;
-          }),
+          onTap: () {
+            if (widget.harnessFixed) {
+              Navigator.of(context).pop(NewSessionChoice(
+                project: project,
+                harness: widget.fixedHarness!,
+                name: _name.text.trim(),
+              ));
+              return;
+            }
+            setState(() {
+              _project = project;
+              _step = 1;
+            });
+          },
         );
       },
     );
@@ -325,17 +355,18 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
       child: Row(
         children: [
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => const AgentProvidersScreen(),
-                ),
-              );
-            },
-            child: const Text('Провайдеры'),
-          ),
+          if (!widget.harnessFixed)
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const AgentProvidersScreen(),
+                  ),
+                );
+              },
+              child: const Text('Провайдеры'),
+            ),
           const Spacer(),
           TextButton(
             onPressed: () => Navigator.of(context).pop(),

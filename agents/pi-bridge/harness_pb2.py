@@ -24,53 +24,57 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rharness.proto\x12\nharness.v1\"\x07\n\x05\x45mpty\"E\n\nAskRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\x13\n\x0bsystem_note\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\"=\n\x08\x41skReply\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\r\n\x05state\x18\x03 \x01(\t\"b\n\tRunStatus\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12#\n\x05state\x18\x02 \x01(\x0e\x32\x14.harness.v1.RunState\x12\x0c\n\x04turn\x18\x03 \x01(\x05\x12\x12\n\nlast_error\x18\x04 \x01(\t\"\xcc\x01\n\x08Settings\x12\x1a\n\x12max_context_tokens\x18\x01 \x01(\x05\x12\x19\n\x11max_output_tokens\x18\x02 \x01(\x05\x12\x18\n\x10thinking_enabled\x18\x03 \x01(\x08\x12\x17\n\x0fthinking_effort\x18\x04 \x01(\t\x12!\n\x19sampling_temperature_x100\x18\x05 \x01(\x05\x12\x1b\n\x13sampling_top_p_x100\x18\x06 \x01(\x05\x12\x16\n\x0esampling_top_k\x18\x07 \x01(\x05\",\n\x0e\x43ompactRequest\x12\x1a\n\x12keep_last_messages\x18\x01 \x01(\x05\"\x91\x01\n\x0c\x43ompactReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x15\n\rtokens_before\x18\x02 \x01(\x05\x12\x14\n\x0ctokens_after\x18\x03 \x01(\x05\x12\x17\n\x0fmessages_before\x18\x04 \x01(\x05\x12\x16\n\x0emessages_after\x18\x05 \x01(\x05\x12\x17\n\x0fsummary_preview\x18\x06 \x01(\t\"\"\n\x12GetMessagesRequest\x12\x0c\n\x04last\x18\x01 \x01(\x05\"7\n\x08ToolCall\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x11\n\targuments\x18\x03 \x01(\t\"\x91\x01\n\x07Message\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12(\n\ntool_calls\x18\x03 \x03(\x0b\x32\x14.harness.v1.ToolCall\x12\x14\n\x0ctool_call_id\x18\x04 \x01(\t\x12\x0c\n\x04name\x18\x05 \x01(\t\x12\x19\n\x11reasoning_content\x18\x06 \x01(\t\"A\n\x10GetMessagesReply\x12\x1e\n\x01m\x18\x01 \x03(\x0b\x32\x13.harness.v1.Message\x12\r\n\x05model\x18\x02 \x01(\t\"\xb7\x02\n\x0bStatusReply\x12&\n\x08settings\x18\x01 \x01(\x0b\x32\x14.harness.v1.Settings\x12\"\n\x03run\x18\x02 \x01(\x0b\x32\x15.harness.v1.RunStatus\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x18\n\x10history_messages\x18\x04 \x01(\x05\x12\x1a\n\x12prompt_tokens_last\x18\x05 \x01(\x05\x12\x13\n\x0bqueue_depth\x18\x06 \x01(\x05\x12\x1a\n\x12started_at_unix_ms\x18\x07 \x01(\x03\x12\x16\n\x0ehistory_loaded\x18\x08 \x01(\x08\x12\x13\n\x0bloaded_from\x18\t \x01(\t\x12\x1a\n\x12persisted_messages\x18\n \x01(\x05\x12\x18\n\x10\x61\x63tive_subagents\x18\x0b \x03(\t\"\x82\x01\n\x0bSessionInfo\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0f\n\x07preview\x18\x02 \x01(\t\x12\x10\n\x08messages\x18\x03 \x01(\x05\x12\x12\n\ncreated_ms\x18\x04 \x01(\x03\x12\x12\n\nupdated_ms\x18\x05 \x01(\x03\x12\x0e\n\x06\x61\x63tive\x18\x06 \x01(\x08\x12\x0c\n\x04name\x18\x07 \x01(\t\">\n\x11ListSessionsReply\x12)\n\x08sessions\x18\x01 \x03(\x0b\x32\x17.harness.v1.SessionInfo\"(\n\x12LoadSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"*\n\x14\x44\x65leteSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"E\n\x12\x44\x65leteSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07\x64\x65leted\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\"8\n\x14RenameSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\"/\n\x12RenameSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t*u\n\x08RunState\x12\x12\n\x0eRUN_STATE_IDLE\x10\x00\x12\x15\n\x11RUN_STATE_RUNNING\x10\x01\x12\x15\n\x11RUN_STATE_STOPPED\x10\x02\x12\x12\n\x0eRUN_STATE_DONE\x10\x03\x12\x13\n\x0fRUN_STATE_ERROR\x10\x04\x32\x87\x06\n\x07Harness\x12\x33\n\x03\x41sk\x12\x16.harness.v1.AskRequest\x1a\x14.harness.v1.AskReply\x12\x30\n\x04Stop\x12\x11.harness.v1.Empty\x1a\x15.harness.v1.RunStatus\x12\x32\n\x06Resume\x12\x11.harness.v1.Empty\x1a\x15.harness.v1.RunStatus\x12\x39\n\x0bSetSettings\x12\x14.harness.v1.Settings\x1a\x14.harness.v1.Settings\x12?\n\x07\x43ompact\x12\x1a.harness.v1.CompactRequest\x1a\x18.harness.v1.CompactReply\x12\x34\n\x06Status\x12\x11.harness.v1.Empty\x1a\x17.harness.v1.StatusReply\x12K\n\x0bGetMessages\x12\x1e.harness.v1.GetMessagesRequest\x1a\x1c.harness.v1.GetMessagesReply\x12\x35\n\nNewSession\x12\x11.harness.v1.Empty\x1a\x14.harness.v1.AskReply\x12@\n\x0cListSessions\x12\x11.harness.v1.Empty\x1a\x1d.harness.v1.ListSessionsReply\x12\x43\n\x0bLoadSession\x12\x1e.harness.v1.LoadSessionRequest\x1a\x14.harness.v1.AskReply\x12Q\n\rDeleteSession\x12 .harness.v1.DeleteSessionRequest\x1a\x1e.harness.v1.DeleteSessionReply\x12Q\n\rRenameSession\x12 .harness.v1.RenameSessionRequest\x1a\x1e.harness.v1.RenameSessionReplyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rharness.proto\x12\nharness.v1\"\x07\n\x05\x45mpty\"!\n\x11NewSessionRequest\x12\x0c\n\x04root\x18\x01 \x01(\t\"#\n\x13ListSessionsRequest\x12\x0c\n\x04root\x18\x01 \x01(\t\"E\n\nAskRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\x13\n\x0bsystem_note\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\"=\n\x08\x41skReply\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\r\n\x05state\x18\x03 \x01(\t\"b\n\tRunStatus\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12#\n\x05state\x18\x02 \x01(\x0e\x32\x14.harness.v1.RunState\x12\x0c\n\x04turn\x18\x03 \x01(\x05\x12\x12\n\nlast_error\x18\x04 \x01(\t\"\xcc\x01\n\x08Settings\x12\x1a\n\x12max_context_tokens\x18\x01 \x01(\x05\x12\x19\n\x11max_output_tokens\x18\x02 \x01(\x05\x12\x18\n\x10thinking_enabled\x18\x03 \x01(\x08\x12\x17\n\x0fthinking_effort\x18\x04 \x01(\t\x12!\n\x19sampling_temperature_x100\x18\x05 \x01(\x05\x12\x1b\n\x13sampling_top_p_x100\x18\x06 \x01(\x05\x12\x16\n\x0esampling_top_k\x18\x07 \x01(\x05\",\n\x0e\x43ompactRequest\x12\x1a\n\x12keep_last_messages\x18\x01 \x01(\x05\"\x91\x01\n\x0c\x43ompactReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x15\n\rtokens_before\x18\x02 \x01(\x05\x12\x14\n\x0ctokens_after\x18\x03 \x01(\x05\x12\x17\n\x0fmessages_before\x18\x04 \x01(\x05\x12\x16\n\x0emessages_after\x18\x05 \x01(\x05\x12\x17\n\x0fsummary_preview\x18\x06 \x01(\t\"\"\n\x12GetMessagesRequest\x12\x0c\n\x04last\x18\x01 \x01(\x05\"7\n\x08ToolCall\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x11\n\targuments\x18\x03 \x01(\t\"\x91\x01\n\x07Message\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12(\n\ntool_calls\x18\x03 \x03(\x0b\x32\x14.harness.v1.ToolCall\x12\x14\n\x0ctool_call_id\x18\x04 \x01(\t\x12\x0c\n\x04name\x18\x05 \x01(\t\x12\x19\n\x11reasoning_content\x18\x06 \x01(\t\"A\n\x10GetMessagesReply\x12\x1e\n\x01m\x18\x01 \x03(\x0b\x32\x13.harness.v1.Message\x12\r\n\x05model\x18\x02 \x01(\t\"\xc5\x02\n\x0bStatusReply\x12&\n\x08settings\x18\x01 \x01(\x0b\x32\x14.harness.v1.Settings\x12\"\n\x03run\x18\x02 \x01(\x0b\x32\x15.harness.v1.RunStatus\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x18\n\x10history_messages\x18\x04 \x01(\x05\x12\x1a\n\x12prompt_tokens_last\x18\x05 \x01(\x05\x12\x13\n\x0bqueue_depth\x18\x06 \x01(\x05\x12\x1a\n\x12started_at_unix_ms\x18\x07 \x01(\x03\x12\x16\n\x0ehistory_loaded\x18\x08 \x01(\x08\x12\x13\n\x0bloaded_from\x18\t \x01(\t\x12\x1a\n\x12persisted_messages\x18\n \x01(\x05\x12\x18\n\x10\x61\x63tive_subagents\x18\x0b \x03(\t\x12\x0c\n\x04root\x18\x0c \x01(\t\"\x90\x01\n\x0bSessionInfo\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0f\n\x07preview\x18\x02 \x01(\t\x12\x10\n\x08messages\x18\x03 \x01(\x05\x12\x12\n\ncreated_ms\x18\x04 \x01(\x03\x12\x12\n\nupdated_ms\x18\x05 \x01(\x03\x12\x0e\n\x06\x61\x63tive\x18\x06 \x01(\x08\x12\x0c\n\x04name\x18\x07 \x01(\t\x12\x0c\n\x04root\x18\x08 \x01(\t\">\n\x11ListSessionsReply\x12)\n\x08sessions\x18\x01 \x03(\x0b\x32\x17.harness.v1.SessionInfo\"6\n\x12LoadSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04root\x18\x02 \x01(\t\"8\n\x14\x44\x65leteSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04root\x18\x02 \x01(\t\"E\n\x12\x44\x65leteSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07\x64\x65leted\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\"F\n\x14RenameSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x0c\n\x04root\x18\x03 \x01(\t\"/\n\x12RenameSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t*u\n\x08RunState\x12\x12\n\x0eRUN_STATE_IDLE\x10\x00\x12\x15\n\x11RUN_STATE_RUNNING\x10\x01\x12\x15\n\x11RUN_STATE_STOPPED\x10\x02\x12\x12\n\x0eRUN_STATE_DONE\x10\x03\x12\x13\n\x0fRUN_STATE_ERROR\x10\x04\x32\xa1\x06\n\x07Harness\x12\x33\n\x03\x41sk\x12\x16.harness.v1.AskRequest\x1a\x14.harness.v1.AskReply\x12\x30\n\x04Stop\x12\x11.harness.v1.Empty\x1a\x15.harness.v1.RunStatus\x12\x32\n\x06Resume\x12\x11.harness.v1.Empty\x1a\x15.harness.v1.RunStatus\x12\x39\n\x0bSetSettings\x12\x14.harness.v1.Settings\x1a\x14.harness.v1.Settings\x12?\n\x07\x43ompact\x12\x1a.harness.v1.CompactRequest\x1a\x18.harness.v1.CompactReply\x12\x34\n\x06Status\x12\x11.harness.v1.Empty\x1a\x17.harness.v1.StatusReply\x12K\n\x0bGetMessages\x12\x1e.harness.v1.GetMessagesRequest\x1a\x1c.harness.v1.GetMessagesReply\x12\x41\n\nNewSession\x12\x1d.harness.v1.NewSessionRequest\x1a\x14.harness.v1.AskReply\x12N\n\x0cListSessions\x12\x1f.harness.v1.ListSessionsRequest\x1a\x1d.harness.v1.ListSessionsReply\x12\x43\n\x0bLoadSession\x12\x1e.harness.v1.LoadSessionRequest\x1a\x14.harness.v1.AskReply\x12Q\n\rDeleteSession\x12 .harness.v1.DeleteSessionRequest\x1a\x1e.harness.v1.DeleteSessionReply\x12Q\n\rRenameSession\x12 .harness.v1.RenameSessionRequest\x1a\x1e.harness.v1.RenameSessionReplyb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'harness_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_RUNSTATE']._serialized_start=1756
-  _globals['_RUNSTATE']._serialized_end=1873
+  _globals['_RUNSTATE']._serialized_start=1898
+  _globals['_RUNSTATE']._serialized_end=2015
   _globals['_EMPTY']._serialized_start=29
   _globals['_EMPTY']._serialized_end=36
-  _globals['_ASKREQUEST']._serialized_start=38
-  _globals['_ASKREQUEST']._serialized_end=107
-  _globals['_ASKREPLY']._serialized_start=109
-  _globals['_ASKREPLY']._serialized_end=170
-  _globals['_RUNSTATUS']._serialized_start=172
-  _globals['_RUNSTATUS']._serialized_end=270
-  _globals['_SETTINGS']._serialized_start=273
-  _globals['_SETTINGS']._serialized_end=477
-  _globals['_COMPACTREQUEST']._serialized_start=479
-  _globals['_COMPACTREQUEST']._serialized_end=523
-  _globals['_COMPACTREPLY']._serialized_start=526
-  _globals['_COMPACTREPLY']._serialized_end=671
-  _globals['_GETMESSAGESREQUEST']._serialized_start=673
-  _globals['_GETMESSAGESREQUEST']._serialized_end=707
-  _globals['_TOOLCALL']._serialized_start=709
-  _globals['_TOOLCALL']._serialized_end=764
-  _globals['_MESSAGE']._serialized_start=767
-  _globals['_MESSAGE']._serialized_end=912
-  _globals['_GETMESSAGESREPLY']._serialized_start=914
-  _globals['_GETMESSAGESREPLY']._serialized_end=979
-  _globals['_STATUSREPLY']._serialized_start=982
-  _globals['_STATUSREPLY']._serialized_end=1293
-  _globals['_SESSIONINFO']._serialized_start=1296
-  _globals['_SESSIONINFO']._serialized_end=1426
-  _globals['_LISTSESSIONSREPLY']._serialized_start=1428
-  _globals['_LISTSESSIONSREPLY']._serialized_end=1490
-  _globals['_LOADSESSIONREQUEST']._serialized_start=1492
-  _globals['_LOADSESSIONREQUEST']._serialized_end=1532
-  _globals['_DELETESESSIONREQUEST']._serialized_start=1534
-  _globals['_DELETESESSIONREQUEST']._serialized_end=1576
-  _globals['_DELETESESSIONREPLY']._serialized_start=1578
-  _globals['_DELETESESSIONREPLY']._serialized_end=1647
-  _globals['_RENAMESESSIONREQUEST']._serialized_start=1649
-  _globals['_RENAMESESSIONREQUEST']._serialized_end=1705
-  _globals['_RENAMESESSIONREPLY']._serialized_start=1707
-  _globals['_RENAMESESSIONREPLY']._serialized_end=1754
-  _globals['_HARNESS']._serialized_start=1876
-  _globals['_HARNESS']._serialized_end=2651
+  _globals['_NEWSESSIONREQUEST']._serialized_start=38
+  _globals['_NEWSESSIONREQUEST']._serialized_end=71
+  _globals['_LISTSESSIONSREQUEST']._serialized_start=73
+  _globals['_LISTSESSIONSREQUEST']._serialized_end=108
+  _globals['_ASKREQUEST']._serialized_start=110
+  _globals['_ASKREQUEST']._serialized_end=179
+  _globals['_ASKREPLY']._serialized_start=181
+  _globals['_ASKREPLY']._serialized_end=242
+  _globals['_RUNSTATUS']._serialized_start=244
+  _globals['_RUNSTATUS']._serialized_end=342
+  _globals['_SETTINGS']._serialized_start=345
+  _globals['_SETTINGS']._serialized_end=549
+  _globals['_COMPACTREQUEST']._serialized_start=551
+  _globals['_COMPACTREQUEST']._serialized_end=595
+  _globals['_COMPACTREPLY']._serialized_start=598
+  _globals['_COMPACTREPLY']._serialized_end=743
+  _globals['_GETMESSAGESREQUEST']._serialized_start=745
+  _globals['_GETMESSAGESREQUEST']._serialized_end=779
+  _globals['_TOOLCALL']._serialized_start=781
+  _globals['_TOOLCALL']._serialized_end=836
+  _globals['_MESSAGE']._serialized_start=839
+  _globals['_MESSAGE']._serialized_end=984
+  _globals['_GETMESSAGESREPLY']._serialized_start=986
+  _globals['_GETMESSAGESREPLY']._serialized_end=1051
+  _globals['_STATUSREPLY']._serialized_start=1054
+  _globals['_STATUSREPLY']._serialized_end=1379
+  _globals['_SESSIONINFO']._serialized_start=1382
+  _globals['_SESSIONINFO']._serialized_end=1526
+  _globals['_LISTSESSIONSREPLY']._serialized_start=1528
+  _globals['_LISTSESSIONSREPLY']._serialized_end=1590
+  _globals['_LOADSESSIONREQUEST']._serialized_start=1592
+  _globals['_LOADSESSIONREQUEST']._serialized_end=1646
+  _globals['_DELETESESSIONREQUEST']._serialized_start=1648
+  _globals['_DELETESESSIONREQUEST']._serialized_end=1704
+  _globals['_DELETESESSIONREPLY']._serialized_start=1706
+  _globals['_DELETESESSIONREPLY']._serialized_end=1775
+  _globals['_RENAMESESSIONREQUEST']._serialized_start=1777
+  _globals['_RENAMESESSIONREQUEST']._serialized_end=1847
+  _globals['_RENAMESESSIONREPLY']._serialized_start=1849
+  _globals['_RENAMESESSIONREPLY']._serialized_end=1896
+  _globals['_HARNESS']._serialized_start=2018
+  _globals['_HARNESS']._serialized_end=2819
 # @@protoc_insertion_point(module_scope)

@@ -152,8 +152,15 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     );
   }
 
-  void _openNewHarness({required bool wide}) {
-    _open(AgentProject.fromPath(''), harness: 'harness', embedded: wide);
+  Future<void> _openNewHarness({required bool wide}) async {
+    final choice = await showNewSessionWizard(context, ref, fixedHarness: 'harness');
+    if (choice == null || !mounted) return;
+    await _open(
+      choice.project,
+      harness: 'harness',
+      embedded: wide,
+      nameIt: choice.name.isNotEmpty ? choice.name : null,
+    );
   }
 
   Future<void> _open(

@@ -75,12 +75,12 @@ class HarnessStub:
                 _registered_method=True)
         self.NewSession = channel.unary_unary(
                 '/harness.v1.Harness/NewSession',
-                request_serializer=harness__pb2.Empty.SerializeToString,
+                request_serializer=harness__pb2.NewSessionRequest.SerializeToString,
                 response_deserializer=harness__pb2.AskReply.FromString,
                 _registered_method=True)
         self.ListSessions = channel.unary_unary(
                 '/harness.v1.Harness/ListSessions',
-                request_serializer=harness__pb2.Empty.SerializeToString,
+                request_serializer=harness__pb2.ListSessionsRequest.SerializeToString,
                 response_deserializer=harness__pb2.ListSessionsReply.FromString,
                 _registered_method=True)
         self.LoadSession = channel.unary_unary(
@@ -169,15 +169,18 @@ class HarnessServicer:
         """Discard the conversation and start a fresh session (system prompt only).
         The previous session (if it has messages) is archived first, so it shows
         up in ListSessions. Allowed only when no run is active or paused.
+        root: switch the working folder for the new session ("" = keep the
+        current one).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def ListSessions(self, request, context):
-        """All sessions: the currently loaded one plus the archived ones
-        (<root>/.llm-harness/sessions/<id>.jsonl). Sorted by last update, newest
-        first.
+        """All sessions of the daemon: the currently loaded one plus the archived
+        ones (<root>/.llm-harness/sessions/<id>.jsonl). root selects one working
+        folder ("" = every folder this daemon has been in, union). Each entry
+        carries the folder it belongs to. Sorted by last update, newest first.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -251,12 +254,12 @@ def add_HarnessServicer_to_server(servicer, server):
             ),
             'NewSession': grpc.unary_unary_rpc_method_handler(
                     servicer.NewSession,
-                    request_deserializer=harness__pb2.Empty.FromString,
+                    request_deserializer=harness__pb2.NewSessionRequest.FromString,
                     response_serializer=harness__pb2.AskReply.SerializeToString,
             ),
             'ListSessions': grpc.unary_unary_rpc_method_handler(
                     servicer.ListSessions,
-                    request_deserializer=harness__pb2.Empty.FromString,
+                    request_deserializer=harness__pb2.ListSessionsRequest.FromString,
                     response_serializer=harness__pb2.ListSessionsReply.SerializeToString,
             ),
             'LoadSession': grpc.unary_unary_rpc_method_handler(
@@ -493,7 +496,7 @@ class Harness:
             request,
             target,
             '/harness.v1.Harness/NewSession',
-            harness__pb2.Empty.SerializeToString,
+            harness__pb2.NewSessionRequest.SerializeToString,
             harness__pb2.AskReply.FromString,
             options,
             channel_credentials,
@@ -520,7 +523,7 @@ class Harness:
             request,
             target,
             '/harness.v1.Harness/ListSessions',
-            harness__pb2.Empty.SerializeToString,
+            harness__pb2.ListSessionsRequest.SerializeToString,
             harness__pb2.ListSessionsReply.FromString,
             options,
             channel_credentials,

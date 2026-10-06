@@ -882,7 +882,7 @@ def list_projects():
             for path in candidates:
                 if not path.is_dir() or path.name.startswith("."):
                     continue
-                if (path / ".git").exists() or sessions_dir_for(path).is_dir() or claude_sessions_dir(path).is_dir():
+                if (path / ".git").exists() or sessions_dir_for(path).is_dir() or claude_sessions_dir(path).is_dir() or (path / ".llm-harness").is_dir():
                     add(path)
 
     for folder, reader in (
@@ -1188,7 +1188,7 @@ def flush_pending_name(session):
         return
     if session.harness == HARNESS_LLM:
         try:
-            ha.rename_session(session.id, session.pending_name)
+            ha.rename_session(session.id, session.pending_name, root=getattr(session, "native_root", session.cwd))
         except ha.Err as e:
             log("отложенное имя не записалось (%s): %s" % (session.key, e))
             return
@@ -1209,8 +1209,12 @@ def set_session_name(key, name):
     harness, session_id = split_key(key)
     clean = clean_session_name(name)
     if harness == HARNESS_LLM:
+        root = ""
+        brief = ha.find_brief(session_id)
+        if brief is not None:
+            root = brief.get("path") or ""
         try:
-            return ha.rename_session(session_id, clean)
+            return ha.rename_session(session_id, clean, root=root)
         except ha.Err as e:
             raise PiError(str(e))
     file = find_session_file(harness, session_id)
@@ -2080,7 +2084,7 @@ class HarnessSession(AgentSession):
     harness = HARNESS_LLM
 
     def __init__(self, cwd, session_id=None):
-        super().__init__(cwd, model="mtplx")
+        super().__init__(cwd or (ha.HUB.root or ""), model="mtplx")
         self.provider = "harness"
         self.effort = ""
         self.last_usage = {}
@@ -2088,11 +2092,15 @@ class HarnessSession(AgentSession):
             self.id = str(session_id)
         else:
             try:
-                self.id = ha.new_session()
+                self.id = ha.new_session(root=self.cwd)
             except ha.Err as e:
                 raise PiError(str(e))
         if not self.id:
             raise PiError("LLM harness не сообщил идентификатор сессии")
+        # корень, в котором живёт сессия в демоне: может отличаться от self.cwd,
+        # если сессию открыли, указав другую папку
+        brief = ha.find_brief(self.id)
+        self.native_root = (brief or {}).get("path") or self.cwd
         ha.HUB.attach(self)
 
     def alive(self):
@@ -2107,7 +2115,7 @@ class HarnessSession(AgentSession):
     def prompt(self, text):
         self.counters["userMessages"] += 1
         try:
-            ha.ask(self.id, text)
+            ha.ask(self.id, text, root=self.native_root)
         except ha.Err as e:
             raise PiError(str(e))
 
@@ -2171,7 +2179,7 @@ class HarnessSession(AgentSession):
 
     def messages(self):
         try:
-            return ha.fetch_messages(self.id)
+            return ha.fetch_messages(self.id, root=self.native_root)
         except ha.Err as e:
             raise PiError(str(e))
 
@@ -2188,7 +2196,7 @@ def _session_brief(session):
         "harness": session.harness,
         "harnessName": HARNESS_NAMES.get(session.harness, session.harness),
         "contextEstimated": context_estimated,
-        "path": session.cwd,
+        "path": getattr(session, "native_root", session.cwd),
         "name": str(
             session.pending_name or state.get("sessionName") or meta.get("name") or ""
         ),
@@ -2681,7 +2689,7 @@ class Handler(BaseHTTPRequestHandler):
                                 raise PiError("сессия не найдена: %s" % parts[2])
                             items = []
                             try:
-                                items = ha.fetch_messages(native_id)
+                                items = ha.fetch_messages(native_id, root=brief.get("path") or "")
                             except ha.Err:
                                 items = []
                         else:
@@ -2849,11 +2857,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 3 and parts[1] == "sessions":
                 if split_key(parts[2])[0] == HARNESS_LLM:
+                    native_id = split_key(parts[2])[1]
                     session = POOL.take(parts[2])
                     if session is not None:
                         session.stop()
+                    root = ""
+                    if session is not None:
+                        root = getattr(session, "cwd", "")
+                    else:
+                        brief = ha.find_brief(native_id)
+                        if brief is not None:
+                            root = brief.get("path") or ""
                     try:
-                        ha.delete_session(split_key(parts[2])[1])
+                        ha.delete_session(native_id, root=root)
                     except ha.Err as e:
                         raise PiError(str(e))
                     self._json(200, {"ok": True, "deleted": 1, "restored": 0})
@@ -2899,14 +2915,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             folders = [Path(str(p["path"])) for p in list_projects_cached()]
 
-        sessions = cached_sessions((tuple(str(f) for f in folders), asked), lambda: self._build_sessions(folders, asked))
+        sessions = cached_sessions((tuple(str(f) for f in folders), asked), lambda: self._build_sessions(folders, asked, raw=bool(raw)))
         self._json(200, {"path": str(folders[0]) if raw else "", "sessions": sessions})
 
-    def _build_sessions(self, folders, asked):
+    def _build_sessions(self, folders, asked, raw=False):
         sessions = []
         if asked == HARNESS_LLM:
             try:
-                sessions.extend(ha.list_sessions())
+                root = str(folders[0]) if raw else ""
+                sessions.extend(ha.list_sessions(root=root))
             except ha.Err:
                 pass
         else:
@@ -2926,15 +2943,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _open_session(self, body):
         raw = str(body.get("path") or "").strip()
+        harness = str(body.get("harness") or "").strip().lower()
+        if not harness:
+            harness = HARNESS_PI
+        if not raw and harness == HARNESS_LLM:
+            raw = ha.HUB.root
         path = allowed_path(raw) if raw else None
         if path is None:
             raise PiError("папка вне разрешённых корней: %s" % raw)
         raw_id = str(body.get("sessionId") or "").strip()
-        harness = str(body.get("harness") or "").strip().lower()
         if not harness and raw_id:
             harness = split_key(raw_id)[0]
-        if not harness:
-            harness = HARNESS_PI
         if harness not in HARNESS_NAMES:
             raise PiError("неизвестный харнесс: %s" % harness)
         session_id = split_key(raw_id)[1] if raw_id else None
@@ -2950,7 +2969,12 @@ class Handler(BaseHTTPRequestHandler):
     def _reopen(self, key):
         harness, native_id = split_key(key)
         if harness == HARNESS_LLM:
-            cwd = ha.HUB.root or str((CONFIG.get("roots") or [str(Path.home() / "work")])[0])
+            cwd = ""
+            brief = ha.find_brief(native_id)
+            if brief is not None:
+                cwd = brief.get("path") or ""
+            if not cwd:
+                cwd = ha.HUB.root or str((CONFIG.get("roots") or [str(Path.home() / "work")])[0])
             path = allowed_path(cwd)
             if path is None:
                 raise PiError("сессия открыта в папке вне разрешённых корней: %s" % cwd)
@@ -2979,7 +3003,7 @@ class Handler(BaseHTTPRequestHandler):
             "harness": session.harness,
             "harnessName": HARNESS_NAMES.get(session.harness, session.harness),
             "contextEstimated": context_estimated,
-            "path": session.cwd,
+            "path": getattr(session, "native_root", session.cwd),
             "name": str(
                 session.pending_name or state.get("sessionName") or meta.get("name") or ""
             ),
