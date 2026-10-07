@@ -298,7 +298,9 @@ def stop_run(native_id):
     if str(_require_status().session_id or "") != native_id:
         return
     try:
-        _check(LINK.call("Stop", pb.Empty()), "last_error")
+        # Ответ Stop — это статус прогона, а не ошибка: после успешной остановки
+        # в нём last_error = "stopped by user", проверять его на ошибочность нельзя.
+        LINK.call("Stop", pb.Empty())
     except grpc.RpcError as e:
         raise Err(grpc_error(e, "не удалось остановить прогон"))
 
