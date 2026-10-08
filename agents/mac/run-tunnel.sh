@@ -4,26 +4,25 @@
 #
 # Managed by launchd (com.agent.mac-tunnel, KeepAlive). It forwards:
 #   VPS 127.0.0.1:18810 -> mac 127.0.0.1:18810  (mac status server)
-#   VPS 127.0.0.1:18812 -> mac 127.0.0.1:1234   (llama.cpp, local LLM for CloudlyRu)
+#   VPS 127.0.0.1:18812 -> mac 127.0.0.1:8080   (llama.cpp model router, local LLM for CloudlyRu and iq-translate)
 #   VPS 127.0.0.1:18818 -> mac 127.0.0.1:1238   (whisper.cpp, speech recognition for iq-translate)
-#   VPS 127.0.0.1:18820 -> mac 127.0.0.1:18820  (pi bridge: harness inside a project folder, cloudlyru repo)
-#   VPS 127.0.0.1:18822 -> mac 127.0.0.1:1235   (TranslateGemma-4B, translation engine for iq-translate)
+#   VPS 127.0.0.1:18820 -> mac 127.0.0.1:18820  (agent bridge: harness inside a project folder, cloudlyru repo)
+#   VPS 127.0.0.1:18822 -> mac 127.0.0.1:8080   (the same router, translation model for iq-translate)
 #
 # 18818 exists for the same reason: the iq-translate backend runs ON the VPS, its
 # voice endpoint has to reach the speech engine that lives on this Mac.
 #
-# 18822 is the translation half of that same backend once it moved to its own
-# engine: 18812 still serves the general 4B model used for search and the
-# language pairs TranslateGemma does not cover, while 18822 leads to the
-# translation model on 1235.
+# 18812 and 18822 both lead to the same model router on 8080 (ru.llama.router,
+# presets in ~/llama-presets.ini): which model answers is picked by the
+# `model` id in each backend's own LLM_MODEL/MT_MODEL, not by the port.
 #
 # 18812 and 18820 exist because the CloudlyRu backend runs ON the VPS and has to
-# reach the model and the pi bridge that live on this Mac. All of these bind to
+# reach the model and the agent bridge that live on this Mac. All of these bind to
 # loopback on both ends: only the VPS itself can talk to them, nothing is exposed
 # to the internet, and none needs TLS or an auth layer.
 #
-# Порт 18820 отдаётся мосту agents/pi-bridge: раздел «Проекты» в приложении даёт агенту pi
-# папку проекта, и сервер приложения (src/projects) ходит к мосту по этому же принципу —
+# Порт 18820 отдаётся мосту agents/bridge: раздел «Проекты» в приложении даёт агенту
+# (Claude Code или llm-harness) папку проекта, и сервер приложения (src/projects) ходит к мосту по этому же принципу —
 # loopback на обоих концах, без TLS и авторизации на плече: снаружи порт не виден никому,
 # а доступ к разделу закрыт сессией приложения.
 #
@@ -74,10 +73,10 @@ sleep 1
 # 3) Establish the tunnel. exit -> launchd restarts us -> wait + cleanup + connect.
 exec "$SSH" -N \
   -R 127.0.0.1:18810:127.0.0.1:18810 \
-  -R 127.0.0.1:18812:127.0.0.1:1234 \
+  -R 127.0.0.1:18812:127.0.0.1:8080 \
   -R 127.0.0.1:18818:127.0.0.1:1238 \
   -R 127.0.0.1:18820:127.0.0.1:18820 \
-  -R 127.0.0.1:18822:127.0.0.1:1235 \
+  -R 127.0.0.1:18822:127.0.0.1:8080 \
   root@"$VPS" \
   -o ServerAliveInterval=5 \
   -o ServerAliveCountMax=12 \

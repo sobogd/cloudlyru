@@ -5,7 +5,7 @@ import { ProjectsService } from './projects.service';
 export interface RunningSession {
   /** Идентификатор (`харнесс--id`) — тот же, что в списке сессий приложения. */
   id: string;
-  /** Харнесс: pi или claude. */
+  /** Харнесс: claude или harness. */
   harness: string;
   /** Папка проекта, в которой идёт работа. */
   path: string;
@@ -105,7 +105,7 @@ export class ProjectsActivityService implements OnModuleInit, OnModuleDestroy {
       if (!id || session.busy !== true) continue;
       current.set(id, {
         id,
-        harness: typeof session.harness === 'string' ? session.harness : 'pi',
+        harness: typeof session.harness === 'string' ? session.harness : 'claude',
         path: typeof session.cwd === 'string' ? session.cwd : '',
       });
     }

@@ -3,7 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../theme.dart';
 import 'agent_controller.dart';
-import 'agent_providers_screen.dart';
 import 'agent_types.dart';
 
 class NewSessionChoice {
@@ -85,7 +84,7 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
     }
     if (!mounted) return;
     final harnesses = available.isEmpty
-        ? const <String>['pi']
+        ? const <String>['claude']
         : [for (final h in available) h.harness];
     await ref.read(agentAllModelsProvider.notifier).load(harnesses);
   }
@@ -213,17 +212,8 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
 
   Widget _modelStep() {
     final state = ref.watch(agentAllModelsProvider);
-    final piLocal = [
-      for (final m in state.of('pi'))
-        if (m.local) m,
-    ];
-    final piRemote = [
-      for (final m in state.of('pi'))
-        if (!m.local) m,
-    ];
     final claude = state.of('claude');
-    final anyAvailable =
-        piLocal.isNotEmpty || piRemote.isNotEmpty || claude.isNotEmpty;
+    final anyAvailable = claude.isNotEmpty;
 
     if (state.loading && !anyAvailable) {
       return const Padding(
@@ -252,16 +242,8 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
             ),
           if (!anyAvailable && state.error == null)
             _hint(
-              'Моделей не видно. Проверьте на маке, что pi настроен: pi --list-models.',
+              'Моделей не видно. Проверьте на маке, что установлен Claude Code.',
             ),
-          if (piLocal.isNotEmpty) ...[
-            _groupTitle('На этом маке'),
-            for (final model in piLocal) _modelRow(model, 'pi'),
-          ],
-          if (piRemote.isNotEmpty) ...[
-            _groupTitle('По API (удалённые)'),
-            for (final model in piRemote) _modelRow(model, 'pi'),
-          ],
           if (claude.isNotEmpty) ...[
             _groupTitle('Claude Code'),
             for (final model in claude) _modelRow(model, 'claude'),
@@ -355,18 +337,6 @@ class _NewSessionWizardState extends ConsumerState<_NewSessionWizard> {
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
       child: Row(
         children: [
-          if (!widget.harnessFixed)
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => const AgentProvidersScreen(),
-                  ),
-                );
-              },
-              child: const Text('Провайдеры'),
-            ),
           const Spacer(),
           TextButton(
             onPressed: () => Navigator.of(context).pop(),

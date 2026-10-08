@@ -72,7 +72,7 @@ class AgentModelsState {
   final String? error;
 
   const AgentModelsState({
-    this.harness = 'pi',
+    this.harness = 'claude',
     this.models = const [],
     this.efforts = const [],
     this.loading = false,
@@ -109,7 +109,7 @@ class AgentModelsController extends Notifier<AgentModelsState> {
   @override
   AgentModelsState build() => const AgentModelsState();
 
-  Future<void> load({String harness = 'pi'}) async {
+  Future<void> load({String harness = 'claude'}) async {
     final keep = state.harness == harness ? state.models : const <AgentModel>[];
     final keepEfforts = state.harness == harness
         ? state.efforts
@@ -229,119 +229,6 @@ class AgentActivityController extends Notifier<AgentActivityState> {
 }
 
 
-class AgentProvidersState {
-  final List<AgentProvider> providers;
-
-  final bool loading;
-
-  final String? error;
-
-  const AgentProvidersState({
-    this.providers = const [],
-    this.loading = false,
-    this.error,
-  });
-
-  List<AgentProvider> get custom => [
-    for (final p in providers)
-      if (p.custom) p,
-  ];
-
-  List<AgentProvider> get builtin => [
-    for (final p in providers)
-      if (!p.custom) p,
-  ];
-}
-
-final agentProvidersProvider =
-    NotifierProvider<AgentProvidersController, AgentProvidersState>(
-      AgentProvidersController.new,
-    );
-
-class AgentProvidersController extends Notifier<AgentProvidersState> {
-  AgentApi get _api => ref.read(agentApiProvider);
-
-  @override
-  AgentProvidersState build() => const AgentProvidersState();
-
-  Future<void> load() async {
-    state = AgentProvidersState(providers: state.providers, loading: true);
-    try {
-      final providers = await _api.providers();
-      state = AgentProvidersState(providers: providers);
-    } on AgentApiException catch (e) {
-      state = AgentProvidersState(providers: state.providers, error: e.message);
-    }
-  }
-
-  Future<String?> save({
-    required String key,
-    required String name,
-    required String baseUrl,
-    required String api,
-    required String apiKey,
-    required List<AgentModel> models,
-  }) async {
-    state = AgentProvidersState(providers: state.providers, loading: true);
-    try {
-      final providers = await _api.saveProvider(
-        key: key,
-        name: name,
-        baseUrl: baseUrl,
-        api: api,
-        apiKey: apiKey,
-        models: models,
-      );
-      state = AgentProvidersState(providers: providers);
-      await ref.read(agentModelsProvider.notifier).load();
-      return null;
-    } on AgentApiException catch (e) {
-      state = AgentProvidersState(providers: state.providers, error: e.message);
-      return e.message;
-    }
-  }
-
-  Future<void> remove(String key) async {
-    try {
-      final providers = await _api.deleteProvider(key);
-      state = AgentProvidersState(providers: providers);
-      await ref.read(agentModelsProvider.notifier).load();
-    } on AgentApiException catch (e) {
-      state = AgentProvidersState(providers: state.providers, error: e.message);
-    }
-  }
-
-  Future<String?> setKey(String provider, String apiKey) async {
-    try {
-      final providers = await _api.saveProviderKey(provider, apiKey);
-      state = AgentProvidersState(providers: providers);
-      await ref.read(agentModelsProvider.notifier).load();
-      return null;
-    } on AgentApiException catch (e) {
-      state = AgentProvidersState(providers: state.providers, error: e.message);
-      return e.message;
-    }
-  }
-
-  Future<(List<AgentModel>, String?)> probe({
-    required String baseUrl,
-    String provider = '',
-    String apiKey = '',
-  }) async {
-    try {
-      final models = await _api.probeProvider(
-        baseUrl: baseUrl,
-        provider: provider,
-        apiKey: apiKey,
-      );
-      return (models, null);
-    } on AgentApiException catch (e) {
-      return (const <AgentModel>[], e.message);
-    }
-  }
-}
-
-
 class AgentProjectsState {
   final List<AgentProject> projects;
 
@@ -450,7 +337,7 @@ class AgentSessionsController extends Notifier<AgentSessionsState> {
 
   Future<AgentSessionInfo?> open(
     AgentProject project, {
-    String harness = 'pi',
+    String harness = 'claude',
     String? sessionId,
     String? modelKey,
     String? effort,

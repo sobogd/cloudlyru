@@ -218,7 +218,7 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final chosen = await showModelPicker(
       context,
       ref,
-      harness: session?.harness.isEmpty ?? true ? 'pi' : session!.harness,
+      harness: session?.harness.isEmpty ?? true ? 'claude' : session!.harness,
       current: session?.model,
     );
     if (chosen == null || !mounted) return;
@@ -876,7 +876,14 @@ class _AgentThreadScreenState extends ConsumerState<AgentThreadScreen> {
     final rows = <(String, String)>[
       ('Идентификатор', session.id),
       ('Проект', session.path),
-      ('Харнесс', session.harnessName.isEmpty ? 'pi' : session.harnessName),
+      (
+        'Харнесс',
+        session.harnessName.isNotEmpty
+            ? session.harnessName
+            : session.harness == 'harness'
+                ? 'LLM harness'
+                : 'Claude Code',
+      ),
       ('Модель', session.modelLabel),
       ('Где считает', session.whereLabel),
       if (session.harness == 'claude')

@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { env } from '../config/env';
 
 /**
- * Ошибка обращения к мосту pi.
+ * Ошибка обращения к мосту агента.
  *
  * Несёт код моста (или 0, если ответа не было) и готовый текст: причина приходит от моста, а
  * сетевые сбои формулируются здесь — контроллер только переводит это в HTTP-ответ.
@@ -34,7 +34,7 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const STT_TIMEOUT_MS = 120_000;
 
 /**
- * Клиент моста до харнесса pi на домашнем маке (`agents/pi-bridge/`).
+ * Клиент моста до харнессов на домашнем маке (`agents/bridge/`).
  *
  * Сервер ходит к мосту через reverse-SSH туннель, на
  * `http://127.0.0.1:18820` — порт открыт только на loopback самого VPS, наружу не смотрит
@@ -42,7 +42,7 @@ const STT_TIMEOUT_MS = 120_000;
  * `/projects/*` и ни адресов туннеля, ни токенов не знает.
  *
  * Сервис ничего не решает: он перекладывает запросы и отдаёт поток ответа агента как есть.
- * Проекты, сессии, инструменты и история живут на маке, у pi.
+ * Проекты, сессии, инструменты и история живут на маке, у агентов.
  */
 @Injectable()
 export class ProjectsService {
@@ -50,12 +50,12 @@ export class ProjectsService {
 
   /** Настроен ли мост: пустой адрес означает, что раздел работать не может. */
   get configured(): boolean {
-    return env.PI_BRIDGE_URL.trim().length > 0;
+    return env.BRIDGE_URL.trim().length > 0;
   }
 
   /** Адрес моста без хвостовых слэшей, чтобы пути склеивались одним способом. */
   private base(): string {
-    return env.PI_BRIDGE_URL.trim().replace(/\/+$/, '');
+    return env.BRIDGE_URL.trim().replace(/\/+$/, '');
   }
 
   /** Настроено ли распознавание речи: без адреса ручка голосового ввода не работает. */
@@ -218,7 +218,7 @@ export class ProjectsService {
           `мост не ответил за ${Math.round((options.timeoutMs ?? REQUEST_TIMEOUT_MS) / 1000)} с`,
         );
       }
-      this.logger.warn(`мост pi недоступен: ${String(e)}`);
+      this.logger.warn(`мост недоступен: ${String(e)}`);
       throw new ProjectsError(
         502,
         'мост недоступен: мак спит, выключен или туннель отключился',

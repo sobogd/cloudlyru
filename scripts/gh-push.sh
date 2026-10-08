@@ -7,7 +7,7 @@
 # подставляется сам, поэтому в аргументах его быть не должно: `./scripts/gh-push.sh main`.
 #
 # После пуша перезапускает мост до харнессов, если в уехавших коммитах менялся
-# agents/pi-bridge/ (см. scripts/restart-bridge.sh — иначе мост остаётся со старым кодом).
+# agents/bridge/ (см. scripts/restart-bridge.sh — иначе мост остаётся со старым кодом).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

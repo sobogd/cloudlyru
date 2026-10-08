@@ -77,11 +77,11 @@ class AgentApi {
     ];
   }
 
-  Future<List<AgentModel>> models({String harness = 'pi'}) async =>
+  Future<List<AgentModel>> models({String harness = 'claude'}) async =>
       (await catalog(harness: harness)).$1;
 
   Future<(List<AgentModel>, List<AgentEffort>)> catalog({
-    String harness = 'pi',
+    String harness = 'claude',
   }) async {
     final data = await _send<Map<String, dynamic>>(
       () => _get(
@@ -102,106 +102,6 @@ class AgentApi {
           if (e is Map) AgentEffort.fromJson(e.cast<String, dynamic>()),
     ];
     return (models, efforts);
-  }
-
-  Future<List<AgentProvider>> providers() async {
-    final data = await _send<Map<String, dynamic>>(
-      () => _get('/projects/providers'),
-    );
-    final raw = data?['providers'];
-    return <AgentProvider>[
-      if (raw is List)
-        for (final p in raw)
-          if (p is Map) AgentProvider.fromJson(p.cast<String, dynamic>()),
-    ];
-  }
-
-  Future<List<AgentProvider>> saveProvider({
-    required String key,
-    required String name,
-    required String baseUrl,
-    required String api,
-    required String apiKey,
-    required List<AgentModel> models,
-  }) async {
-    final data = await _send<Map<String, dynamic>>(
-      () => _post(
-        '/projects/providers',
-        data: <String, dynamic>{
-          'key': key,
-          'name': name,
-          'baseUrl': baseUrl,
-          'api': api,
-          'apiKey': apiKey,
-          'models': <Map<String, dynamic>>[
-            for (final m in models)
-              <String, dynamic>{
-                'id': m.id,
-                'name': m.name,
-                if (m.contextWindow != null) 'contextWindow': m.contextWindow,
-                if (m.maxTokens != null) 'maxTokens': m.maxTokens,
-                'thinking': m.thinking,
-                if (m.images) 'images': true,
-                if (m.samplingParams.isNotEmpty)
-                  'samplingParams': m.samplingParams,
-              },
-          ],
-        },
-      ),
-    );
-    return _providersOf(data);
-  }
-
-  Future<List<AgentProvider>> deleteProvider(String key) async {
-    final data = await _send<Map<String, dynamic>>(
-      () => _delete('/projects/providers/${Uri.encodeComponent(key)}'),
-    );
-    return _providersOf(data);
-  }
-
-  Future<List<AgentModel>> probeProvider({
-    required String baseUrl,
-    String provider = '',
-    String apiKey = '',
-  }) async {
-    final data = await _send<Map<String, dynamic>>(
-      () => _post(
-        '/projects/providers/probe',
-        data: <String, dynamic>{
-          'baseUrl': baseUrl,
-          if (provider.isNotEmpty) 'provider': provider,
-          if (apiKey.isNotEmpty) 'apiKey': apiKey,
-        },
-      ),
-    );
-    final raw = data?['models'];
-    return <AgentModel>[
-      if (raw is List)
-        for (final m in raw)
-          if (m is Map) AgentModel.fromJson(m.cast<String, dynamic>()),
-    ];
-  }
-
-  Future<List<AgentProvider>> saveProviderKey(
-    String provider,
-    String apiKey,
-  ) async {
-    final data = await _send<Map<String, dynamic>>(
-      () => _post(
-        '/projects/providers/key',
-        data: <String, dynamic>{'provider': provider, 'apiKey': apiKey},
-      ),
-    );
-    return _providersOf(data);
-  }
-
-  List<AgentProvider> _providersOf(Map<String, dynamic>? data) {
-    final raw = data?['providers'];
-    return <AgentProvider>[
-      if (raw is List)
-        for (final p in raw)
-          if (p is Map) AgentProvider.fromJson(p.cast<String, dynamic>()),
-    ];
   }
 
   Future<List<AgentProject>> projects() async {
@@ -239,7 +139,7 @@ class AgentApi {
 
   Future<AgentSessionInfo> openSession(
     String path, {
-    String harness = 'pi',
+    String harness = 'claude',
     String? sessionId,
     String? modelKey,
     String? effort,

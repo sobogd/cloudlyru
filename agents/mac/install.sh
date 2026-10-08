@@ -11,7 +11,7 @@ DST="$HOME/Library/LaunchAgents"
 mkdir -p "$ROOT/logs" 2>/dev/null || true
 
 count=0
-for p in "$SRC"/com.agent.*.plist "$ROOT"/../pi-bridge/com.agent.pi-bridge.plist; do
+for p in "$SRC"/com.agent.*.plist "$ROOT"/../bridge/com.agent.bridge.plist; do
   [ -e "$p" ] || continue
   cp "$p" "$DST/$(basename "$p")"
   count=$((count+1))
@@ -20,11 +20,11 @@ echo "deployed $count plists to $DST"
 echo "labels: $(ls "$SRC"/com.agent.*.plist | xargs -n1 basename | sed 's/com.agent.//;s/.plist//' | tr '\n' ' ')"
 echo "NOTE: changes apply on next reboot (running jobs keep current defs)."
 
-# pi-bridge needs grpcio (llm-harness adapter), which the system python lacks:
+# bridge needs grpcio (llm-harness adapter), which the system python lacks:
 # keep a dedicated venv next to the bridge.
-PB="$ROOT/../pi-bridge"
+PB="$ROOT/../bridge"
 if [ ! -x "$PB/.venv/bin/python3" ]; then
   /opt/homebrew/bin/python3 -m venv "$PB/.venv"
   "$PB/.venv/bin/python3" -m pip install -q grpcio protobuf
 fi
-echo "pi-bridge venv: $PB/.venv"
+echo "bridge venv: $PB/.venv"

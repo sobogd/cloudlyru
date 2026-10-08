@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# run-llm.sh — keeps the local LLM server (oMLX) serving CloudlyRu and pi.
+# run-llm.sh — keeps the local LLM server (oMLX) serving CloudlyRu.
 #
 # Managed by launchd (com.agent.llm, RunAtLoad + KeepAlive).
 #
@@ -11,10 +11,10 @@
 # и смена сервера.
 #
 # Раньше llama.cpp держали из-за вызова инструментов: у mlx-lm разбор tool_calls был сырой.
-# oMLX — отдельный сервер со своим разбором; если в «Чате» или pi инструменты перестанут
+# oMLX — отдельный сервер со своим разбором; если агентские инструменты перестанут
 # вызываться, первое подозрение — сюда, а откат — вернуть llama-server с GGUF.
 #
-# Имена моделей. Клиенты (LLM_MODEL сервера CloudlyRu, pi, уже созданные чаты) просят
+# Имена моделей. Клиенты (LLM_MODEL сервера CloudlyRu, уже созданные чаты) просят
 # `qwen/qwen3.8-27b`, `qwen/qwen3.5-9b`, `qwen/qwen3.5-4b`. У oMLX псевдоним у модели один,
 # поэтому вместо псевдонимов включён `model_fallback` в ~/.omlx/settings.json: любое
 # незнакомое имя уходит модели по умолчанию. Какая модель по умолчанию, что она закреплена

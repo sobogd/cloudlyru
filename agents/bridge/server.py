@@ -20,33 +20,18 @@ from pathlib import Path
 
 import harness_adapter as ha
 
-PORT = int(os.environ.get("PI_BRIDGE_PORT", "18820"))
-HOST = os.environ.get("PI_BRIDGE_HOST", "127.0.0.1")
+PORT = int(os.environ.get("BRIDGE_PORT", "18820"))
+HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
 
-CONFIG_PATH = Path(os.environ.get("PI_BRIDGE_CONFIG", str(Path.home() / ".pi-bridge.json")))
+LEGACY_CONFIG_PATH = Path.home() / ".pi-bridge.json"
+CONFIG_PATH = Path(os.environ.get("BRIDGE_CONFIG", str(Path.home() / ".agent-bridge.json")))
 
-PI_SESSIONS = Path.home() / ".pi" / "agent" / "sessions"
-PI_MODELS = Path.home() / ".pi" / "agent" / "models.json"
-PI_AUTH = Path.home() / ".pi" / "agent" / "auth.json"
+
 
 SESSIONS_PATH = Path(os.environ.get(
-    "PI_BRIDGE_SESSIONS", str(Path.home() / ".pi-bridge-sessions.json")
+    "BRIDGE_SESSIONS", str(Path.home() / ".agent-bridge-sessions.json")
 ))
 
-BUILTIN_PROVIDERS = [
-    {"key": "anthropic", "name": "Anthropic (Claude)"},
-    {"key": "openai", "name": "OpenAI"},
-    {"key": "google", "name": "Google (Gemini)"},
-    {"key": "deepseek", "name": "DeepSeek"},
-    {"key": "xai", "name": "xAI (Grok)"},
-    {"key": "mistral", "name": "Mistral"},
-    {"key": "groq", "name": "Groq"},
-    {"key": "openrouter", "name": "OpenRouter"},
-    {"key": "cerebras", "name": "Cerebras"},
-    {"key": "together", "name": "Together AI"},
-    {"key": "nvidia", "name": "NVIDIA NIM"},
-    {"key": "xiaomi", "name": "Xiaomi (MiMo)"},
-]
 
 COMMAND_TIMEOUT = 60.0
 STATE_TIMEOUT = 8.0
@@ -59,28 +44,8 @@ SESSIONS_CACHE_SECONDS = 5.0
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_NAME_CHARS = 120
 OWN_EVENTS = {"queued", "queued_started", "idle", "error"}
-
-FORWARDED_EVENTS = {
-    "message_update",
-    "tool_execution_start",
-    "tool_execution_update",
-    "tool_execution_end",
-    "agent_start",
-    "agent_end",
-    "agent_settled",
-    "turn_end",
-    "queue_update",
-    "compaction_start",
-    "compaction_end",
-    "auto_retry_start",
-    "auto_retry_end",
-    "extension_error",
-}
-
 log_lock = threading.Lock()
 
-_models_cache = None
-models_lock = threading.Lock()
 
 
 def log(message):
@@ -91,6 +56,13 @@ def log(message):
 
 
 def load_config():
+    if not CONFIG_PATH.exists() and LEGACY_CONFIG_PATH.exists():
+        # одноразовый перенос настроек из старого имени
+        CONFIG_PATH.write_bytes(LEGACY_CONFIG_PATH.read_bytes())
+        try:
+            LEGACY_CONFIG_PATH.unlink()
+        except OSError:
+            pass
     if CONFIG_PATH.exists():
         try:
             cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -105,9 +77,6 @@ def load_config():
         "host": HOST,
         "roots": [str(Path.home() / "work")],
         "depth": 2,
-        "pi": "pi",
-        "provider": "",
-        "model": "",
         "claude_effort": "",
         "harness": {"grpc": "127.0.0.1:9000", "sse": "http://127.0.0.1:9001"},
         "token": secrets.token_hex(24),
@@ -169,47 +138,6 @@ def remember_session_choice(key, provider=None, model=None, effort=None):
             log("не смог сохранить выбор модели для %s (%s): %s" % (key, SESSIONS_PATH, e))
 
 
-def journal_model(harness, session_id, file=None):
-    if not session_id:
-        return "", ""
-    file = file or find_session_file(harness, session_id)
-    if file is None:
-        return "", ""
-    reader = read_claude_meta if harness == HARNESS_CLAUDE else read_session_meta
-    meta = reader(file)
-    return str(meta.get("provider") or ""), str(meta.get("model") or "")
-
-
-def default_model():
-    provider = str(CONFIG.get("provider") or "").strip()
-    model = str(CONFIG.get("model") or "").strip()
-    if provider and model:
-        return provider, model
-
-    try:
-        data = json.loads(PI_MODELS.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        log("не смог прочитать модели pi (%s) — модель выберет сам pi" % e)
-        return provider, model
-
-    providers = data.get("providers") if isinstance(data, dict) else None
-    if not isinstance(providers, dict):
-        return provider, model
-    for name, body in providers.items():
-        if not isinstance(body, dict):
-            continue
-        models = body.get("models")
-        if not isinstance(models, list) or not models or not isinstance(models[0], dict):
-            continue
-        return provider or str(name), model or str(models[0].get("id") or "")
-    return provider, model
-
-
-def sessions_dir_for(cwd):
-    encoded = str(cwd).lstrip(os.sep).replace("/", "-").replace("\\", "-").replace(":", "-")
-    return PI_SESSIONS / ("--%s--" % encoded)
-
-
 def content_text(content):
     if isinstance(content, str):
         return content
@@ -222,100 +150,9 @@ def content_text(content):
     return "".join(parts)
 
 
-def thinking_text(content):
-    if not isinstance(content, list):
-        return ""
-    return "".join(
-        str(b.get("thinking") or "")
-        for b in content
-        if isinstance(b, dict) and b.get("type") == "thinking"
-    )
-
-
-def normalize_messages(messages):
-    items = []
-    by_call = {}
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        if role == "user":
-            text = content_text(message.get("content"))
-            if text.strip():
-                items.append({"kind": "user", "text": text})
-        elif role == "assistant":
-            blocks = []
-            calls = []
-            content = message.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    kind = block.get("type")
-                    if kind == "text":
-                        text = str(block.get("text") or "")
-                        if text.strip():
-                            blocks.append({"type": "text", "text": text})
-                    elif kind == "thinking":
-                        thinking = str(block.get("thinking") or "")
-                        if thinking.strip():
-                            blocks.append({"type": "reasoning", "text": thinking})
-                    elif kind == "toolCall":
-                        call = {
-                            "id": str(block.get("id") or ""),
-                            "name": str(block.get("name") or ""),
-                            "args": block.get("arguments") if isinstance(block.get("arguments"), dict) else {},
-                            "output": "",
-                            "isError": False,
-                        }
-                        calls.append(call)
-                        by_call[call["id"]] = call
-                        blocks.append({"type": "tool", "id": call["id"]})
-            elif isinstance(content, str) and content.strip():
-                blocks.append({"type": "text", "text": content})
-
-            error = message.get("errorMessage")
-            if not blocks and not error:
-                continue
-            if items and items[-1].get("kind") == "assistant":
-                items[-1]["blocks"].extend(blocks)
-                items[-1]["tools"].extend(calls)
-                if error:
-                    items[-1]["error"] = str(error)
-            else:
-                items.append({
-                    "kind": "assistant",
-                    "blocks": blocks,
-                    "tools": calls,
-                    "text": "",
-                    "reasoning": "",
-                    "error": str(error) if error else "",
-                })
-        elif role == "toolResult":
-            call = by_call.get(str(message.get("toolCallId") or ""))
-            if call is not None:
-                call["output"] = content_text(message.get("content"))
-                call["isError"] = bool(message.get("isError"))
-        elif role == "bashExecution":
-            items.append({
-                "kind": "bash",
-                "command": str(message.get("command") or ""),
-                "output": str(message.get("output") or ""),
-                "exitCode": message.get("exitCode"),
-            })
-
-    for item in items:
-        if item.get("kind") != "assistant":
-            continue
-        item["text"] = "".join(b["text"] for b in item["blocks"] if b["type"] == "text")
-        item["reasoning"] = "".join(b["text"] for b in item["blocks"] if b["type"] == "reasoning")
-    return items
-
-
-HARNESS_PI = "pi"
 HARNESS_CLAUDE = "claude"
 HARNESS_LLM = "harness"
-HARNESS_NAMES = {HARNESS_PI: "pi", HARNESS_CLAUDE: "Claude Code", HARNESS_LLM: "LLM harness"}
+HARNESS_NAMES = {HARNESS_CLAUDE: "Claude Code", HARNESS_LLM: "LLM harness"}
 
 CLAUDE_ALIASES = [
     {"id": "default", "name": "Как настроено в Claude Code", "contextWindow": 200_000},
@@ -387,11 +224,11 @@ def session_key(harness, session_id):
 
 def split_key(key):
     text = str(key or "")
-    for harness in (HARNESS_PI, HARNESS_CLAUDE, HARNESS_LLM):
+    for harness in (HARNESS_CLAUDE, HARNESS_LLM):
         prefix = harness + "--"
         if text.startswith(prefix):
             return harness, text[len(prefix):]
-    return HARNESS_PI, text
+    return HARNESS_CLAUDE, text
 
 
 def claude_profile():
@@ -420,8 +257,7 @@ def session_cwd(harness, session_id):
     file = find_session_file(harness, session_id)
     if file is None:
         return None
-    reader = read_claude_meta if harness == HARNESS_CLAUDE else read_session_meta
-    cwd = str(reader(file).get("cwd") or "")
+    cwd = str(read_claude_meta(file).get("cwd") or "")
     return cwd or None
 
 
@@ -430,10 +266,9 @@ def find_session_file(harness, session_id):
         return None
     if harness == HARNESS_LLM:
         return None
-    if harness == HARNESS_CLAUDE:
-        found = sorted(claude_projects_dir().glob("*/%s.jsonl" % session_id))
-    else:
-        found = sorted(PI_SESSIONS.glob("*/**%s.jsonl" % session_id))
+    if harness != HARNESS_CLAUDE:
+        return None
+    found = sorted(claude_projects_dir().glob("*/%s.jsonl" % session_id))
     return found[0] if found else None
 
 
@@ -633,8 +468,7 @@ def normalize_claude_messages(entries):
 
 def harness_status():
     result = []
-    for harness, binary in ((HARNESS_PI, CONFIG.get("pi") or "pi"),
-                            (HARNESS_CLAUDE, CONFIG.get("claude") or "claude")):
+    for harness, binary in ((HARNESS_CLAUDE, CONFIG.get("claude") or "claude"),):
         path = shutil.which(str(binary)) or ""
         version = ""
         if path:
@@ -668,25 +502,10 @@ def claude_session_files(path):
     return files
 
 
-def session_files(path):
-    folder = sessions_dir_for(path)
-    if not folder.is_dir():
-        return []
-    files = [p for p in folder.glob("*.jsonl") if p.is_file()]
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return files
-
-
 def read_file_messages(harness, file):
     if not file or not file.exists():
         return []
-    if harness == HARNESS_CLAUDE:
-        return normalize_claude_messages(read_jsonl(file))
-    messages = []
-    for entry in read_jsonl(file):
-        if entry.get("type") == "message" and isinstance(entry.get("message"), dict):
-            messages.append(entry["message"])
-    return normalize_messages(messages)
+    return normalize_claude_messages(read_jsonl(file))
 
 
 def read_jsonl(file):
@@ -725,65 +544,6 @@ def cached_meta(file, reader):
     meta = reader(file)
     with meta_cache_lock:
         _meta_cache[str(file)] = (key, meta)
-    return meta
-
-
-def read_session_meta(file):
-    meta = {
-        "id": file.stem.split("_")[-1],
-        "cwd": "",
-        "startedAt": None,
-        "name": "",
-        "title": "",
-        "messages": 0,
-        "provider": "",
-        "model": "",
-    }
-    try:
-        with file.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                kind = entry.get("type")
-                if kind == "session":
-                    meta["id"] = str(entry.get("id") or meta["id"])
-                    meta["cwd"] = str(entry.get("cwd") or "")
-                    meta["startedAt"] = entry.get("timestamp")
-                elif kind == "model_change":
-                    if not meta["model"]:
-                        meta["provider"] = str(entry.get("provider") or "")
-                        meta["model"] = str(entry.get("modelId") or "")
-                elif kind == "session_info":
-                    name = entry.get("name")
-                    meta["name"] = name.strip() if isinstance(name, str) else ""
-                elif kind == "message":
-                    message = entry.get("message")
-                    if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
-                        meta["messages"] += 1
-                        if not meta["title"] and message.get("role") == "user":
-                            text = content_text(message.get("content")).strip().replace("\n", " ")
-                            if text:
-                                meta["title"] = text[:80]
-    except OSError as e:
-        log("не смог прочитать сессию %s: %s" % (file, e))
-    if not meta["name"]:
-        meta["name"] = meta["title"]
-    if not meta["startedAt"] or not meta.get("updatedAt"):
-        try:
-            stamp = file.stat().st_mtime
-        except OSError:
-            stamp = None
-        if not meta["startedAt"] and stamp is not None:
-            meta["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
-        if not meta.get("updatedAt") and stamp is not None:
-            meta["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
     return meta
 
 
@@ -858,7 +618,7 @@ def list_projects():
         if resolved is None or not resolved.is_dir() or str(resolved) in seen:
             return
         seen.add(str(resolved))
-        files = session_files(resolved) + claude_session_files(resolved)
+        files = claude_session_files(resolved)
         last = folder_last_used(resolved, files)
         projects.append({
             "path": str(resolved),
@@ -882,11 +642,10 @@ def list_projects():
             for path in candidates:
                 if not path.is_dir() or path.name.startswith("."):
                     continue
-                if (path / ".git").exists() or sessions_dir_for(path).is_dir() or claude_sessions_dir(path).is_dir() or (path / ".llm-harness").is_dir():
+                if (path / ".git").exists() or claude_sessions_dir(path).is_dir() or (path / ".llm-harness").is_dir():
                     add(path)
 
     for folder, reader in (
-        (PI_SESSIONS, read_session_meta),
         (claude_projects_dir(), read_claude_meta),
     ):
         if not folder.is_dir():
@@ -940,8 +699,7 @@ def session_file(session):
         if found:
             session.file_cache = found
     if session.file_cache and session.start_meta is None:
-        reader = read_claude_meta if session.harness == HARNESS_CLAUDE else read_session_meta
-        session.start_meta = reader(session.file_cache)
+        session.start_meta = read_claude_meta(session.file_cache)
     return session.file_cache
 
 
@@ -968,147 +726,23 @@ def is_local_model(model):
     return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 
-def provider_base_url(provider):
-    name = str(provider or "").strip()
-    if not name:
-        return ""
-    try:
-        data = json.loads(PI_MODELS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    providers = data.get("providers") if isinstance(data, dict) else None
-    entry = providers.get(name) if isinstance(providers, dict) else None
-    if isinstance(entry, dict):
-        return str(entry.get("baseUrl") or "")
-    return ""
-
-
-def list_models(harness=HARNESS_PI):
+def list_models(harness=HARNESS_CLAUDE):
     if harness == HARNESS_LLM:
         return [dict(ha.MODEL)]
-    if harness == HARNESS_CLAUDE:
-        return [
-            {
-                "provider": HARNESS_CLAUDE,
-                "id": entry["id"],
-                "name": entry["name"],
-                "contextWindow": entry["contextWindow"],
-                "maxTokens": None,
-                "thinking": True,
-                "baseUrl": "",
-                "local": False,
-                "hasKey": True,
-            }
-            for entry in CLAUDE_MODELS
-        ]
-    return list_pi_models()
-
-
-def list_pi_models():
-    global _models_cache
-    with models_lock:
-        if _models_cache and time.time() - _models_cache[0] < 60:
-            return _models_cache[1]
-
-    rows = []
-    try:
-        out = subprocess.run(
-            [str(CONFIG.get("pi") or "pi"), "--list-models"],
-            capture_output=True, text=True, timeout=30,
-        )
-        for line in (out.stdout or "").splitlines()[1:]:
-            parts = re.split(r"\s{2,}", line.strip())
-            if len(parts) < 2:
-                continue
-            rows.append({
-                "provider": parts[0],
-                "id": parts[1],
-                "contextWindow": parse_size(parts[2]) if len(parts) > 2 else None,
-                "maxTokens": parse_size(parts[3]) if len(parts) > 3 else None,
-                "thinking": (parts[4].lower() in ("yes", "да")) if len(parts) > 4 else False,
-            })
-    except (OSError, subprocess.SubprocessError) as e:
-        log("pi --list-models не ответил: %s" % e)
-
-    described = describe_providers()
-    models = []
-    for row in rows:
-        info = described.get(row["provider"], {})
-        by_id = info.get("models", {}).get(row["id"], {})
-        base = by_id.get("baseUrl") or info.get("baseUrl") or ""
-        models.append({
-            **row,
-            "name": by_id.get("name") or row["id"],
-            "contextWindow": by_id.get("contextWindow") or row["contextWindow"],
-            "maxTokens": by_id.get("maxTokens") or row["maxTokens"],
-            "baseUrl": base,
-            "local": is_local_model({"baseUrl": base, "provider": row["provider"]}),
-            "hasKey": by_id.get("hasKey", info.get("hasKey", True)),
-        })
-
-    if not models:
-        for provider, info in described.items():
-            for model_id, by_id in (info.get("models") or {}).items():
-                models.append({
-                    "provider": provider,
-                    "id": model_id,
-                    "name": by_id.get("name") or model_id,
-                    "contextWindow": by_id.get("contextWindow"),
-                    "maxTokens": by_id.get("maxTokens"),
-                    "thinking": bool(by_id.get("reasoning")),
-                    "baseUrl": by_id.get("baseUrl") or info.get("baseUrl") or "",
-                    "local": is_local_model({"baseUrl": by_id.get("baseUrl") or info.get("baseUrl"), "provider": provider}),
-                    "hasKey": by_id.get("hasKey", info.get("hasKey", True)),
-                })
-
-    with models_lock:
-        _models_cache = (time.time(), models)
-    return models
-
-
-def describe_providers():
-    try:
-        data = json.loads(PI_MODELS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    providers = data.get("providers") if isinstance(data, dict) else None
-    if not isinstance(providers, dict):
-        return {}
-    result = {}
-    for name, body in providers.items():
-        if not isinstance(body, dict):
-            continue
-        models = {}
-        for model in body.get("models") or []:
-            if not isinstance(model, dict) or not model.get("id"):
-                continue
-            models[str(model["id"])] = {
-                "name": model.get("name"),
-                "baseUrl": model.get("baseUrl") or body.get("baseUrl"),
-                "contextWindow": model.get("contextWindow"),
-                "maxTokens": model.get("maxTokens"),
-                "reasoning": bool(model.get("reasoning")),
-                "hasKey": bool(str(body.get("apiKey") or "").strip()),
-            }
-        result[str(name)] = {
-            "name": body.get("name"),
-            "baseUrl": body.get("baseUrl"),
-            "hasKey": bool(str(body.get("apiKey") or "").strip()),
-            "models": models,
+    return [
+        {
+            "provider": HARNESS_CLAUDE,
+            "id": entry["id"],
+            "name": entry["name"],
+            "contextWindow": entry["contextWindow"],
+            "maxTokens": None,
+            "thinking": True,
+            "baseUrl": "",
+            "local": False,
+            "hasKey": True,
         }
-    return result
-
-
-def parse_size(raw):
-    text = str(raw or "").strip().upper()
-    match = re.match(r"^([0-9.]+)\s*([KMG]?)$", text)
-    if not match:
-        return None
-    value = float(match.group(1))
-    for suffix, factor in (("K", 1_000), ("M", 1_000_000), ("G", 1_000_000_000)):
-        if match.group(2) == suffix:
-            value *= factor
-    return int(value)
+        for entry in CLAUDE_MODELS
+    ]
 
 
 def remove_session_files(key):
@@ -1132,39 +766,8 @@ def remove_session_files(key):
     return file
 
 
-def last_journal_id(file, tail_bytes=64 * 1024):
-    try:
-        with file.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - tail_bytes))
-            data = handle.read()
-    except OSError:
-        return None
-    for line in reversed(data.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line.decode("utf-8", "replace"))
-        except ValueError:
-            continue
-        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
-            return entry["id"]
-    return None
-
-
 def write_session_name(file, harness, session_id, clean):
-    if harness == HARNESS_CLAUDE:
-        entry = {"type": "custom-title", "customTitle": clean, "sessionId": session_id}
-    else:
-        entry = {
-            "type": "session_info",
-            "id": uuid.uuid4().hex[:8],
-            "parentId": last_journal_id(file),
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z",
-            "name": clean,
-        }
+    entry = {"type": "custom-title", "customTitle": clean, "sessionId": session_id}
     try:
         with file.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1260,189 +863,6 @@ def write_json_file(path, data, mode=0o600):
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.chmod(tmp, mode)
     tmp.replace(path)
-
-
-def provider_list():
-    models = read_json_file(PI_MODELS)
-    providers = models.get("providers") if isinstance(models.get("providers"), dict) else {}
-    auth = read_json_file(PI_AUTH)
-
-    result = []
-    for key, body in providers.items():
-        if not isinstance(body, dict):
-            continue
-        api_key = str(body.get("apiKey") or "")
-        base_url = str(body.get("baseUrl") or "")
-        result.append({
-            "key": str(key),
-            "name": str(body.get("name") or key),
-            "baseUrl": base_url,
-            "api": str(body.get("api") or "openai-completions"),
-            "custom": True,
-            "hasKey": bool(api_key.strip()),
-            "keyLength": len(api_key.strip()),
-            "local": is_local_model({"baseUrl": base_url, "provider": str(key)}),
-            "models": [
-                {
-                    "id": str(m.get("id")),
-                    "name": str(m.get("name") or m.get("id")),
-                    "contextWindow": m.get("contextWindow"),
-                    "maxTokens": m.get("maxTokens"),
-                    "thinking": bool(m.get("reasoning")),
-                    "images": "image" in (m.get("input") or []),
-                    **( {"samplingParams": m["samplingParams"]} if isinstance(m.get("samplingParams"), dict) else {} ),
-                }
-                for m in (body.get("models") or [])
-                if isinstance(m, dict) and m.get("id")
-            ],
-        })
-
-    for entry in BUILTIN_PROVIDERS:
-        credential = auth.get(entry["key"])
-        key_value = ""
-        if isinstance(credential, dict):
-            key_value = str(credential.get("key") or "")
-        result.append({
-            "key": entry["key"],
-            "name": entry["name"],
-            "baseUrl": "",
-            "api": "",
-            "custom": False,
-            "hasKey": bool(key_value.strip()),
-            "keyLength": len(key_value.strip()),
-            "local": False,
-            "models": [],
-        })
-    return result
-
-
-def provider_probe(base_url, api_key):
-    base = str(base_url or "").strip().rstrip("/")
-    if not base:
-        raise PiError("нужен адрес провайдера")
-    if not base.startswith("http://") and not base.startswith("https://"):
-        raise PiError("адрес должен начинаться с http:// или https://")
-    request = urllib.request.Request(base + "/models", headers={
-        "Authorization": "Bearer %s" % api_key,
-        "Accept": "application/json",
-    })
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        raise PiError("провайдер ответил %s: %s" % (e.code, e.read()[:200].decode("utf-8", "replace")))
-    except (urllib.error.URLError, ValueError, OSError) as e:
-        raise PiError("провайдер недоступен: %s" % e)
-
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, list):
-        data = payload if isinstance(payload, list) else []
-    models = []
-    for item in data:
-        if isinstance(item, dict) and item.get("id"):
-            models.append({"id": str(item["id"]), "name": str(item.get("name") or item["id"])})
-        elif isinstance(item, str):
-            models.append({"id": item, "name": item})
-    return models
-
-
-def save_provider(body):
-    key = str(body.get("key") or "").strip()
-    if not key:
-        raise PiError("нужен идентификатор провайдера (латиницей, без пробелов)")
-    if not re.match(r"^[a-zA-Z0-9._-]+$", key):
-        raise PiError("идентификатор провайдера: только латиница, цифры, точка, дефис и подчёркивание")
-    base_url = str(body.get("baseUrl") or "").strip()
-    if not base_url.startswith("http://") and not base_url.startswith("https://"):
-        raise PiError("адрес провайдера должен начинаться с http:// или https://")
-
-    models = read_json_file(PI_MODELS)
-    providers = models.get("providers")
-    if not isinstance(providers, dict):
-        providers = {}
-        models["providers"] = providers
-    existing = providers.get(key) if isinstance(providers.get(key), dict) else {}
-
-    api_key = str(body.get("apiKey") or "").strip()
-    if not api_key:
-        api_key = str(existing.get("apiKey") or "")
-
-    new_models = []
-    for item in body.get("models") or []:
-        if not isinstance(item, dict) or not item.get("id"):
-            continue
-        entry = {
-            "id": str(item["id"]),
-            "name": str(item.get("name") or item["id"]),
-            "reasoning": bool(item.get("thinking")),
-            "input": ["text", "image"] if item.get("images") else ["text"],
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        }
-        if item.get("contextWindow"):
-            entry["contextWindow"] = int(item["contextWindow"])
-        if item.get("maxTokens"):
-            entry["maxTokens"] = int(item["maxTokens"])
-        sampling = item.get("samplingParams")
-        if isinstance(sampling, dict):
-            clean = {str(k): v for k, v in sampling.items() if isinstance(v, (int, float, str))}
-            if clean:
-                entry["samplingParams"] = clean
-        new_models.append(entry)
-    if not new_models:
-        raise PiError("нужна хотя бы одна модель: без неё pi не сможет выбрать, чем отвечать")
-
-    providers[key] = {
-        "name": str(body.get("name") or existing.get("name") or key),
-        "baseUrl": base_url,
-        "apiKey": api_key,
-        "api": str(body.get("api") or existing.get("api") or "openai-completions"),
-        "models": new_models,
-    }
-    write_json_file(PI_MODELS, models)
-    invalidate_models_cache()
-    log("сохранил провайдера %s (%s, моделей %d)" % (key, base_url, len(new_models)))
-    return provider_list()
-
-
-def delete_provider(key):
-    models = read_json_file(PI_MODELS)
-    providers = models.get("providers") if isinstance(models.get("providers"), dict) else {}
-    body = providers.get(key) if isinstance(providers.get(key), dict) else None
-    if body is None:
-        raise PiError("провайдер не найден: %s" % key)
-    if key == (default_model()[0] or ""):
-        raise PiError(
-            "это провайдер по умолчанию: на нём работает мак, когда модель не выбрана — "
-            "сначала назначьте другого провайдера в ~/.pi-bridge.json"
-        )
-    providers.pop(key)
-    write_json_file(PI_MODELS, models)
-    invalidate_models_cache()
-    log("удалил провайдера %s" % key)
-    return provider_list()
-
-
-def save_provider_key(provider, api_key):
-    name = str(provider or "").strip()
-    if not name:
-        raise PiError("нужен провайдер")
-    auth = read_json_file(PI_AUTH)
-    value = str(api_key or "").strip()
-    if value:
-        auth[name] = {"type": "api_key", "key": value}
-        log("сохранил ключ провайдера %s (длина %d)" % (name, len(value)))
-    else:
-        auth.pop(name, None)
-        log("убрал ключ провайдера %s" % name)
-    write_json_file(PI_AUTH, auth)
-    invalidate_models_cache()
-    return provider_list()
-
-
-def invalidate_models_cache():
-    global _models_cache
-    with models_lock:
-        _models_cache = None
 
 
 class PiError(Exception):
@@ -1712,191 +1132,6 @@ class AgentSession:
 
     def messages(self):
         raise NotImplementedError
-
-
-class PiSession(AgentSession):
-
-    harness = "pi"
-
-    def __init__(self, cwd, session_id=None, provider=None, model=None):
-        super().__init__(cwd, model=model)
-        self.id = session_id or ""
-        self.provider = provider or ""
-        self._start(session_id)
-
-    def _start(self, session_id):
-        provider, model = default_model()
-        provider = self.provider or provider
-        model = self.model or model
-        if session_id and not self.provider and not self.model:
-            key = session_key(self.harness, session_id)
-            remembered = session_choice(key)
-            self.provider = str(remembered.get("provider") or "")
-            self.model = str(remembered.get("model") or "")
-            provider = self.provider or provider
-            model = self.model or model
-            if not self.provider and not self.model:
-                provider, model = journal_model(self.harness, session_id) or (provider, model)
-                self.provider, self.model = provider, model
-            if self.provider or self.model:
-                log("сессия %s: поднимаю с прежней моделью %s/%s" % (
-                    session_id, self.provider or "?", self.model or "?"))
-        cmd = [str(CONFIG.get("pi") or "pi"), "--mode", "rpc"]
-        if session_id:
-            cmd += ["--session-id", session_id]
-        if provider:
-            cmd += ["--provider", provider]
-        if model:
-            cmd += ["--model", model]
-        cmd.append("--approve")
-
-        log("запускаю pi в %s: %s" % (self.cwd, " ".join(cmd)))
-        try:
-            self.proc = subprocess.Popen(
-                cmd,
-                cwd=self.cwd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                start_new_session=True,
-            )
-        except OSError as e:
-            raise PiError("не удалось запустить pi (%s): %s" % (CONFIG.get("pi"), e))
-
-        self.reader = threading.Thread(target=self._read_stdout, daemon=True)
-        self.reader.start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
-
-        state = self.command("get_state", timeout=COMMAND_TIMEOUT)
-        self.id = str(state.get("sessionId") or self.id or "")
-        self.state = state
-
-    def _read_stdout(self):
-        for line in self.proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except ValueError:
-                log("не разобрал строку pi: %s" % line[:200])
-                continue
-            if not isinstance(message, dict):
-                continue
-
-            kind = message.get("type")
-            if kind == "response":
-                pending = self.pending.pop(str(message.get("id")), None)
-                if pending is not None:
-                    pending.put(message)
-                continue
-            if kind == "extension_ui_request":
-                self._answer_ui(message)
-                continue
-            if kind in FORWARDED_EVENTS:
-                self._dispatch(message)
-
-        self._fail_waiters("процесс pi завершился")
-
-    def _read_stderr(self):
-        for line in self.proc.stderr:
-            line = line.rstrip()
-            if not line:
-                continue
-            self.stderr_tail.append(line)
-            del self.stderr_tail[:-20]
-            log("pi: %s" % line[:300])
-
-    def _answer_ui(self, message):
-        request_id = str(message.get("id") or "")
-        method = str(message.get("method") or "")
-        title = str(message.get("title") or message.get("message") or "")
-        response = {"type": "extension_ui_response", "id": request_id}
-        shown = ""
-        if method == "confirm":
-            response["confirmed"] = True
-            shown = "подтверждено автоматически"
-        elif method == "select":
-            options = message.get("options")
-            if isinstance(options, list) and options:
-                response["value"] = options[0]
-                shown = "выбрано автоматически: %s" % options[0]
-            else:
-                response["cancelled"] = True
-                shown = "отменено автоматически: вариантов нет"
-        elif method in ("input", "editor"):
-            response["cancelled"] = True
-            shown = "отменено автоматически: ввод текста без человека"
-        else:
-            return
-        log("автоответ на диалог расширения (%s): %s — %s" % (method, shown, title[:120]))
-        self._write(response)
-        self._publish({"type": "ui", "method": method, "title": title, "auto": shown})
-
-    def command(self, kind, timeout=COMMAND_TIMEOUT, **fields):
-        if self.proc is None or self.proc.poll() is not None:
-            detail = self.stderr_tail[-1] if self.stderr_tail else "без вывода"
-            raise PiError("процесс pi не работает (%s)" % detail)
-        request_id = uuid.uuid4().hex
-        answer = queue.Queue(maxsize=1)
-        self.pending[request_id] = answer
-        self._write(dict({"id": request_id, "type": kind}, **fields))
-        try:
-            response = answer.get(timeout=timeout)
-        except queue.Empty:
-            self.pending.pop(request_id, None)
-            raise PiError("pi не ответил на %s за %.0f с" % (kind, timeout))
-        if not response.get("success"):
-            raise PiError(str(response.get("error") or "pi отклонил команду %s" % kind))
-        data = response.get("data")
-        return data if isinstance(data, dict) else {}
-
-    def prompt(self, text):
-        self.command("prompt", message=text)
-
-    def abort(self):
-        if self.proc is None or self.proc.poll() is not None:
-            return
-        try:
-            self._write({"id": uuid.uuid4().hex, "type": "abort"})
-        except PiError as e:
-            log("не смог отправить abort в сессию %s: %s" % (self.id, e))
-
-    def set_model(self, provider, model):
-        self.command("set_model", provider=provider, modelId=model)
-        self.provider, self.model = provider, model
-        remember_session_choice(session_key(self.harness, self.id), provider=provider, model=model)
-
-    def messages(self, timeout=STATE_TIMEOUT):
-        data = self.command("get_messages", timeout=timeout)
-        messages = data.get("messages")
-        return normalize_messages(messages if isinstance(messages, list) else [])
-
-    def refresh_state(self, timeout=COMMAND_TIMEOUT):
-        try:
-            self.state = self.command("get_state", timeout=timeout)
-            stats = self.command("get_session_stats", timeout=timeout)
-        except PiError as e:
-            log("не смог обновить состояние сессии %s: %s" % (self.id, e))
-            return self.state
-        stats = stats if isinstance(stats, dict) else {}
-        context = stats.get("contextUsage")
-        self.state = {
-            **self.state,
-            "tokens": stats.get("tokens") if isinstance(stats.get("tokens"), dict) else None,
-            "contextUsage": context if isinstance(context, dict) else None,
-            "cost": stats.get("cost"),
-            "userMessages": stats.get("userMessages"),
-            "assistantMessages": stats.get("assistantMessages"),
-            "toolCalls": stats.get("toolCalls"),
-            "totalMessages": stats.get("totalMessages"),
-        }
-        return self.state
-
 
 
 class ClaudeSession(AgentSession):
@@ -2225,81 +1460,6 @@ def _session_brief(session):
     }
 
 
-def translate_pi_event(session, event):
-    kind = event.get("type")
-    out = []
-
-    if kind == "message_update":
-        delta = event.get("assistantMessageEvent")
-        if isinstance(delta, dict):
-            delta_kind = delta.get("type")
-            if delta_kind == "text_delta" and delta.get("delta"):
-                out.append({"type": "delta", "text": str(delta["delta"])})
-            elif delta_kind == "thinking_delta" and delta.get("delta"):
-                out.append({"type": "reasoning", "text": str(delta["delta"])})
-            elif delta_kind == "toolcall_start":
-                out.append({
-                    "type": "tool_call",
-                    "id": str(delta.get("id") or ""),
-                    "name": str(delta.get("toolName") or ""),
-                })
-        usage = event.get("usage")
-        if isinstance(usage, dict) and (usage.get("totalTokens") or usage.get("input")):
-            out.append({
-                "type": "usage",
-                "input": usage.get("input"),
-                "output": usage.get("output"),
-                "totalTokens": usage.get("totalTokens"),
-            })
-        return out, False
-
-    if kind == "tool_execution_start":
-        out.append({
-            "type": "tool_start",
-            "id": str(event.get("toolCallId") or ""),
-            "name": str(event.get("toolName") or ""),
-            "args": event.get("args") if isinstance(event.get("args"), dict) else {},
-        })
-        return out, False
-
-    if kind == "tool_execution_update":
-        partial = event.get("partialResult")
-        text = content_text(partial.get("content")) if isinstance(partial, dict) else ""
-        out.append({"type": "tool_update", "id": str(event.get("toolCallId") or ""), "text": text})
-        return out, False
-
-    if kind == "tool_execution_end":
-        result = event.get("result") if isinstance(event.get("result"), dict) else {}
-        out.append({
-            "type": "tool_end",
-            "id": str(event.get("toolCallId") or ""),
-            "name": str(event.get("toolName") or ""),
-            "text": content_text(result.get("content")),
-            "isError": bool(event.get("isError")),
-        })
-        return out, False
-
-    if kind == "compaction_start":
-        return [{"type": "status", "step": "сжимаю контекст"}], False
-
-    if kind == "compaction_end":
-        return [{"type": "compacted"}], False
-
-    if kind == "agent_settled":
-        session.busy = False
-        session.touched = time.time()
-        try:
-            session.state = session.refresh_state(timeout=STATE_TIMEOUT)
-        except Exception as e:
-            log("не смог обновить состояние сессии %s: %s" % (session.id, e))
-        return [{"type": "done", "session": _session_brief(session)}], True
-
-    if kind in ("auto_retry_start", "auto_retry_end", "extension_error", "queue_update"):
-        return [{**event, "type": kind}], False
-
-    return out, False
-
-
 def translate_claude_event(session, event):
     kind = event.get("type")
     subtype = event.get("subtype")
@@ -2405,9 +1565,7 @@ def translate(session, event):
         return [{"type": "error", "message": str(event.get("message") or "сбой харнесса")}], True
     if session.harness == HARNESS_LLM:
         return ha.translate_harness_event(session, event)
-    if session.harness == HARNESS_CLAUDE:
-        return translate_claude_event(session, event)
-    return translate_pi_event(session, event)
+    return translate_claude_event(session, event)
 
 
 class Pool:
@@ -2418,7 +1576,7 @@ class Pool:
         self.reaper = threading.Thread(target=self._reap, daemon=True)
         self.reaper.start()
 
-    def open(self, cwd, harness=HARNESS_PI, session_id=None, provider=None, model=None, effort=None):
+    def open(self, cwd, harness=HARNESS_CLAUDE, session_id=None, model=None, effort=None):
         key = session_key(harness, session_id) if session_id else ""
         if key:
             with self.lock:
@@ -2428,7 +1586,7 @@ class Pool:
                     session._restart()
                 session.touched = time.time()
                 return session
-        session = self._spawn(cwd, harness, session_id, provider, model, effort)
+        session = self._spawn(cwd, harness, session_id, model, effort)
         with self.lock:
             existing = self.sessions.get(session.key)
             if existing is not None and existing is not session:
@@ -2438,20 +1596,19 @@ class Pool:
             self.sessions[session.key] = session
             return session
 
-    def _spawn(self, cwd, harness, session_id, provider, model, effort):
+    def _spawn(self, cwd, harness, session_id, model, effort):
         if harness == HARNESS_CLAUDE:
             session = ClaudeSession(cwd, session_id, model=model, effort=effort)
         elif harness == HARNESS_LLM:
             session = HarnessSession(cwd, session_id)
         else:
-            session = PiSession(cwd, session_id, model=model, provider=provider)
+            raise PiError("неизвестный харнесс: %s" % harness)
         if not session.id:
             detail = session.stderr_tail[-1] if session.stderr_tail else "без вывода"
             session.stop()
             raise PiError("%s не сообщил идентификатор сессии (%s)" % (harness, detail))
         remember_session_choice(
             session.key,
-            provider=provider,
             model=model,
             effort=session.effort if harness == HARNESS_CLAUDE else None,
         )
@@ -2459,8 +1616,6 @@ class Pool:
 
     def maybe(self, key):
         keys = [str(key)]
-        if not any(str(key).startswith(h + "--") for h in HARNESS_NAMES):
-            keys.append(session_key(HARNESS_PI, key))
         with self.lock:
             session = next((self.sessions[k] for k in keys if k in self.sessions), None)
         if session is not None and not session.alive():
@@ -2656,14 +1811,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/harnesses":
                 self._json(200, {"harnesses": harness_status()})
             elif path == "/models":
-                harness = str((params.get("harness") or [HARNESS_PI])[0]).strip().lower() or HARNESS_PI
+                harness = str((params.get("harness") or [HARNESS_CLAUDE])[0]).strip().lower() or HARNESS_CLAUDE
                 self._json(200, {
                     "models": list_models(harness),
                     "harness": harness,
                     "efforts": CLAUDE_EFFORTS if harness == HARNESS_CLAUDE else (ha.EFFORTS if harness == HARNESS_LLM else []),
                 })
-            elif path == "/providers":
-                self._json(200, {"providers": provider_list()})
             elif path == "/sessions":
                 self._list_sessions(params)
             elif path.startswith("/sessions/"):
@@ -2734,24 +1887,6 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/sessions":
                 self._open_session(body)
                 return
-            if path == "/providers":
-                self._json(200, {"providers": save_provider(body)})
-                return
-            if path == "/providers/probe":
-                api_key = str(body.get("apiKey") or "").strip()
-                provider = str(body.get("provider") or "").strip()
-                if not api_key and provider:
-                    saved = read_json_file(PI_MODELS).get("providers") or {}
-                    entry = saved.get(provider) if isinstance(saved.get(provider), dict) else {}
-                    api_key = str(entry.get("apiKey") or "")
-                models = provider_probe(body.get("baseUrl"), api_key)
-                self._json(200, {"models": models})
-                return
-            if path == "/providers/key":
-                self._json(200, {
-                    "providers": save_provider_key(body.get("provider"), body.get("apiKey")),
-                })
-                return
             parts = path.split("/")
             if len(parts) >= 4 and parts[1] == "sessions":
                 action = parts[3]
@@ -2806,23 +1941,14 @@ class Handler(BaseHTTPRequestHandler):
                             raise PiError(str(e))
                         self._json(200, {"summary": data.get("summaryPreview") or ""})
                         return
-                    if session.harness != HARNESS_PI:
-                        raise PiError("сжатие контекста есть только у pi: Claude Code сжимает его сам")
-                    instructions = body.get("instructions")
-                    data = session.command(
-                        "compact",
-                        timeout=900.0,
-                        **({"customInstructions": instructions} if isinstance(instructions, str) and instructions else {}),
-                    )
-                    self._json(200, {"summary": data.get("summary") or ""})
+                    raise PiError("у Claude Code нет ручной компакции: он сжимает контекст сам")
                 elif action == "model":
                     if session.harness == HARNESS_LLM:
                         raise PiError("у LLM harness одна встроенная модель: mtplx")
-                    provider = str(body.get("provider") or "").strip()
                     model = str(body.get("modelId") or "").strip()
-                    if not provider or not model:
-                        raise PiError("нужны provider и modelId")
-                    session.set_model(provider, model)
+                    if not model:
+                        raise PiError("нужен modelId")
+                    session.set_model(HARNESS_CLAUDE, model)
                     session.refresh_state(timeout=STATE_TIMEOUT)
                     self._json(200, {"session": self._session_brief(session)})
                 elif action == "effort":
@@ -2836,10 +1962,6 @@ class Handler(BaseHTTPRequestHandler):
                     session.set_effort(str(body.get("effort") or ""))
                     session.refresh_state(timeout=STATE_TIMEOUT)
                     self._json(200, {"session": self._session_brief(session)})
-                elif action == "ui":
-                    if session.harness == HARNESS_LLM:
-                        raise PiError("у LLM harness нет диалогов подтверждения")
-                    self._json(200, self._manual_ui(session, body))
                 else:
                     self._json(404, {"error": "неизвестная ручка: %s" % path})
                 return
@@ -2852,9 +1974,6 @@ class Handler(BaseHTTPRequestHandler):
 
         def run():
             parts = path.split("/")
-            if len(parts) == 3 and parts[1] == "providers":
-                self._json(200, {"providers": delete_provider(parts[2])})
-                return
             if len(parts) == 3 and parts[1] == "sessions":
                 if split_key(parts[2])[0] == HARNESS_LLM:
                     native_id = split_key(parts[2])[1]
@@ -2890,15 +2009,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
     def _health(self):
-        provider, model = default_model()
-        harnesses = harness_status()
-        pi_version = next((h["version"] for h in harnesses if h["harness"] == HARNESS_PI), "")
         return {
             "ok": True,
-            "pi": pi_version,
-            "harnesses": harnesses,
-            "provider": provider,
-            "model": model,
+            "harnesses": harness_status(),
+            "provider": "",
+            "model": "",
             "roots": CONFIG.get("roots") or [],
             "sessions": POOL.list(),
         }
@@ -2928,9 +2043,6 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         else:
             for folder in folders:
-                if asked in ("", HARNESS_PI):
-                    for file in session_files(folder):
-                        sessions.append({**cached_meta(file, read_session_meta), "harness": HARNESS_PI, "path": str(folder)})
                 if asked in ("", HARNESS_CLAUDE):
                     for file in claude_session_files(folder):
                         sessions.append({**cached_meta(file, read_claude_meta), "harness": HARNESS_CLAUDE, "path": str(folder)})
@@ -2943,26 +2055,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _open_session(self, body):
         raw = str(body.get("path") or "").strip()
-        harness = str(body.get("harness") or "").strip().lower()
-        if not harness:
-            harness = HARNESS_PI
+        harness = str(body.get("harness") or "").strip().lower() or HARNESS_CLAUDE
         if not raw and harness == HARNESS_LLM:
             raw = ha.HUB.root
         path = allowed_path(raw) if raw else None
         if path is None:
             raise PiError("папка вне разрешённых корней: %s" % raw)
         raw_id = str(body.get("sessionId") or "").strip()
-        if not harness and raw_id:
-            harness = split_key(raw_id)[0]
         if harness not in HARNESS_NAMES:
             raise PiError("неизвестный харнесс: %s" % harness)
         session_id = split_key(raw_id)[1] if raw_id else None
-        provider = str(body.get("provider") or "").strip() or None
         model = str(body.get("model") or "").strip() or None
         effort = str(body.get("effort") or "").strip() or None
         if harness == HARNESS_CLAUDE and effort is not None:
             remember_claude_effort(effort)
-        session = POOL.open(path, harness, session_id, provider=provider, model=model, effort=effort)
+        session = POOL.open(path, harness, session_id, model=model, effort=effort)
         session.refresh_state(timeout=STATE_TIMEOUT)
         self._json(200, {"session": self._session_brief(session)})
 
@@ -3034,9 +2141,7 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _file_brief(self, harness, native_id, file):
-        reader = read_claude_meta if harness == HARNESS_CLAUDE else read_session_meta
-        meta = reader(file)
-        provider_name = str(meta.get("provider") or "")
+        meta = read_claude_meta(file)
         return {
             "id": session_key(harness, native_id),
             "harness": harness,
@@ -3047,9 +2152,7 @@ class Handler(BaseHTTPRequestHandler):
             "model": str(meta.get("model") or ""),
             "modelName": str(meta.get("model") or ""),
             "provider": str(meta.get("provider") or ""),
-            "local": harness != HARNESS_CLAUDE and is_local_model(
-                {"provider": provider_name, "baseUrl": provider_base_url(provider_name)}
-            ),
+            "local": False,
             "thinkingLevel": "",
             "busy": False,
             "messages": int(meta.get("messages") or 0),
@@ -3133,20 +2236,6 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             session.unsubscribe(events)
-
-    def _manual_ui(self, session, body):
-        request_id = str(body.get("requestId") or "").strip()
-        if not request_id:
-            raise PiError("нужен requestId")
-        response = {"type": "extension_ui_response", "id": request_id}
-        if "confirmed" in body:
-            response["confirmed"] = bool(body["confirmed"])
-        elif "value" in body:
-            response["value"] = body["value"]
-        else:
-            response["cancelled"] = True
-        session._write(response)
-        return {"ok": True}
 
     def _prompt(self, session, body):
         text = str(body.get("text") or "").strip()
@@ -3240,7 +2329,7 @@ def main():
     harness_cfg = CONFIG.get("harness") if isinstance(CONFIG.get("harness"), dict) else {}
     ha.init(harness_cfg.get("grpc"), harness_cfg.get("sse"))
     server = ThreadingHTTPServer((host, port), Handler)
-    log("мост pi слушает %s:%d, корни: %s" % (host, port, ", ".join(CONFIG.get("roots") or [])))
+    log("мост агента слушает %s:%d, корни: %s" % (host, port, ", ".join(CONFIG.get("roots") or [])))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

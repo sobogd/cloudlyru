@@ -165,7 +165,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
 
   Future<void> _open(
     AgentProject project, {
-    String harness = 'pi',
+    String harness = 'claude',
     String? sessionId,
     String? modelKey,
     required bool embedded,
@@ -621,7 +621,7 @@ class _ProjectsScreenState extends ConsumerState<ProjectsScreen> {
     if (wide && session.id == _selectedId) return;
     _open(
       AgentProject.fromPath(session.path),
-      harness: session.harness.isEmpty ? 'pi' : session.harness,
+      harness: session.harness.isEmpty ? 'claude' : session.harness,
       sessionId: session.id,
       embedded: wide,
     );

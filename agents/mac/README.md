@@ -16,7 +16,7 @@ Cloudly. Статус-панель (`mac-status-server.py`) — **только A
 | `com.agent.claude-tangem` | сессия Claude в `~/.claude-work` (в launchd `disabled`) |
 
 Туннель отдаёт на VPS (loopback самого VPS): `18810` панель, `18812`→`1234`,
-`18818`→`1238`, `18820` pi-bridge, `18822`→`1235`. Наружу ничего не смотрит.
+`18818`→`1238`, `18820` мост агентов (`agents/bridge`), `18822`→`1235`. Наружу ничего не смотрит.
 
 ## Ручки панели (`/api/*`; требуется `X-Mac-Token`, если задан `MAC_SERVICE_TOKEN`)
 

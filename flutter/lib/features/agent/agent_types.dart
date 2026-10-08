@@ -316,64 +316,6 @@ class AgentHarness {
   String get label => name.isNotEmpty ? name : harness;
 }
 
-class AgentProvider {
-  final String key;
-
-  final String name;
-
-  final String baseUrl;
-
-  final String api;
-
-  final bool custom;
-
-  final bool hasKey;
-
-  final int keyLength;
-
-  final bool local;
-
-  final List<AgentModel> models;
-
-  const AgentProvider({
-    required this.key,
-    this.name = '',
-    this.baseUrl = '',
-    this.api = '',
-    this.custom = false,
-    this.hasKey = false,
-    this.keyLength = 0,
-    this.local = false,
-    this.models = const [],
-  });
-
-  factory AgentProvider.fromJson(Map<String, dynamic> json) => AgentProvider(
-    key: json['key']?.toString() ?? '',
-    name: json['name']?.toString() ?? '',
-    baseUrl: json['baseUrl']?.toString() ?? '',
-    api: json['api']?.toString() ?? '',
-    custom: json['custom'] == true,
-    hasKey: json['hasKey'] == true,
-    keyLength: json['keyLength'] is num
-        ? (json['keyLength'] as num).toInt()
-        : 0,
-    local: json['local'] == true,
-    models: <AgentModel>[
-      if (json['models'] is List)
-        for (final m in json['models'] as List)
-          if (m is Map)
-            AgentModel.fromJson({
-              ...m.cast<String, dynamic>(),
-              'provider': json['key']?.toString() ?? '',
-              'local': json['local'] == true,
-              'hasKey': json['hasKey'] == true,
-            }),
-    ],
-  );
-
-  String get label => name.isNotEmpty ? name : key;
-}
-
 class AgentEffort {
   final String id;
 
@@ -644,22 +586,18 @@ class AgentUsage {
 }
 
 class AgentHealth {
-  final String pi;
-
   final String provider;
   final String model;
 
   final List<String> roots;
 
   const AgentHealth({
-    this.pi = '',
     this.provider = '',
     this.model = '',
     this.roots = const [],
   });
 
   factory AgentHealth.fromJson(Map<String, dynamic> json) => AgentHealth(
-    pi: json['pi']?.toString() ?? '',
     provider: json['provider']?.toString() ?? '',
     model: json['model']?.toString() ?? '',
     roots: <String>[
@@ -668,8 +606,7 @@ class AgentHealth {
     ],
   );
 
-  String get label =>
-      [if (pi.isNotEmpty) 'pi $pi', if (model.isNotEmpty) model].join(' · ');
+  String get label => model;
 }
 
 class AgentHistoryPage {

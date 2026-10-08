@@ -1,37 +1,37 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  launchd-агент моста до харнесса pi (agents/pi-bridge/server.py).
+  launchd-агент моста до харнессов (agents/bridge/server.py): Claude Code и llm-harness.
 
   Ставится копированием в ~/Library/LaunchAgents и загрузкой:
-    cp agents/pi-bridge/com.agent.pi-bridge.plist ~/Library/LaunchAgents/
-    launchctl load ~/Library/LaunchAgents/com.agent.pi-bridge.plist
+    cp agents/bridge/com.agent.bridge.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.agent.bridge.plist
 
-  Python — из venv в agents/pi-bridge/.venv: мост больше пользуется не только стандартной
-  библиотекой — адаптер к llm-harness ходит по gRPC (grpcio). venv создаётся install.sh
-  из agents/mac, если его ещё нет.
+  Python — из venv в agents/bridge/.venv: мост пользуется не только стандартной библиотекой —
+  адаптер к llm-harness ходит по gRPC (grpcio). venv создаётся install.sh из agents/mac,
+  если его ещё нет.
 
   Порт 18820 слушает только loopback, и на VPS его видит только сервер приложения — через
   reverse-SSH туннель мака (строка -R 127.0.0.1:18820 в cloudlyru/agents/mac/run-tunnel.sh).
-  Менять порт нужно вместе с этим скриптом и с PI_BRIDGE_URL в окружении сервера.
+  Менять порт нужно вместе с этим скриптом и с BRIDGE_URL в окружении сервера.
 
   KeepAlive: раздел «Проекты» в приложении без моста не работает вовсе, поэтому упавший
   сервис обязан вернуться сам. ThrottleInterval не даёт ему крутиться в цикле перезапусков,
   если он падает сразу (например, порт занят другим процессом).
 
-  HOME задан явно: launchd не наследует окружение оболочки, а pi ищет свои сессии, настройки
-  и список моделей по ~/.pi/agent — без HOME он стартовал бы как чужой пользователь.
+  HOME задан явно: launchd не наследует окружение оболочки, а мост ищет сессии Claude Code
+  и настройки по ~/.claude — без HOME он стартовал бы как чужой пользователь.
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.agent.pi-bridge</string>
+  <string>com.agent.bridge</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/sobogd/work/cloudlyru/agents/pi-bridge/.venv/bin/python3</string>
-    <string>/Users/sobogd/work/cloudlyru/agents/pi-bridge/server.py</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/bridge/.venv/bin/python3</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/bridge/server.py</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/sobogd/work/cloudlyru/agents/pi-bridge</string>
+  <string>/Users/sobogd/work/cloudlyru/agents/bridge</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
@@ -46,8 +46,8 @@
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>StandardOutPath</key>
-  <string>/tmp/pi-bridge.log</string>
+  <string>/tmp/agent-bridge.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/pi-bridge.err.log</string>
+  <string>/tmp/agent-bridge.err.log</string>
 </dict>
 </plist>

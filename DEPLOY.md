@@ -80,12 +80,13 @@ gh secret set MAIL_PURGE_ENABLED  --body true    # затем само удал�
 `MAIL_MAX_MESSAGE_MB` (по умолчанию `64`) — потолок размера письма: больше — письмо
 пропускается с причиной в логе, курсор за него не двигается.
 
-## Раздел «Проекты»: агент pi работает в папке проекта на маке
+## Раздел «Проекты»: агенты работают в папке проекта на маке
 
 Раздел «Проекты» в приложении (иконка терминала в левом баре) даёт агенту папку
-проекта: он читает и правит файлы, запускает команды. Агентом работает харнесс
-[pi](https://github.com/earendil-works/pi) (`@earendil-works/pi-coding-agent`), моделью — та же
-локальная llama.cpp, что работает на маке.
+проекта: он читает и правит файлы, запускает команды. Агентов (харнессов) двое:
+[Claude Code](https://claude.com/claude-code) (его собственные модели и подписка) и
+llm-harness (локальная модель на маке, gRPC 9000 / SSE 9001). Харнесс выбирается в
+списке сессий проекта, у каждого своя история разговоров.
 
 Сервер на VPS ходит к мосту на маке через reverse-SSH туннель, порт
 открыт только на loopback обоих концов, наружу не смотрит никто, поэтому ни TLS, ни ключей на
@@ -93,49 +94,48 @@ gh secret set MAIL_PURGE_ENABLED  --body true    # затем само удал�
 
 | Слой | Где живёт | Что делает |
 |---|---|---|
-| Мост `agents/pi-bridge/server.py` | мак, `127.0.0.1:18820` | HTTP+SSE наружу, `pi --mode rpc` по stdio внутрь; пул процессов, allowlist корней |
+| Мост `agents/bridge/server.py` | мак, `127.0.0.1:18820` | HTTP+SSE наружу, `claude --print stream-json` и gRPC llm-harness внутрь; пул процессов, allowlist корней |
 | Туннель `com.agent.mac-tunnel` | мак → VPS | пробрасывает `VPS 127.0.0.1:18820 -> мак 127.0.0.1:18820` |
 | Сервер `src/projects` | VPS | проксирует `/projects/*` к мосту, поток событий отдаёт как есть; раз в 5 с спрашивает `/health` и держит снимок работы (`/projects/activity`) |
 | Раздел в приложении | телефон и мак | список проектов, сессии, переписка с карточками инструментов, выбор харнесса и модели |
 
-Агентов двое: pi (локальная llama.cpp и любые удалённые провайдеры) и Claude Code (его
-собственные модели и подписка). Харнесс выбирается в списке сессий проекта, у каждого своя
-история разговоров. Claude Code запускается с профилем из настройки `claude_config_dir` —
-без неё он отвечает «Not logged in», хотя в терминале работает.
-
-Модель для сессии выбирается в приложении из списка, который отдаёт pi: локальная llama.cpp
-на маке или удалённый провайдер по API. Там же (Настройки → Агент → «Модели и ключи»)
-провайдеры и добавляются: адрес, ключ и список моделей пишутся в файлы pi на маке через мост,
-а сохранённый ключ никогда не читается обратно — приложение и сервер его не хранят. Подробности —
-в `agents/pi-bridge/README.md`.
+Claude Code запускается с профилем из настройки `claude_config_dir` в `~/.agent-bridge.json` —
+без неё он отвечает «Not logged in», хотя в терминале работает; модель для сессии
+выбирается в приложении из встроенного каталога Claude Code. llm-harness — отдельный
+launchd-агент мака (`com.agent.harness`, `agents/mac/run-harness.sh`): если он не поднят,
+харнесс в `/harnesses` значится недоступным. Подробности — в `agents/bridge/README.md`.
 
 Установка на маке и на VPS:
 
 ```bash
 # 1) мост
-cp agents/pi-bridge/com.agent.pi-bridge.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.agent.pi-bridge.plist
-# 2) порт в туннеле: в cloudlyru/agents/mac/run-tunnel.sh строка -R 127.0.0.1:18820
+cp agents/bridge/com.agent.bridge.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.agent.bridge.plist
+# 2) llm-harness
+cp agents/mac/com.agent.harness.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.agent.harness.plist
+# 3) порт в туннеле: в cloudlyru/agents/mac/run-tunnel.sh строка -R 127.0.0.1:18820
 #    и порт в очистке залипших слушателей, затем перезапуск туннеля
 launchctl kickstart -k gui/$(id -u)/com.agent.mac-tunnel
-# 3) проверка: порт слушает loopback VPS и мост отвечает
+# 4) проверка: порт слушает loopback VPS и мост отвечает
 ssh root@46.225.143.221 'ss -ltn | grep 18820; curl -s http://127.0.0.1:18820/health'
 ```
 
-Переменная сервера `PI_BRIDGE_URL` (по умолчанию `http://127.0.0.1:18820`) задаётся в
+Переменная сервера `BRIDGE_URL` (по умолчанию `http://127.0.0.1:18820`) задаётся в
 `deploy.yml` и переопределяется одноимённым секретом репозитория.
 
 Диагностика:
 
 ```bash
-launchctl list | grep pi-bridge
-tail -20 /tmp/pi-bridge.err.log        # автоответы агента тоже здесь
+launchctl list | grep bridge
+tail -20 /tmp/agent-bridge.err.log
 ssh root@46.225.143.221 'curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18820/health'
 ```
 
-Первый запуск моста создаёт `~/.pi-bridge.json` (режим 600) со списком разрешённых корней (по
-умолчанию `~/work`). Это единственная граница раздела: песочницы у pi нет, и инструменты
+Первый запуск моста создаёт `~/.agent-bridge.json` (режим 600) со списком разрешённых корней (по
+умолчанию `~/work`). Это единственная граница раздела: песочницы у агента нет, и инструменты
 работают с правами пользователя.
+
 
 ## Первичная настройка сервера (один раз, root)
 

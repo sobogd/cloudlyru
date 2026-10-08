@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Перезапуск моста до харнессов (agents/pi-bridge/server.py, launchd com.agent.pi-bridge).
+# Перезапуск моста до харнессов (agents/bridge/server.py, launchd com.agent.bridge).
 #
 # Зачем. Мост — долгоживущий python-процесс под launchd с KeepAlive: launchd поднимает его
 # только когда процесс упал, а не когда на диске появился новый код. После правки
-# agents/pi-bridge/** в памяти остаётся старая версия, и мост отвечает по-старому — например,
+# agents/bridge/** в памяти остаётся старая версия, и мост отвечает по-старому — например,
 # отдаёт прежний список моделей Claude Code и пустой список уровней усилия, хотя в коде они
 # уже есть. kickstart -k гасит процесс принудительно (`-k`), launchd поднимает его заново
 # уже с новым кодом.
@@ -13,14 +13,14 @@
 #   ./scripts/restart-bridge.sh --quiet    — то же, но без вывода при успехе (для хуков)
 #   ./scripts/restart-bridge.sh --if-changed <commit> [<commit>]
 #                                          — перезапустить, только если в диапазоне коммитов
-#                                            (или в одиночном коммите) менялся agents/pi-bridge/
+#                                            (или в одиночном коммите) менялся agents/bridge/
 #
 # Код возврата: 0 — мост перезапущен или перезапуск не требовался; 1 — агент не загружен
 # (мост на этой машине не стоит, перезапускать нечего).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-LABEL="com.agent.pi-bridge"
+LABEL="com.agent.bridge"
 QUIET=0
 RANGE=()
 
@@ -47,10 +47,10 @@ fi
 if [ ${#RANGE[@]} -gt 0 ]; then
   BASE="${RANGE[0]}"
   HEAD_REF="${RANGE[1]:-HEAD}"
-  if ! CHANGED=$(git diff --name-only "$BASE" "$HEAD_REF" -- agents/pi-bridge/); then
+  if ! CHANGED=$(git diff --name-only "$BASE" "$HEAD_REF" -- agents/bridge/); then
     echo "не удалось сравнить $BASE..$HEAD_REF — перезапускаю мост на всякий случай" >&2
   elif [ -z "$CHANGED" ]; then
-    log "agents/pi-bridge/ в $BASE..$HEAD_REF не менялся — мост не трогаю"
+    log "agents/bridge/ в $BASE..$HEAD_REF не менялся — мост не трогаю"
     exit 0
   fi
 fi
@@ -59,7 +59,7 @@ launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
 # Ждём, пока новый процесс поднимется и ответит /health: иначе вызывающий скрипт продолжит
 # работу, не зная, поднялся ли мост. Порт и адрес берём те же, что у моста по умолчанию.
-PORT=$(python3 -c 'import json,pathlib;p=pathlib.Path.home()/".pi-bridge.json";print((json.loads(p.read_text()).get("port") if p.exists() else None) or 18820)' 2>/dev/null || echo 18820)
+PORT=$(python3 -c 'import json,pathlib;p=pathlib.Path.home()/".agent-bridge.json";print((json.loads(p.read_text()).get("port") if p.exists() else None) or 18820)' 2>/dev/null || echo 18820)
 for _ in $(seq 1 20); do
   if curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     log "мост перезапущен (:${PORT})"
@@ -68,5 +68,5 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 
-echo "мост не ответил на :${PORT}/health за 10 с — смотрите /tmp/pi-bridge.err.log" >&2
+echo "мост не ответил на :${PORT}/health за 10 с — смотрите /tmp/agent-bridge.err.log" >&2
 exit 1

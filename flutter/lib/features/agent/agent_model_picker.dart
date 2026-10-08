@@ -5,13 +5,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../theme.dart';
 import 'agent_controller.dart';
-import 'agent_providers_screen.dart';
 import 'agent_types.dart';
 
 Future<AgentModel?> showModelPicker(
   BuildContext context,
   WidgetRef ref, {
-  String harness = 'pi',
+  String harness = 'claude',
   String? current,
 }) async {
   final controller = ref.read(agentModelsProvider.notifier);
@@ -65,7 +64,7 @@ class _ModelPickerDialog extends ConsumerWidget {
                       ),
                     if (state.models.isEmpty && state.error == null)
                       const Text(
-                        'Моделей не видно. Проверьте на маке, что pi настроен: pi --list-models.',
+                        'Моделей не видно. Проверьте, что агент настроен на маке.',
                         style: TextStyle(
                           color: C.fg3,
                           fontSize: 12.5,
@@ -92,12 +91,9 @@ class _ModelPickerDialog extends ConsumerWidget {
                     ],
                     const SizedBox(height: 8),
                     Text(
-                      harness == 'claude'
-                          ? 'Список — из каталога установленного Claude Code: псевдонимы семейств'
-                                ' и конкретные версии. Доступ у него свой — подписка или ключ на'
-                                ' маке, и приложение в него не вмешивается.'
-                          : 'Удалённую модель добавляют кнопкой «Добавить провайдера»: адрес и '
-                                'ключ уедут на мак и останутся там — в приложении ключей нет.',
+                      'Список — из каталога установленного Claude Code: псевдонимы семейств '
+                      'и конкретные версии. Доступ у него свой — подписка или ключ на маке, '
+                      'и приложение в него не вмешивается.',
                       style: const TextStyle(
                         color: C.fg3,
                         fontSize: 11.5,
@@ -109,18 +105,6 @@ class _ModelPickerDialog extends ConsumerWidget {
               ),
       ),
       actions: [
-        if (harness == 'pi')
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => const AgentProvidersScreen(),
-                ),
-              );
-            },
-            child: const Text('Добавить провайдера'),
-          ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Закрыть'),

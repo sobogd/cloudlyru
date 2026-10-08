@@ -3,7 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers.dart';
 import '../../util/master_detail.dart';
-import 'agent_panel.dart';
 import 'account_panel.dart';
 import 'mail_accounts_panel.dart';
 import 'queue_errors_screen.dart';
@@ -59,12 +58,6 @@ class SettingsScreen extends ConsumerWidget {
           title: 'Аккаунт',
           icon: Icons.person_outline,
           body: const AccountPanel(),
-        ),
-        MasterDetailEntry(
-          id: 'agent',
-          title: 'Агент',
-          icon: Icons.smart_toy_outlined,
-          body: const AgentPanel(),
         ),
         MasterDetailEntry(
           id: 'tokens',
