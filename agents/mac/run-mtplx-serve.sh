@@ -52,32 +52,32 @@ start_server() {
     --model /Users/sobogd/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed \
     --model-id mtplx-qwen38-27b-optimized-speed \
     --host 127.0.0.1 --port "$PORT" \
-    --depth 3 \
-    --generation-mode mtp \
-    --profile turbo \
-    --reasoning auto \
-    --preserve-thinking auto \
-    --verify-strategy capture_commit \
-    --verify-core linear-gdn-from-conv-tape \
-    --rate-limit 0 \
-    --stream-interval 1 \
-    --scheduler-mode serial \
-    --batching-preset latency \
-    --mtp-batch-numerics throughput \
-    --warmup-tokens 16 \
-    --paged-kv-quantization q8 \
+    #--depth 3 \
+    #--generation-mode mtp \
+    #--profile turbo \
+    #--reasoning auto \
+    #--preserve-thinking auto \
+    #--verify-strategy capture_commit \
+    #--verify-core linear-gdn-from-conv-tape \
+    #--rate-limit 0 \
+    #--stream-interval 1 \
+    #--scheduler-mode serial \
+    #--batching-preset latency \
+    #--mtp-batch-numerics throughput \
+    #--warmup-tokens 16 \
+    #--paged-kv-quantization q8 \
     --fan-mode default \
-    --retrieval-max-resident 2 \
-    --ssd-session-cache on \
-    --ssd-session-cache-max-size auto \
-    --ssd-session-cache-min-prefix-tokens 512 \
-    --tool-prompt-mode hybrid \
-    --chat-template-profile tokenizer \
-    --temperature 1.0 \
-    --top-p 0.95 \
-    --top-k 20 \
-    --reasoning-parser qwen3 \
-    --reasoning-effort medium \
+    #--retrieval-max-resident 2 \
+    #--ssd-session-cache on \
+    #--ssd-session-cache-max-size auto \
+    #--ssd-session-cache-min-prefix-tokens 512 \
+    #--tool-prompt-mode hybrid \
+    #--chat-template-profile tokenizer \
+    #--temperature 1.0 \
+    #--top-p 0.95 \
+    #--top-k 20 \
+    #--reasoning-parser qwen3 \
+    #--reasoning-effort medium \
     >>"$LOG" 2>&1 &
   say "mtplx serve запущен (pid $!), лог: $LOG"
 }
