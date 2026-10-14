@@ -83,6 +83,8 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// Идёт необратимая операция над папкой (очистка корзины, удаление отмеченных писем):
   /// блокирует повторное нажатие.
   bool _busy = false;
+  /// Идёт перечитка счётчиков по кнопке обновления: по ней иконка крутится.
+  bool _refreshing = false;
   /// Отмеченные галочками письма — их id, а не индексы.
   ///
   /// Именно id: лента виртуальная, строки приходят по абсолютным индексам, и после удаления
@@ -302,10 +304,24 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   /// поэтому достаточно перечитать счётчики. Полная синхронизация с почтовым сервером осталась
   /// кнопкой «Проверить» в настройках (`mailSync`).
   ///
-  /// Кнопки обновления у экрана нет намеренно: она дублировала жест, а её спиннер был ещё одним
-  /// индикатором загрузки на экране. Ошибку показывает `_loadCounters` — полоской снизу, если
-  /// список уже на экране, и текстом, если показывать больше нечего.
-  Future<void> _refresh() => _loadCounters();
+  /// Обновление списка: жест «потянуть вниз» или кнопка в шапке.
+  ///
+  /// Отдельного прохода по IMAP тут нет — сервер держит IDLE и складывает письма в базу сам,
+  /// поэтому достаточно перечитать счётчики. Полная синхронизация с почтовым сервером осталась
+  /// кнопкой «Проверить» в настройках (`mailSync`).
+  ///
+  /// [_refreshing] поднимается на время запроса: по нему иконка в шапке крутится, а повторное
+  /// нажатие не запускает второй запрос. Ошибку показывает `_loadCounters` — полоской снизу,
+  /// если список уже на экране, и текстом, если показывать больше нечего.
+  Future<void> _refresh() async {
+    if (_refreshing) return;
+    setState(() => _refreshing = true);
+    try {
+      await _loadCounters();
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
+  }
 
   /// Очищает корзину почты целиком (безвозвратно — в отличие от удаления письма, которое
   /// только переносит его в корзину). Отмена в диалоге — выход без запроса. Побочно: перечитка
@@ -477,7 +493,6 @@ class _MailScreenState extends ConsumerState<MailScreen> {
         // В режиме выбора шапка другая: счётчик и одно действие. Остальные действия экрана
         // (папки, поиск, «написать») в этот момент недоступны — выбор отменяют или доводят.
         appBar: _selected.isEmpty ? _boxAppBar(t) : _selectionAppBar(),
-        // Обновление — только жестом «потянуть вниз»: своей кнопки у экрана нет.
         body: RefreshIndicator(
           onRefresh: _refresh,
           child: _list(t, api),
@@ -495,6 +510,11 @@ class _MailScreenState extends ConsumerState<MailScreen> {
   AppBar _boxAppBar(int? t) => AppBar(
         title: Text(_boxLabel(_box), style: const TextStyle(color: C.fg, fontSize: 18)),
         actions: [
+          IconButton(
+            tooltip: 'Обновить список',
+            icon: Icon(_refreshing ? Icons.autorenew : Icons.refresh, color: C.fg),
+            onPressed: _refreshing ? null : _refresh,
+          ),
           if (_box == 'trash' && (t ?? 0) > 0)
             IconButton(tooltip: 'Очистить корзину', icon: const Icon(Icons.delete_sweep_outlined, color: C.fg), onPressed: _busy ? null : _emptyTrash),
           IconButton(
