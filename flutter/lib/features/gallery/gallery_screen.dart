@@ -81,20 +81,25 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   @override
   Widget build(BuildContext context) {
     final c = _c;
-    return Scaffold(
-      backgroundColor: C.canvas,
-      appBar: c == null || !c.selecting
-          ? _boxAppBar(c)
-          : _selectionAppBar(c),
-      // В режиме выбора системный бэк сначала снимает выбор, а не уходит с экрана.
-      body: PopScope(
-        canPop: c == null || !c.selecting,
-        onPopInvokedWithResult: (didPop, _) {
-          if (!didPop && c != null) c.clearSelection();
-        },
-        child: c == null
-            ? const Center(child: CircularProgressIndicator())
-            : ListenableBuilder(listenable: c, builder: (_, _) => _body(c)),
+    if (c == null) {
+      return Scaffold(
+        backgroundColor: C.canvas,
+        appBar: _boxAppBar(null),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+    return ListenableBuilder(
+      listenable: c,
+      builder: (_, _) => Scaffold(
+        backgroundColor: C.canvas,
+        appBar: c.selecting ? _selectionAppBar(c) : _boxAppBar(c),
+        body: PopScope(
+          canPop: !c.selecting,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop) c.clearSelection();
+          },
+          child: _body(c),
+        ),
       ),
     );
   }
