@@ -142,13 +142,16 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
 
   PreferredSizeWidget _selectionAppBar(GalleryController c) {
     return AppBar(
+      backgroundColor: C.surface2,
       leading: IconButton(
+        tooltip: 'Отменить выбор',
         icon: const Icon(Icons.close, color: C.fg),
         onPressed: c.deleting ? null : () => c.clearSelection(),
       ),
       title: Text('Выбрано: ${c.selected.length}', style: const TextStyle(color: C.fg, fontSize: 17)),
       actions: [
         IconButton(
+          tooltip: 'Удалить',
           icon: Icon(c.deleting ? Icons.hourglass_top : Icons.delete_outline, color: C.fg),
           onPressed: c.deleting || c.selected.isEmpty ? null : () => _confirmDeleteSelected(c),
         ),
