@@ -78,7 +78,8 @@ publish() {
 # Побочно: файлы сборки в flutter/build/ и объекты в S3.
 build_android() {
   (cd flutter && flutter build apk --release)
-  publish scripts/publish-apk.mjs flutter/build/app/outputs/apk/release/app-release.apk
+  cp flutter/build/app/outputs/apk/release/output-metadata.json flutter/build/app/outputs/flutter-apk/
+  publish scripts/publish-apk.mjs flutter/build/app/outputs/flutter-apk/app-release.apk
 }
 
 # macOS: архив с Cloudly.app и его публикация. ditto, а не zip: он сохраняет права и
