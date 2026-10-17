@@ -184,6 +184,12 @@ class _ExpenseFormScreenState extends ConsumerState<ExpenseFormScreen> {
         _busy = false;
         _error = e.message;
       });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = 'Не удалось выбрать или загрузить документ';
+      });
     }
   }
 
@@ -307,6 +313,12 @@ class _ExpenseFormScreenState extends ConsumerState<ExpenseFormScreen> {
         _busy = false;
         _error = e.message;
       });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = 'Не удалось сохранить расход';
+      });
     }
   }
 
@@ -336,6 +348,12 @@ class _ExpenseFormScreenState extends ConsumerState<ExpenseFormScreen> {
       setState(() {
         _busy = false;
         _error = err.message;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = 'Не удалось удалить расход';
       });
     }
   }
