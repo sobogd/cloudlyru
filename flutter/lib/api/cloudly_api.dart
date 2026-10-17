@@ -604,6 +604,12 @@ class CloudlyApi {
   /// Убирает файл в корзину.
   Future<void> deleteFile(String id) async => _req('/files/$id', method: 'DELETE');
 
+  /// Убирает в корзину пачку файлов — то же, что [deleteFile], для списка с галочками.
+  ///
+  /// Одним запросом, а не циклом по [deleteFile]: сервер по списку id делает одно обновление.
+  Future<void> fileDeleteMany(List<String> ids) async =>
+      _req('/files/bulk-delete', method: 'POST', body: {'ids': ids});
+
   /// Метаданные файла: имя, размер, зона, хеш и разобранные метаданные содержимого.
   Future<FileMeta> fileMeta(String id) async =>
       FileMeta.fromJson(_m(await _req('/files/$id')));

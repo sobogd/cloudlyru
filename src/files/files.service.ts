@@ -880,6 +880,29 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     return { ok: true };
   }
 
+  /**
+   * Пакетный soft-delete: те же правила, что у [softDelete], но по списку id. Чужие и уже
+   * удалённые записи отбрасываются молча (клиент выбрал их из своего списка, лишнего там нет),
+   * в журнал пишется событие по каждой.
+   */
+  async softDeleteMany(entryIds: string[], userId: string) {
+    if (!entryIds.length) return { ok: true, deleted: 0 };
+    const tree = await this.auth.subtreeIds(userId);
+    const found = await this.prisma.fileEntry.findMany({
+      where: { id: { in: entryIds }, folderId: { in: tree }, deletedAt: null },
+    });
+    const entries = found.filter((e) => !isHiddenZone(e.zone));
+    if (!entries.length) return { ok: true, deleted: 0 };
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      for (const entry of entries) {
+        await tx.fileEntry.update({ where: { id: entry.id }, data: { deletedAt: now } });
+        await this.changes.recordEntry(userId, entry.id, 'delete', tx);
+      }
+    });
+    return { ok: true, deleted: entries.length };
+  }
+
   async restore(entryId: string, userId: string) {
     // проверяем по дереву с удалёнными папками: запись из корзины может лежать
     // внутри уже удалённой папки, и тогда нужен понятный конфликт, а не 404

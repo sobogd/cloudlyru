@@ -108,6 +108,12 @@ class GalleryController extends ChangeNotifier {
   /// Разбивка по месяцам, из которой собирается геометрия.
   List<MediaMonthBucket> _months = const [];
 
+  /// Выбранные кадры (множественный выбор): ключ — id записи.
+  final Set<String> _selected = {};
+
+  /// Идёт удаление выбранных кадров.
+  bool _deleting = false;
+
   /// Локальный индекс наполнен целиком: лента показана вся, догружать нечего.
   bool _complete = false;
 
@@ -384,6 +390,90 @@ class GalleryController extends ChangeNotifier {
           MediaMonthBucket(month: m.month, count: math.max(0, m.count - 1))
         else
           m,
+    ];
+    _rebuild();
+    _publishCounters();
+    _refreshTopFromScroll();
+    notifyListeners();
+  }
+
+  /// Выбранные кадры — для отметки в плитке и счётчика в шапке.
+  Set<String> get selected => _selected;
+
+  /// Включён ли режим выбора: есть выбранные кадры.
+  bool get selecting => _selected.isNotEmpty;
+
+  /// Идёт удаление выбранных кадров: шапка показывает индикатор и блокирует повтор.
+  bool get deleting => _deleting;
+
+  /// Выбран ли кадр [entryId].
+  bool isSelected(String entryId) => _selected.contains(entryId);
+
+  /// Переключить выбор кадра [entryId].
+  void toggleSelection(String entryId) {
+    if (!_selected.remove(entryId)) _selected.add(entryId);
+    notifyListeners();
+  }
+
+  /// Снять выбор целиком — выход из режима выбора.
+  void clearSelection() {
+    if (_selected.isEmpty) return;
+    _selected.clear();
+    notifyListeners();
+  }
+
+  /// Удалить выбранные кадры: серверный soft-delete, затем локальный индекс.
+  ///
+  /// При неудаче выбор остаётся — можно повторить. Побочно: [_selected] (снят),
+  /// [_months] (месяцы уменьшены), [index] (пересобрана), слушатели.
+  Future<void> deleteSelected() async {
+    if (_selected.isEmpty || _deleting) return;
+    _deleting = true;
+    notifyListeners();
+    try {
+      final ids = _selected.toList();
+      await apiOf().fileDeleteMany(ids);
+      await _removeFromIndex(ids);
+      _selected.clear();
+    } catch (_) {
+      // Выбор остаётся: сервер не подтвердил удаление.
+    } finally {
+      _deleting = false;
+      notifyListeners();
+    }
+  }
+
+  /// Снять кадры [entryIds] из локального индекса и геометрии.
+  ///
+  /// Месяц каждого кадра находится по текущей геометрии: кадры месяца сдвигаются, и
+  /// разбивка уменьшается на число снятых. Побочно: [store] (кадры и месяцы), [pages]
+  /// (месяцы перечитаны), [_months], [index], [_top]/[_bottom], слушатели.
+  Future<void> _removeFromIndex(List<String> entryIds) async {
+    final idx = index;
+    if (idx == null) return;
+    final wanted = entryIds.toSet();
+    final byMonth = <String, int>{};
+    for (var i = 0; i < idx.itemCount; i++) {
+      final at = idx.locateItem(i);
+      if (at == null) continue;
+      final it = pages.loadedAt(at.month, at.offset);
+      if (it != null && wanted.contains(it.entryId)) {
+        byMonth[at.month] = (byMonth[at.month] ?? 0) + 1;
+      }
+    }
+    if (byMonth.isEmpty) return;
+    await store.removeEntries(entryIds);
+    for (final e in byMonth.entries) {
+      await store.decrementMonth(e.key, by: e.value);
+    }
+    for (final month in byMonth.keys) {
+      pages.dropMonth(month);
+    }
+    _months = [
+      for (final m in _months)
+        if (byMonth.containsKey(m.month ?? ''))
+          MediaMonthBucket(month: m.month, count: math.max(0, m.count - byMonth[m.month ?? '']!))
+        else m,
     ];
     _rebuild();
     _publishCounters();

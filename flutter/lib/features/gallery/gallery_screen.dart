@@ -83,24 +83,19 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     final c = _c;
     return Scaffold(
       backgroundColor: C.canvas,
-      appBar: AppBar(
-        // Подпись месяца в шапке — тот, что у верхнего видимого кадра: у ленты нет заголовка
-        // «Медиа вообще», и во время прокрутки нужно понимать, в каком году ты находишься.
-        title: c == null
-            ? const Text('Медиа', style: TextStyle(color: C.fg, fontSize: 17))
-            : ValueListenableBuilder<String>(
-                valueListenable: c.barTitle,
-                builder: (_, title, _) => Text(title, style: const TextStyle(color: C.fg, fontSize: 17)),
-              ),
-        bottom: c == null ? null : _syncBar(c),
-        actions: c == null ? null : [_previewsButton(c)],
+      appBar: c == null || !c.selecting
+          ? _boxAppBar(c)
+          : _selectionAppBar(c),
+      // В режиме выбора системный бэк сначала снимает выбор, а не уходит с экрана.
+      body: PopScope(
+        canPop: c == null || !c.selecting,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop && c != null) c.clearSelection();
+        },
+        child: c == null
+            ? const Center(child: CircularProgressIndicator())
+            : ListenableBuilder(listenable: c, builder: (_, _) => _body(c)),
       ),
-      // Экран обязан слушать контроллер: геометрия и кадры меняются из фоновых загрузок
-      // (наполнение индекса, удаление кадра, подключение миниатюр), и без подписки сетка
-      // осталась бы той, какой её собрали в первый раз — с прежним числом строк и кадров.
-      body: c == null
-          ? const Center(child: CircularProgressIndicator())
-          : ListenableBuilder(listenable: c, builder: (_, _) => _body(c)),
     );
   }
 
@@ -124,6 +119,54 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
               ),
       ),
     );
+  }
+
+  PreferredSizeWidget _boxAppBar(GalleryController? c) {
+    return AppBar(
+      title: c == null
+          ? const Text('Медиа', style: TextStyle(color: C.fg, fontSize: 17))
+          : ValueListenableBuilder<String>(
+              valueListenable: c.barTitle,
+              builder: (_, title, _) => Text(title, style: const TextStyle(color: C.fg, fontSize: 17)),
+            ),
+      bottom: c == null ? null : _syncBar(c),
+      actions: c == null ? null : [_previewsButton(c)],
+    );
+  }
+
+  PreferredSizeWidget _selectionAppBar(GalleryController c) {
+    return AppBar(
+      leading: IconButton(
+        icon: const Icon(Icons.close, color: C.fg),
+        onPressed: c.deleting ? null : () => c.clearSelection(),
+      ),
+      title: Text('Выбрано: ${c.selected.length}', style: const TextStyle(color: C.fg, fontSize: 17)),
+      actions: [
+        IconButton(
+          icon: Icon(c.deleting ? Icons.hourglass_top : Icons.delete_outline, color: C.fg),
+          onPressed: c.deleting || c.selected.isEmpty ? null : () => _confirmDeleteSelected(c),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _confirmDeleteSelected(GalleryController c) async {
+    final n = c.selected.length;
+    final ok = await confirmDialog(
+      context,
+      'Удалить $n ${_plural(n)}?',
+      'Кадры будут перемещены в корзину.',
+      confirmLabel: 'Удалить',
+    );
+    if (ok == true) await c.deleteSelected();
+  }
+
+  String _plural(int n) {
+    final m10 = n % 10, m100 = n % 100;
+    if (m100 >= 11 && m100 <= 14) return 'кадра';
+    if (m10 == 1) return 'кадр';
+    if (m10 >= 2 && m10 <= 4) return 'кадра';
+    return 'кадров';
   }
 
   /// Кнопка режима показа превью в шапке раздела.
@@ -287,6 +330,8 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       scrolling: c.isScrolling,
       previews: c.showPreviews.value,
       onTap: () => _openViewer(c, row.firstItem + i),
+      selectable: c.selecting,
+      selected: c.isSelected(item.entryId),
     );
   }
 
@@ -339,6 +384,11 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   /// с прежним числом страниц.
   void _openViewer(GalleryController c, int index) {
     if (index < 0) return;
+    if (c.selecting) {
+      final item = c.itemAt(index);
+      if (item != null) c.toggleSelection(item.entryId);
+      return;
+    }
     // Просмотрщик листает по номерам ленты, поэтому на время его работы геометрия не
     // пересобирается: кадры, доехавшие сверху, сдвинули бы все номера, и вместо открытого
     // снимка показался бы соседний (см. `GalleryController.openViewer`).

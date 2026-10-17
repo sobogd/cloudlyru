@@ -1,13 +1,30 @@
-import { Body, Controller, Delete, Get, Param, Patch, Req, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { FilesService } from './files.service';
 import { CurrentUser, RequestUser } from '../common/decorators';
 import { isPlainObject } from '../common/utils';
 import { badRequest } from '../common/errors';
 
+const BULK_IDS_MAX = 500;
+
+/** Массив строк, без дублей и пустых, не больше [BULK_IDS_MAX]. */
+function bulkIds(body: unknown): string[] {
+  if (!isPlainObject(body) || !Array.isArray(body.ids)) throw badRequest('invalid body');
+  const ids = [...new Set(body.ids.filter((v): v is string => typeof v === 'string' && v.length > 0))];
+  if (!ids.length) throw badRequest('no ids');
+  if (ids.length > BULK_IDS_MAX) throw badRequest('too many ids');
+  return ids;
+}
+
 @Controller('files')
 export class FilesController {
   constructor(private readonly files: FilesService) {}
+
+  /** Пакетный soft-delete: список id из тела. До маршрутов с `:id`, чтобы id не перехватывал путь. */
+  @Post('bulk-delete')
+  bulkDelete(@Body() body: unknown, @CurrentUser() user: RequestUser) {
+    return this.files.softDeleteMany(bulkIds(body), user.id);
+  }
 
   @Get(':id')
   meta(@Param('id') id: string, @CurrentUser() user: RequestUser) {

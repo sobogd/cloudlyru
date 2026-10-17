@@ -40,6 +40,8 @@ class GalleryTile extends StatefulWidget {
     required this.scrolling,
     required this.previews,
     required this.onTap,
+    this.selectable = false,
+    this.selected = false,
   });
 
   /// Кадр, который показывает плитка.
@@ -59,6 +61,12 @@ class GalleryTile extends StatefulWidget {
 
   /// Открыть кадр в просмотрщике.
   final VoidCallback onTap;
+
+  /// Режим выбора: плитка показывает отметку и реагирует на тап переключением выбора.
+  final bool selectable;
+
+  /// Кадр выбран.
+  final bool selected;
 
   @override
   State<GalleryTile> createState() => _GalleryTileState();
@@ -231,42 +239,80 @@ class _GalleryTileState extends State<GalleryTile> {
     final item = widget.item;
     // Режим без превью — сразу значок. Список едет или пауза после остановки не прошла —
     // тоже значок: декодировать картинку в кадре прокрутки значит отбирать кадр у движения.
-    if (!widget.previews || !_settled) return _placeholder(item);
-    final sha = item.sha256;
-    final thumbs = widget.thumbs;
-    final file = (sha != null && thumbs != null && !_missing) ? thumbs.file(sha) : null;
-    if (file == null) return _placeholder(item);
-    final dpr = MediaQuery.devicePixelRatioOf(context);
+    Widget content;
+    if (!widget.previews || !_settled) {
+      content = _placeholderContent(item);
+    } else {
+      final sha = item.sha256;
+      final thumbs = widget.thumbs;
+      final file = (sha != null && thumbs != null && !_missing) ? thumbs.file(sha) : null;
+      if (file == null) {
+        content = _placeholderContent(item);
+      } else {
+        final dpr = MediaQuery.devicePixelRatioOf(context);
+        content = Image.file(
+          file,
+          width: widget.side,
+          height: widget.side,
+          fit: BoxFit.cover,
+          // Кадр не мигает заглушкой при перерисовке окна и декодируется в размер клетки:
+          // миниатюра 256×256 после кэша картинок занимала бы память под квадрат 256, хотя на
+          // экране она 75 dp.
+          //
+          // Фильтрация — `low`, а не `medium`: миниатюра приходит квадратом 256 и ужимается в клетку
+          // на считаные проценты, мипмапы тут ничего не улучшают, а строятся они на каждую картинку
+          // заново — при пролистывании это десятки построений в секунду.
+          gaplessPlayback: true,
+          cacheWidth: (widget.side * dpr).round(),
+          filterQuality: FilterQuality.low,
+          // Заглушка держится до первого кадра картинки, и это не украшение: `Image` до своего
+          // первого кадра не рисует НИЧЕГО, поэтому клетка на время декодирования оставалась
+          // пустой — вместо заглушки человек видел дыру на всё место клетки. Видно это ровно
+          // в тот момент, когда список встал и клетки разом меняют заглушку на картинки:
+          // «пропало всё, даже заглушек нет» — это оно. Декодируются они пачкой (столько,
+          // сколько влезло на экран), так что дыра заметна глазом.
+          //
+          // `wasSynchronouslyLoaded` — картинка взята из кэша картинок целиком: у неё кадр уже
+          // есть, и заглушку показывать нечего (иначе она мигала бы на каждой перерисовке).
+          frameBuilder: (context, child, frame, loaded) =>
+              (loaded || frame != null) ? child : _placeholderContent(item),
+          errorBuilder: (_, _, _) => _placeholderContent(item),
+        );
+      }
+    }
     return GestureDetector(
       onTap: widget.onTap,
-      child: Image.file(
-        file,
-        width: widget.side,
-        height: widget.side,
-        fit: BoxFit.cover,
-        // Кадр не мигает заглушкой при перерисовке окна и декодируется в размер клетки:
-        // миниатюра 256×256 после кэша картинок занимала бы память под квадрат 256, хотя на
-        // экране она 75 dp.
-        //
-        // Фильтрация — `low`, а не `medium`: миниатюра приходит квадратом 256 и ужимается в клетку
-        // на считаные проценты, мипмапы тут ничего не улучшают, а строятся они на каждую картинку
-        // заново — при пролистывании это десятки построений в секунду.
-        gaplessPlayback: true,
-        cacheWidth: (widget.side * dpr).round(),
-        filterQuality: FilterQuality.low,
-        // Заглушка держится до первого кадра картинки, и это не украшение: `Image` до своего
-        // первого кадра не рисует НИЧЕГО, поэтому клетка на время декодирования оставалась
-        // пустой — вместо заглушки человек видел дыру на всё место клетки. Видно это ровно
-        // в тот момент, когда список встал и клетки разом меняют заглушку на картинки:
-        // «пропало всё, даже заглушек нет» — это оно. Декодируются они пачкой (столько,
-        // сколько влезло на экран), так что дыра заметна глазом.
-        //
-        // `wasSynchronouslyLoaded` — картинка взята из кэша картинок целиком: у неё кадр уже
-        // есть, и заглушку показывать нечего (иначе она мигала бы на каждой перерисовке).
-        frameBuilder: (context, child, frame, loaded) =>
-            (loaded || frame != null) ? child : _placeholder(item),
-        errorBuilder: (_, _, _) => _placeholder(item),
-      ),
+      child: _overlay(content),
+    );
+  }
+
+  /// Обёртка содержимого клетки: в режиме выбора — подсветка и отметка поверх.
+  Widget _overlay(Widget content) {
+    if (!widget.selectable && !widget.selected) return content;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        content,
+        if (widget.selected)
+          Container(color: C.accent.withValues(alpha: 0.25)),
+        if (widget.selectable)
+          Positioned(
+            top: 4,
+            left: 4,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              width: 22,
+              height: 22,
+              decoration: BoxDecoration(
+                color: widget.selected ? C.accent : Colors.black54,
+                borderRadius: BorderRadius.circular(11),
+              ),
+              child: widget.selected
+                  ? const Icon(Icons.check, color: Colors.white, size: 16)
+                  : null,
+            ),
+          ),
+      ],
     );
   }
 
@@ -277,7 +323,7 @@ class _GalleryTileState extends State<GalleryTile> {
   /// различать нечего — картинки не будет ни у кого, — поэтому значок показывается всегда:
   /// иначе клетка готового кадра осталась бы пустым серым квадратом и была бы неотличима
   /// от клетки, про которую ничего не известно.
-  Widget _placeholder(MediaItem item) {
+  Widget _placeholderContent(MediaItem item) {
     final isVideo = item.mime.startsWith('video/');
     final impossible = item.previewState == 'impossible';
     final IconData? icon = !widget.previews
@@ -285,13 +331,10 @@ class _GalleryTileState extends State<GalleryTile> {
         : impossible
             ? (isVideo ? Icons.videocam_off_outlined : Icons.hide_image_outlined)
             : (item.previewState == 'done' ? null : (isVideo ? Icons.movie_outlined : Icons.image_outlined));
-    return GestureDetector(
-      onTap: widget.onTap,
-      child: Container(
-        color: C.surface3,
-        alignment: Alignment.center,
-        child: icon == null ? null : Icon(icon, color: C.fg3, size: 20),
-      ),
+    return Container(
+      color: C.surface3,
+      alignment: Alignment.center,
+      child: icon == null ? null : Icon(icon, color: C.fg3, size: 20),
     );
   }
 }
