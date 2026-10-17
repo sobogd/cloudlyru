@@ -114,6 +114,9 @@ class GalleryController extends ChangeNotifier {
   /// Идёт удаление выбранных кадров.
   bool _deleting = false;
 
+  /// Режим выбора включён кнопкой в шапке (независимо от того, что уже выбрано).
+  bool _selectionMode = false;
+
   /// Локальный индекс наполнен целиком: лента показана вся, догружать нечего.
   bool _complete = false;
 
@@ -400,8 +403,14 @@ class GalleryController extends ChangeNotifier {
   /// Выбранные кадры — для отметки в плитке и счётчика в шапке.
   Set<String> get selected => _selected;
 
-  /// Включён ли режим выбора: есть выбранные кадры.
-  bool get selecting => _selected.isNotEmpty;
+  /// Включён ли режим выбора (кнопкой в шапке).
+  bool get selecting => _selectionMode;
+
+  /// Включить режим выбора.
+  void enterSelectionMode() {
+    _selectionMode = true;
+    notifyListeners();
+  }
 
   /// Идёт удаление выбранных кадров: шапка показывает индикатор и блокирует повтор.
   bool get deleting => _deleting;
@@ -417,8 +426,9 @@ class GalleryController extends ChangeNotifier {
 
   /// Снять выбор целиком — выход из режима выбора.
   void clearSelection() {
-    if (_selected.isEmpty) return;
+    if (_selected.isEmpty && !_selectionMode) return;
     _selected.clear();
+    _selectionMode = false;
     notifyListeners();
   }
 
@@ -435,6 +445,7 @@ class GalleryController extends ChangeNotifier {
       await apiOf().fileDeleteMany(ids);
       await _removeFromIndex(ids);
       _selected.clear();
+      _selectionMode = false;
     } catch (_) {
       // Выбор остаётся: сервер не подтвердил удаление.
     } finally {

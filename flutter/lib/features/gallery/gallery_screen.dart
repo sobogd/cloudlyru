@@ -130,7 +130,13 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
               builder: (_, title, _) => Text(title, style: const TextStyle(color: C.fg, fontSize: 17)),
             ),
       bottom: c == null ? null : _syncBar(c),
-      actions: c == null ? null : [_previewsButton(c)],
+      actions: c == null ? null : [
+        IconButton(
+          icon: const Icon(Icons.checklist, color: C.fg),
+          onPressed: () => c.enterSelectionMode(),
+        ),
+        _previewsButton(c),
+      ],
     );
   }
 
