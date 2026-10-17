@@ -15,6 +15,7 @@ import '../../util/download.dart';
 import '../../util/format.dart';
 import '../../util/widgets.dart';
 import '../files/file_detail.dart';
+import 'file_picker_screen.dart';
 import 'mail_body_web.dart';
 import 'mail_row.dart';
 import 'mail_search_screen.dart';
@@ -1102,6 +1103,9 @@ class _MailComposerScreenState extends ConsumerState<MailComposerScreen> {
   /// Поле «копия» раскрыто, если копия уже непустая (так приходит «ответ всем»); в остальных
   /// случаях оно спрятано за ссылкой «+ копия», чтобы не занимать место в обычном письме.
   late bool _ccOpen = (widget.context_?.cc.isNotEmpty ?? false);
+  /// Файлы из облака, прикреплённые в форме (через «Прикрепить файл»): сервер берёт их
+  /// содержимое из S3 по id при отправке.
+  final List<FolderEntry> _picks = [];
   bool _busy = false;
   String? _error;
 
@@ -1125,6 +1129,20 @@ class _MailComposerScreenState extends ConsumerState<MailComposerScreen> {
     super.dispose();
   }
 
+  /// Открывает выбор файлов из облака; выбранные добавляются к вложениям формы.
+  Future<void> _pickFiles() async {
+    final picked = await Navigator.push<List<FolderEntry>>(
+      context,
+      MaterialPageRoute(builder: (_) => const FilePickerScreen()),
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      for (final e in picked) {
+        if (!_picks.any((p) => p.id == e.id)) _picks.add(e);
+      }
+    });
+  }
+
   /// Отправляет письмо: собирает поля формы и вложения из контекста в один запрос.
   ///
   /// `_busy` защищает от второго нажатия: отправку отменить нельзя, а два запроса отправят
@@ -1139,7 +1157,10 @@ class _MailComposerScreenState extends ConsumerState<MailComposerScreen> {
       _error = null;
     });
     try {
-      final attachments = widget.context_?.attachments.map((a) => a.entryId).toList() ?? const <String>[];
+      final attachments = [
+        ...(widget.context_?.attachments.map((a) => a.entryId).toList() ?? const <String>[]),
+        ..._picks.map((e) => e.id),
+      ];
       final res = await ref.read(appStateProvider).api.mailSend({
         'accountId': _accountId,
         'to': _to.text.trim(),
@@ -1171,6 +1192,11 @@ class _MailComposerScreenState extends ConsumerState<MailComposerScreen> {
         leading: IconButton(icon: const Icon(Icons.close, color: C.fg), onPressed: () => Navigator.pop(context)),
         title: const Text('Письмо', style: TextStyle(color: C.fg, fontSize: 16)),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.attach_file, color: C.fg),
+            tooltip: 'Прикрепить файл',
+            onPressed: _busy ? null : _pickFiles,
+          ),
           // Кнопка слушает поле «кому» сама: её доступность зависит от текста, который
           // пользователь печатает, а `build` формы при вводе не перезапускается (у `TextField`
           // нет ни `onChanged`, ни слушателя). Без этого `onPressed` оставался бы `null` до
@@ -1211,17 +1237,31 @@ class _MailComposerScreenState extends ConsumerState<MailComposerScreen> {
           TextField(controller: _subject, decoration: const InputDecoration(labelText: 'тема')),
           const SizedBox(height: 8),
           TextField(controller: _text, minLines: 10, maxLines: null, decoration: const InputDecoration(hintText: 'текст письма')),
-          if ((widget.context_?.attachments ?? const []).isNotEmpty) ...[
+          if ((widget.context_?.attachments ?? const []).isNotEmpty || _picks.isNotEmpty) ...[
             const SizedBox(height: 8),
             Panel(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('Вложения (${widget.context_!.attachments.length})', style: const TextStyle(color: C.fg3, fontSize: 13)),
-              ...widget.context_!.attachments.map((a) => ListTile(
+              Text('Вложения (${(widget.context_?.attachments.length ?? 0) + _picks.length})', style: const TextStyle(color: C.fg3, fontSize: 13)),
+              ...(widget.context_?.attachments ?? const <MailReplyAttachment>[]).map((a) => ListTile(
                 contentPadding: EdgeInsets.zero,
                 leading: const Icon(Icons.attach_file, color: C.fg3),
                 title: Text(a.filename, style: const TextStyle(color: C.fg, fontSize: 14)),
                 subtitle: Text(fmtSize(a.size), style: const TextStyle(color: C.fg3, fontSize: 12)),
               )),
+              ..._picks.map((e) {
+                final size = e.size;
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.attach_file, color: C.fg3),
+                  title: Text(e.name, style: const TextStyle(color: C.fg, fontSize: 14)),
+                  subtitle: (size == null) ? null : Text(fmtSize(size), style: const TextStyle(color: C.fg3, fontSize: 12)),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.close, color: C.fg3),
+                    onPressed: () => setState(() => _picks.remove(e)),
+                  ),
+                );
+              }),
             ])),
+            TextButton(onPressed: _busy ? null : _pickFiles, child: const Text('+ прикрепить файл')),
           ],
           if (_error != null) ...[
             const SizedBox(height: 8),
