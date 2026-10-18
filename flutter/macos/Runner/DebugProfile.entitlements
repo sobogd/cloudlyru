@@ -7,6 +7,11 @@
 	     к ним даётся только через security-scoped bookmarks, то есть через нативный код. -->
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
+	<!-- file_picker на macOS требует право на чтение выбранных файлов: без него pickFiles
+	     падает с ENTITLEMENT_NOT_FOUND ещё до открытия диалога. Песочницы нет, поэтому право
+	     система игнорирует — оно нужно только для проверки самого плагина. -->
+	<key>com.apple.security.files.user-selected.read-only</key>
+	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>com.apple.security.network.server</key>
