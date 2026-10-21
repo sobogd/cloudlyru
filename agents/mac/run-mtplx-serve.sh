@@ -29,11 +29,18 @@
 # =============================================================================
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOME="${HOME:-/Users/sobogd}"
+# inline postcommit: стрим хода закрывается только после коммита кэша сессии.
+# 300 c — потолок ожидания коммита (дефолт 30 с урезал бы «синхронность» в дыру).
+export MTPLX_STREAM_COMMIT_WAIT_MAX_S=300
+# mtplx 2.12.0: флаг --session-postcommit-mode убран, режим задаётся переменной.
+export MTPLX_SESSION_POSTCOMMIT_MODE=inline
 
 MTPLX=/opt/homebrew/bin/mtplx
 PORT=8000
 LOG=/tmp/mtplx-serve.log
 CHECK_EVERY=30
+ENV_FILE=/Users/sobogd/work/.env
+MTPLX_API_KEY="$(grep -E '^MTPLX_API_KEY=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)"
 
 # Прошлое состояние — чтобы писать в лог только переходы, а не строку каждые 30 секунд.
 state=""
@@ -43,41 +50,33 @@ say() {
 }
 
 server_ok() {
-  curl -sf -m 5 "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -q '"ok":true'
+  curl -sf -m 5 -H "X-API-Key: ${MTPLX_API_KEY}" "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -q '"ok":true'
 }
 
 start_server() {
+  if [ -z "$MTPLX_API_KEY" ]; then
+    say "нет MTPLX_API_KEY в $ENV_FILE — не запускаю без ключа"
+    return 1
+  fi
   # Логи сервера идут в отдельный файл: launchd пишет в свой лог только переходы состояния.
+  # Закомментированные флаги — дефолты CLI, оставлены для справки (не влезать в команду:
+  # комментарий после «\» глотает продолжение строки и рвёт запуск).
+  #   --depth 3 --generation-mode mtp --profile turbo --reasoning auto
+  #   --preserve-thinking auto --verify-strategy capture_commit
+  #   --verify-core linear-gdn-from-conv-tape --rate-limit 0 --stream-interval 1
+  #   --scheduler-mode serial --batching-preset latency --mtp-batch-numerics throughput
+  #   --warmup-tokens 16 --retrieval-max-resident 2 --ssd-session-cache on
+  #   --ssd-session-cache-max-size auto --ssd-session-cache-min-prefix-tokens 512
+  #   --tool-prompt-mode hybrid --chat-template-profile tokenizer
+  #   --temperature 1.0 --top-p 0.95 --top-k 20 --reasoning-parser qwen3
+  #   --reasoning-effort medium
   nohup "$MTPLX" serve \
     --model /Users/sobogd/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed \
     --model-id mtplx-qwen38-27b-optimized-speed \
     --host 127.0.0.1 --port "$PORT" \
-    #--depth 3 \
-    #--generation-mode mtp \
-    #--profile turbo \
-    #--reasoning auto \
-    #--preserve-thinking auto \
-    #--verify-strategy capture_commit \
-    #--verify-core linear-gdn-from-conv-tape \
-    #--rate-limit 0 \
-    #--stream-interval 1 \
-    #--scheduler-mode serial \
-    #--batching-preset latency \
-    #--mtp-batch-numerics throughput \
-    #--warmup-tokens 16 \
-    #--paged-kv-quantization q8 \
+    --api-key "$MTPLX_API_KEY" \
+    --paged-kv-quantization off \
     --fan-mode default \
-    #--retrieval-max-resident 2 \
-    #--ssd-session-cache on \
-    #--ssd-session-cache-max-size auto \
-    #--ssd-session-cache-min-prefix-tokens 512 \
-    #--tool-prompt-mode hybrid \
-    #--chat-template-profile tokenizer \
-    #--temperature 1.0 \
-    #--top-p 0.95 \
-    #--top-k 20 \
-    #--reasoning-parser qwen3 \
-    #--reasoning-effort medium \
     >>"$LOG" 2>&1 &
   say "mtplx serve запущен (pid $!), лог: $LOG"
 }
