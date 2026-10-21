@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd-агент главной локальной модели: oMLX (Qwen3.8-27B, порт 8000).
+  Заменил com.agent.mtplx (mtplx → omlx, октябрь 2026).
+
+  Скрипт — вечный сторож (run-omlx-serve.sh): проверяет /health каждые
+  30 секунд, при падении перезапускает сервер: omlx-cli serve --headless
+  (без GUI oMLX.app — см. run-omlx-serve.sh).
+
+  RunAtLoad поднимает его при входе в систему после перезагрузки мака,
+  KeepAlive не даёт самому сторожу исчезнуть.
+
+  Сервер слушает только loopback, ключ — из auth-секции ~/.omlx/settings.json
+  (старый mtplx-ключ сохранён в sub_keys — клиенты работают как раньше).
+  Внешний доступ — через com.user.mtplx-tunnel (autossh 0.0.0.0:9999 → :8000).
+
+  HOME задан явно: launchd не наследует окружение оболочки, omlx ищет
+  модели (~/.omlx/models) и настройки (~/.omlx/settings.json) по $HOME.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent.omlx</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/sobogd/work/cloudlyru/agents/mac/run-omlx-serve.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/sobogd</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/omlx-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/omlx-agent.err.log</string>
+</dict>
+</plist>
