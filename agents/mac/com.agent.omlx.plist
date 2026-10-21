@@ -12,7 +12,7 @@
 
   Сервер слушает только loopback, ключ — из auth-секции ~/.omlx/settings.json
   (старый mtplx-ключ сохранён в sub_keys — клиенты работают как раньше).
-  Внешний доступ — через com.user.mtplx-tunnel (autossh 0.0.0.0:9999 → :8000).
+  Внешний доступ — через com.user.llm-tunnel (autossh 0.0.0.0:9999 → :8000).
 
   HOME задан явно: launchd не наследует окружение оболочки, omlx ищет
   модели (~/.omlx/models) и настройки (~/.omlx/settings.json) по $HOME.
