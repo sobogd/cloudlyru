@@ -10,17 +10,18 @@ Cloudly. Статус-панель (`mac-status-server.py`) — **только A
 | --- | --- |
 | `com.agent.mac-status` | панель API на `:18810` |
 | `com.agent.mac-tunnel` | reverse-SSH туннель Mac → VPS (см. порты ниже) |
-| `com.agent.omlx` | oMLX `:8000` — главная локальная модель (headless, без GUI-приложения) |
 | `com.agent.whisper` | whisper.cpp `:1238` — распознавание речи |
 | `com.agent.claude-tangem` | сессия Claude в `~/.claude-work` (в launchd `disabled`) |
 
-`com.agent.mtplx` (mtplx, тоже `:8000`) выведен из эксплуатации в пользу
-`com.agent.omlx` (2026-10): plist и скрипт — в `archived/` этой папки.
+`com.agent.omlx` (oMLX `:8000` — главная локальная модель) и
+`com.user.llm-tunnel` (туннель `9999→8000` наружу) — в репо
+`~/work/llm-tunnel` (plist и скрипт `run-omlx-serve.sh`), раскатывает
+deploy-агент того репо.
+`com.agent.mtplx` (mtplx) выведен из эксплуатации: plist и скрипт — в
+`archived/` этой папки.
 Старые `com.agent.llm*` (llama.cpp) — предшественники; их plist'ы остались
 в папке и при повторном `./install.sh` вернутся в LaunchAgents — убрать
 оттуда, если llama.cpp больше не используется.
-`com.user.llm-tunnel` (туннель `9999→8000` наружу, бывший mtplx-tunnel)
-живёт и туннелит omlx — см. репо `~/work/llm-tunnel`.
 
 Туннель отдаёт на VPS (loopback самого VPS): `18810` панель, `18812`→`1234`,
 `18818`→`1238`, `18820` мост агентов (`agents/bridge`), `18822`→`1235`. Наружу ничего не смотрит.
