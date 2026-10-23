@@ -7,8 +7,9 @@
 # После перезагрузки мака launchd поднимает агента при входе в систему, сторож
 # поднимает модель — сервер живёт без участия человека.
 #
-# Работает БЕЗ GUI oMLX.app: omlx-cli serve --headless — самодостаточное
+# Работает БЕЗ GUI oMLX.app: omlx-cli serve — самодостаточное
 # Python-окружение из Contents/Resources приложения, app-процесс не нужен.
+# Без --headless: веб-UI админки (/admin) включён, логин = API-ключ.
 # Модели ищет в ~/.omlx/models (сейчас pyros-vault/Qwen3.8-27B-Uncensored-oQ4e-mtp).
 # Auth — из auth-секции ~/.omlx/settings.json; старый mtplx-ключ в sub_keys,
 # поэтому клиенты со старым ключом продолжают работать.
@@ -40,7 +41,7 @@ server_ok() {
 }
 
 start_server() {
-  nohup "$OMLX_CLI" serve --port "$PORT" --headless >>"$LOG" 2>&1 &
+  nohup "$OMLX_CLI" serve --port "$PORT" >>"$LOG" 2>&1 &
   say "omlx serve запущен (pid $!), лог: $LOG"
 }
 
