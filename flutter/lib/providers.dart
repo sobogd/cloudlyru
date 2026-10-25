@@ -8,8 +8,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import 'app_state.dart';
-import 'features/gallery/data/gallery_store.dart';
-import 'features/gallery/data/gallery_sync.dart';
 import 'media/thumb_cache.dart';
 import 'media/thumb_store.dart';
 import 'storage/settings.dart';
@@ -68,23 +66,21 @@ final appStateProvider = ChangeNotifierProvider<AppState>((ref) {
   return state;
 });
 
-/// Синхронизатор живёт на всё приложение: разделы, настройки и очередь смотрят в одно
+/// Синхронизатор живёт на всё приложение: раздел и настройки смотрят в одно
 /// состояние — иначе две копии показывали бы разное.
 ///
 /// Создаётся лениво, при первом чтении (это делает `CloudlyApp.initState`), и живёт до конца
 /// процесса: `ref.onDispose` нужен не для выхода из аккаунта, а на случай разрушения scope
-/// (в рабочем приложении его не разрушают). Замечание на будущее: сейчас `dispose` снимает
-/// только мгновенный режим, а сторож, базы и наблюдение за папками закрывает `signOut` —
-/// значит при разрушении scope без выхода из аккаунта они останутся жить (см.
-/// `SyncController.dispose`). Выход из аккаунта синхронизатор не удаляет, а гасит себя
-/// изнутри ([SyncController.signOut]) — объект остаётся и оживает при следующем входе.
+/// (в рабочем приложении его не разрушают). Выход из аккаунта синхронизатор не удаляет, а
+/// гасит себя изнутри ([SyncController.signOut]) — объект остаётся и оживает при следующем
+/// входе.
 final syncControllerProvider = ChangeNotifierProvider<SyncController>((ref) {
   final controller = SyncController();
   ref.onDispose(controller.dispose);
   return controller;
 });
 
-/// Хранилище и очередь миниатюр галереи.
+/// Хранилище и очередь миниатюр раздела «Файлы».
 ///
 /// Открывается один раз на приложение: каталог данных читается с диска, и держать по копии
 /// на экран незачем — очередь общая, а её прогресс и счётчики должны быть одни на всех.
@@ -95,21 +91,4 @@ final syncControllerProvider = ChangeNotifierProvider<SyncController>((ref) {
 final thumbCacheProvider = FutureProvider<ThumbCache>((ref) async {
   final store = await ThumbStore.open();
   return ThumbCache(store: store, apiOf: () => ref.read(appStateProvider).api);
-});
-
-/// Локальный индекс галереи и его синхронизация с сервером.
-///
-/// Индекс лежит в своей базе (`cloudly-gallery.db`) и читается с диска: раздел показывает всю
-/// библиотеку без сети, а сервер догоняет список журналом изменений и верхней страницей ленты.
-/// Полное наполнение индекса идёт фоном и продолжается между открытиями раздела.
-///
-/// Журнал приходит по device-токену ([SyncController.api]), а лента — по веб-сессии: два разных
-/// доступа к одному аккаунту, и оба уже есть у приложения.
-final galleryProvider = FutureProvider<GallerySync>((ref) async {
-  final store = await GalleryStore.open();
-  return GallerySync(
-    store: store,
-    apiOf: () => ref.read(appStateProvider).api,
-    changesApiOf: () => ref.read(syncControllerProvider).api,
-  );
 });

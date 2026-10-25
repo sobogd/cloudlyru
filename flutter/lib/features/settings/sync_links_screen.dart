@@ -71,8 +71,8 @@ class _SyncLinksScreenState extends ConsumerState<SyncLinksScreen> {
     if (!mounted || localPath == null) return;
 
     final links = _links;
-    // Занятые папки облака подсвечиваем в выборе, а «Фото» не показываем вовсе: её содержимое
-    // ведёт раздел «Фото», и связка залила бы туда вторую копию
+    // Занятые папки облака подсвечиваем в выборе, а системную папку «Фото» не показываем
+    // вовсе: это поддерево зоны PHOTOS, а связка в него залила бы вторую копию содержимого
     final photoId = ref.read(appStateProvider).user?.photoFolderId;
     final picked = await Navigator.of(context).push<({String id, String path})>(
       MaterialPageRoute(

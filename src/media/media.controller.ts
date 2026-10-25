@@ -1,15 +1,13 @@
-import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { FULL_SIZE, MediaService, VIDEO_MIMES, isVideoMime } from './media.service';
-import { AlbumsService } from './albums.service';
 import { S3Service } from '../s3/s3.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from '../auth/auth.service';
 import { CurrentUser, RateLimit, RequestUser } from '../common/decorators';
 import { RateLimitGuard } from '../common/guards/rate-limit.guard';
 import { sendObjectOr404, sendFirstExisting } from '../common/http-object';
-import { asString, isPlainObject } from '../common/utils';
-import { badRequest, notFound } from '../common/errors';
+import { notFound } from '../common/errors';
 
 /** Превью неизменяемы (ключ = sha256), но приватны — кэширует только браузер пользователя. */
 const PREVIEW_CACHE = 'private, max-age=600';
@@ -29,7 +27,6 @@ function inlineVideoMime(mime: unknown): string {
 export class MediaController {
   constructor(
     private readonly media: MediaService,
-    private readonly albums: AlbumsService,
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
     private readonly auth: AuthService,
@@ -231,36 +228,5 @@ export class MediaController {
       }
     }
     return res.status(404).end();
-  }
-
-  @Get('albums')
-  listAlbums(@CurrentUser() user: RequestUser) {
-    return this.albums.list(user.id);
-  }
-
-  @Post('albums')
-  createAlbum(@Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
-    return this.albums.create(user.id, asString(body.name, 'name'));
-  }
-
-  @Get('albums/:id')
-  getAlbum(@Param('id') id: string, @CurrentUser() user: RequestUser) {
-    return this.albums.get(user.id, id);
-  }
-
-  @Post('albums/:id/items')
-  addItems(@Param('id') id: string, @Body() body: Record<string, unknown>, @CurrentUser() user: RequestUser) {
-    if (!isPlainObject(body) || !Array.isArray(body.entryIds)) throw badRequest('entryIds array required');
-    return this.albums.addItems(user.id, id, body.entryIds as string[]);
-  }
-
-  @Delete('albums/:id')
-  removeAlbum(@Param('id') id: string, @CurrentUser() user: RequestUser) {
-    return this.albums.remove(user.id, id);
-  }
-
-  @Delete('albums/:id/items/:entryId')
-  removeItem(@Param('id') id: string, @Param('entryId') entryId: string, @CurrentUser() user: RequestUser) {
-    return this.albums.removeItem(user.id, id, entryId);
   }
 }

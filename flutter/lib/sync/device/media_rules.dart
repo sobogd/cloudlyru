@@ -1,33 +1,11 @@
-import '../section.dart';
-
-/// Правила отбора: что считается фото и видео, что попадает в раздел «Файлы», а что не стоит
-/// показывать вообще. Здесь только чистые функции — весь отбор живёт тут, в интерфейсе его нет,
-/// и именно эти функции проверяют тесты.
-///
-/// Разделение на медиа и файлы идёт по расширению, а не по папке: скриншоты лежат и в `DCIM`,
-/// и в `Pictures/Screenshots`, а скачанные фотографии — в `Download` рядом с документами,
-/// поэтому «папки для фото» и «папки для файлов» списком не разложить.
+/// Правила отбора: что не стоит показывать вообще и mime по расширению.
+/// Здесь только чистые функции — весь отбор живёт тут, в интерфейсе его нет.
 ///
 /// Пользуются этими правилами обход диска (`device_files.dart`), обход зеркала
-/// (`mirror/mirror_scanner.dart`, `mirror/mirror_rules.dart`, `mirror/mirror_pull.dart`),
-/// выгрузка (`queue/upload_runner.dart` — тип файла для сервера) и экран очереди
-/// (`ui/queue_screen.dart` — иконка строки). Одно правило на всех и означает, что зеркало
-/// и очередь видят одинаковый набор файлов.
+/// (`mirror/mirror_scanner.dart`, `mirror/mirror_rules.dart`, `mirror/mirror_pull.dart`)
+/// и выгрузка (`queue/uploader.dart` — тип файла для сервера). Одно правило на всех и
+/// означает, что зеркало и обход видят одинаковый набор файлов.
 abstract final class MediaRules {
-  /// Фото: сюда же RAW и HEIC — камера телефона пишет именно так.
-  static const Set<String> _image = {
-    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif', 'jxl',
-    'dng', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'orf', 'raf', 'rw2', 'pef', 'sr2',
-    'tif', 'tiff', 'svg',
-  };
-
-  /// Видео: включает контейнеры камер и телефонов (`3gp`, `mts`) и то, что часто скачивают.
-  /// Расширения сравниваются в нижнем регистре — камеры пишут и `JPG`, и `MP4`.
-  static const Set<String> _video = {
-    'mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', '3gp', '3g2', 'mpg', 'mpeg',
-    'mts', 'm2ts', 'ts', 'wmv', 'flv',
-  };
-
   /// Недописанное и служебное: в списках не показываем.
   ///
   /// `.cloudly-tmp` — наш собственный временный файл при скачивании, `.cloudly-old` — резервная
@@ -49,28 +27,11 @@ abstract final class MediaRules {
 
   /// Расширение имени в нижнем регистре без точки; пустая строка — точки в имени нет
   /// (`README`) или имя кончается точкой. Считается от последней точки, поэтому
-  /// `archive.tar.gz` даёт `gz` — для отбора медиа это верно, а составные расширения
-  /// в правилах не участвуют.
+  /// `archive.tar.gz` даёт `gz`. Используется только [mimeOf].
   static String extension(String name) {
     final dot = name.lastIndexOf('.');
     return dot < 0 ? '' : name.substring(dot + 1).toLowerCase();
   }
-
-  /// Фото ли файл — по расширению из [_image].
-  static bool isImage(String name) => _image.contains(extension(name));
-
-  /// Видео ли файл — по расширению из [_video].
-  static bool isVideo(String name) => _video.contains(extension(name));
-
-  /// Фото и видео вместе — то, что показывается в разделе «Фото и видео».
-  static bool isMedia(String name) => isImage(name) || isVideo(name);
-
-  /// Куда попадает файл: медиа — в фото, всё остальное — в файлы.
-  ///
-  /// Разделы дополняют друг друга: один и тот же файл не может попасть в оба, и это то, ради
-  /// чего раздел «Файлы» показывает документы, а не «всё, что не попало в фото».
-  static bool matches(Section section, String name) =>
-      section == Section.photos ? isMedia(name) : !isMedia(name);
 
   /// Имена на точку не показываем: это `.nomedia`, `.thumbnails`, чужой служебный мусор.
   static bool isHidden(String name) => name.startsWith('.');

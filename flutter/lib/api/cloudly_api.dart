@@ -786,67 +786,7 @@ class CloudlyApi {
   Future<Map<String, dynamic>> macTermReset() async =>
       _m(await _req('/mac/term/reset', method: 'POST', body: {}));
 
-  // ---------- медиа ----------
-
-  /// Сколько кадров в медиатеке. Галерея им не пользуется: её список курсорный, и полной
-  /// высоты прокрутки у него нет. Число нужно прогреву миниатюр — по нему считается ход работы.
-  Future<int> mediaCount({CancelToken? cancelToken}) async =>
-      toNum(await _req('/media/count', cancelToken: cancelToken))?.toInt() ?? 0;
-
-  /// Порция кадров ленты: [offset] — с какого начинать, [limit] — сколько отдать.
-  ///
-  /// Тоже только для прогрева миниатюр (`ThumbCache.warmLibrary`): он идёт по всей библиотеке
-  /// страницами и нумерует их сам. Листание галереи ходит в [mediaFeed] — там адресом кадра
-  /// служит он сам, а не номер, который сдвигается при каждой загрузке фото.
-  Future<List<MediaItem>> mediaRange(int offset, int limit, {CancelToken? cancelToken}) async =>
-      _lm(await _req('/media/range?offset=$offset&limit=$limit', cancelToken: cancelToken))
-          .map(MediaItem.fromJson)
-          .toList();
-
-  /// Страница курсорной ленты — так галерея листает кадры.
-  ///
-  /// Направление задаётся одним из курсоров: [before] — кадры старше него (прокрутка в
-  /// прошлое), [after] — новее (прокрутка к свежему). Оба сразу не передаются. Курсор с
-  /// `at = null` адресует хвост ленты — кадры без даты съёмки, они идут после всех
-  /// датированных (см. [MediaCursor]). Курсора нет — приходит начало ленты.
-  ///
-  /// [ids] — выборка конкретных записей без курсора: так синхронизация забирает изменившееся
-  /// по журналу одним запросом. Список сервер режет до 500 id (`MEDIA_FEED_IDS_MAX`).
-  ///
-  /// Порядок кадров в ответе всегда ленты (свежие → старые), независимо от направления.
-  Future<MediaFeedPage> mediaFeed({
-    MediaCursor? before,
-    MediaCursor? after,
-    int limit = 200,
-    List<String>? ids,
-    CancelToken? cancelToken,
-  }) async {
-    final q = <String>['limit=$limit'];
-    if (ids != null && ids.isNotEmpty) {
-      q.add('ids=${Uri.encodeQueryComponent(ids.join(','))}');
-    } else if (before != null) {
-      // Пустой `before` — не «нет курсора», а курсор без даты: сервер различает эти случаи.
-      q.add('before=${Uri.encodeQueryComponent(before.at ?? '')}');
-      q.add('beforeId=${Uri.encodeQueryComponent(before.id)}');
-    } else if (after != null) {
-      q.add('after=${Uri.encodeQueryComponent(after.at ?? '')}');
-      q.add('afterId=${Uri.encodeQueryComponent(after.id)}');
-    }
-    return MediaFeedPage.fromJson(_m(await _req('/media/feed?${q.join('&')}', cancelToken: cancelToken)));
-  }
-
-  /// Месяцы медиатеки со счётчиками кадров — из них строится таймлайн.
-  ///
-  /// [tzOffsetMin] — сдвиг пояса клиента в минутах на восток от UTC (Москва: `180`). Сервер
-  /// считает бакет месяца как `capturedAt + tz`, поэтому без этого параметра кадр, снятый
-  /// вечером последнего числа месяца, попадает в следующий бакет. Сервер ограничивает сдвиг
-  /// диапазоном ±14 часов.
-  Future<List<MediaMonthBucket>> mediaMonths({int? tzOffsetMin, CancelToken? cancelToken}) async {
-    final tz = tzOffsetMin == null ? '' : '?tz=$tzOffsetMin';
-    return _lm(await _req('/media/months$tz', cancelToken: cancelToken))
-        .map(MediaMonthBucket.fromJson)
-        .toList();
-  }
+  // ---------- превью файлов ----------
 
   /// Байты превью для списка (квадрат-миниатюра) по хэшу содержимого.
   ///
@@ -870,25 +810,6 @@ class CloudlyApi {
       throw _toException(e);
     }
   }
-
-  /// Состояния сборки превью для перечисленных кадров.
-  ///
-  /// Галерея зовёт это по видимым клеткам, у которых превью ещё не собрано: состояние приходит
-  /// и вместе с кадром, но к моменту показа превью обычно только в очереди, и без перезапроса
-  /// клетка оставалась бы серой. Список сервер режет до 500 id (`MEDIA_STATUS_MAX`), признака
-  /// усечения в ответе нет — больше 500 за раз слать нельзя.
-  Future<List<MediaStatusItem>> mediaStatus(List<String> entryIds) async =>
-      _lm(await _req('/media/status', method: 'POST', body: {'entryIds': entryIds}))
-          .map(MediaStatusItem.fromJson)
-          .toList();
-
-  /// Полные метаданные кадра: для просмотрщика и карточки параметров.
-  Future<MediaInfo> mediaInfo(String entryId) async =>
-      MediaInfo.fromJson(_m(await _req('/media/${Uri.encodeComponent(entryId)}')));
-
-  /// Точки для карты (кадры с координатами и собранным превью); разбирает их экран карты.
-  Future<Map<String, dynamic>> mediaMap({CancelToken? cancelToken}) async =>
-      _m(await _req('/media/map', cancelToken: cancelToken));
 
   // ---------- очередь превью ----------
 

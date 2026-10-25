@@ -11,16 +11,17 @@ import { S3Service } from '../s3/s3.service';
 /**
  * Фото, которые мы умеем конвертировать: `mediaKindOf` ставит на них задачу 'photo' (sharp).
  *
- * Это НЕ список того, что видно в ленте «Медиа»: лента строится по строкам `MediaMeta`
- * (`src/media-feed/media-feed.service.ts`), а их получает любой `image/*` — RAW камер,
- * BMP, JXL (см. captureAny). Такие файлы попадают в раздел «Медиа», просто без превью.
+ * Это список того, для чего сервер соберёт превью: любой `image/*` получает строку
+ * `MediaMeta` (EXIF для деталки файла), но в превью попадает не всё — RAW камер, BMP, JXL
+ * (см. captureAny) превью не имеют. Раздела «Медиа» больше нет: превью используется
+ * только в «Файлах» (миниатюры и деталка).
  */
 export const IMAGE_MIMES = ['image/jpeg', 'image/heic', 'image/heif', 'image/png', 'image/webp', 'image/tiff', 'image/avif', 'image/gif'];
 /**
  * Видео, которые считаем медиа и ставим на конвертацию. Тип объявляет клиент, и кроме mp4/mov
  * от телефонов приходят 3GP/3GP2 со старых аппаратов (`video/3gpp` — так его называет и наш
  * Flutter-клиент для `.3gp`): пока их тут не было, файл не считался медиа вообще — ни строки
- * `MediaMeta` (не появлялся в ленте), ни задачи (очередь помечала «превью не собираются»).
+ * `MediaMeta`, ни задачи (очередь помечала «превью не собираются»).
  */
 export const VIDEO_MIMES = [
   'video/mp4', 'video/quicktime', 'video/x-m4v', 'video/webm', 'video/x-matroska', 'video/avi', 'video/ogg', 'video/mpeg',
@@ -38,13 +39,13 @@ export function isVideoMime(mime: unknown): boolean {
   return String(mime ?? '').toLowerCase().startsWith('video/');
 }
 
-/** Это картинка? Любой `image/*`: RAW камер (DNG/CR2/NEF) и BMP sharp не конвертирует, но в ленте им быть. */
+/** Это картинка? Любой `image/*`: RAW камер (DNG/CR2/NEF) и BMP sharp не конвертирует, но превью-строку `MediaMeta` получает. */
 export function isImageMime(mime: unknown): boolean {
   return String(mime ?? '').toLowerCase().startsWith('image/');
 }
 
 /**
- * Вид задачи конвейера по MIME; null — конвертировать нечем (превью не будет, но в ленте файл
+ * Вид задачи конвейера по MIME; null — конвертировать нечем (превью не будет, но файл
  * остаётся).
  *
  * Видео — по префиксу: объявленный клиентом тип бывает и `video/3gpp`, и `video/x-msvideo`,

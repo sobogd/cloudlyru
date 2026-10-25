@@ -9,9 +9,7 @@ import '../features/agent/projects_screen.dart';
 import '../features/mac/mac_screen.dart';
 import '../features/files/files_screen.dart';
 import '../features/mail/mail_screen.dart';
-import '../features/map/map_screen.dart';
 import '../features/notes/notes_screen.dart';
-import '../features/gallery/gallery_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../factura/invoices_screen.dart';
 import '../features/trash/trash_screen.dart';
@@ -25,12 +23,12 @@ import '../theme.dart';
 /// последнего раздела: [_ShellState.initState] ищет сохранённое имя по `name` и при промахе
 /// молча остаётся на «Файлах». Список открытый: новый раздел — новое значение здесь и строка
 /// в [_tabLook], больше менять нечего. Порядок значений = порядок разделов в баре, поэтому
-/// новый раздел вставляется в нужное место, а не в конец списка: «Заметки» стоят после «Карты».
-enum AppTab { files, mail, media, map, notes, invoices, projects, mac, trash, settings }
+/// новый раздел вставляется в нужное место, а не в конец списка: «Заметки» стоят после «Почты».
+enum AppTab { files, mail, notes, invoices, projects, mac, trash, settings }
 
 /// Название раздела для человека и его иконка.
 ///
-/// Подписи здесь именно человеческие: «Медиа», а не `media`, и «Инвойсы», а не `invoices`.
+/// Подписи здесь именно человеческие: «Заметки», а не `notes`, и «Инвойсы», а не `invoices`.
 /// Ключом для настроек остаётся `AppTab.name` (см. комментарий к нему), поэтому менять эти
 /// подписи можно свободно — сохранённый раздел от них не зависит.
 ///
@@ -42,12 +40,6 @@ typedef _TabLook = ({String label, IconData icon, IconData activeIcon});
 const Map<AppTab, _TabLook> _tabLook = {
   AppTab.files: (label: 'Файлы', icon: Icons.folder_outlined, activeIcon: Icons.folder),
   AppTab.mail: (label: 'Почта', icon: Icons.mail_outline, activeIcon: Icons.mail),
-  AppTab.media: (
-    label: 'Медиа',
-    icon: Icons.photo_library_outlined,
-    activeIcon: Icons.photo_library,
-  ),
-  AppTab.map: (label: 'Карта', icon: Icons.map_outlined, activeIcon: Icons.map),
   AppTab.notes: (
     label: 'Заметки',
     icon: Icons.sticky_note_2_outlined,
@@ -166,8 +158,6 @@ class _ShellState extends ConsumerState<Shell> {
   Widget _screenFor(AppTab tab) => _screens.putIfAbsent(tab, () => switch (tab) {
         AppTab.files => const FilesScreen(),
         AppTab.mail => const MailScreen(),
-        AppTab.media => const GalleryScreen(),
-        AppTab.map => const MapScreen(),
         AppTab.notes => const NotesScreen(),
         AppTab.invoices => const InvoicesScreen(),
         AppTab.projects => const ProjectsScreen(),

@@ -2,14 +2,14 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart';
 
 import '../api/cloudly_api.dart';
 import 'data/mirror_store.dart';
-import 'data/queue_store.dart';
 import 'data/selection.dart';
 import 'data/sync_links.dart';
-import 'data/sync_prefs.dart';
 import 'device/device_files.dart';
 import 'device/native_fs.dart';
 import 'mirror/mirror_engine.dart';
@@ -18,9 +18,6 @@ import 'mirror/mirror_status.dart';
 import 'mirror/mirror_watcher.dart';
 import 'net/device_token.dart';
 import 'net/sync_api.dart';
-import 'queue/queue_builder.dart';
-import 'queue/queue_refresher.dart';
-import 'queue/upload_runner.dart';
 import 'section.dart';
 
 /// Состояние синхронизации для интерфейса: доступ к файлам, статус зеркала, очередь.
@@ -29,7 +26,7 @@ import 'section.dart';
 /// возвращения из системных настроек): сам доступ спрашивается у [NativeFs].
 enum SyncAccess { unknown, granted, denied }
 
-/// Одна точка сборки всего синхронизатора: базы, выбор папок, движок зеркала, очередь,
+/// Одна точка сборки всего синхронизатора: базы, выбор папок, движок зеркала,
 /// мгновенный режим. Интерфейс говорит только с ней — ни баз, ни сетевого клиента он не знает.
 ///
 /// Токен устройства берётся у сессии: корень зеркала сервер заводит именно устройству, а
@@ -67,21 +64,18 @@ class SyncController extends ChangeNotifier {
   late final MirrorStatusHolder _status;
 
   SharedPreferences? _prefs;
-  SyncPrefs? syncPrefs;
+
+  /// Остаток выбора папок прежних сборок: читается один раз для переноса в связки
+  /// ([_migrateLegacySelection]) и больше не используется.
   Selection? selection;
 
   /// Связки «папка на устройстве ↔ папка в облаке» раздела «Файлы»: что и куда синхронизировать.
-  /// Выбор папок для «Фото» живёт отдельно ([selection]) — там зеркала нет, только заливка
-  /// в медиатеку.
   SyncLinks? links;
-  QueueStore? queueStore;
   MirrorStore? mirrorStore;
   SyncApi? _api;
 
-  /// Клиент синхронизации (device-токен) для тех, кому нужен журнал изменений помимо зеркала.
+  /// Клиент синхронизации (device-токен): нужен движку зеркала и журнала изменений.
   ///
-  /// Лента «Медиа» ведёт по журналу свой курсор и свой список: `/sync/*` отвечает только на
-  /// device-токен, а выпускает его этот контроллер — второй такой же токен заводить незачем.
   /// null означает, что токена ещё нет (или он отозван): потребитель обязан работать и без
   /// журнала, на том, что уже лежит на устройстве.
   SyncApi? get api => _api;
@@ -92,7 +86,6 @@ class SyncController extends ChangeNotifier {
   String _login = '';
   MirrorEngine? engine;
   MirrorLive? live;
-  UploadRunner? uploads;
 
   /// Состояние зеркала: одно на всё приложение, чтобы раздел «Файлы» и настройки не показывали
   /// разное.
@@ -101,17 +94,15 @@ class SyncController extends ChangeNotifier {
   /// Доступ ко всем файлам: [SyncAccess.unknown] — ещё не спрашивали.
   SyncAccess access = SyncAccess.unknown;
 
-  /// Что делает синхронизатор прямо сейчас: «обновляю очередь», «выгружаю файл».
+  /// Что делает синхронизатор прямо сейчас: «сверяю…», «выгружаю…».
   String? activity;
-
-  /// Сколько строк ждёт выгрузки: по этому числу живёт кнопка на вкладке «Очередь».
-  int waiting = 0;
-
-  /// Последний итог наполнения очереди.
-  String? queueNote;
 
   /// Устройство: так называется корень зеркала в облаке.
   String deviceLabel = 'Android';
+
+  /// Ключ отметки одноразовой уборки после удаления «Фото» и очереди выгрузки (см.
+  /// [_cleanupRemovedMedia]).
+  static const String _mediaCleanupKey = 'sync_media_removed_cleanup';
 
   /// Старт уже выполнен: [start] вызывается и при входе в аккаунт, и при старте приложения,
   /// а второй раз поднимать базы и наблюдение нельзя.
@@ -176,7 +167,6 @@ class SyncController extends ChangeNotifier {
     final epoch = ++_sessionEpoch;
     try {
       _prefs ??= await SharedPreferences.getInstance();
-      syncPrefs ??= SyncPrefs(_prefs!);
       selection ??= Selection(_prefs!);
       links ??= SyncLinks(_prefs!);
       // Доступ и метка устройства — до баз: если база почему-то не откроется, человек всё равно
@@ -186,14 +176,16 @@ class SyncController extends ChangeNotifier {
           ? SyncAccess.granted
           : SyncAccess.denied;
 
-      // Базы открываем по одной: поломка одной не должна отменять всё остальное. Так уже было —
-      // не открылась база, и вместе с ней «не поставилось» наблюдение и «не запускалось» зеркало
-      queueStore ??= await _openQueueStore();
+      // Базу открываем отдельно: если она не откроется, человек должен видеть «база зеркала
+      // не открылась», а не «проверяю доступ к файлам…» навсегда
       mirrorStore ??= await _openMirrorStore();
       // Выключателя синхронизации нет: она всегда включена — в этом её смысл. Флаг в базе
       // мог остаться от прежних сборок, поэтому снимаем его, иначе синхронизация молчала бы
       // без всякой возможности её вернуть.
       await mirrorStore?.clearMeta(MirrorStore.keyPaused);
+      // Одноразовая уборка после удаления раздела «Фото» и очереди выгрузки: базы и
+      // настройки этих функций остаются на диске и без уборки занимали бы место навсегда
+      await _cleanupRemovedMedia();
       // Перенос прежнего выбора папок — после баз: пары «папка телефона ↔ папка облака»
       // сложились в прошлых проходах и лежат именно в базе зеркала
       await _migrateLegacySelection();
@@ -206,10 +198,6 @@ class SyncController extends ChangeNotifier {
       await _ensureEngine();
       await _ensureLive();
 
-      // корень зеркала нужен «Файлам» сразу: без него синхронизируемая папка не отличается
-      // от обычной
-      final api = _api;
-      if (api != null) await _rememberSystemFolders(api);
       if (epoch != _sessionEpoch || _disposed) return;
       notifyListeners();
       // Синхронизация не должна ждать, пока её попросят: проверяем себя сразу после старта и
@@ -253,17 +241,13 @@ class SyncController extends ChangeNotifier {
     await _restoreLastState(store);
   }
 
-  /// Выгрузчик очереди и мгновенный режим.
+  /// Мгновенный режим: опрос журнала изменений и проход по событию файловой системы.
   ///
-  /// Мгновенный режим не зависит от базы очереди: её отказ не должен глушить опрос журнала,
-  /// хотя и выгрузка из очереди без неё невозможна. Побочные эффекты: открытие базы очереди
-  /// (если она ещё не открыта), создание выгрузчика и запуск опроса.
+  /// Не зависит от базы: её отказ не должен глушить опрос журнала. Побочные эффекты:
+  /// создание режима и запуск опроса.
   Future<void> _ensureLive() async {
     final api = _api;
     if (api == null) return;
-    queueStore ??= await _openQueueStore();
-    final queue = queueStore;
-    if (queue != null) uploads ??= UploadRunner(api, queue);
     final store = mirrorStore;
     final e = engine;
     if (store == null || e == null || live != null) return;
@@ -277,28 +261,8 @@ class SyncController extends ChangeNotifier {
     live = liveMode;
   }
 
-  /// База очереди: своя попытка и свой отчёт об ошибке — из-за неё одной синхронизация
-  /// не должна пропадать целиком.
-  ///
-  /// @return открытая база или `null`, если она не открылась: причина уходит в [queueNote]
-  ///         и в лог, а остальная синхронизация продолжает подниматься. Строки, застрявшие
-  ///         в работе после прошлого запуска, возвращаются в ожидание.
-  Future<QueueStore?> _openQueueStore() async {
-    try {
-      final store = await QueueStore.open();
-      // после перезапуска ничего не может быть «в работе»: строки, застрявшие в RUNNING,
-      // возвращаем в ожидание, иначе кнопка «play» на них не появится уже никогда
-      await store.resetRunning();
-      return store;
-    } catch (e) {
-      debugPrint('cloudly-sync: база очереди не открылась: $e');
-      queueNote = 'база очереди не открылась: $e';
-      return null;
-    }
-  }
-
-  /// База зеркала: та же логика, что у очереди, — своя попытка и своя причина отказа
-  /// в [activity], чтобы интерфейс объяснил, почему зеркало молчит.
+  /// База зеркала: своя попытка и своя причина отказа в [activity], чтобы интерфейс
+  /// объяснил, почему зеркало молчит.
   Future<MirrorStore?> _openMirrorStore() async {
     try {
       return await MirrorStore.open();
@@ -376,23 +340,20 @@ class SyncController extends ChangeNotifier {
         notifyListeners();
         return false;
       }
-      await _rememberSystemFolders(api);
     }
     // Старт мог упасть на любой фазе: не открылись настройки, не открылась база зеркала,
     // не поднялся движок. Догоняем всё, чего не хватает, а не только токен — иначе
     // синхронизация оставалась бы мёртвой до перезапуска приложения, хотя все вызывающие
-    // ([checkAndResume], [refreshQueue], [uploadItem], [mirrorPass]) считали бы её живой
+    // ([checkAndResume], [mirrorPass]) считали бы её живой
     if (_prefs == null) {
       try {
         _prefs = await SharedPreferences.getInstance();
-        syncPrefs ??= SyncPrefs(_prefs!);
         selection ??= Selection(_prefs!);
         links ??= SyncLinks(_prefs!);
       } catch (e) {
         debugPrint('cloudly-sync: настройки не открылись: $e');
       }
     }
-    queueStore ??= await _openQueueStore();
     mirrorStore ??= await _openMirrorStore();
     await _migrateLegacySelection();
     await _ensureEngine();
@@ -402,32 +363,44 @@ class SyncController extends ChangeNotifier {
     return true;
   }
 
-  /// Запомнить системные папки сервера: медиатеку «Фото» и легаси-«Телефон». Спрашиваем один
-  /// раз при запуске — id медиатеки нужен наполнению очереди.
+  /// Одноразовая уборка после удаления раздела «Фото» и очереди выгрузки (сборка +223).
   ///
-  /// Корень зеркала устройства здесь больше не запоминается: папки в облаке для «Файлов»
-  /// выбирает человек, и сервер их не заводит (см. `SyncLinks`).
+  /// Эти функции оставили на диске своё: базы `cloudly-queue.db` (очередь),
+  /// `cloudly-gallery.db` (локальный индекс галереи) и её прежнее имя `cloudly-media.db`
+  /// плюс ключ выбранных папок фото. Без уборки файлы бы остались в данных приложения
+  /// навсегда — панели, которая умела чистить кэш, больше нет. Флаг в настройках гарантирует
+  /// один проход: повторные удаления нежеланы (файла нет — `delete` молча проходит, но
+  /// лишний обход незачем).
   ///
-  /// Побочные эффекты: запрос к серверу и запись в настройки (кэш — истина всё равно за
-  /// ответом сервера). Ошибка не пробрасывается: папки придут при следующем случае.
-  Future<void> _rememberSystemFolders(SyncApi api) async {
-    final prefs = syncPrefs;
+  /// База зеркала `cloudly-mirror.db` не трогается — по ней живёт синхронизация «Файлов»,
+  /// и миниатюры файлов из `flutter/lib/media` не чистим: на них теперь опирается
+  /// раздел «Файлы». WAL/SHM-хвосты удаляем вместе с базой: они появляются, если процесс
+  /// убили в момент записи, и без этого след от базы остался бы навсегда.
+  ///
+  /// Побочные эффекты: чтение и запись настроек, удаление файлов из папки баз приложения.
+  /// Ошибки не пробрасываются: уборка — удобство, а не условие работы синхронизации.
+  Future<void> _cleanupRemovedMedia() async {
+    final prefs = _prefs;
     if (prefs == null) return;
+    if (prefs.getBool(_mediaCleanupKey) == true) return;
     try {
-      final me = await api.systemFolders();
-      final photo = me.photoFolderId;
-      if (photo != null && photo.isNotEmpty) {
-        await prefs.setPhotoFolderId(photo);
+      final dir = await getDatabasesPath();
+      for (final name in const ['cloudly-queue.db', 'cloudly-gallery.db', 'cloudly-media.db']) {
+        for (final suffix in const ['', '-wal', '-shm']) {
+          final f = File(p.join(dir, '$name$suffix'));
+          if (await f.exists()) await f.delete();
+        }
       }
-      final phone = me.phoneFolderId;
-      if (phone != null && phone.isNotEmpty) {
-        await prefs.setPhoneFolderId(phone);
-      }
-      notifyListeners();
+      await prefs.remove('sync_folders_photos');
     } catch (e) {
-      // папки придут и позже — например, при наполнении очереди; ронять из-за них старт незачем
-      debugPrint('cloudly-sync: системные папки не спрошены: $e');
+      debugPrint('cloudly-sync: уборка после удаления «Фото» не удалась: $e');
+      return;
     }
+    if (!await prefs.setBool(_mediaCleanupKey, true)) {
+      debugPrint('cloudly-sync: отметка о уборке не сохранена — повторим на следующем запуске');
+      return;
+    }
+    debugPrint('cloudly-sync: базы удалённых «Фото» и очереди выгрузки убраны');
   }
 
   /// Токен устройства: свой у каждого устройства, поэтому корень зеркала в облаке не делится
@@ -511,9 +484,9 @@ class SyncController extends ChangeNotifier {
   /// [start] можно звать снова. Закрытие баз закрывает и состояние зеркала в памяти: строки
   /// в базе остаются на диске и переживут следующий вход в тот же аккаунт.
   Future<void> signOut() async {
-    // Сессия закрывается до всего остального: текущий проход и текущая выгрузка увидят смену
-    // эпохи (см. [mirrorPass] и [uploadItem]) и остановятся сами, а не будут писать в базу,
-    // которую вот-вот закроют
+    // Сессия закрывается до всего остального: текущий проход увидит смену эпохи
+    // (см. [mirrorPass]) и остановится сам, а не будет писать в базу, которую вот-вот
+    // закроют
     _sessionEpoch++;
     try {
       await _api?.revokeOwnToken();
@@ -540,50 +513,38 @@ class SyncController extends ChangeNotifier {
     tokenError = null;
     _started = false;
     _lastTokenRetryAt = null;
-    _lastQueueRefreshAt = null;
 
-    // Базы закрываем, только когда текущая работа закончилась: закрыть их под работающим
-    // движком — значит получить исключения из закрытой базы и незавершённую сессию выгрузки.
+    // Базу закрываем, только когда текущая работа закончилась: закрыть её под работающим
+    // движком — значит получить исключения из закрытой базы.
     // Если работа идёт, закрытие откладывается до её конца, а сессия считается новой уже сейчас
-    final pending = <Future<void>>[
-      ?_passInFlight,
-      ?_uploadInFlight,
-    ];
-    final queue = queueStore;
+    final pending = <Future<void>>[?_passInFlight];
     final mirror = mirrorStore;
-    queueStore = null;
     mirrorStore = null;
     _prefs = null;
-    syncPrefs = null;
     selection = null;
     links = null;
     _linkedCloudIds = null;
     engine = null;
-    uploads = null;
     live = null;
     _files = null;
     if (pending.isEmpty) {
-      await queue?.close();
       await mirror?.close();
     } else {
       unawaited(
         Future.wait(pending).then((_) async {
-          await queue?.close();
           await mirror?.close();
         }),
       );
     }
 
     // Состояние сбрасывается целиком: иначе после смены аккаунта экраны показывали бы значения
-    // прошлого (доступ, «выгружено: …», метку устройства), а залипшая фаза зеркала пережила бы
-    // выход и вход — интерфейс вечно писал бы «выгружаю…»
+    // прошлого (доступ, метку устройства), а залипшая фаза зеркала пережила бы
+    // выход и вход — интерфейс вечно писал бы «сверяю…»
     _status.reset();
     mirrorStatus = const MirrorStatus();
     access = SyncAccess.unknown;
     activity = null;
-    queueNote = null;
     deviceLabel = 'Android';
-    waiting = 0;
     notifyListeners();
   }
 
@@ -624,16 +585,14 @@ class SyncController extends ChangeNotifier {
 
   /// Проверить доступ после возвращения из системных настроек.
   ///
-  /// Побочные эффекты: проба доступа, при выданном доступе — постановка наблюдения за папками
-  /// и наполнение очереди (без доступа и то и другое бессмысленно), затем уведомление
-  /// интерфейса.
+  /// Побочные эффекты: проба доступа, при выданном доступе — постановка наблюдения за
+  /// папками (без доступа она бессмысленна), затем уведомление интерфейса.
   Future<void> recheckAccess() async {
     access = await native.hasAllFilesAccess()
         ? SyncAccess.granted
         : SyncAccess.denied;
     if (access == SyncAccess.granted) {
       await startWatching();
-      await refreshQueue();
     } else {
       // доступ отозвали в системных настройках: наблюдать больше нечего, а обход без него
       // считает папки нечитаемыми и запрещает удаления — об этом надо сказать, а не молчать
@@ -655,15 +614,6 @@ class SyncController extends ChangeNotifier {
         : SyncAccess.denied;
     if (now == was) return;
     await recheckAccess();
-  }
-
-  /// Выбор папок раздела «Фото» изменился: наполняем очередь заново.
-  ///
-  /// @param section раздел, в котором меняли выбор; в теле не используется — очередь
-  ///        пересобирается целиком. Наблюдения за папками у «Фото» нет: там плоская заливка
-  ///        в медиатеку, а не зеркало дерева (см. `QueueBuilder`).
-  Future<void> onSelectionChanged(Section section) async {
-    await refreshQueue();
   }
 
   /// Разовый перенос прежнего выбора папок в связки.
@@ -763,48 +713,24 @@ class SyncController extends ChangeNotifier {
   /// сам, его надо догнать.
   static const int _stalePassMs = 10 * 60 * 1000;
 
-  /// Сколько файлов очереди выгружаем за одну проверку: остальное — следующим заходом.
-  ///
-  /// Число выбрано так, чтобы одна проверка (тик сторожа — раз в минуту) не занимала канал
-  /// надолго на очереди в сотни файлов: остальное подхватит следующий тик. Источник —
-  /// соображение о длительности, а не замер.
-  static const int _drainPerCheck = 20;
-
-  /// Как часто сторож просыпается: раз в минуту он смотрит, есть ли что выгружать.
+  /// Как часто сторож просыпается: раз в минуту он проверяет токен устройства и доступ
+  /// к файлам — оба могут измениться без действия человека.
   static const Duration _watchdogEvery = Duration(seconds: 60);
-
-  /// Как часто сторож пересматривает выбранные папки, когда выгружать нечего. Пять минут —
-  /// компромисс между свежестью очереди и обходом диска: заход стоит `stat` по каждому файлу
-  /// выбранных папок и полного чтения таблицы очереди.
-  static const Duration _queueRefreshEvery = Duration(minutes: 5);
 
   /// Как часто сторож пробует выпустить токен заново, если клиента синхронизации нет.
   /// Реже, чем [._watchdogEvery]: выпуск токена — это запрос к серверу и запись в шифрованное
   /// хранилище, а отказ обычно держится дольше минуты.
   static const Duration _tokenRetryEvery = Duration(minutes: 5);
 
-  /// Проверка уже идёт: два захода разом трогали бы одни и те же строки очереди.
+  /// Проверка уже идёт: два захода разом трогали бы одни и те же состояния.
   bool _resuming = false;
 
-  /// Сторож: пока приложение открыто, ждущее выгружается само.
+  /// Сторож: страховка от «синхронизация встала без видимой причины».
   Timer? _watchdog;
-  DateTime? _lastQueueRefreshAt;
   DateTime? _lastTokenRetryAt;
 
-  /// Идёт выгрузка файла. Очередь, сторож, «проверить» и кнопка на строке должны делить один
-  /// канал: иначе сторож начинал следующий файл, пока льётся гигабайтное видео, — и канал,
-  /// и батарея делились бы между N выгрузками.
-  bool _uploading = false;
-
-  /// Строки, выгружаемые прямо сейчас: повторный запуск той же строки (тап по ней в момент
-  /// тика сторожа) дал бы два `initUpload` на одно имя и лишнюю конфликтную копию в облаке.
-  final Set<int> _uploadingIds = <int>{};
-
-  /// Идущий проход зеркала: по нему [signOut] понимает, что базы закрывать ещё рано.
+  /// Идущий проход зеркала: по нему [signOut] понимает, что базу закрывать ещё рано.
   Future<void>? _passInFlight;
-
-  /// Идущая выгрузка очереди — по той же причине.
-  Future<void>? _uploadInFlight;
 
   /// Подписка на состояние зеркала: её нужно отменять вместе с контроллером.
   StreamSubscription<MirrorStatus>? _statusSubscription;
@@ -822,10 +748,10 @@ class SyncController extends ChangeNotifier {
   ///        назад и ждать нечего. Автоматическим заходам (старт, открытие раздела, сторож)
   ///        это не нужно: там проход идёт по нужде, а не по требованию.
   ///
-  /// Побочные эффекты: выпуск токена, если его нет, наполнение очереди, выгрузка до
-  /// [_drainPerCheck] файлов и, если зеркало не работает или давно не заканчивало проход,
-  /// запуск прохода в фоне ([mirrorPass] не ожидается). Второй заход во время первого
-  /// возвращается сразу. В конце — подсчёт ждущих строк и уведомление интерфейса.
+  /// Побочные эффекты: выпуск токена, если его нет, перестановка наблюдения и, если зеркало
+  /// не работает или давно не заканчивало проход, запуск прохода в фоне ([mirrorPass] не
+  /// ожидается). Второй заход во время первого возвращается сразу. В конце — уведомление
+  /// интерфейса.
   Future<void> checkAndResume({bool mirror = false}) async {
     if (_resuming) return;
     _resuming = true;
@@ -833,17 +759,11 @@ class SyncController extends ChangeNotifier {
     notifyListeners();
     try {
       if (_api == null && !await ensureReady()) return;
-      await refreshQueue();
       // наблюдение могло не встать при старте или отвалиться после перезагрузки системы
       await startWatching();
 
-      // Сначала очередь: её и видно в разделе. Раньше догон стоял после прохода зеркала,
-      // а проход идёт минутами — всё это время человек смотрел на «ждёт запуска» и решал,
-      // что синхронизация встала.
-      await _drainQueue();
-
-      // Проход зеркала — после очереди и без ожидания: он может идти минутами, а раздел
-      // не должен из-за него ничего ждать
+      // Проход зеркала — без ожидания: он может идти минутами, а раздел не должен из-за него
+      // ничего ждать
       final status = mirrorStatus;
       // связок нет — зеркалу нечего делать: ни обходить, ни догонять
       final hasLinks = links?.all().isNotEmpty ?? false;
@@ -865,55 +785,19 @@ class SyncController extends ChangeNotifier {
     } finally {
       _resuming = false;
       activity = null;
-      waiting = await queueStore?.waitingCount() ?? waiting;
       notifyListeners();
-    }
-  }
-
-  /// Выгрузить ждущее из очереди — без кнопки. Очередь «Фото» наполняется сама, а кнопок
-  /// «начать» в разделе больше нет: если файл ждёт выгрузки, он должен уехать сам.
-  ///
-  /// Побочные эффекты — выгрузка файлов в облако (см. [uploadItem]); ход работы уходит
-  /// в [activity] и в очередь на экране. Исключения не пробрасываются: сбой одного файла
-  /// остаётся ошибкой его строки.
-  Future<void> _drainQueue() async {
-    final store = queueStore;
-    if (store == null || uploads == null) return;
-    // Одна выгрузка за раз: если файл уже льётся (его начал сторож, «проверить» или кнопка),
-    // второй не начинаем — очередь подождёт текущего
-    if (_uploading) return;
-    // Таблицу читаем один раз: раньше она перечитывалась на каждой итерации — до двадцати
-    // полных чтений тысяч строк за одну проверку на изоляте интерфейса
-    final items = await store.items();
-    // Каждую строку в этой проверке пробуем один раз: иначе упавший файл крутился бы вечно
-    final tried = <int>{};
-    for (var done = 0; done < _drainPerCheck; done++) {
-      QueueItem? next;
-      for (final item in items) {
-        if (tried.contains(item.id)) continue;
-        // неудавшиеся пробуем наравне с ожидающими: следующий заход может пройти
-        if (item.state == QueueState.pending ||
-            item.state == QueueState.failed) {
-          next = item;
-          break;
-        }
-      }
-      if (next == null) return;
-      tried.add(next.id);
-      await uploadItem(next.id);
     }
   }
 
   /// Сторож, пока приложение открыто.
   ///
-  /// Проверки «при открытии раздела» мало: файл может появиться, пока раздел закрыт, а строка
-  /// очереди — остаться ждать, пока человек снова туда зайдёт. Сторож каждую минуту смотрит,
-  /// есть ли что выгружать (и выгружает), а раз в пять минут пересматривает выбранные папки —
-  /// иначе новые файлы вообще не попадут в очередь до следующей проверки.
+  /// Проходы зеркала ведёт сам движок (мгновенный режим опрашивает журнал и реагирует на
+  /// события файловой системы), а вот «встала ли синхронизация без видимой причины» никто
+  /// больше не смотрит: токен могли отозвать в вебе, а доступ ко всем файлам — отозвать в
+  /// системных настройках. Сторож раз в минуту проверяет оба без действия человека.
   ///
   /// Работает только на переднем плане, то есть на телефонах в фоне стоит: там работа замирает
-  /// вместе с процессом, а накопившееся разбирают те же проходы, когда человек возвращается в
-  /// приложение (на iOS это ещё и `checkAndResume`). На десктопе сторож идёт всегда.
+  /// вместе с процессом. На десктопе сторож идёт всегда.
   /// Заводится один раз: повторный вызов оставляет прежний таймер.
   void _startWatchdog() {
     if (_disposed) return;
@@ -922,11 +806,11 @@ class SyncController extends ChangeNotifier {
     });
   }
 
-  /// Один тик сторожа: выгрузить ждущее или, если ждать нечего, пересобрать очередь.
+  /// Один тик сторожа: повторить выпуск токена и перепроверить доступ ко всем файлам.
   ///
-  /// В фоне (на телефонах), во время другой проверки и без клиента синхронизации тик молча
-  /// выходит: без токена он ничего не сделает, а очередь зависит от сервера. Ошибки не
-  /// пробрасываются — сторож не должен падать из-за одного сбоя.
+  /// В фоне (на телефонах) и во время другой проверки тик молча выходит: без токена и
+  /// без доступа он ничего не сделает. Ошибки не пробрасываются — сторож не должен
+  /// падать из-за одного сбоя.
   Future<void> _watchdogTick() async {
     if (_disposed || !foreground || _resuming) return;
     // Токен устройства мог быть отозван в вебе или не выпуститься при старте. Сторож —
@@ -940,127 +824,11 @@ class SyncController extends ChangeNotifier {
       await ensureReady();
       if (_api == null) return;
     }
-    final store = queueStore;
-    if (store == null) return;
     try {
       // доступ могли отозвать в системных настройках при живом приложении
       await _recheckAccessQuietly();
-      // выгрузка уже идёт — второй файл не начинаем
-      if (_uploading) return;
-      if (await store.waitingCount() > 0) {
-        await _drainQueue();
-        return;
-      }
-      // ждать нечего: не чаще раза в пять минут смотрим, не появилось ли нового на телефоне
-      final last = _lastQueueRefreshAt;
-      final now = DateTime.now();
-      if (last == null || now.difference(last) > _queueRefreshEvery) {
-        // Срок отсчитываем и при неудачном заходе: иначе отказ (нет сети, нет токена) заставлял
-        // бы обходить папки заново каждую минуту
-        _lastQueueRefreshAt = now;
-        await refreshQueue(quiet: true);
-      }
     } catch (e) {
       debugPrint('cloudly-sync: сторож споткнулся: $e');
-    }
-  }
-
-  /// Наполнить очередь: пройти выбранные папки и поставить новое. Ничего не выгружает.
-  ///
-  /// @param quiet тихий заход (сторож): не показывать ход работы в [activity].
-  /// @return итог наполнения для интерфейса или `null`, если наполнить не удалось: причина
-  ///         уходит в [queueNote]. Побочные эффекты: чтение диска, запросы к серверу, строки
-  ///         в базе очереди, счётчик [waiting]. Ошибка не выбрасывается наружу — иначе сторож
-  ///         и открытие раздела падали бы из-за одной нечитаемой папки.
-  Future<QueueBuildResult?> refreshQueue({bool quiet = false}) async {
-    final store = queueStore;
-    final sel = selection;
-    final prefs = syncPrefs;
-    if (store == null || sel == null || prefs == null) return null;
-    // Токен мог не выпуститься при старте (сеть, лимит живых токенов): без повторной попытки
-    // кнопка «Обновить» молча ничего бы не делала
-    if (_api == null && !await ensureReady()) {
-      queueNote = tokenError ?? 'нет токена устройства';
-      notifyListeners();
-      return null;
-    }
-    // тихий заход не перебивает то, что уже показано в «синхронизация: …»
-    if (!quiet) {
-      activity = 'прохожу папки…';
-      notifyListeners();
-    }
-    try {
-      final refresher = QueueRefresher(() => _api, prefs, sel, store, files);
-      final result = await refresher.refresh(
-        onProgress: (m) {
-          activity = m;
-          notifyListeners();
-        },
-      );
-      queueNote = result.text();
-      waiting = await store.waitingCount();
-      return result;
-    } catch (e) {
-      queueNote = 'не удалось пройти папки: ${describeError(e)}';
-      return null;
-    } finally {
-      if (!quiet) {
-        activity = null;
-        notifyListeners();
-      }
-    }
-  }
-
-  /// Выгрузить один файл из очереди: кнопкой на строке — если хочется поторопить.
-  ///
-  /// @param itemId строка очереди; @param onProgress — счётчик байтов для строки на экране.
-  /// Побочные эффекты: сеть, файл в облаке, состояние строки в базе очереди, [activity]
-  /// и [waiting]. Ошибки не пробрасываются: причина уходит в [queueNote].
-  Future<void> uploadItem(
-    int itemId, {
-    void Function(UploadProgress)? onProgress,
-  }) async {
-    // строка могла ждать с прошлого запуска, когда токена ещё не было
-    if (_api == null && !await ensureReady()) {
-      queueNote = tokenError ?? 'нет токена устройства';
-      notifyListeners();
-      return;
-    }
-    final runner = uploads;
-    if (runner == null) return;
-    // Одна выгрузка за раз и ни одной строки дважды: очередь, сторож, «проверить» и кнопка
-    // на строке делят один канал. Без этого тап по строке в момент тика сторожа запускал бы
-    // два прохода по одной строке, а сторож — второй файл поверх гигабайтного видео
-    if (_uploading || !_uploadingIds.add(itemId)) return;
-    _uploading = true;
-    activity = 'выгружаю…';
-    notifyListeners();
-    try {
-      final run = runner.run(itemId, onProgress: onProgress);
-      _uploadInFlight = run.then<void>((_) {}, onError: (Object _) {});
-      await run;
-    } catch (e) {
-      // Отказ авторизации (401/403) выглядит как обычная ошибка строки, но означает, что
-      // токен устройства отозван или истёк. Клиент синхронизации помечаем негодным:
-      // [ensureReady] при следующей проверке выпустит новый, иначе вся очередь осталась бы
-      // мёртвой до перезапуска приложения, а признака в интерфейсе не было бы
-      if (e is SyncApiException && (e.status == 401 || e.status == 403)) {
-        _api = null;
-        tokenError = 'токен устройства отозван — нужен новый';
-        debugPrint('cloudly-sync: $tokenError');
-      } else {
-        queueNote = 'выгрузка не удалась: ${describeError(e)}';
-      }
-    } finally {
-      _uploading = false;
-      _uploadingIds.remove(itemId);
-      _uploadInFlight = null;
-      // счётчик обновляем в любом случае: строка могла сменить состояние даже при ошибке.
-      // База берётся в переменную: [signOut] мог её обнулить прямо во время выгрузки
-      final store = queueStore;
-      activity = null;
-      if (store != null) waiting = await store.waitingCount();
-      if (!_disposed) notifyListeners();
     }
   }
 
@@ -1152,9 +920,9 @@ class SyncController extends ChangeNotifier {
   @override
   void dispose() {
     // Провайдер уничтожается — работа прекращается целиком: таймер сторожа, подписка
-    // на состояние, мгновенный режим и базы. Раньше здесь закрывался только мгновенный режим,
-    // а сторож продолжал будить изолят интерфейса и выгружать файлы, дёргая notifyListeners
-    // у уже уничтоженного [ChangeNotifier]
+    // на состояние, мгновенный режим и база. Раньше здесь закрывался только мгновенный режим,
+    // а сторож продолжал будить изолят интерфейса, дёргая notifyListeners у уже уничтоженного
+    // [ChangeNotifier]
     _disposed = true;
     _watchdog?.cancel();
     _watchdog = null;
@@ -1162,11 +930,8 @@ class SyncController extends ChangeNotifier {
     _statusSubscription = null;
     unawaited(live?.dispose());
     unawaited(_status.dispose());
-    final queue = queueStore;
     final mirror = mirrorStore;
-    queueStore = null;
     mirrorStore = null;
-    if (queue != null) unawaited(queue.close());
     if (mirror != null) unawaited(mirror.close());
     super.dispose();
   }

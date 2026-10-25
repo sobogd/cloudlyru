@@ -37,12 +37,11 @@ class FolderNode {
 /// откуда файл приехал.
 ///
 /// Абсолютный [path] нужен, чтобы открыть файл, [root] — чтобы понять, из какого выбранного
-/// корня он пришёл (корней может быть несколько: внутренняя память и карта памяти), [media] —
-/// только для иконки в списке: раздел определяется папкой, а не типом файла.
+/// корня он пришёл (корней может быть несколько: внутренняя память и карта памяти).
 class DeviceFile {
   /// [path] и [name] — где файл лежит и как зовётся; [dir] — папка файла; [relDir] — путь
   /// папки внутри выбранного корня; [root] — выбранный корень; [size] и [mtime] — из `stat`
-  /// на момент обхода; [media] — фото или видео по расширению.
+  /// на момент обхода.
   const DeviceFile({
     required this.path,
     required this.name,
@@ -51,7 +50,6 @@ class DeviceFile {
     required this.root,
     required this.size,
     required this.mtime,
-    required this.media,
   });
 
   final String path;
@@ -64,8 +62,6 @@ class DeviceFile {
   /// Время изменения файла на телефоне (мс с эпохи): по нему файл сравнивается с версией
   /// в облаке и по нему же список сортируется «свежие сверху».
   final int mtime;
-
-  final bool media;
 }
 
 /// Итог обхода выбранных папок.
@@ -298,7 +294,6 @@ class DeviceFiles {
             root: root,
             size: stat.size,
             mtime: stat.modified.millisecondsSinceEpoch,
-            media: MediaRules.isMedia(name),
           ));
           if (found.length >= hardMax) {
             // Уперлись в предел: в список попало не всё, и `capped` говорит об этом в итоге —

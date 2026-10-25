@@ -1,7 +1,6 @@
 import { Global, Module } from '@nestjs/common';
 import { MediaController } from './media.controller';
 import { MediaService } from './media.service';
-import { AlbumsService } from './albums.service';
 
 /**
  * @Global: MediaService (EXIF/таймлайн) нужен во многих модулях — единый инстанс,
@@ -10,7 +9,7 @@ import { AlbumsService } from './albums.service';
 @Global()
 @Module({
   controllers: [MediaController],
-  providers: [MediaService, AlbumsService],
+  providers: [MediaService],
   exports: [MediaService],
 })
 export class MediaModule {}

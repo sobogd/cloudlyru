@@ -14,7 +14,6 @@ import { UploadsModule } from './uploads/uploads.module';
 import { TrashModule } from './trash/trash.module';
 import { DavModule } from './dav/dav.module';
 import { MediaModule } from './media/media.module';
-import { MediaFeedModule } from './media-feed/media-feed.module';
 import { QueueModule } from './queue/queue.module';
 import { HealthModule } from './health/health.module';
 import { UnzipModule } from './unzip/unzip.module';
@@ -60,7 +59,6 @@ import { NotesModule } from './notes/notes.module';
     TrashModule,
     DavModule,
     MediaModule,
-    MediaFeedModule,
     QueueModule,
     HealthModule,
     UnzipModule,

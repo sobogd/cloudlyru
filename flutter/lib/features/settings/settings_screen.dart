@@ -8,7 +8,6 @@ import 'mail_accounts_panel.dart';
 import 'queue_errors_screen.dart';
 import 'queue_panel.dart';
 import 'sync_panel.dart';
-import 'thumbs_panel.dart';
 import 'tokens_panel.dart';
 import 'updater.dart';
 
@@ -70,12 +69,6 @@ class SettingsScreen extends ConsumerWidget {
           title: 'Синхронизация',
           icon: Icons.sync,
           body: const SyncPanel(),
-        ),
-        MasterDetailEntry(
-          id: 'thumbs',
-          title: 'Миниатюры галереи',
-          icon: Icons.image_outlined,
-          body: const ThumbsPanel(),
         ),
         MasterDetailEntry(
           id: 'updater',

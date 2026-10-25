@@ -166,24 +166,18 @@ class ChangesPage {
   final List<CloudChange> changes;
 }
 
-/// Свои данные и системные папки: зеркалу нужен id этого устройства в журнале изменений.
+/// Свои данные: зеркалу нужен id этого устройства в журнале изменений.
 ///
 /// Приходит от `GET /auth/me`; этим же запросом проверяется живость device-токена.
 class MeInfo {
   const MeInfo({
     required this.login,
-    this.photoFolderId,
-    this.phoneFolderId,
     this.mirrorFolderId,
     this.deviceId,
   });
 
   /// Логин владельца токена; пустая строка — сервер его не отдал.
   final String login;
-
-  /// Системные папки разделов: медиатека «Фото» и легаси-«Телефон». null — папки ещё нет.
-  final String? photoFolderId;
-  final String? phoneFolderId;
 
   /// Прежний корень зеркала устройства (`‹Имя устройства› - Файлы`). Эта сборка его не читает
   /// и не создаёт: папки облака для «Файлов» человек выбирает связками (см. `SyncLinks`).
@@ -367,19 +361,10 @@ class SyncApi {
     final o = _mOrThrow(await _req('/auth/me'), 'свои данные');
     return MeInfo(
       login: '${o['login'] ?? ''}',
-      photoFolderId: _sOrNull(o['photoFolderId']),
-      phoneFolderId: _sOrNull(o['phoneFolderId']),
       mirrorFolderId: _sOrNull(o['mirrorFolderId']),
       deviceId: _sOrNull(o['deviceId']),
     );
   }
-
-  /// Только системные папки: очередь наполняется и без корня зеркала.
-  ///
-  /// Отдельного запроса нет намеренно — это тот же `GET /auth/me`, что и [meInfo], просто
-  /// названный по делу: очередь не должна знать, что «системные папки» и «свои данные»
-  /// приходят одним ответом.
-  Future<MeInfo> systemFolders() => meInfo();
 
   /// Отозвать токен, которым пришёл запрос. Нужно при выходе: без этого серверный токен
   /// остаётся живым до истечения срока и даёт полный доступ к облаку.

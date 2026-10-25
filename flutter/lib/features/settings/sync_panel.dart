@@ -5,10 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers.dart';
-import '../../sync/section.dart';
 import '../../sync/sync_controller.dart';
-import '../../sync/ui/folder_tree_screen.dart';
-import '../../sync/ui/queue_screen.dart';
 import '../../theme.dart';
 import '../../util/widgets.dart';
 import 'sync_links_screen.dart';
@@ -16,15 +13,13 @@ import 'sync_links_screen.dart';
 /// iOS: папки для синхронизации там не обходятся, а выбираются через системный «Файлы»
 /// (см. `sync/device/ios_folders.dart`), и синхронизация идёт, только пока приложение открыто —
 /// фоновой работы система не даёт. Панель об этом говорит строкой, а не прячет раздел:
-/// остальное (связки, очередь, зеркало) работает как везде.
+/// остальное (связки, зеркало) работает как везде.
 final bool _ios = Platform.isIOS;
 
-/// Группа «Синхронизация»: доступ к файлам, связки «устройство ↔ облако», папки «Фото»,
-/// очередь и зеркало.
+/// Группа «Синхронизация»: доступ к файлам, связки «устройство ↔ облако» и зеркало.
 ///
 /// Всё, что делает синхронизатор, видно и настраивается здесь: отдельной вкладки у него нет —
-/// нижняя навигация остаётся той же, что и раньше, а разделы «Файлы»/«Фото» и очередь
-/// открываются строками отсюда.
+/// нижняя навигация остаётся той же, что и раньше, а раздел «Файлы» открывается строкой отсюда.
 class SyncPanel extends ConsumerStatefulWidget {
   const SyncPanel({super.key});
 
@@ -47,8 +42,8 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
 
   /// Открывает вложенный экран и перерисовывается по возвращении.
   ///
-  /// Перерисовка нужна потому, что там меняется то, что показывает эта панель: выбор папок
-  /// для разделов и очередь выгрузки. Побочно: маршрут и `setState`.
+  /// Перерисовка нужна потому, что там меняется то, что показывает эта панель: связки.
+  /// Побочно: маршрут и `setState`.
   Future<void> _open(Widget screen) async {
     await Navigator.of(context)
         .push(MaterialPageRoute<void>(builder: (_) => screen));
@@ -84,7 +79,6 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
     final sync = ref.watch(syncControllerProvider);
     // у «Файлов» не выбор папок, а связки: папку в облаке человек выбирает сам
     final fileLinks = sync.links?.all().length ?? 0;
-    final photoFolders = sync.selection?.count(Section.photos) ?? 0;
     final granted = sync.access == SyncAccess.granted;
 
     return Panel(
@@ -159,24 +153,6 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
             enabled: granted,
             onTap: () => _open(const SyncLinksScreen()),
           ),
-          _row(
-            icon: Icons.photo_library_outlined,
-            title: 'Папки для фото и видео',
-            subtitle: photoFolders == 0
-                ? 'не выбраны'
-                : 'выбрано: $photoFolders',
-            enabled: granted,
-            onTap: () => _open(const FolderTreeScreen(section: Section.photos)),
-          ),
-          _row(
-            icon: Icons.cloud_upload_outlined,
-            title: 'Очередь выгрузки',
-            subtitle: sync.waiting == 0
-                ? 'нечего выгружать'
-                : 'в очереди: ${sync.waiting} — выгружается само',
-            enabled: granted,
-            onTap: () => _open(const QueueScreen()),
-          ),
           const SizedBox(height: 8),
           Text(
             _statusLine(sync),
@@ -204,9 +180,6 @@ class _SyncPanelState extends ConsumerState<SyncPanel> {
     final parts = <String>['в облаке: ${status.inCloudFiles} файлов'];
     if (status.waitingFiles > 0) {
       parts.add('ждёт выгрузки: ${status.waitingFiles}');
-    }
-    if (sync.waiting > 0) {
-      parts.add('в очереди: ${sync.waiting}');
     }
     return parts.join(' · ');
   }

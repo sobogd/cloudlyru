@@ -11,7 +11,7 @@ import 'thumb_store.dart';
 /// Значения — за время жизни объекта (сессию приложения): счётчики не сбрасываются при
 /// открытии экрана, иначе прогресс «прыгал» бы при каждом заходе в настройки.
 class ThumbQueueStats {
-  /// Сколько миниатюр ждёт загрузки (включая фоновые, поставленные прогревом).
+  /// Сколько миниатюр ждёт загрузки (включая фоновые).
   final int queued;
 
   /// Сколько качается прямо сейчас (не больше [ThumbCache.concurrency]).
@@ -44,30 +44,13 @@ class ThumbQueueStats {
   bool get busy => queued > 0 || running > 0;
 }
 
-/// Ход прогрева всей библиотеки (кнопка «Скачать все миниатюры»).
-class ThumbWarmProgress {
-  /// Сколько кадров ленты уже просмотрено (не скачано: часть могла быть на диске).
-  final int scanned;
-
-  /// Сколько кадров в ленте всего, по данным сервера.
-  final int total;
-
-  /// Прогрев продолжается прямо сейчас.
-  final bool running;
-
-  const ThumbWarmProgress({required this.scanned, required this.total, required this.running});
-
-  /// Доля просмотренного от 0 до 1; при неизвестном общем числе — 0.
-  double get fraction => total > 0 ? (scanned / total).clamp(0.0, 1.0) : 0.0;
-}
-
-/// Очередь загрузки миниатюр и прогрев библиотеки.
+/// Очередь загрузки миниатюр для раздела «Файлы».
 ///
 /// Зачем своя очередь, а не `CachedNetworkImage` у каждой плитки: миниатюры копятся в данных
 /// приложения (см. [ThumbStore]), а не в кэш-каталоге, поэтому загрузку ведёт приложение.
 /// Плюс одна очередь даёт то, чего не даёт загрузка «виджет за виджетом»: ограничение
-/// параллелизма (сервер и канал не выдерживают сотни одновременных запросов), приоритет
-/// видимого окна над фоновым прогревом и общий прогресс.
+/// параллелизма (сервер и канал не выдерживают сотни одновременных запросов) и общий
+/// прогресс.
 ///
 /// Дедупликация: один sha256 — одна загрузка. Две плитки с одинаковым содержимым (файл лежит
 /// в двух папках) ждут один и тот же [Future], а не качают одно и то же дважды.
@@ -98,13 +81,10 @@ class ThumbCache {
   /// Состояние очереди для интерфейса.
   final ValueNotifier<ThumbQueueStats> queue = ValueNotifier(ThumbQueueStats.idle);
 
-  /// Прогресс прогрева библиотеки; `null` — прогрев не запускался в этой сессии.
-  final ValueNotifier<ThumbWarmProgress?> warm = ValueNotifier(null);
-
   /// Приоритетная очередь: то, что человек видит сейчас.
   final List<String> _high = [];
 
-  /// Фоновая очередь: прогрев библиотеки.
+  /// Фоновая очередь: миниатюры, которые пока не в окне, но скоро будут.
   final List<String> _low = [];
 
   /// Кто ждёт миниатюру: sha256 → ожидающий. Значение — и «в очереди», и «качается».
@@ -116,37 +96,6 @@ class ThumbCache {
   int _running = 0;
   int _done = 0;
   int _failed = 0;
-  bool _warming = false;
-  bool _stopped = false;
-  bool _paused = false;
-
-  /// Приостановить загрузку: список едет, и качать в это время нечего (см. `GalleryController`).
-  ///
-  /// Начатые загрузки доигрываются — оборвать запрос в середине нельзя, — а новые не берутся
-  /// из очереди до снятия паузы. Очередь при этом не теряется: просьбы остаются в ней и уходят
-  /// на сервер сразу после остановки списка. Так прокрутка не платит за сеть и за декодирование
-  /// картинок, которых человек всё равно не рассматривает.
-  bool get paused => _paused;
-  set paused(bool value) {
-    if (_paused == value) return;
-    _paused = value;
-    if (!_paused) _pump();
-  }
-
-  /// Сколько страниц ленты просматривает прогрев за раз: серверный потолок одного
-  /// `/media/range` (`MEDIA_RANGE_MAX = 1000`, src/media-feed/media-feed.service.ts).
-  static const int _warmPage = 1000;
-
-  /// Сколько загрузок прогрев держит в очереди. Больше — и десятки тысяч строк висят
-  /// в памяти ради работы, которая всё равно идёт по нескольку загрузок за раз.
-  static const int _warmBacklog = 400;
-
-
-  /// Сколько миниатюр ещё не на диске из тех, что уже поставлены или поставятся.
-  ///
-  /// Нужно панели настроек: «в очереди» показывает только текущий хвост, а человеку важно
-  /// видеть, сколько осталось до конца прогрева.
-  int get pending => _high.length + _low.length + _running;
 
   /// Сколько раз пробовать одну миниатюру, прежде чем признать неудачу.
   static const int _attempts = 3;
@@ -162,16 +111,14 @@ class ThumbCache {
   /// Попросить миниатюру: вернётся, когда файл появится на диске (или станет ясно, что его
   /// не будет). Повторные вызовы для того же sha256 получают тот же [Future].
   ///
-  /// [background] — фоновая загрузка (прогрев): она уступает место всему, что показывает
-  /// человек, и не мешает кадру отрисоваться быстрее.
+  /// [background] — фоновая загрузка: уступает место тому, что человек видит сейчас, и не
+  /// мешает кадру отрисоваться быстрее.
   Future<void> request(String sha, {bool background = false}) {
     if (sha.length < 2) return Future.value();
     if (file(sha) != null || _missing.contains(sha)) return Future.value();
     final existing = _waiting[sha];
     if (existing != null) return existing.future;
-    // Фоновые задачи НЕ отбрасываются никогда: прогрев библиотеки ставит их быстрее, чем они
-    // качаются, и раньше «лишние» просто терялись — из 51 тысячи миниатюр скачивалось две с
-    // половиной. Размер очереди регулирует сам прогрев, дожидаясь её опустошения (warmLibrary).
+    // Повторную просьбу не ставим дважды: ожидающий уже в очереди.
     final completer = Completer<void>();
     _waiting[sha] = completer;
     (background ? _low : _high).add(sha);
@@ -183,94 +130,10 @@ class ThumbCache {
   /// Сколько миниатюр лежит на диске и сколько они занимают.
   Future<ThumbStats> stats() => store.stats();
 
-  /// Стереть все миниатюры вместе с памятью о «превью нет»: после очистки кадры можно
-  /// спрашивать заново — к этому моменту на сервере превью могло уже собраться.
-  Future<void> clear() async {
-    await store.clear();
-    _missing.clear();
-    _done = 0;
-    _failed = 0;
-    _publish();
-  }
-
-  /// Скачать миниатюры всей библиотеки.
-  ///
-  /// Идёт страницами `/media/range` — по тем же кадрам и в том же порядке, что и лента, —
-  /// и ставит в фоновую очередь всё, у чего превью уже собрано (`previewState == 'done'`).
-  /// Кадры с несобранным превью пропускаются: качать нечего, а миниатюра «на будущее» всё
-  /// равно появится только после того, как сервер её соберёт.
-  ///
-  /// Повторный запуск после прерывания безопасен: уже скачанные кадры пропускаются по
-  /// наличию файла (см. [request]), поэтому прогресс не теряется. Останавливается
-  /// [stopWarm]; завершается, когда очередь опустеет.
-  Future<void> warmLibrary() async {
-    if (_warming) return;
-    _warming = true;
-    _stopped = false;
-    var scanned = 0;
-    var total = 0;
-    try {
-      final api = apiOf();
-      total = await api.mediaCount();
-      warm.value = ThumbWarmProgress(scanned: 0, total: total, running: true);
-      for (var offset = 0; offset < total; offset += _warmPage) {
-        if (_stopped) break;
-        // Ждём, пока очередь опустится, ДО постановки следующей страницы: иначе задачи
-        // копились бы в памяти десятками тысяч, а качались всё равно по нескольку за раз.
-        // Именно ожидание, а не отбрасывание: отброшенная задача не вернётся, и прогрев
-        // оставался неполным.
-        while (!_stopped && _waiting.length > _warmBacklog) {
-          await Future.delayed(const Duration(milliseconds: 200));
-        }
-        if (_stopped) break;
-        final page = await api.mediaRange(offset, _warmPage);
-        if (page.isEmpty) break;
-        for (final item in page) {
-          final sha = item.sha256;
-          if (sha == null || sha.isEmpty || item.previewState != 'done') continue;
-          unawaited(request(sha, background: true));
-        }
-        scanned += page.length;
-        warm.value = ThumbWarmProgress(scanned: scanned, total: total, running: true);
-      }
-      // Дожидаемся конца очереди: иначе полоса прогресса исчезнет с ещё идущей загрузкой.
-      while (!_stopped && (_running > 0 || _waiting.isNotEmpty)) {
-        await Future.delayed(const Duration(milliseconds: 200));
-      }
-    } catch (e) {
-      if (kDebugMode) debugPrint('warm thumbs error: $e');
-    } finally {
-      _warming = false;
-      warm.value = ThumbWarmProgress(scanned: scanned, total: total, running: false);
-    }
-  }
-
-  /// Выбросить фоновые задачи, которые больше не нужны.
-  ///
-  /// Так делает лента при смене окна: кадры, для которых стоял прогрев, уже уехали с экрана,
-  /// и качать их — значит занимать канал и потоки впустую, пока видимые плитки ждут своей
-  /// очереди. Начатые загрузки доигрываются (отменить запрос в середине нельзя), но новые из
-  /// старого набора не берутся.
-  void dropBackground() {
-    if (_low.isEmpty) return;
-    for (final sha in _low) {
-      _waiting.remove(sha)?.complete();
-    }
-    _low.clear();
-    _publish();
-  }
-
-  /// Остановить прогрев. Уже начатые загрузки доигрываются, очередь фоновых задач не берётся.
-  void stopWarm() {
-    _stopped = true;
-  }
-
   /// Взять следующую задачу, если есть свободный слот.
   ///
-  /// На паузе (список едет) не берётся ничего: очередь ждёт остановки, а снятие паузы зовёт
-  /// [paused] — иначе после неё загрузка не возобновилась бы, пока не придёт новая просьба.
+  /// Сначала — видимые миниатюры (_high): они уступают место фону, пока человек на них смотрит.
   void _pump() {
-    if (_paused) return;
     while (_running < concurrency) {
       final sha = _high.isNotEmpty
           ? _high.removeLast()
