@@ -36,7 +36,7 @@ const prisma = new PrismaClient();
 // in-запросы режем на порции: Postgres ограничивает число параметров в одном запросе,
 // а фото-ассетов может быть десятки тысяч.
 const CHUNK = 5000;
-function chunks(list) {
+function* chunks(list) {
   for (let i = 0; i < list.length; i += CHUNK) yield list.slice(i, i + CHUNK);
 }
 
